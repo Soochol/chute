@@ -65,6 +65,7 @@ impl Sandbox {
             (OsString::from("GIT_CONFIG_NOSYSTEM"), Some("1".into())),
             (OsString::from("XDG_STATE_HOME"), None),
             (OsString::from("HC_TERMINAL_ID"), None),
+            (OsString::from("HERDR_APP_HOME"), None),
             (OsString::from("GIT_DIR"), None),
             (OsString::from("GIT_WORK_TREE"), None),
             (OsString::from("GIT_INDEX_FILE"), None),
