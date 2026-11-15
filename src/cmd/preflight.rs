@@ -1,8 +1,28 @@
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 
-use super::{Ctx, not_implemented};
+use super::{Ctx, REFUSED};
+use crate::config::Config;
+use crate::feedback::{self, Feedback, Subject, Written};
+use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
+use crate::model::{
+    Blocked, ConflictFile, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty, Partner,
+    PrNumber, PreflightRecord, PreflightResult, QueueItem, RepoInfo, Sha, StepFailure, VerifyMode,
+};
+use crate::store::RepoStore;
+use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
+
+const KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LOG_ROOT: &str = "preflight";
+const SHOWN_PATHS: usize = 5;
+const REF_KEY_LIMIT: usize = 80;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -11,19 +31,727 @@ pub struct Args {
     pub json: bool,
 }
 
-pub fn run(_args: Args, _ctx: &Ctx) -> Result<ExitCode> {
-    not_implemented("preflight")
+pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    let report = preflight(ctx)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render(&report));
+    }
+    Ok(match report.result {
+        PreflightResult::Pass => ExitCode::SUCCESS,
+        PreflightResult::Fail | PreflightResult::Conflict => ExitCode::from(REFUSED),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct Report {
+    result: PreflightResult,
+    head: Sha,
+    base: Sha,
+    with: Vec<PrNumber>,
+    skipped: Vec<Skipped>,
+    flaky: Vec<FlakyReport>,
+    kind: Option<FailureKind>,
+    mode: Option<Mode>,
+    summary: Option<String>,
+    report: Option<PathBuf>,
+    report_json: Option<PathBuf>,
+    blocked: Option<Blocked>,
+    at_ms: EpochMs,
+}
+
+#[derive(Debug, Serialize)]
+struct Skipped {
+    pr: PrNumber,
+    why: Why,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Why {
+    HeadChanged,
+    FetchFailed,
+    Conflict,
+    InBase,
+}
+
+impl Why {
+    fn label(self) -> &'static str {
+        match self {
+            Why::HeadChanged => "등록한 뒤 HEAD가 바뀌었다",
+            Why::FetchFailed => "HEAD를 가져오지 못했다",
+            Why::Conflict => "앞의 큐 항목과 충돌한다",
+            Why::InBase => "이미 기준에 들어 있다",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FlakyReport {
+    step: String,
+    tests: Vec<String>,
+}
+
+struct Target {
+    head: Sha,
+    branch: Option<String>,
+}
+
+struct Judged {
+    result: PreflightResult,
+    with: Vec<PrNumber>,
+    flaky: Vec<FlakyStep>,
+    written: Option<Written>,
+}
+
+fn preflight(ctx: &Ctx) -> Result<Report> {
+    let dir = ctx.target_dir()?;
+    let (info, store) = ctx.registered_repo()?;
+    let target = read_target(ctx, &dir)?;
+    let state = store.load()?;
+    if let Some(blocked) = &state.blocked {
+        eprintln!("{}", blocked_notice(blocked));
+    }
+    let queued: Vec<&QueueItem> = state
+        .queue
+        .iter()
+        .filter(|item| matches!(item.state, ItemState::Queued(_) | ItemState::InBatch))
+        .filter(|item| Some(item.branch.as_str()) != target.branch.as_deref())
+        .collect();
+
+    let gitops = Gitops::new(&ctx.ext, &ctx.home, &info);
+    let slot = gitops.lock_preflight_slot()?.open()?;
+    let base = slot.fetch_base()?;
+    let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)?
+        .ok_or_else(|| {
+            anyhow!(
+                "origin/{}에서 chute.toml을 읽지 못했다. 기본 브랜치에 올렸는지 확인한다",
+                info.default_branch
+            )
+        })?;
+
+    let mut skipped = Vec::new();
+    let mut items = fetch_queue(&slot, &queued, &mut skipped);
+    items.push(MergeItem::Local {
+        head: target.head.clone(),
+    });
+    let merged = slot.merge(&base, &items)?;
+    let Some((own, queue_outcomes)) = merged.items.split_last() else {
+        bail!("합치기 결과가 비었다");
+    };
+    let mut together: Vec<(PrNumber, String, Sha)> = Vec::new();
+    for outcome in queue_outcomes {
+        let MergeItem::Pr {
+            pr, title, head, ..
+        } = &outcome.item
+        else {
+            bail!("큐 항목이 아닌 것이 큐 자리에 있다");
+        };
+        match outcome.result {
+            ItemResult::Merged { .. } => together.push((*pr, title.clone(), head.clone())),
+            ItemResult::AlreadyMerged => skipped.push(skip(*pr, Why::InBase, None)),
+            ItemResult::Conflict(_) => skipped.push(skip(*pr, Why::Conflict, None)),
+        }
+    }
+
+    let worktrees_root = feedback::worktrees_root(|key| std::env::var_os(key)).unwrap_or_default();
+    let feedback = Feedback {
+        ext: &ctx.ext,
+        repo: &info,
+        store: &store,
+        config: &config,
+        worktrees_root: &worktrees_root,
+    };
+    let at = EpochMs::now();
+    let run = Run {
+        ctx,
+        info: &info,
+        store: &store,
+        config: &config,
+        feedback: &feedback,
+        gitops: &gitops,
+        slot: &slot,
+        target: &target,
+        base: &base,
+        together: &together,
+        log_dir: log_dir(&store, &target.head, at)?,
+    };
+    let judged = match &own.result {
+        ItemResult::Conflict(files) => run.conflict(files)?,
+        ItemResult::Merged { .. } | ItemResult::AlreadyMerged => run.verify(&merged.tip)?,
+    };
+
+    let report = Report::new(&judged, &target, &base, skipped, state.blocked, at);
+    if let Err(e) = record(&store, &target, &report) {
+        eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
+    }
+    forget_failed_ref(&gitops, &target, &report);
+    prune(&store);
+    Ok(report)
+}
+
+fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
+    let status = ctx
+        .ext
+        .git(dir, ["--no-optional-locks", "status", "--porcelain"])?
+        .ok()?;
+    if !status.trim().is_empty() {
+        let lines: Vec<&str> = status.lines().collect();
+        let shown = lines
+            .iter()
+            .take(SHOWN_PATHS)
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = lines.len().saturating_sub(SHOWN_PATHS);
+        let tail = if more > 0 {
+            format!("\n  …외 {more}개")
+        } else {
+            String::new()
+        };
+        bail!(
+            "커밋되지 않은 변경이 있어 검증하지 않는다. 변경을 커밋한 뒤 다시 실행한다:\n{shown}{tail}"
+        );
+    }
+    let head = ctx
+        .ext
+        .git(dir, ["rev-parse", "--verify", "HEAD^{commit}"])?
+        .ok()?;
+    let head = Sha::try_from(head.trim().to_owned()).map_err(|e| anyhow!(e))?;
+    let named = ctx
+        .ext
+        .git(dir, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let branch = named
+        .success()
+        .then(|| named.stdout_text().trim().to_owned())
+        .filter(|name| !name.is_empty());
+    Ok(Target { head, branch })
+}
+
+fn fetch_queue(slot: &Slot, queued: &[&QueueItem], skipped: &mut Vec<Skipped>) -> Vec<MergeItem> {
+    let mut items = Vec::new();
+    for item in queued {
+        match slot.fetch_pr_head(item.pr, &item.head) {
+            Ok(PrHead::Unchanged) => items.push(MergeItem::Pr {
+                pr: item.pr,
+                branch: item.branch.clone(),
+                title: item.title.clone(),
+                head: item.head.clone(),
+            }),
+            Ok(PrHead::Changed { .. }) => skipped.push(skip(item.pr, Why::HeadChanged, None)),
+            Err(e) => skipped.push(skip(item.pr, Why::FetchFailed, Some(format!("{e:#}")))),
+        }
+    }
+    items
+}
+
+fn skip(pr: PrNumber, why: Why, detail: Option<String>) -> Skipped {
+    Skipped { pr, why, detail }
+}
+
+struct Run<'a> {
+    ctx: &'a Ctx,
+    info: &'a RepoInfo,
+    store: &'a RepoStore,
+    config: &'a Config,
+    feedback: &'a Feedback<'a>,
+    gitops: &'a Gitops,
+    slot: &'a Slot,
+    target: &'a Target,
+    base: &'a Sha,
+    together: &'a [(PrNumber, String, Sha)],
+    log_dir: PathBuf,
+}
+
+impl Run<'_> {
+    fn subject(&self) -> Subject {
+        Subject::Commit {
+            commit: self.target.head.clone(),
+        }
+    }
+
+    fn with(&self) -> Vec<PrNumber> {
+        self.together.iter().map(|(pr, ..)| *pr).collect()
+    }
+
+    fn conflict(&self, files: &NonEmpty<ConflictFile>) -> Result<Judged> {
+        let owners = self.commit_owners()?;
+        let named: Vec<ConflictFile> = files
+            .iter()
+            .map(|file| ConflictFile {
+                path: file.path.clone(),
+                main_commits: file
+                    .main_commits
+                    .iter()
+                    .map(|commit| {
+                        let mut commit = commit.clone();
+                        if let Some(pr) = owners.get(&commit.sha) {
+                            commit.title = format!("큐의 PR {pr}: {}", commit.title);
+                        }
+                        commit
+                    })
+                    .collect(),
+            })
+            .collect();
+        let files = NonEmpty::new(named).ok_or_else(|| anyhow!("충돌한 파일 목록이 비었다"))?;
+        let written =
+            self.feedback
+                .write_report(&self.subject(), &Failure::Conflict { files }, None)?;
+        Ok(Judged {
+            result: PreflightResult::Conflict,
+            with: self.with(),
+            flaky: Vec::new(),
+            written: Some(written),
+        })
+    }
+
+    fn commit_owners(&self) -> Result<HashMap<Sha, PrNumber>> {
+        let mut owners = HashMap::new();
+        for (pr, _, head) in self.together {
+            let range = format!("{}..{head}", self.base);
+            let listed = self
+                .ctx
+                .ext
+                .git(self.slot.path(), ["log", "--format=%H", range.as_str()])?
+                .ok()?;
+            for line in listed.lines() {
+                let sha = Sha::try_from(line.trim().to_owned()).map_err(|e| anyhow!(e))?;
+                owners.entry(sha).or_insert(*pr);
+            }
+        }
+        Ok(owners)
+    }
+
+    fn verify(&self, tip: &Sha) -> Result<Judged> {
+        let with = self.with();
+        let failed = match self.run_steps(&self.log_dir.join("with-queue"))? {
+            Outcome::Passed { flaky } => {
+                return Ok(Judged {
+                    result: PreflightResult::Pass,
+                    with,
+                    flaky,
+                    written: None,
+                });
+            }
+            Outcome::Failed(failed) => failed,
+            Outcome::Cancelled => bail!("검증이 취소됐다"),
+        };
+        let (failure, tree) = if with.is_empty() {
+            (step_failure(&failed, VerifyMode::Solo, tip), tip.clone())
+        } else {
+            self.tell_solo_from_combo(failed, tip)?
+        };
+        let written = self.report_failure(&failure, &tree)?;
+        Ok(Judged {
+            result: PreflightResult::Fail,
+            with,
+            flaky: Vec::new(),
+            written: Some(written),
+        })
+    }
+
+    fn tell_solo_from_combo(&self, failed: verify::Failed, tip: &Sha) -> Result<(Failure, Sha)> {
+        let solo = self.slot.merge(
+            self.base,
+            &[MergeItem::Local {
+                head: self.target.head.clone(),
+            }],
+        )?;
+        if matches!(
+            solo.items.first().map(|item| &item.result),
+            Some(ItemResult::Conflict(_))
+        ) {
+            bail!("기준 위에 이 HEAD만 얹다가 충돌했다. 큐와 함께 합칠 때는 충돌하지 않았다");
+        }
+        match self.run_steps(&self.log_dir.join("solo"))? {
+            Outcome::Passed { .. } => {
+                let partners = self.partners(tip)?;
+                let mode = VerifyMode::Combo { partners };
+                Ok((step_failure(&failed, mode, tip), tip.clone()))
+            }
+            Outcome::Failed(alone) => Ok((
+                step_failure(&alone, VerifyMode::Solo, &solo.tip),
+                solo.tip.clone(),
+            )),
+            Outcome::Cancelled => bail!("검증이 취소됐다"),
+        }
+    }
+
+    fn partners(&self, tip: &Sha) -> Result<NonEmpty<Partner>> {
+        let subject = self.subject();
+        let partners = self
+            .together
+            .iter()
+            .map(|(pr, title, _)| {
+                self.feedback
+                    .partner_or_placeholder(&subject, tip, *pr, title)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        NonEmpty::new(partners).ok_or_else(|| anyhow!("함께 검증한 PR이 없는데 조합 실패로 봤다"))
+    }
+
+    fn report_failure(&self, failure: &Failure, tree: &Sha) -> Result<Written> {
+        let name = failed_ref_name(self.target);
+        self.gitops.set_failed_ref(&name, tree)?;
+        self.feedback
+            .write_report(&self.subject(), failure, Some(&name))
+    }
+
+    fn run_steps(&self, log_dir: &Path) -> Result<Outcome> {
+        let on_step = |name: &str| eprintln!("검증 단계: {name}");
+        let options = Options {
+            on_step: Some(&on_step),
+            ..Options::default()
+        };
+        verify::run(self.config, self.store, self.slot.path(), log_dir, &options)
+            .with_context(|| format!("검증을 돌리지 못했다 (저장소 {})", self.info.slug))
+    }
+}
+
+fn step_failure(failed: &verify::Failed, mode: VerifyMode, tree: &Sha) -> Failure {
+    let step = StepFailure {
+        step: failed.step.clone(),
+        mode,
+        failed_tests: match &failed.detail {
+            Detail::Tests(tests) => tests.to_vec(),
+            Detail::Tail(_) => Vec::new(),
+        },
+        log: failed.log.clone(),
+        tree: tree.clone(),
+    };
+    match failed.cause {
+        Cause::TimedOut => Failure::Timeout(step),
+        Cause::Exited(_) | Cause::Signaled(_) => Failure::Verify(step),
+    }
+}
+
+fn failed_ref_name(target: &Target) -> String {
+    let key = match &target.branch {
+        Some(branch) => branch.as_str(),
+        None => target.head.as_str(),
+    };
+    let plain: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(REF_KEY_LIMIT)
+        .collect();
+    format!("preflight-{plain}")
+}
+
+fn log_dir(store: &RepoStore, head: &Sha, at: EpochMs) -> Result<PathBuf> {
+    let short = &head.as_str()[..head.as_str().len().min(12)];
+    let dir = store.dir().join(LOG_ROOT).join(format!("{short}-{}", at.0));
+    std::path::absolute(&dir)
+        .with_context(|| format!("경로를 절대 경로로 바꾸지 못했다: {}", dir.display()))
+}
+
+impl Report {
+    fn new(
+        judged: &Judged,
+        target: &Target,
+        base: &Sha,
+        skipped: Vec<Skipped>,
+        blocked: Option<Blocked>,
+        at_ms: EpochMs,
+    ) -> Report {
+        let shape = judged
+            .written
+            .as_ref()
+            .map(|written| written.doc.failure.shape());
+        let mode = shape.and_then(|shape| match shape {
+            crate::model::FailureShape::Verify(mode)
+            | crate::model::FailureShape::Timeout(mode) => Some(mode),
+            crate::model::FailureShape::Conflict | crate::model::FailureShape::Ci => None,
+        });
+        Report {
+            result: judged.result,
+            head: target.head.clone(),
+            base: base.clone(),
+            with: judged.with.clone(),
+            skipped,
+            flaky: judged
+                .flaky
+                .iter()
+                .map(|flaky| FlakyReport {
+                    step: flaky.step.clone(),
+                    tests: flaky.tests.clone(),
+                })
+                .collect(),
+            kind: shape.map(|shape| shape.kind()),
+            mode,
+            summary: judged
+                .written
+                .as_ref()
+                .map(|written| written.doc.summary.clone()),
+            report: judged.written.as_ref().map(|written| written.md.clone()),
+            report_json: judged.written.as_ref().map(|written| written.json.clone()),
+            blocked,
+            at_ms,
+        }
+    }
+}
+
+fn record(store: &RepoStore, target: &Target, report: &Report) -> Result<()> {
+    let Some(branch) = &target.branch else {
+        eprintln!("경고: 브랜치가 아닌 HEAD라 결과를 상태에 기록하지 않는다");
+        return Ok(());
+    };
+    let cutoff = report.at_ms.0.saturating_sub(KEEP_FOR.as_millis() as u64);
+    store.update(|state| {
+        let queued: Vec<String> = state.queue.iter().map(|i| i.branch.clone()).collect();
+        state
+            .preflights
+            .retain(|name, old| old.at_ms.0 >= cutoff || queued.contains(name));
+        state.preflights.insert(
+            branch.clone(),
+            PreflightRecord {
+                head: report.head.clone(),
+                result: report.result,
+                report: report.report.clone(),
+                at_ms: report.at_ms,
+                base: Some(report.base.clone()),
+                with: report.with.clone(),
+            },
+        );
+        Ok(())
+    })
+}
+
+fn forget_failed_ref(gitops: &Gitops, target: &Target, report: &Report) {
+    if report.result == PreflightResult::Fail {
+        return;
+    }
+    if let Err(e) = gitops.delete_failed_ref(&failed_ref_name(target)) {
+        eprintln!("경고: 지난 실패 트리 참조를 지우지 못했다: {e:#}");
+    }
+}
+
+fn prune(store: &RepoStore) {
+    let logs = store.dir().join(LOG_ROOT);
+    let reports = store.dir().join("reports");
+    for (dir, only_commit_reports) in [(logs, false), (reports, true)] {
+        if let Err(e) = remove_old(&dir, only_commit_reports) {
+            eprintln!("경고: 오래된 기록을 지우지 못했다 ({}): {e}", dir.display());
+        }
+    }
+}
+
+fn remove_old(dir: &Path, only_commit_reports: bool) -> io::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if only_commit_reports && !entry.file_name().to_string_lossy().starts_with("commit-") {
+            continue;
+        }
+        let age = SystemTime::now()
+            .duration_since(entry.metadata()?.modified()?)
+            .unwrap_or_default();
+        if age > KEEP_FOR {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn blocked_notice(blocked: &Blocked) -> String {
+    format!(
+        "경고: 저장소가 base_broken 상태다. 기준 {}이 검증을 통과하지 못해 큐가 멈춰 있다. 이 결과의 실패가 내 변경 때문이 아닐 수 있다",
+        short(&blocked.base)
+    )
+}
+
+fn short(sha: &Sha) -> &str {
+    &sha.as_str()[..sha.as_str().len().min(12)]
+}
+
+fn render(report: &Report) -> String {
+    let mut out = String::new();
+    let with = if report.with.is_empty() {
+        "없음".to_owned()
+    } else {
+        report
+            .with
+            .iter()
+            .map(|pr| pr.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match (&report.summary, report.result) {
+        (Some(summary), _) => out.push_str(&format!("{summary}\n")),
+        (None, _) => out.push_str(&format!(
+            "통과: HEAD {} (기준 {}, 함께 검증한 PR {with})\n",
+            short(&report.head),
+            short(&report.base)
+        )),
+    }
+    if let Some(path) = &report.report {
+        out.push_str(&format!("보고서: {}\n", path.display()));
+    }
+    if report.result != PreflightResult::Pass {
+        out.push_str(&format!(
+            "HEAD {} · 기준 {} · 함께 검증한 PR {with}\n",
+            short(&report.head),
+            short(&report.base)
+        ));
+    }
+    for skipped in &report.skipped {
+        let detail = skipped
+            .detail
+            .as_ref()
+            .map(|d| format!(": {d}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "건너뛴 PR {}: {}{detail}\n",
+            skipped.pr,
+            skipped.why.label()
+        ));
+    }
+    for flaky in &report.flaky {
+        let tests = if flaky.tests.is_empty() {
+            String::new()
+        } else {
+            format!(" (시험 {})", flaky.tests.join(", "))
+        };
+        out.push_str(&format!(
+            "흔들린 단계: {}{tests}. 다시 돌려 통과해서 통과로 본다\n",
+            flaky.step
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use std::process::ExitCode;
+    use super::*;
+
+    fn sha(text: &str) -> Sha {
+        Sha::try_from(text.to_owned()).unwrap()
+    }
+
+    fn target(branch: Option<&str>) -> Target {
+        Target {
+            head: sha("0123456789abcdef0123456789abcdef01234567"),
+            branch: branch.map(str::to_owned),
+        }
+    }
+
+    fn passed(with: &[u64]) -> Report {
+        Report {
+            result: PreflightResult::Pass,
+            head: sha("0123456789abcdef0123456789abcdef01234567"),
+            base: sha("fedcba9876543210fedcba9876543210fedcba98"),
+            with: with.iter().map(|n| PrNumber(*n)).collect(),
+            skipped: Vec::new(),
+            flaky: Vec::new(),
+            kind: None,
+            mode: None,
+            summary: None,
+            report: None,
+            report_json: None,
+            blocked: None,
+            at_ms: EpochMs(1),
+        }
+    }
 
     #[test]
-    fn not_implemented_yet() {
+    fn the_failed_ref_name_is_a_valid_ref_for_any_branch() {
+        for branch in [
+            "feat/a.b",
+            "a..b",
+            "x.lock",
+            "한글/브랜치",
+            "-lead",
+            "a b~c",
+        ] {
+            let name = failed_ref_name(&target(Some(branch)));
+            assert!(name.starts_with("preflight-"));
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{name}"
+            );
+        }
+        assert!(failed_ref_name(&target(Some(&"a".repeat(500)))).len() < 100);
+    }
+
+    #[test]
+    fn a_detached_head_names_its_ref_after_the_commit() {
         assert_eq!(
-            super::super::run_args(&["preflight", "--json"]),
-            ExitCode::from(2)
+            failed_ref_name(&target(None)),
+            "preflight-0123456789abcdef0123456789abcdef01234567"
         );
+    }
+
+    #[test]
+    fn a_pass_says_what_it_was_verified_with() {
+        let text = render(&passed(&[3, 4]));
+        assert!(text.starts_with("통과: HEAD 0123456789ab"));
+        assert!(text.contains("기준 fedcba987654"));
+        assert!(text.contains("#3, #4"));
+        assert!(render(&passed(&[])).contains("함께 검증한 PR 없음"));
+    }
+
+    #[test]
+    fn skipped_prs_and_flaky_steps_are_listed() {
+        let mut report = passed(&[]);
+        report.skipped.push(skip(PrNumber(5), Why::Conflict, None));
+        report
+            .skipped
+            .push(skip(PrNumber(6), Why::FetchFailed, Some("없다".into())));
+        report.flaky.push(FlakyReport {
+            step: "test".into(),
+            tests: vec!["a::b".into()],
+        });
+        let text = render(&report);
+        assert!(text.contains("건너뛴 PR #5: 앞의 큐 항목과 충돌한다\n"));
+        assert!(text.contains("건너뛴 PR #6: HEAD를 가져오지 못했다: 없다\n"));
+        assert!(text.contains("흔들린 단계: test (시험 a::b)"));
+    }
+
+    #[test]
+    fn a_failure_prints_its_summary_and_report_path() {
+        let mut report = passed(&[]);
+        report.result = PreflightResult::Fail;
+        report.summary = Some("검증 실패(단독): test 단계".into());
+        report.report = Some(PathBuf::from("/s/reports/commit-x/1.md"));
+        let text = render(&report);
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("검증 실패(단독): test 단계"));
+        assert_eq!(lines.next(), Some("보고서: /s/reports/commit-x/1.md"));
+    }
+
+    #[test]
+    fn old_directories_go_and_recent_ones_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("commit-old");
+        let new = dir.path().join("commit-new");
+        let other = dir.path().join("pr-1");
+        for path in [&old, &new, &other] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let long_ago = SystemTime::now() - KEEP_FOR - Duration::from_secs(60);
+        for path in [&old, &other] {
+            fs::File::open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        remove_old(dir.path(), true).unwrap();
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert!(other.exists(), "PR 보고서는 건드리지 않는다");
+        remove_old(&dir.path().join("none"), false).unwrap();
     }
 }
