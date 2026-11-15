@@ -241,8 +241,10 @@ impl Ext {
             for pipe in &mut pipes {
                 pipe.read_available().map_err(io_error(call.clone()))?;
             }
-            if pipes.iter().any(|p| p.bytes.len() > MAX_OUTPUT) {
-                kill_group(&mut child);
+            if pipes.iter().any(|p| p.overflowed) {
+                if exited.is_none() {
+                    kill_group(&mut child);
+                }
                 return Err(ExtError::TooMuchOutput {
                     call,
                     limit: MAX_OUTPUT,
@@ -274,6 +276,7 @@ const CHUNKS_PER_TURN: usize = 16;
 struct Pipe {
     file: Option<File>,
     bytes: Vec<u8>,
+    overflowed: bool,
 }
 
 impl Pipe {
@@ -285,6 +288,7 @@ impl Pipe {
         Ok(Pipe {
             file,
             bytes: Vec::new(),
+            overflowed: false,
         })
     }
 
@@ -303,7 +307,14 @@ impl Pipe {
                     self.file = None;
                     return Ok(());
                 }
-                Ok(n) => self.bytes.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    let room = MAX_OUTPUT - self.bytes.len();
+                    self.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                    if n > room {
+                        self.overflowed = true;
+                        return Ok(());
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
@@ -353,8 +364,11 @@ fn time_out(child: &mut Child, call: String, after: Duration) -> ExtError {
     ExtError::Timeout { call, after }
 }
 
+/// Only for a child not yet reaped: its pid is then still the group id and cannot have
+/// been reused. The child itself is killed too, in case it left the group.
 fn kill_group(child: &mut Child) {
     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+    let _ = child.kill();
     let _ = child.wait();
 }
 
@@ -509,6 +523,26 @@ mod tests {
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_child_that_leaves_its_group_is_still_killed_on_timeout() {
+        let sb = Sandbox::new();
+        let gh = sb.script(
+            "leave-gh",
+            "exec python3 -I -c 'import os,time; os.setpgid(0, os.getpgid(os.getppid())); time.sleep(30)'\n",
+        );
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
+        let started = Instant::now();
+        let err = ext
+            .call(Tool::Gh, None, ["api"], Duration::from_millis(300))
+            .unwrap_err();
+        assert!(matches!(err, ExtError::Timeout { .. }), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
             "{:?}",
             started.elapsed()
         );
