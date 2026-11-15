@@ -1,17 +1,19 @@
-const SECTION_OF_STATE = {
+const table = (entries) => Object.assign(Object.create(null), entries);
+
+const SECTION_OF_STATE = table({
   awaiting_approval: "human",
   needs_human: "human",
   in_batch: "batch",
   queued: "waiting",
   bounced: "bounced",
-};
+});
 
-const ACTIONS_OF_STATE = {
+const ACTIONS_OF_STATE = table({
   awaiting_approval: ["approve", "drop"],
   needs_human: ["retry", "drop"],
-};
+});
 
-const ACTION_LABEL = { approve: "승인", retry: "다시 시도", drop: "빼기" };
+const ACTION_LABEL = table({ approve: "승인", retry: "다시 시도", drop: "빼기" });
 
 const SECTION_ORDER = ["alerts", "human", "batch", "waiting", "bounced", "unknown", "today"];
 
@@ -25,41 +27,45 @@ const SECTION_TITLE = {
   today: "오늘",
 };
 
-const HUMAN_REASON = {
+const HUMAN_REASON = table({
   budget: "재시도 예산을 다 썼다",
   unreachable: "에이전트에게 전달하지 못했다",
   gave_up: "에이전트가 포기를 선언했다",
-};
+});
 
-const BOUNCE_REASON = {
+const BOUNCE_REASON = table({
   conflict: "충돌",
   verify: "검증 실패",
   timeout: "시간 초과",
   head_changed: "HEAD 변경",
   ci: "CI 실패",
-};
+});
 
-const FAILURE_MODE = { solo: "단독", combo: "조합" };
-const PHASE = { building: "합치는 중", verifying: "검증 중", bisecting: "이분 탐색 중", pushing: "push 중" };
-const APPROVAL = { agent: "에이전트 신뢰", human: "사람 확인" };
-const BLOCK_REASON = { base_broken: "기준 커밋이 검증에 실패해 큐가 멈췄다" };
-const PREFLIGHT = {
+const FAILURE_MODE = table({ solo: "단독", combo: "조합" });
+const PHASE = table({ building: "합치는 중", verifying: "검증 중", bisecting: "이분 탐색 중", pushing: "push 중" });
+const APPROVAL = table({ agent: "에이전트 신뢰", human: "사람 확인" });
+const BLOCK_REASON = table({ base_broken: "기준 커밋이 검증에 실패해 큐가 멈췄다" });
+const PREFLIGHT = table({
   pass: { text: "preflight 통과", tone: "ok" },
   fail: { text: "preflight 실패", tone: "error" },
   conflict: { text: "preflight 충돌", tone: "error" },
-};
+});
 
+const plain = (v) => (typeof v === "string" ? v : JSON.stringify(v));
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const list = (v) => (Array.isArray(v) ? v : []);
 const str = (v) => (typeof v === "string" ? v : "");
 const num = (v) => (Number.isFinite(v) ? String(v) : "—");
-const named = (table, code) => (code == null ? null : (table[code] ?? String(code)));
+const named = (names, code) => (code == null ? null : (names[code] ?? plain(code)));
 
 export const firstLine = (value) =>
   String(value ?? "")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? "";
+
+export const failureText = (r) =>
+  firstLine(r.stderr) || firstLine(r.stdout) || (Number.isInteger(r.code) ? `종료 코드 ${r.code}` : "비정상 종료");
 
 export function formatDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";
@@ -98,7 +104,7 @@ function failureOf(item) {
 function preflightOf(item) {
   const record = item.preflight;
   if (!isObject(record)) return { text: "preflight 없음", tone: "muted", stale: false };
-  const known = PREFLIGHT[record.result] ?? { text: `preflight ${record.result}`, tone: "muted" };
+  const known = PREFLIGHT[record.result] ?? { text: `preflight ${plain(record.result)}`, tone: "muted" };
   const stale = record.head !== item.head;
   return {
     text: stale ? `${known.text} (이전 HEAD)` : known.text,
@@ -108,7 +114,7 @@ function preflightOf(item) {
 }
 
 function actionsOf(item, repoPath) {
-  if (!repoPath) return [];
+  if (!repoPath || !Number.isInteger(item.pr)) return [];
   return (ACTIONS_OF_STATE[item.state] ?? []).map((verb) => ({
     verb,
     label: ACTION_LABEL[verb],
@@ -217,7 +223,7 @@ function repoBoard(view, now) {
         position: placed.waiting.length + 1,
         ciPending,
         label: ciPending ? "CI 대기" : "대기",
-        note: item.state_reason && !ciPending ? String(item.state_reason) : null,
+        note: item.state_reason && !ciPending ? plain(item.state_reason) : null,
         agent: agentOf(item.agent),
       });
     } else if (section === "unknown") {
@@ -225,8 +231,8 @@ function repoBoard(view, now) {
         key: `${path}#${item.pr}`,
         pr: item.pr,
         title: str(item.title),
-        state: item.state == null ? "(없음)" : String(item.state),
-        reason: item.state_reason == null ? null : String(item.state_reason),
+        state: item.state == null ? "(없음)" : plain(item.state),
+        reason: item.state_reason == null ? null : plain(item.state_reason),
       });
     } else placed[section].push(cardOf(item, path));
   }
@@ -259,7 +265,7 @@ export function interpret(run, now = Date.now()) {
       hint: "저장소에서 `cargo install --path .`을 실행하거나 target/release/chute를 PATH에 둔다. Herdr가 찾지 못하면 mod의 props `bin`에 실행 파일 경로를 준다.",
     };
   }
-  if (r.code !== 0) return failed(firstLine(r.stderr) || firstLine(r.stdout) || `종료 코드 ${r.code}`);
+  if (r.code !== 0) return failed(failureText(r));
 
   let data;
   try {

@@ -341,3 +341,74 @@ test("formatDuration", () => {
   assert.equal(formatDuration(null), "—");
   assert.equal(formatDuration(-1), "—");
 });
+
+test("values that are names of built-in object keys are shown as they are", () => {
+  for (const word of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+    const data = withQueue(
+      { ...itemOf(20), pr: 30, state: word },
+      { ...itemOf(15), pr: 31, state_reason: word },
+      { ...itemOf(9), pr: 32, state_reason: word },
+      { ...itemOf(20), pr: 33, state_reason: word },
+      { ...itemOf(21), pr: 34, preflight: { result: word, head: "21e5678" } },
+      { ...itemOf(15), pr: 35, last_failure: { ...itemOf(15).last_failure, mode: word } },
+    );
+    data.batch = { ...data.batch, phase: word };
+    data.blocked = { reason: word, base: "abc", since_ms: 1 };
+    data.approval = word;
+    const repo = only(data);
+    const find = (id, pr) => section(repo, id).items.find((item) => item.pr === pr);
+
+    assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.state]), [[30, word]], word);
+    assert.equal(find("bounced", 31).reason, word, word);
+    assert.equal(find("bounced", 35).failure.mode, word, word);
+    assert.equal(find("human", 32).reason, word, word);
+    assert.equal(find("waiting", 33).note, word, word);
+    assert.equal(find("human", 34).preflight.text, `preflight ${word}`, word);
+    assert.equal(section(repo, "batch").items[0].phase, word, word);
+    assert.equal(section(repo, "alerts").items[0].text, `큐가 멈췄다: ${word}`, word);
+    assert.equal(repo.approval, word, word);
+  }
+});
+
+test("an object where a state or reason should be is shown as JSON text", () => {
+  const data = withQueue(
+    { ...itemOf(20), pr: 30, state: { a: 1 }, state_reason: ["x"] },
+    { ...itemOf(20), pr: 31, state_reason: { b: 2 } },
+  );
+  const repo = only(data);
+  assert.deepEqual(section(repo, "unknown").items.map((i) => [i.state, i.reason]), [['{"a":1}', '["x"]']]);
+  assert.equal(section(repo, "waiting").items[0].note, '{"b":2}');
+});
+
+test("an item without a PR number gets no buttons", () => {
+  const noPr = { ...itemOf(21), pr: undefined };
+  const items = section(only(withQueue(noPr, itemOf(9))), "human").items;
+  assert.equal(items.length, 2);
+  for (const item of items) {
+    if (item.pr === undefined) assert.deepEqual(item.actions, []);
+    else assert.equal(item.actions.length, 2);
+  }
+});
+
+test("an exit code that is not a number is reported without printing null", () => {
+  const result = interpret({ code: null, stdout: "", stderr: "" }, NOW);
+  assert.equal(result.kind, "failed");
+  assert.equal(result.detail, "비정상 종료");
+});
+
+test("warnings alone still make the alerts section", () => {
+  const data = { ...clone(fixture), blocked: null };
+  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["warning", "warning", "warning"]);
+});
+
+test("a blocked queue and a stopped daemon are both announced, blocked first", () => {
+  const data = { ...clone(fixture), daemon: { running: false, terminal: null, pid: null } };
+  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["blocked", "daemon", "warning", "warning", "warning"]);
+  data.warnings = [];
+  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["blocked", "daemon"]);
+});
+
+test("an unknown failure mode is shown as it is", () => {
+  const data = withQueue({ ...itemOf(15), last_failure: { ...itemOf(15).last_failure, mode: "triple" } });
+  assert.equal(section(only(data), "bounced").items[0].failure.mode, "triple");
+});
