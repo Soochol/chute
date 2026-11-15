@@ -21,7 +21,7 @@ use crate::gitops::{
 use crate::model::{
     Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event, EventKind,
     Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber, QueueItem,
-    RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
+    QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
 };
 use crate::queue;
 use crate::store::{Home, RepoStore};
@@ -367,7 +367,34 @@ impl Engine {
         looked.is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
     }
 
+    fn prune_no_checks_warnings(&self) -> Result<()> {
+        let waiting = |s: &State, pr: Option<PrNumber>| {
+            s.queue.iter().any(|i| {
+                Some(i.pr) == pr && i.state == ItemState::Queued(Some(QueuedReason::CiPending))
+            })
+        };
+        let stale = |s: &State| {
+            s.warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::NoChecks && !waiting(s, w.pr))
+        };
+        if !stale(&self.store.load()?) {
+            return Ok(());
+        }
+        self.store.update(|s| {
+            let keep: Vec<bool> = s
+                .warnings
+                .iter()
+                .map(|w| w.kind != WarningKind::NoChecks || waiting(s, w.pr))
+                .collect();
+            let mut keep = keep.into_iter();
+            s.warnings.retain(|_| keep.next().unwrap_or(true));
+            Ok(())
+        })
+    }
+
     pub fn run_once(&self) -> Result<Pass> {
+        self.prune_no_checks_warnings()?;
         let waiting = |s: &crate::model::State| {
             s.queue.iter().any(|i| match i.state {
                 ItemState::Queued(None) => true,
@@ -644,7 +671,11 @@ impl Run<'_> {
                 Ok(false)
             }
             CiVerdict::NoChecks => {
-                let waited = EpochMs::now().0.saturating_sub(item.submitted_ms.0);
+                let since = item
+                    .last_failure
+                    .as_ref()
+                    .map_or(item.submitted_ms, |f| f.at_ms.max(item.submitted_ms));
+                let waited = EpochMs::now().0.saturating_sub(since.0);
                 self.defer(pr, waited > NO_CHECKS_WARNING_AFTER_MS)?;
                 Ok(false)
             }
@@ -660,6 +691,9 @@ impl Run<'_> {
         self.engine.store.update(|s| {
             queue::requeue(s, pr)?;
             queue::set_ci_pending(s, pr)?;
+            if let Some(batch) = &mut s.batch {
+                batch.prs.retain(|p| *p != pr);
+            }
             let warned = s
                 .warnings
                 .iter()
@@ -677,7 +711,8 @@ impl Run<'_> {
             Ok(())
         })?;
         self.deferred.insert(pr);
-        Ok(())
+        self.record.prs.retain(|p| *p != pr);
+        self.save_record()
     }
 
     fn clear_no_checks_warning(&self, pr: PrNumber) -> Result<()> {

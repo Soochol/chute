@@ -317,3 +317,99 @@ fn a_leftover_ci_wait_mark_with_the_option_off_is_merged_on_local_verification_w
     assert_eq!(summary.merged, prs(&[1]));
     assert_eq!(lab.gh_check_reads(), 0);
 }
+
+#[test]
+fn a_pr_held_back_for_ci_is_not_a_member_of_the_running_batch_or_its_record() {
+    let lab = Lab::build("@STATUS@", REQUIRE_CI, 60);
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    lab.gh_checks(1, &[("build", "pending")]);
+    lab.gh_checks(2, &[("build", "pass")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    let during = std::fs::read_to_string(lab.sb.root().join("status-during.json")).unwrap();
+    let during: serde_json::Value = serde_json::from_str(&during).unwrap();
+    assert_eq!(during["batch"]["prs"], serde_json::json!([2]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.prs, prs(&[2]));
+}
+
+#[test]
+fn a_resubmitted_pr_gets_ten_quiet_minutes_before_the_no_checks_warning() {
+    let lab = lab_requiring_ci();
+    let head = lab.open_pr(1, &[("a.txt", "a\n")]);
+    make_submitted_minutes_ago(&lab, 1, 30);
+    lab.gh_checks(1, &[("build", "fail")]);
+    done(lab.engine().run_once().unwrap());
+    lab.queue_pr(1, &head, Some(lab.agent()), Approval::Agent);
+    make_submitted_minutes_ago(&lab, 1, 30);
+    lab.gh_checks(1, &[]);
+
+    lab.engine().run_once().unwrap();
+
+    assert_eq!(lab.item_state(1), Some(CI_PENDING));
+    assert!(
+        lab.state().warnings.is_empty(),
+        "{:?}",
+        lab.state().warnings
+    );
+}
+
+#[test]
+fn the_no_checks_warning_goes_away_when_the_pr_leaves_the_queue() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    make_submitted_minutes_ago(&lab, 1, 11);
+    lab.engine().run_once().unwrap();
+    assert_eq!(lab.state().warnings.len(), 1);
+
+    lab.gh_says_closed(1);
+    lab.engine().run_once().unwrap();
+    assert!(lab.state().queue.is_empty());
+    lab.engine().run_once().unwrap();
+
+    assert!(
+        lab.state().warnings.is_empty(),
+        "{:?}",
+        lab.state().warnings
+    );
+}
+
+#[test]
+fn the_no_checks_warning_goes_away_once_the_option_is_turned_off() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    make_submitted_minutes_ago(&lab, 1, 11);
+    lab.engine().run_once().unwrap();
+    assert_eq!(lab.state().warnings.len(), 1);
+    let config = std::fs::read_to_string(lab.repo.path().join("chute.toml"))
+        .unwrap()
+        .replace("require_ci = true", "require_ci = false");
+    lab.main_commit(&[("chute.toml", &config)], "chore: require_ci 끔");
+
+    let summary = done(lab.engine().run_once().unwrap());
+    lab.engine().run_once().unwrap();
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(
+        lab.state().warnings.is_empty(),
+        "{:?}",
+        lab.state().warnings
+    );
+}
+
+#[test]
+fn eight_prs_without_checks_do_not_keep_a_ninth_green_pr_from_merging() {
+    let lab = lab_requiring_ci();
+    for n in 1..=9 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+    }
+    lab.gh_checks(9, &[("build", "pending")]);
+    lab.engine().run_once().unwrap();
+    lab.gh_checks(9, &[("build", "pass")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[9]));
+}
