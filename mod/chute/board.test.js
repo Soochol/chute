@@ -113,6 +113,17 @@ test("an awaiting item whose head is missing or unsafe gets no approve button, o
   }
 });
 
+test("a valid head with no buttons for another reason does not claim the head is unknown", () => {
+  for (const patch of [{ pr: "21" }, { pr: 21.5 }]) {
+    const item = section(only(withQueue({ ...itemOf(21), ...patch })), "human").items[0];
+    assert.deepEqual(item.actions, []);
+    assert.equal(item.approvalBlocked, null);
+  }
+  const data = clone(fixture);
+  data.repo.path = "";
+  assert.equal(section(only(data), "human").items.find((i) => i.pr === 21).approvalBlocked, null);
+});
+
 test("a needs_human item keeps retry and drop even without a head", () => {
   const item = section(only(withQueue({ ...itemOf(9), head: undefined })), "human").items[0];
   assert.deepEqual(item.actions.map((a) => a.args), [

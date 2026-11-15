@@ -97,6 +97,8 @@ export function formatDuration(seconds) {
 // Mirrors `Sha` in src/model.rs: lowercase hex, 4 to 64 characters.
 const SAFE_HEAD = /^[0-9a-f]{4,64}$/;
 
+const safeHeadOf = (item) => (typeof item.head === "string" && SAFE_HEAD.test(item.head) ? item.head : null);
+
 export const actionArgs = (verb, pr, repoPath, head) =>
   verb === "approve" ? [verb, String(pr), "--head", head, "--repo", repoPath] : [verb, String(pr), "--repo", repoPath];
 
@@ -137,7 +139,7 @@ function preflightOf(item) {
 
 function actionsOf(item, repoPath) {
   if (!repoPath || !Number.isInteger(item.pr)) return [];
-  const head = typeof item.head === "string" && SAFE_HEAD.test(item.head) ? item.head : null;
+  const head = safeHeadOf(item);
   return (ACTIONS_OF_STATE[item.state] ?? [])
     .filter((verb) => verb !== "approve" || head !== null)
     .map((verb) => ({
@@ -163,7 +165,7 @@ function cardOf(item, repoPath) {
     card.preflight = preflightOf(item);
     card.config = item.touches_config === true ? "chute.toml 변경" : "chute.toml 변경 없음";
     card.configChanged = item.touches_config === true;
-    card.approvalBlocked = card.actions.some((a) => a.verb === "approve") ? null : "HEAD를 알 수 없어 승인할 수 없다";
+    card.approvalBlocked = safeHeadOf(item) ? null : "HEAD를 알 수 없어 승인할 수 없다";
   } else if (item.state === "needs_human") {
     card.reason = named(HUMAN_REASON, item.state_reason) ?? "사람 차례";
   } else if (item.state === "bounced") {
