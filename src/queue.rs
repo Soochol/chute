@@ -400,11 +400,8 @@ pub fn take_batch(state: &mut State, max_batch: u32) -> Vec<PrNumber> {
     let mut taken = Vec::new();
     for waiting_on_ci in [false, true] {
         for item in &mut state.queue {
-            if taken.len() >= max_batch as usize {
-                return taken;
-            }
             let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
-            if is_waiting != waiting_on_ci {
+            if is_waiting != waiting_on_ci || (!is_waiting && taken.len() >= max_batch as usize) {
                 continue;
             }
             if let Some(Next::To(to)) = step(item.state, Action::Take) {
@@ -760,13 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn take_batch_puts_prs_waiting_on_ci_after_the_others_and_never_ahead_of_them() {
+    fn take_batch_takes_every_ci_waiter_after_the_others_and_caps_only_the_others() {
         let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED), (3, CI_PENDING), (4, QUEUED)]);
-        assert_eq!(prs(&take_batch(&mut state, 3)), [2, 4, 1]);
-        assert_eq!(state_of(&state, 3), CI_PENDING);
+        assert_eq!(prs(&take_batch(&mut state, 1)), [2, 1, 3]);
+        assert_eq!(state_of(&state, 4), QUEUED);
         let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED)]);
-        assert_eq!(prs(&take_batch(&mut state, 1)), [2]);
-        assert_eq!(state_of(&state, 1), CI_PENDING);
+        assert_eq!(prs(&take_batch(&mut state, 1)), [2, 1]);
     }
 
     #[test]

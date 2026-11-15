@@ -599,6 +599,7 @@ impl Run<'_> {
         let mut ready = Vec::new();
         for item in taken {
             match self.engine.inspect(item)? {
+                Inspection::Ready if ready.len() >= self.config.max_batch as usize => {}
                 Inspection::Ready if self.passes_ci_gate(item)? => ready.push(item.pr),
                 Inspection::Ready => {}
                 Inspection::Closed => {

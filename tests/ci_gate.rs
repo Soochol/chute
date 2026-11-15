@@ -262,3 +262,58 @@ fn passing_checks_do_not_override_a_failing_local_verification() {
     );
     assert!(lab.merge_commits_on_main().is_empty());
 }
+
+#[test]
+fn a_passing_pr_behind_more_pending_prs_than_max_batch_is_still_examined_and_merged() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 2", 60);
+    for n in 1..=3 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+        lab.gh_checks(n, &[("build", if n < 3 { "pending" } else { "pass" })]);
+    }
+    for n in 1..=3 {
+        lab.store
+            .update(|s| Ok(chute::queue::set_ci_pending(s, PrNumber(n))?))
+            .unwrap();
+    }
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[3]));
+    assert_eq!(lab.item_state(1), Some(CI_PENDING));
+    assert_eq!(lab.item_state(2), Some(CI_PENDING));
+}
+
+#[test]
+fn passing_prs_beyond_max_batch_go_back_to_the_queue_and_merge_next_time() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 1", 60);
+    for n in 1..=2 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+        lab.gh_checks(n, &[("build", "pass")]);
+        lab.store
+            .update(|s| Ok(chute::queue::set_ci_pending(s, PrNumber(n))?))
+            .unwrap();
+    }
+
+    let first = done(lab.engine().run_once().unwrap());
+    assert_eq!(first.merged, prs(&[1]));
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+    assert_eq!(lab.gh_check_reads(), 1);
+
+    let second = done(lab.engine().run_once().unwrap());
+    assert_eq!(second.merged, prs(&[2]));
+}
+
+#[test]
+fn a_leftover_ci_wait_mark_with_the_option_off_is_merged_on_local_verification_without_asking_gh() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.store
+        .update(|s| Ok(chute::queue::set_ci_pending(s, PrNumber(1))?))
+        .unwrap();
+    lab.gh_checks(1, &[("build", "fail")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(lab.gh_check_reads(), 0);
+}
