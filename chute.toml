@@ -1,0 +1,19 @@
+# chute 자신의 검증 명령. AGENTS.md의 검사와 같다.
+approval = "agent"
+respawn = ["claude", "--dangerously-skip-permissions"]
+
+[[verify]]
+name = "fmt"
+run = "cargo fmt --check"
+timeout = 300
+
+[[verify]]
+name = "clippy"
+run = "cargo clippy --all-targets -- -D warnings"
+timeout = 1800
+
+[[verify]]
+name = "test"
+run = "cargo test"
+timeout = 1800
+failed = 'test (\S+) \.\.\. FAILED'
