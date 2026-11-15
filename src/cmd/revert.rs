@@ -59,14 +59,14 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
                 "batch {}의 변경은 이미 {}에 없다. 아무것도 올리지 않았다.",
                 id.0, info.default_branch
             );
-            if record.prs.is_empty() {
+            if record.prs.len() == targets.len() {
+                record_push(&store, &id, &record)?;
+                print!("{}", report(&info, &id, &record, &[], false));
+            } else {
                 println!(
-                    "되돌린 커밋을 {}의 이력에서 찾지 못해 기록하지 않았다.",
+                    "되돌린 커밋을 {}의 이력에서 모두 찾지는 못해 기록하지 않았다.",
                     info.default_branch
                 );
-            } else {
-                record_push(&store, &id, &record)?;
-                print!("{}", report(&info, &id, &record, &done.skipped, false));
             }
             return Ok(());
         }

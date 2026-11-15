@@ -397,3 +397,22 @@ fn a_batch_already_removed_by_plain_commits_pushes_and_records_nothing() {
     let list: serde_json::Value = serde_json::from_str(&list).unwrap();
     assert_eq!(list[0]["reverted"], false);
 }
+
+#[test]
+fn a_batch_recorded_only_when_every_pr_has_a_revert_commit_on_main() {
+    let lab = Lab::new("");
+    let id = merge_batch(&lab, &[(1, "a.txt", "a\n"), (2, "b.txt", "b\n")]);
+    let record = lab.store.read_batch(&id).unwrap().unwrap();
+    hand_revert(&lab, record.merges[0].commit.as_str());
+    lab.remove_from_main("b.txt", "chore: rm b");
+    let main_before = lab.origin_main();
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(lab.origin_main(), main_before);
+    assert!(stdout(&out).contains("기록하지 않았다"), "{}", stdout(&out));
+    let list = stdout(&chute(&lab, &["batches", "--json"]));
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(list[0]["reverted"], false);
+}
