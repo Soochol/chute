@@ -299,7 +299,7 @@ impl Feedback<'_> {
         } else {
             format!("{slug}-{key}-{tree}")
         };
-        let dir = format!("\"$(cd \"${{TMPDIR:-/tmp}}\" && pwd)/chute-repro-{id}\"");
+        let dir = format!("\"${{TMPDIR:-/tmp}}/chute-repro-{id}\"");
         let repo = shell_word(&self.repo.path.to_string_lossy());
         let failed_ref = failed_ref
             .map(|name| self.failed_ref_at(name, &step.tree))
@@ -310,10 +310,7 @@ impl Feedback<'_> {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let limit = if timed_out {
-            format!(
-                "$(command -v timeout >/dev/null 2>&1 && echo timeout {}) ",
-                configured.timeout.as_secs()
-            )
+            format!("timeout -k 5 {} ", configured.timeout.as_secs())
         } else {
             String::new()
         };
@@ -384,10 +381,11 @@ impl Feedback<'_> {
         let text = match diff {
             Err(e) => format!("diff를 만들지 못했다: {e}\n").into_bytes(),
             Ok(diff) if !diff.success() => format!(
-                "diff를 만들지 못했다: git이 종료 코드 {:?}로 끝났다. {}\n",
-                diff.code,
+                "diff를 만들지 못했다: git이 실패했다({}). {}\n",
+                exit_text(diff.code),
                 diff.stderr_text().trim()
             )
+            .replace(". \n", ".\n")
             .into_bytes(),
             Ok(diff) if diff.stdout.is_empty() => {
                 "이 머지 커밋은 바뀐 파일이 없다\n".as_bytes().to_vec()
@@ -1448,10 +1446,17 @@ fn is_name_taken(out: &Output) -> bool {
     serde_json::from_slice::<Failure>(&out.stderr).is_ok_and(|f| f.error.kind == "name_taken")
 }
 
+fn exit_text(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("종료 코드 {code}"),
+        None => "신호로 끝남".to_owned(),
+    }
+}
+
 fn hc_failure(verb: &str, out: &Output) -> String {
     format!(
-        "hc {verb}가 실패했다(종료 코드 {:?}): {}",
-        out.code,
+        "hc {verb}가 실패했다({}): {}",
+        exit_text(out.code),
         out.stderr_text().trim()
     )
 }
