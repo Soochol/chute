@@ -424,7 +424,7 @@ fn mode_label(mode: &VerifyMode) -> String {
         VerifyMode::Solo => "단독".to_owned(),
         VerifyMode::Combo { partners } => {
             let prs: Vec<String> = partners.iter().map(|p| p.pr.to_string()).collect();
-            format!("조합: {}", prs.join(", "))
+            format!("조합, 상대 PR {}", prs.join(", "))
         }
     }
 }
@@ -460,7 +460,7 @@ fn summarize(cause: &Cause) -> String {
 }
 
 fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<String> {
-    let merge = format!("`git fetch origin && git merge origin/{default_branch}`");
+    let merge = format!("`git fetch origin`과 `git merge origin/{default_branch}`를 차례로 실행해");
     let (fix, give_up) = match subject {
         Subject::Pr { .. } => (
             "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",
@@ -473,17 +473,17 @@ fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<Str
     };
     let mut steps = match cause {
         Cause::Conflict(_) => vec![format!(
-            "{merge}로 기준 브랜치를 합치고 충돌한 파일을 푼다. 충돌 상대가 아직 머지되지 않은 큐의 PR이면 그 PR이 머지된 뒤에 합쳐도 된다."
+            "{merge} 기준 브랜치를 합치고 충돌한 파일을 푼다. 충돌 상대가 아직 머지되지 않은 큐의 PR이면 그 PR이 머지된 뒤에 합쳐도 된다."
         )],
         Cause::Step { timed_out, step } => {
             let mut steps =
                 vec!["위 재현 방법으로 같은 단계를 돌려 실패를 직접 확인한다.".to_owned()];
             if *timed_out {
-                steps.push("시간 제한은 `chute.toml`의 `timeout`이다. 값을 늘려서 풀지 않는다(그 파일을 고친 PR은 사람 승인을 기다린다). 로그 끝부분에서 멈춘 곳을 찾는다.".to_owned());
+                steps.push("시간 제한은 `chute.toml`의 `timeout` 값이다. 값을 늘려서 풀지 않는다. 그 파일을 고친 PR은 사람 승인을 기다린다. 로그 끝부분에서 멈춘 곳을 찾는다.".to_owned());
             }
             if let VerifyMode::Combo { .. } = step.mode {
                 steps.push(format!(
-                    "상대 PR의 변경과 이 PR의 변경이 어디서 어긋나는지 diff에서 찾는다. 상대 PR은 이 PR이 맞춘다. 상대가 이미 머지됐으면 {merge}로 합친 뒤 확인한다."
+                    "diff에서 상대 PR의 변경과 이 PR의 변경이 어디서 어긋나는지 찾아 이 PR을 맞춘다. 상대 PR이 이미 머지됐으면 {merge} 합친 뒤 확인한다."
                 ));
             }
             steps
@@ -587,10 +587,10 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
     }
     match &step.mode {
         VerifyMode::Solo => out.push(
-            "- 범위: **단독**. 기준 브랜치에 이 PR만 얹어도 같은 단계가 실패한다. 이 PR의 변경이 원인이다".to_owned(),
+            "- 범위: 단독. 기준 브랜치에 이 PR만 얹어도 같은 단계가 실패한다. 이 PR의 변경이 원인이다".to_owned(),
         ),
         VerifyMode::Combo { .. } => out.push(
-            "- 범위: **조합**. 기준 브랜치에 이 PR만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다".to_owned(),
+            "- 범위: 조합. 기준 브랜치에 이 PR만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다".to_owned(),
         ),
     }
     out.push(format!("- 로그: {}", code(&step.log.display().to_string())));
@@ -686,10 +686,10 @@ impl Notice<'_> {
                     .next
                     .iter()
                     .enumerate()
-                    .map(|(i, step)| format!("{}) {step}", i + 1))
+                    .map(|(i, step)| format!("{}. {step}", i + 1))
                     .collect();
                 format!(
-                    "chute 반송: {label} — {}. 보고서: {}. 할 일: {}",
+                    "chute 반송: {label}. {}. 보고서: {}. 할 일: {}",
                     written.doc.summary,
                     written.md.display(),
                     steps.join(" ")
@@ -699,7 +699,7 @@ impl Notice<'_> {
                 registered,
                 current,
             } => format!(
-                "chute 알림: {label}의 HEAD가 바뀌었다(등록 {}, 지금 {}). 머지는 등록한 HEAD만 한다. 고칠 것이 끝났으면 `chute submit`을 다시 실행한다.",
+                "chute 알림: {label}의 HEAD가 바뀌었다. 등록한 HEAD: {}, 지금 HEAD: {}. 머지는 등록한 HEAD만 한다. 고칠 것이 끝났으면 `chute submit`을 다시 실행한다.",
                 short(registered),
                 short(current)
             ),
@@ -721,6 +721,9 @@ fn inert(text: &str) -> String {
         })
         .collect();
     one_line(&plain)
+        .replace(" :", ":")
+        .replace(" ,", ",")
+        .replace(" .", ".")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
