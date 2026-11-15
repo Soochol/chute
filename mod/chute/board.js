@@ -163,6 +163,7 @@ function cardOf(item, repoPath) {
     card.preflight = preflightOf(item);
     card.config = item.touches_config === true ? "chute.toml 변경" : "chute.toml 변경 없음";
     card.configChanged = item.touches_config === true;
+    card.approvalBlocked = card.actions.some((a) => a.verb === "approve") ? null : "HEAD를 알 수 없어 승인할 수 없다";
   } else if (item.state === "needs_human") {
     card.reason = named(HUMAN_REASON, item.state_reason) ?? "사람 차례";
   } else if (item.state === "bounced") {

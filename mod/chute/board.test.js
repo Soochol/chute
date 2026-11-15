@@ -104,10 +104,12 @@ test("an awaiting item whose head is missing or unsafe gets no approve button, o
   for (const head of unsafe) {
     const item = section(only(withQueue({ ...itemOf(21), head })), "human").items[0];
     assert.deepEqual(item.actions.map((a) => a.verb), ["drop"], JSON.stringify(head));
+    assert.equal(item.approvalBlocked, "HEAD를 알 수 없어 승인할 수 없다", JSON.stringify(head));
   }
   for (const head of ["abcd", "a".repeat(64), "09e5678"]) {
     const item = section(only(withQueue({ ...itemOf(21), head })), "human").items[0];
     assert.deepEqual(item.actions[0].args.slice(0, 4), ["approve", "21", "--head", head], head);
+    assert.equal(item.approvalBlocked, null, head);
   }
 });
 

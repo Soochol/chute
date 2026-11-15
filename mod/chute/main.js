@@ -200,7 +200,8 @@ export default class Chute extends View {
           .when(Boolean(card.preflight), (el) => el.child(chip(card.preflight.text, tone(card.preflight.tone, t))))
           .when(Boolean(card.config), (el) =>
             el.child(chip(card.config, card.configChanged ? t.blocked : t.dim)),
-          ),
+          )
+          .when(Boolean(card.approvalBlocked), (el) => el.child(chip(card.approvalBlocked, t.ansi1))),
       )
       .when(Boolean(card.failure?.summary), (el) =>
         el.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(card.failure.summary)),
