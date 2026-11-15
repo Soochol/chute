@@ -122,7 +122,40 @@ impl Engine {
         bail!("batch 슬롯을 다른 프로세스가 쥐고 있다")
     }
 
+    /// Appends an event, except one already written: a PR is merged once per submission and a
+    /// batch finishes once, however many times a run cut short repeats the step.
     fn history(&self, kind: EventKind) -> Result<()> {
+        let once = matches!(
+            kind,
+            EventKind::Merged { .. } | EventKind::BatchFinished { .. }
+        );
+        if once {
+            let seen = self
+                .store
+                .history()?
+                .events
+                .iter()
+                .any(|e| match (&e.kind, &kind) {
+                    (
+                        EventKind::Merged {
+                            pr, submitted_ms, ..
+                        },
+                        EventKind::Merged {
+                            pr: p,
+                            submitted_ms: s,
+                            ..
+                        },
+                    ) => pr == p && submitted_ms == s,
+                    (
+                        EventKind::BatchFinished { batch, .. },
+                        EventKind::BatchFinished { batch: b, .. },
+                    ) => batch == b,
+                    _ => false,
+                });
+            if seen {
+                return Ok(());
+            }
+        }
         self.store.append_history(&Event {
             at_ms: EpochMs::now(),
             kind,
@@ -198,10 +231,8 @@ impl Engine {
                     None
                 }
             };
-            if let Some(mut record) = record
-                && record.finished_ms.is_none()
-            {
-                let now = EpochMs::now();
+            if let Some(mut record) = record {
+                let now = record.finished_ms.unwrap_or_else(EpochMs::now);
                 for (item, commit) in &settled {
                     let known = record.merges.iter().any(|m| m.pr == item.pr);
                     if let (Some(commit), false) = (commit, known) {
@@ -211,9 +242,27 @@ impl Engine {
                         });
                     }
                 }
+                let told_bounced = bounced_prs.clone();
                 for pr in &record.bounced {
                     if !bounced_prs.contains(pr) {
                         bounced_prs.push(*pr);
+                    }
+                }
+                for pr in &bounced_prs {
+                    let sent_back = state.queue.iter().find(|i| i.pr == *pr);
+                    if let Some(QueueItem {
+                        state: ItemState::Bounced(reason),
+                        attempts,
+                        ..
+                    }) = sent_back
+                        && !told_bounced.contains(pr)
+                    {
+                        self.history(EventKind::Bounced {
+                            pr: *pr,
+                            batch: Some(id.clone()),
+                            reason: *reason,
+                            attempts: *attempts,
+                        })?;
                     }
                 }
                 for merge in &record.merges {
@@ -1063,6 +1112,18 @@ impl Run<'_> {
 
     fn wind_down(&mut self) -> Result<()> {
         let engine = self.engine;
+        let now = EpochMs::now();
+        self.record.finished_ms = Some(now);
+        self.save_record()?;
+        if !self.merged.is_empty() || !self.bounced.is_empty() {
+            engine.history(EventKind::BatchFinished {
+                batch: self.id().clone(),
+                merged: self.merged.clone(),
+                bounced: self.bounced.clone(),
+                seconds: now.0.saturating_sub(self.record.started_ms.0) / 1000,
+                verify_s: self.record.verify_s,
+            })?;
+        }
         let prs: Vec<PrNumber> = self.items.keys().copied().collect();
         engine.store.update(|s| {
             for pr in &prs {
@@ -1074,19 +1135,6 @@ impl Run<'_> {
             s.batch = None;
             Ok(())
         })?;
-        let now = EpochMs::now();
-        self.record.finished_ms = Some(now);
-        self.record.verify_s = self.verify_time.as_secs();
-        self.save_record()?;
-        if !self.merged.is_empty() || !self.bounced.is_empty() {
-            engine.history(EventKind::BatchFinished {
-                batch: self.id().clone(),
-                merged: self.merged.clone(),
-                bounced: self.bounced.clone(),
-                seconds: now.0.saturating_sub(self.record.started_ms.0) / 1000,
-                verify_s: self.record.verify_s,
-            })?;
-        }
         engine.prune_failed_refs()?;
         reap_orphans(&engine.batch_slot_dir())?;
         if engine.cancel.is_cancelled() {

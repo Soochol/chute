@@ -1169,3 +1169,69 @@ fn a_bounce_is_in_the_batch_record_before_the_next_verification_runs() {
         during.iter().map(|r| &r.bounced).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn a_pr_whose_merge_was_already_recorded_is_not_recorded_again_when_it_is_processed_again() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    let item = lab.item(1).unwrap();
+    done(lab.engine().run_once().unwrap());
+    assert_eq!(lab.merged_prs(), [1]);
+
+    lab.store
+        .update(|s| {
+            s.queue.push(item);
+            Ok(())
+        })
+        .unwrap();
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(lab.merged_prs(), [1]);
+    assert!(lab.state().queue.is_empty());
+    assert_eq!(chute_status(&lab)["today"]["merged"], 1);
+}
+
+#[test]
+fn recovery_writes_the_finished_event_a_batch_with_a_finished_record_never_got() {
+    let lab = Lab::new("");
+    lab.strand_in_batch();
+    let landed = engine_kit::sha(&lab.origin_main());
+    let mut record = batch_record(
+        "b-crashed",
+        vec![chute::model::MergeRef {
+            pr: PrNumber(2),
+            commit: landed,
+        }],
+        &[1],
+    );
+    record.finished_ms = Some(chute::model::EpochMs::now());
+    lab.store.write_batch(&record).unwrap();
+
+    lab.engine().recover().unwrap();
+    lab.engine().recover().unwrap();
+
+    assert_eq!(batch_finished(&lab), [(prs(&[2]), prs(&[1]))]);
+}
+
+#[test]
+fn recovery_tells_history_about_a_bounce_the_record_has_and_the_history_lacks() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.strand_in_batch();
+    lab.store
+        .update(|s| {
+            s.queue[0].state = ItemState::Bounced(BounceReason::Verify);
+            s.queue[0].attempts = 1;
+            Ok(())
+        })
+        .unwrap();
+    lab.store
+        .write_batch(&batch_record("b-crashed", Vec::new(), &[1]))
+        .unwrap();
+
+    lab.engine().recover().unwrap();
+    lab.engine().recover().unwrap();
+
+    assert_eq!(lab.bounced_events(), [(1, BounceReason::Verify)]);
+    assert_eq!(chute_status(&lab)["today"]["bounced"], 1);
+}
