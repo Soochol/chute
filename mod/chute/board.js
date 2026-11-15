@@ -64,18 +64,22 @@ const list = (v) => (Array.isArray(v) ? v : []);
 const str = (v) => (typeof v === "string" ? v : "");
 const num = (v) => (Number.isFinite(v) ? String(v) : "—");
 const prOf = (v) => (Number.isSafeInteger(v) && v > 0 ? v : "?");
-const rawText = (v) => (v == null || v === "" ? null : plain(v));
+const blank = (v) => typeof v === "string" && v.trim() === "";
+const rawText = (v) => (v == null || blank(v) ? null : plain(v));
 const named = (names, code) => {
-  if (code == null || code === "") return null;
+  if (code == null || blank(code)) return null;
   const key = plain(code);
   return names[key] ?? key;
 };
 
 export const firstLine = (value) =>
-  String(value ?? "")
+  (typeof value === "string" ? value : "")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? "";
+
+export const causeText = (cause) =>
+  firstLine(typeof cause === "string" ? cause : typeof cause?.message === "string" ? cause.message : "");
 
 export const failureText = (r) =>
   firstLine(r.stderr) || firstLine(r.stdout) || (Number.isInteger(r.code) ? `종료 코드 ${r.code}` : "비정상 종료");
@@ -117,7 +121,7 @@ function failureOf(item) {
 function preflightOf(item) {
   const record = item.preflight;
   if (!isObject(record)) return { text: "preflight 없음", tone: "muted", stale: false };
-  const result = record.result == null ? "?" : plain(record.result);
+  const result = rawText(record.result) ?? "?";
   const known = PREFLIGHT[result] ?? { text: `preflight ${result}`, tone: "muted" };
   const stale = record.head !== item.head;
   return {
@@ -179,8 +183,8 @@ function alertsOf(view, now) {
     alerts.push({ kind: "daemon", tone: "error", text: "데몬이 꺼져 있다", detail: "`chute up`으로 켠다" });
   }
   for (const warning of list(view.warnings)) {
-    const message = typeof warning === "string" ? warning : str(warning?.message) || str(warning?.kind);
-    alerts.push({ kind: "warning", tone: "warn", text: message || "경고", detail: "" });
+    const words = typeof warning === "string" ? [warning] : [warning?.message, warning?.kind];
+    alerts.push({ kind: "warning", tone: "warn", text: words.map((w) => str(w).trim()).find(Boolean) ?? "경고", detail: "" });
   }
   return alerts;
 }
@@ -188,11 +192,11 @@ function alertsOf(view, now) {
 function batchOf(batch, members, now) {
   if (!isObject(batch) && members.length === 0) return [];
   const b = isObject(batch) ? batch : {};
-  const byPr = new Map(members.map((item) => [item.pr, item]));
-  const prs = list(b.prs).map((pr) => ({ pr: prOf(pr), title: str(byPr.get(pr)?.title) }));
-  const listed = new Set(list(b.prs));
-  for (const item of members) {
-    if (!listed.has(item.pr)) prs.push({ pr: item.pr, title: str(item.title) });
+  const unlisted = new Map();
+  for (const item of members) unlisted.set(item.pr, [...(unlisted.get(item.pr) ?? []), item]);
+  const prs = list(b.prs).map((pr) => ({ pr: prOf(pr), title: str(unlisted.get(pr)?.shift()?.title) }));
+  for (const rest of unlisted.values()) {
+    for (const item of rest) prs.push({ pr: item.pr, title: str(item.title) });
   }
   return [
     {
@@ -239,7 +243,6 @@ function repoBoard(view, now) {
     else if (section === "waiting") {
       const ciPending = item.state_reason === "ci_pending";
       placed.waiting.push({
-        key: `${path}#${item.pr}`,
         pr: item.pr,
         title: str(item.title),
         position: placed.waiting.length + 1,
@@ -249,7 +252,6 @@ function repoBoard(view, now) {
       });
     } else if (section === "unknown") {
       placed.unknown.push({
-        key: `${path}#${item.pr}`,
         pr: item.pr,
         title: str(item.title),
         state: item.state ?? "(없음)",
@@ -263,7 +265,6 @@ function repoBoard(view, now) {
 
   return {
     slug: str(repo.slug) || "(이름 없는 저장소)",
-    path,
     stateDir: str(repo.state_dir),
     approval: named(APPROVAL, view.approval),
     sections: SECTION_ORDER.filter((id) => placed[id].length > 0).map((id) => ({

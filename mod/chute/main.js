@@ -1,7 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, props, run, theme, watchFolder } from "herdr";
-import { failureText, firstLine, interpret } from "./board.js";
+import { causeText, failureText, interpret } from "./board.js";
 
 const FALLBACK_MS = 15000;
 const MIN_READ_GAP_MS = 1000;
@@ -31,10 +31,10 @@ export default class Chute extends View {
       try {
         let result;
         try {
-          const r = await exec(this.bin, ["status", "--json", "--all"]);
+          const r = (await exec(this.bin, ["status", "--json", "--all"])) ?? {};
           result = { code: r.code, stdout: r.stdout, stderr: r.stderr };
         } catch (e) {
-          result = { spawnError: String(e?.message ?? e) };
+          result = { spawnError: causeText(e) };
         }
         this.result = result;
         this.settle(interpret(result), cx);
@@ -84,10 +84,10 @@ export default class Chute extends View {
     cx.spawn(async (cx) => {
       let text = "";
       try {
-        const r = await exec(this.bin, action.args);
+        const r = (await exec(this.bin, action.args)) ?? {};
         if (r.code !== 0) text = failureText(r);
       } catch (e) {
-        text = firstLine(e?.message ?? e) || "명령을 실행하지 못했다";
+        text = causeText(e) || "명령을 실행하지 못했다";
       }
       if (text) this.errors.set(card.key, { text, state: card.state });
       this.busy.delete(card.key);

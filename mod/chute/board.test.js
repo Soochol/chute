@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { actionArgs, formatDuration, interpret } from "./board.js";
+import { actionArgs, causeText, formatDuration, interpret } from "./board.js";
 
 const fixture = JSON.parse(readFileSync(new URL("../../tests/fixtures/status-full.json", import.meta.url), "utf8"));
 const NOW = fixture.batch.started_ms + 312_000;
@@ -531,8 +531,15 @@ test("a batch that has not started its first round shows no round, and one that 
 });
 
 test("a clock that is not a number falls back to the real clock", () => {
-  const [alert] = section(only([fixture], NaN), "alerts").items;
-  assert.ok(!alert.detail.includes("—"), alert.detail);
+  const real = Date.now;
+  Date.now = () => NOW;
+  try {
+    for (const clock of [NaN, Infinity, null, "x"]) {
+      assert.equal(section(board([fixture], clock).repos[0], "alerts").items[0].detail, "기준 0a1b2c3 · 7분 12초 전부터", String(clock));
+    }
+  } finally {
+    Date.now = real;
+  }
 });
 
 test("a waiting item that waits for CI shows no raw reason", () => {
@@ -602,6 +609,8 @@ test("failure text prefers stderr, then stdout, then the exit code", () => {
   assert.equal(interpret({ code: 2, stdout: "", stderr: "\n   spaced out  \n" }, NOW).detail, "spaced out");
   assert.equal(interpret({ code: 0, stdout: `${"x".repeat(300)}\nmore` }, NOW).detail.length < 200, true);
   assert.equal(interpret({ spawnError: "" }, NOW).kind, "missing");
+  assert.equal(interpret({ code: 1, stdout: { a: 1 }, stderr: { b: 2 } }, NOW).detail, "종료 코드 1");
+  assert.equal(interpret({ code: null, stdout: {}, stderr: [] }, NOW).detail, "비정상 종료");
 });
 
 test("batch members come from the batch record even when the queue lacks them", () => {
@@ -643,4 +652,163 @@ test("a batch record with garbage in its PR list does not leak objects", () => {
   const data = clone(fixture);
   data.batch.prs = [12, { a: 1 }, null, "13"];
   assert.deepEqual(section(only(data), "batch").items[0].prs.map((p) => p.pr), [12, "?", "?", "?", 13]);
+});
+
+test("a rejection from exec becomes its message, or nothing", () => {
+  assert.equal(causeText(new Error("cannot run chute: not found\nmore")), "cannot run chute: not found");
+  assert.equal(causeText("spawn failed"), "spawn failed");
+  for (const odd of [undefined, null, {}, { code: "ENOENT" }, { message: 5 }, 7]) assert.equal(causeText(odd), "", String(odd));
+});
+
+test("random malformed status never breaks the board", () => {
+  let seed = 20261115;
+  const rnd = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = (list) => list[Math.floor(rnd() * list.length)];
+  const WORDS = ["", " ", "x", "queued", "in_batch", "bounced", "ci_pending", "ci", "budget", "pass", "solo", "base_broken", "__proto__", "constructor", "toString", "?", "5", "-1", "a\nb", "t1"];
+  const NUMS = [0, 1, 2, 3, 5, 12, -1, 1.5, 1e21, -0, 9007199254740993, 1794724200000, 1e-7];
+  const garbage = (depth = 0) => {
+    const kind = Math.floor(rnd() * (depth > 2 ? 5 : 7));
+    if (kind === 0) return null;
+    if (kind === 1) return rnd() < 0.5;
+    if (kind === 2) return pick(NUMS);
+    if (kind < 5) return pick(WORDS);
+    if (kind === 5) return Array.from({ length: Math.floor(rnd() * 3) }, () => garbage(depth + 1));
+    const object = {};
+    for (let n = Math.floor(rnd() * 3); n > 0; n--) object[pick([...WORDS, "pr", "state", "message", "kind", "terminal", "result", "head", "path"])] = garbage(depth + 1);
+    return object;
+  };
+  const or = (good, odds = 0.25) => (rnd() < odds ? garbage() : good());
+  const maybe = (object, key, make, omitted = 0.1) => {
+    if (rnd() >= omitted) object[key] = make();
+  };
+  const STATES = ["awaiting_approval", "queued", "in_batch", "bounced", "needs_human"];
+  const queueItem = () => {
+    const o = {};
+    maybe(o, "pr", () => or(() => pick([1, 2, 3, 5, 12, 99])));
+    maybe(o, "title", () => or(() => pick(["t", "제목", ""])));
+    maybe(o, "head", () => or(() => "abc1234"));
+    maybe(o, "state", () => or(() => pick(STATES), 0.2));
+    maybe(o, "state_reason", () => or(() => pick([null, "ci_pending", "ci", "budget", "conflict", "verify", "timeout", "head_changed", "unreachable", "gave_up"])), 0.3);
+    maybe(o, "agent", () => or(() => ({ terminal: or(() => "t1"), name: or(() => "impl"), alive: or(() => true) })));
+    maybe(o, "attempts", () => or(() => 1));
+    maybe(o, "budget", () => or(() => 3));
+    maybe(o, "submitted_ms", () => or(() => pick(NUMS)));
+    maybe(o, "touches_config", () => or(() => rnd() < 0.5));
+    maybe(o, "preflight", () => or(() => ({ head: or(() => "abc1234"), result: or(() => pick(["pass", "fail", "conflict"])) })));
+    maybe(o, "last_failure", () => or(() => ({ kind: or(() => "verify"), mode: or(() => "solo"), summary: or(() => "s"), report: or(() => "/r") })));
+    return o;
+  };
+  const statusView = () => {
+    const o = {};
+    maybe(o, "repo", () => or(() => ({ slug: or(() => "a/b"), path: or(() => "/p"), state_dir: or(() => "/s") }), 0.15));
+    maybe(o, "approval", () => or(() => pick(["agent", "human"])));
+    maybe(o, "daemon", () => or(() => ({ running: or(() => rnd() < 0.5) })));
+    maybe(o, "blocked", () => or(() => pick([null, { reason: or(() => "base_broken"), base: or(() => "0a1"), since_ms: or(() => 1794724080000) }])));
+    maybe(o, "batch", () => or(() => pick([null, { prs: or(() => Array.from({ length: Math.floor(rnd() * 4) }, () => or(() => pick([1, 2, 3, 5, 12])))), phase: or(() => "verifying"), step: or(() => "test"), round: or(() => 1), started_ms: or(() => 1794724200000) }])));
+    maybe(o, "queue", () => or(() => Array.from({ length: Math.floor(rnd() * 6) }, () => or(queueItem, 0.1)), 0.1));
+    maybe(o, "today", () => or(() => ({ merged: or(() => 1), bounced: or(() => 0), flaky: or(() => 0), batches: or(() => 1), median_lead_s: or(() => 60), verify_s: or(() => 5) })));
+    maybe(o, "warnings", () => or(() => Array.from({ length: Math.floor(rnd() * 3) }, () => or(() => ({ kind: or(() => "config"), message: or(() => "m") })))));
+    return o;
+  };
+
+  const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  const SECTION_OF = new Map(Object.entries({ awaiting_approval: "human", needs_human: "human", queued: "waiting", bounced: "bounced", in_batch: "batch" }));
+  const validPr = (pr) => Number.isSafeInteger(pr) && pr > 0;
+  for (let run = 0; run < 20000; run++) {
+    const data = rnd() < 0.1 ? garbage() : rnd() < 0.5 ? [statusView(), statusView()] : [statusView()];
+    const text = JSON.stringify(data);
+    const ctx = `input ${text.slice(0, 500)}`;
+    const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
+
+    const leaves = [];
+    const walk = (value, path) => {
+      if (value !== null && typeof value === "object") Object.entries(value).forEach(([k, v]) => walk(v, `${path}.${k}`));
+      else leaves.push([path, value]);
+    };
+    walk(result, "");
+    for (const [path, leaf] of leaves) {
+      assert.ok(leaf === null || ["string", "boolean"].includes(typeof leaf) || Number.isFinite(leaf), `${path} is ${leaf} :: ${ctx}`);
+      if (typeof leaf === "string") {
+        for (const bad of ["undefined", "NaN", "[object", "null", "Infinity"]) {
+          assert.ok(!leaf.includes(bad) || text.includes(bad), `${path} shows ${bad} :: ${ctx}`);
+        }
+      }
+    }
+    if (result.kind !== "board") continue;
+
+    const views = (Array.isArray(data) ? data : [data]).filter(isObject);
+    assert.equal(result.repos.length, views.length, ctx);
+    result.repos.forEach((repo, index) => {
+      const view = views[index];
+      const path = isObject(view.repo) && typeof view.repo.path === "string" ? view.repo.path : "";
+      const queue = (Array.isArray(view.queue) ? view.queue : []).filter(isObject);
+      const shown = Object.fromEntries(repo.sections.map((s) => [s.id, s.items]));
+      const expected = { human: 0, waiting: 0, bounced: 0, unknown: 0, batch: 0 };
+      for (const item of queue) expected[SECTION_OF.get(item.state) ?? "unknown"]++;
+      for (const id of ["human", "waiting", "bounced", "unknown"]) {
+        assert.equal(shown[id]?.length ?? 0, expected[id], `${id} count :: ${ctx}`);
+      }
+      assert.ok((shown.batch?.[0]?.prs.length ?? 0) >= expected.batch, `batch entries :: ${ctx}`);
+
+      for (const [id, items] of Object.entries(shown)) {
+        for (const item of items) {
+          for (const action of item.actions ?? []) {
+            assert.equal(id, "human", `buttons outside human :: ${ctx}`);
+            const [verb, pr, flag, repoPath] = action.args;
+            assert.ok(action.verb === verb && ["approve", "retry", "drop"].includes(verb), `verb :: ${ctx}`);
+            assert.ok(/^[1-9][0-9]*$/.test(pr) && flag === "--repo" && repoPath === path && path !== "", `args ${action.args} :: ${ctx}`);
+            assert.equal(pr, String(item.pr), ctx);
+          }
+        }
+      }
+      for (const card of shown.human ?? []) {
+        const want = card.state === "awaiting_approval" ? ["approve", "drop"] : ["retry", "drop"];
+        const got = card.actions.map((a) => a.verb);
+        assert.deepEqual(got, validPr(card.pr) && path ? want : [], `human buttons :: ${ctx}`);
+      }
+
+      const kinds = [];
+      if (view.blocked) kinds.push("blocked");
+      if (isObject(view.daemon) && view.daemon.running === false) kinds.push("daemon");
+      for (const _ of Array.isArray(view.warnings) ? view.warnings : []) kinds.push("warning");
+      assert.deepEqual((shown.alerts ?? []).map((a) => a.kind), kinds, `alerts :: ${ctx}`);
+      if (kinds.length) assert.equal(repo.sections[0].id, "alerts", ctx);
+      for (const row of shown.waiting ?? []) assert.equal(row.ciPending, row.label === "CI 대기", ctx);
+    });
+  }
+});
+
+test("batch members follow submission order when the batch record lists none", () => {
+  const data = clone(fixture);
+  data.batch.prs = [];
+  assert.deepEqual(section(only(data), "batch").items[0].prs.map((p) => p.pr), [12, 13]);
+});
+
+test("an agent without a name is shown by its terminal", () => {
+  const data = withQueue({ ...itemOf(9), agent: { terminal: "t1rs", name: null, alive: true } }, { ...itemOf(21), agent: { terminal: "t9", name: "", alive: false } });
+  const agents = Object.fromEntries(section(only(data), "human").items.map((i) => [i.pr, i.agent]));
+  assert.deepEqual(agents[9], { terminal: "t1rs", name: null, alive: true, label: "t1rs" });
+  assert.deepEqual(agents[21], { terminal: "t9", name: null, alive: false, label: "t9" });
+});
+
+test("an awaiting item without a preflight record says so in a muted tone", () => {
+  const item = section(only(withQueue({ ...itemOf(21), preflight: null })), "human").items[0];
+  assert.deepEqual([item.preflight.text, item.preflight.tone, item.preflight.stale], ["preflight 없음", "muted", false]);
+});
+
+test("a run error is cut to its first line and an empty output is not quoted", () => {
+  assert.equal(interpret({ spawnError: "first\r\nsecond" }, NOW).detail, "first");
+  assert.equal(interpret({ code: 0, stdout: "", stderr: "" }, NOW).detail, "chute status가 JSON이 아닌 출력을 냈다");
+  assert.equal(interpret({ code: 2, stdout: "", stderr: "line one\r\nline two" }, NOW).detail, "line one");
+});
+
+test("numbers that overflow to infinity are not printed as numbers", () => {
+  const text = '[{"today":{"merged":1e999,"bounced":2,"median_lead_s":1e999,"verify_s":5400}}]';
+  const today = Object.fromEntries(section(interpret({ code: 0, stdout: text }, NOW).repos[0], "today").items.map((s) => [s.key, s.value]));
+  assert.deepEqual([today.merged, today.bounced, today.lead, today.verify], ["—", "2", "—", "1시간 30분"]);
 });
