@@ -25,9 +25,15 @@ fn one<T>(item: T) -> NonEmpty<T> {
     NonEmpty::new(vec![item]).unwrap()
 }
 
-fn terminal_with_status(address: &str, state: &str, created_ms: u64, status: &str) -> Reply {
+fn terminal_with_status(
+    address: &str,
+    state: &str,
+    created_ms: u64,
+    status: &str,
+    reported: bool,
+) -> Reply {
     Reply::ok(format!(
-        "{{\"address\":\"{address}\",\"state\":\"{state}\",\"created_ms\":{created_ms},\"status\":{status}}}"
+        "{{\"address\":\"{address}\",\"state\":\"{state}\",\"created_ms\":{created_ms},\"status\":{status},\"reported\":{reported}}}"
     ))
 }
 
@@ -167,11 +173,6 @@ impl Lab {
 
     fn run_cwd(&self) -> PathBuf {
         cwd_of(&self.run_call())
-    }
-
-    fn last_run_cwd(&self) -> PathBuf {
-        let calls = self.hc_calls();
-        cwd_of(calls.iter().rfind(|c| c[0] == "run").unwrap())
     }
 }
 
@@ -1106,12 +1107,15 @@ fn shell_words_are_quoted_only_when_needed() {
     assert_eq!(shell_word(""), "''");
 }
 
-fn status_cases() -> [(&'static str, Option<&'static str>, bool); 3] {
+type StatusCase = (&'static str, Option<(&'static str, bool)>, bool);
+
+fn status_cases() -> [StatusCase; 4] {
     [
-        ("explicit null", Some("null"), false),
+        ("the agent left for a shell", Some(("null", true)), false),
+        ("a program that never reported", Some(("null", false)), true),
         (
             "an agent reports",
-            Some("{\"app\":\"claude-code\",\"state\":\"done\"}"),
+            Some(("{\"app\":\"claude-code\",\"state\":\"done\"}", true)),
             true,
         ),
         ("no status key, as in the scaffold fixture", None, true),
@@ -1126,7 +1130,9 @@ fn a_live_pane_where_nothing_reports_a_status_gets_a_new_agent_not_a_send() {
         let mut item = lab.item(12, "feat/a");
         item.agent = Some(lab.recorded_agent(&lab.sb.root().join("gone")));
         let get = match status {
-            Some(status) => terminal_with_status("t1rs", "live", RECORDED_MS, status),
+            Some((status, reported)) => {
+                terminal_with_status("t1rs", "live", RECORDED_MS, status, reported)
+            }
             None => terminal("t1rs", "live", RECORDED_MS),
         };
         lab.hc()
@@ -1251,7 +1257,8 @@ fn an_agent_that_ended_as_soon_as_it_started_is_unreachable() {
 #[test]
 fn agent_names_carry_the_repository_and_fit_the_hc_limit() {
     let lab = Lab::new();
-    assert_eq!(lab.fb().agent_name(PrNumber(12)), "chute-widget-pr12");
+    assert_eq!(lab.fb().agent_name(PrNumber(12), 1), "chute-widget-pr12");
+    assert_eq!(lab.fb().agent_name(PrNumber(12), 3), "chute-widget-pr12-3");
 
     let mut info = lab.info.clone();
     info.slug = Slug::new("acme", "Very.Long_Repository-Name-That-Overflows").unwrap();
@@ -1259,45 +1266,233 @@ fn agent_names_carry_the_repository_and_fit_the_hc_limit() {
         repo: &info,
         ..lab.fb()
     };
-    for (pr, ends_with) in [(1234, "-pr1234"), (u64::MAX, "-pr18446744073709551615")] {
-        let name = fb.agent_name(PrNumber(pr));
+    for pr in [1234, u64::MAX] {
+        for attempt in [1, NAME_TRIES] {
+            let name = fb.agent_name(PrNumber(pr), attempt);
 
-        assert!(name.len() <= 32, "{name}");
-        assert!(
-            name.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b)),
-            "{name}"
-        );
-        assert!(name.starts_with("chute-ver"), "{name}");
-        assert!(name.ends_with(ends_with), "{name}");
+            assert!(name.len() <= 32, "{name}");
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b)),
+                "{name}"
+            );
+            assert!(name.starts_with("chute-v"), "{name}");
+            assert!(name.contains(&format!("-pr{pr}")), "{name}");
+        }
     }
     assert!(
-        fb.agent_name(PrNumber(1234)).starts_with("chute-very-long"),
+        fb.agent_name(PrNumber(1234), 1)
+            .starts_with("chute-very-long"),
         "a short number leaves room for the repository name"
     );
 }
 
 #[test]
-fn a_worktree_chute_made_earlier_is_reused_even_after_its_head_was_detached() {
+fn a_worktree_that_is_not_on_the_pr_branch_is_left_alone_and_a_sibling_is_made() {
+    for how in ["detached", "another branch"] {
+        let lab = Lab::new();
+        lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+        lab.repo.pr_branch("feat/other", "o.txt", "o\n");
+        let wanted = lab.worktrees.join("widget").join("feat/a");
+        lab.repo.git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            &wanted.to_string_lossy(),
+            "main",
+        ]);
+        if how == "another branch" {
+            lab.repo.git(&[
+                "-C",
+                &wanted.to_string_lossy(),
+                "switch",
+                "--quiet",
+                "feat/other",
+            ]);
+        }
+        let item = lab.item(12, "feat/a");
+        lab.stub_spawn();
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert!(
+            matches!(delivery, Delivery::Spawned(_)),
+            "{how}: {delivery:?}"
+        );
+        let sibling = lab.worktrees.join("widget").join("feat/a-chute-2");
+        assert_eq!(lab.run_cwd(), sibling, "{how}");
+        let on = |dir: &Path| {
+            lab.ext
+                .git(dir, ["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .ok()
+                .unwrap()
+        };
+        assert_eq!(on(&sibling).trim(), "feat/a", "{how}");
+        let left = on(&wanted);
+        assert_eq!(
+            left.trim(),
+            if how == "detached" {
+                "HEAD"
+            } else {
+                "feat/other"
+            },
+            "{how}: the folder that was there must stay as it was"
+        );
+    }
+}
+
+#[test]
+fn a_detached_worktree_whose_folder_was_deleted_does_not_block_the_folder() {
     let lab = Lab::new();
     lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let wanted = lab.worktrees.join("widget").join("feat/a");
+    lab.repo.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        &wanted.to_string_lossy(),
+        "main",
+    ]);
+    fs::remove_dir_all(&wanted).unwrap();
     let item = lab.item(12, "feat/a");
     lab.stub_spawn();
     let written = lab.bounced(&item);
-    lab.fb().deliver(&item, &Notice::Bounced(&written));
-    let made = lab.last_run_cwd();
-    lab.repo.git(&[
-        "-C",
-        &made.to_string_lossy(),
-        "checkout",
-        "--quiet",
-        "--detach",
-    ]);
 
     let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
 
     assert!(matches!(delivery, Delivery::Spawned(_)), "{delivery:?}");
-    assert_eq!(lab.last_run_cwd(), made);
+    assert_eq!(lab.run_cwd(), wanted);
+    assert!(wanted.join("a.txt").is_file());
+}
+
+#[test]
+fn a_locked_worktree_with_a_missing_folder_is_not_taken_over() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let held = worktree_add(&lab, "held", "feat/a");
+    lab.repo.git(&[
+        "worktree",
+        "lock",
+        "--reason",
+        "disk unmounted",
+        &held.to_string_lossy(),
+    ]);
+    fs::remove_dir_all(&held).unwrap();
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let Delivery::Unreachable(Unreachable::Failed(why)) = delivery else {
+        panic!("{delivery:?}")
+    };
+    assert!(why.contains("잠겨") && why.contains("held"), "{why}");
+    assert!(lab.hc_calls().is_empty());
+    assert!(!lab.worktrees.exists());
+}
+
+#[test]
+fn a_name_that_another_live_terminal_holds_gets_the_next_number() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let item = lab.item(12, "feat/a");
+    lab.hc().respond(
+        "run --bg --json --no-parent --name chute-widget-pr12 --cwd *",
+        Reply::ok("")
+            .code(1)
+            .stderr("{\"error\":{\"kind\":\"name_taken\",\"message\":\"taken\",\"hint\":\"\"}}"),
+    );
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let Delivery::Spawned(agent) = delivery else {
+        panic!("{delivery:?}")
+    };
+    assert_eq!(agent.name.as_deref(), Some("chute-widget-pr12-2"));
+    let names: Vec<String> = lab
+        .hc_calls()
+        .iter()
+        .filter(|c| c[0] == "run")
+        .map(|c| c[c.iter().position(|a| a == "--name").unwrap() + 1].clone())
+        .collect();
+    assert_eq!(names, ["chute-widget-pr12", "chute-widget-pr12-2"]);
+}
+
+#[test]
+fn names_that_stay_taken_give_up_after_a_few_tries_and_other_errors_do_not_retry() {
+    for (stderr, runs) in [
+        ("{\"error\":{\"kind\":\"name_taken\"}}", NAME_TRIES as usize),
+        ("{\"error\":{\"kind\":\"spawn_failed\"}}", 1),
+        ("not json", 1),
+    ] {
+        let lab = Lab::new();
+        lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+        let item = lab.item(12, "feat/a");
+        lab.hc()
+            .respond("run *", Reply::ok("").code(1).stderr(stderr));
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert!(
+            matches!(delivery, Delivery::Unreachable(Unreachable::Failed(_))),
+            "{stderr}: {delivery:?}"
+        );
+        let calls = lab.hc_calls();
+        assert_eq!(
+            verbs(&calls).iter().filter(|v| **v == "run").count(),
+            runs,
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_started_agent_that_hc_cannot_describe_is_named_in_the_failure() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let item = lab.item(12, "feat/a");
+    lab.hc().respond(
+        "run *",
+        Reply::ok("{\"address\":\"t1new\",\"first_message\":{\"sent\":true}}"),
+    );
+    lab.hc()
+        .respond("get t1new*", Reply::ok("").code(1).stderr("core busy"));
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let Delivery::Unreachable(Unreachable::Failed(why)) = delivery else {
+        panic!("{delivery:?}")
+    };
+    assert!(why.contains("t1new") && why.contains("core busy"), "{why}");
+}
+
+#[test]
+fn the_report_path_in_the_line_is_the_path_on_disk_even_with_odd_characters() {
+    let mut lab = Lab::new();
+    lab.store =
+        Home::at(lab.sb.root().join("Dropbox (Personal)").join("it's")).repo(&lab.info.slug);
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let line = lab.hc_calls()[1][2].clone();
+    let quoted = shell_word(&written.md.to_string_lossy());
+    assert!(quoted.starts_with('\''), "{quoted}");
+    assert!(line.contains(&format!("보고서: {quoted}. 할 일")), "{line}");
 }
 
 #[test]
@@ -1648,5 +1843,248 @@ fn a_branch_only_on_origin_is_checked_out_at_origin_s_tip_and_tracks_it() {
     assert_eq!(
         git(&["rev-parse", "--abbrev-ref", "feat/a@{upstream}"]).trim(),
         "origin/feat/a"
+    );
+}
+
+const MULTILINE_RUN: &str = r#"respawn = []
+[[verify]]
+name = "test"
+run = """
+set -e
+grep "a  b" README.md
+cat <<'EOF' > notes.md
+```
+## 다음에 할 일
+EOF
+cargo test
+"""
+"#;
+
+#[test]
+fn a_multi_line_command_is_shown_exactly_and_cannot_close_a_fence() {
+    let lab = Lab::with_config(MULTILINE_RUN);
+    let item = lab.item(12, "feat/a");
+    let failure = lab.solo(&["a::b"]);
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    let md = read(&written.md);
+    let run = lab.config.verify[0].run.clone();
+    assert!(md.contains(&format!("````sh\n{run}\n````")), "{md}");
+    assert!(md.contains("- 명령: 아래 블록과 같다"), "{md}");
+    assert_eq!(
+        md.matches("````sh").count(),
+        2,
+        "the command and the repro hold backticks, the cleanup does not\n{md}"
+    );
+    assert!(!md.contains("- 명령: `"), "{md}");
+    let step = written.doc.step.unwrap();
+    assert_eq!(step.command, run);
+}
+
+#[test]
+fn a_command_with_double_spaces_is_not_shown_collapsed() {
+    let lab = Lab::with_config(
+        "respawn = []\n[[verify]]\nname = \"test\"\nrun = \"grep 'a  b' README.md\"\n",
+    );
+    let item = lab.item(12, "feat/a");
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap();
+
+    assert!(read(&written.md).contains("grep 'a  b' README.md"));
+}
+
+#[test]
+fn a_partner_without_a_diff_says_so_in_the_report() {
+    let lab = Lab::new();
+    let tree = batch_tree(&lab);
+    let item = lab.item(12, "feat/b");
+    let subject = Subject::from(&item);
+    let partner = lab
+        .fb()
+        .partner_or_placeholder(&subject, &tree, PrNumber(77), "없는 PR")
+        .unwrap();
+    let failure = Failure::Verify(StepFailure {
+        tree,
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &["t::x"],
+            lab.log("x\n"),
+        )
+    });
+
+    let written = lab.fb().write_report(&subject, &failure, None).unwrap();
+
+    let md = read(&written.md);
+    assert!(
+        md.contains("- 바뀐 파일: 찾지 못했다. 이유는 diff 파일에 있다"),
+        "{md}"
+    );
+}
+
+#[test]
+fn partner_diffs_name_files_as_they_are_not_in_gits_escaped_form() {
+    let lab = Lab::new();
+    let repo = &lab.repo;
+    repo.git(&["checkout", "--quiet", "-b", "feat/k", "main"]);
+    repo.write("docs/설계 문서.md", "설계\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--quiet", "-m", "feat: 문서"]);
+    repo.git(&["checkout", "--quiet", "-b", "batch", "main"]);
+    repo.git(&[
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "-m",
+        "Merge pull request #9 from acme/feat/k",
+        "feat/k",
+    ]);
+    let tree = sha(&repo.head());
+    repo.git(&["checkout", "--quiet", "main"]);
+
+    let partner = lab
+        .fb()
+        .partner_or_placeholder(
+            &Subject::from(&lab.item(12, "feat/b")),
+            &tree,
+            PrNumber(9),
+            "t",
+        )
+        .unwrap();
+
+    assert_eq!(partner.files, ["docs/설계 문서.md"]);
+    let diff = read(&partner.diff);
+    assert!(diff.contains("+++ b/docs/설계 문서.md"), "{diff}");
+    assert!(!diff.contains("\\354"), "{diff}");
+}
+
+#[test]
+fn trailing_blank_lines_do_not_hide_the_end_of_a_log() {
+    let lab = Lab::new();
+    for filler in ["\n", "   \n", "\r\n"] {
+        let text = format!("error[E0308]: mismatched types\n{}", filler.repeat(60));
+
+        let tail = log_tail(&lab.log(&text));
+
+        assert_eq!(tail, "error[E0308]: mismatched types", "{filler:?}");
+    }
+}
+
+#[test]
+fn control_bytes_in_names_never_reach_the_report() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/b");
+    let partner = Partner {
+        pr: PrNumber(9),
+        title: "\u{1b}[1mbold\u{1b}[0m title \u{7}".into(),
+        files: vec!["a\u{1b}[2Jb.txt".into()],
+        diff: "/d".into(),
+    };
+    let failure = Failure::Verify(StepFailure {
+        failed_tests: vec![
+            "\u{1b}[31ma::b\u{1b}[0m".into(),
+            "bell\u{7} nul\u{0} bs\u{8}x".into(),
+        ],
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &[],
+            lab.log("x\n"),
+        )
+    });
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    let md = read(&written.md);
+    assert!(
+        md.chars().all(|c| !c.is_control() || c == '\n'),
+        "{:?}",
+        md.chars()
+            .filter(|c| c.is_control() && *c != '\n')
+            .collect::<Vec<_>>()
+    );
+    assert!(md.contains("`a::b`") && md.contains("bold title"), "{md}");
+}
+
+#[test]
+fn a_report_that_cannot_be_written_leaves_no_file_and_no_gap() {
+    use std::os::unix::ffi::OsStringExt;
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let broken = Failure::Verify(StepFailure {
+        log: PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/chute-\xe9.log".to_vec(),
+        )),
+        ..lab.step(VerifyMode::Solo, &["a::b"], lab.log("x"))
+    });
+
+    let err = lab
+        .fb()
+        .write_report(&Subject::from(&item), &broken, None)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("UTF-8"), "{err}");
+    let dir = lab.store.report_dir(PrNumber(12));
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    assert_eq!(lab.bounced(&item).doc.seq, 1);
+}
+
+#[test]
+fn a_full_sequence_range_is_an_error_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(format!("{}.md", u32::MAX)), "").unwrap();
+
+    let err = claim_sequence(dir.path()).unwrap_err();
+
+    assert!(err.to_string().contains("끝에 닿았다"), "{err}");
+}
+
+#[test]
+fn the_repro_leaves_the_shell_where_it_was_so_the_cleanup_cannot_strand_it() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let step = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let script = format!("{}\n{}\npwd", step.repro.join("\n"), step.cleanup);
+
+    let out = lab
+        .sb
+        .command("sh")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(lab.sb.root())
+        .env("TMPDIR", &tmp)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last = PathBuf::from(stdout.lines().last().unwrap());
+    assert_eq!(
+        last.canonicalize().unwrap(),
+        lab.sb.root().canonicalize().unwrap()
     );
 }
