@@ -460,7 +460,7 @@ fn summarize(cause: &Cause) -> String {
 }
 
 fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<String> {
-    let merge = format!("`git fetch origin`과 `git merge origin/{default_branch}`를 차례로 실행해");
+    let merge = format!("`git fetch origin`, `git merge origin/{default_branch}` 순서로 실행해");
     let (fix, give_up) = match subject {
         Subject::Pr { .. } => (
             "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",

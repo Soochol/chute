@@ -442,7 +442,7 @@ fn a_conflict_report_names_the_files_and_the_main_commits() {
         "`src/y.rs`",
         "`abc1234def`",
         "feat: x를 바꾼다",
-        "`git fetch origin`과 `git merge origin/main`를 차례로 실행해",
+        "`git fetch origin`, `git merge origin/main` 순서로 실행해",
         "`chute submit`",
     ] {
         assert!(md.contains(needed), "{needed}\n{md}");
