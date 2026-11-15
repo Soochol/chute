@@ -30,6 +30,9 @@ const HC_NAME_LIMIT: usize = 32;
 const FAILED_REF_PREFIX: &str = "refs/chute/failed/";
 const NAME_TRIES: u32 = 5;
 const SIBLING_TRIES: u32 = 20;
+const SHELLS: [&str; 9] = [
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
+];
 const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
 
@@ -531,7 +534,7 @@ fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<Str
     let (fix, give_up) = match subject {
         Subject::Pr { .. } => (
             "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",
-            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 적는다. 사람 차례로 넘어간다.",
+            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. 사람 차례로 넘어간다.",
         ),
         Subject::Commit { .. } => (
             "고쳐서 커밋한 뒤 `chute preflight`를 다시 실행한다. 통과하면 push하고 `chute submit`을 실행한다.",
@@ -544,13 +547,13 @@ fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<Str
         )],
         Cause::Step { timed_out, step } => {
             let mut steps =
-                vec!["위 재현 방법으로 같은 단계를 돌려 실패를 직접 확인한다.".to_owned()];
+                vec!["보고서의 재현 방법으로 같은 단계를 돌려 실패를 직접 확인한다.".to_owned()];
             if *timed_out {
                 steps.push("시간 제한은 `chute.toml`의 `timeout` 값이다. 값을 늘려서 풀지 않는다. 그 파일을 고친 PR은 사람 승인을 기다린다. 로그 끝부분에서 멈춘 곳을 찾는다.".to_owned());
             }
             if let VerifyMode::Combo { .. } = step.mode {
                 steps.push(format!(
-                    "diff에서 상대 PR의 변경과 {this}의 변경이 어디서 어긋나는지 찾아 {this}을 맞춘다. 상대 PR이 이미 머지됐으면 {merge} 합친 뒤 확인한다."
+                    "보고서의 diff 파일에서 상대 PR의 변경과 {this}의 변경이 어디서 어긋나는지 찾아 {this}을 맞춘다. 상대 PR이 이미 머지됐으면 {merge} 합친 뒤 확인한다."
                 ));
             }
             steps
@@ -860,6 +863,17 @@ struct TerminalInfo {
     status: ProgramStatus,
     #[serde(default)]
     reported: bool,
+    #[serde(default)]
+    address: Option<TerminalId>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    foreground: Option<Foreground>,
+}
+
+#[derive(Deserialize)]
+struct Foreground {
+    name: Option<String>,
 }
 
 #[derive(Default)]
@@ -885,7 +899,12 @@ impl TerminalInfo {
     }
 
     fn has_left_for_a_shell(&self) -> bool {
-        self.reported && matches!(self.status, ProgramStatus::NoProgram)
+        let in_a_shell = self
+            .foreground
+            .as_ref()
+            .and_then(|f| f.name.as_deref())
+            .is_some_and(|name| SHELLS.contains(&name));
+        matches!(self.status, ProgramStatus::NoProgram) && (self.reported || in_a_shell)
     }
 }
 
@@ -908,6 +927,11 @@ struct Launched {
 struct FirstMessage {
     sent: bool,
     reason: Option<String>,
+}
+
+enum Started {
+    Launched { name: String, out: Output },
+    Earlier(Agent),
 }
 
 enum Attempt {
@@ -999,7 +1023,19 @@ impl Feedback<'_> {
             item.pr,
             code_span(&item.branch)
         );
-        let (name, out) = self.run_with_free_name(item.pr, &cwd, task)?;
+        let (name, out) = match self.run_with_free_name(item.pr, &cwd, task)? {
+            Started::Launched { name, out } => (name, out),
+            Started::Earlier(agent) => {
+                return match self.send(&agent, line) {
+                    Attempt::Sent => Ok(Delivery::Spawned(agent)),
+                    Attempt::Stuck(why) => Err(why),
+                    Attempt::Gone => Err(Unreachable::Failed(format!(
+                        "이미 떠 있는 에이전트 {}에게 보내지 못했다",
+                        agent.terminal.0
+                    ))),
+                };
+            }
+        };
         let launched: Launched = serde_json::from_slice(&out.stdout)
             .map_err(|e| Unreachable::Failed(format!("hc run의 출력을 읽지 못했다: {e}")))?;
         if let Some(FirstMessage {
@@ -1048,7 +1084,7 @@ impl Feedback<'_> {
         pr: PrNumber,
         cwd: &Path,
         task: String,
-    ) -> Result<(String, Output), Unreachable> {
+    ) -> Result<Started, Unreachable> {
         for attempt in 1..=NAME_TRIES {
             let name = self.agent_name(pr, attempt);
             let mut args: Vec<OsString> = ["run", "--bg", "--json", "--no-parent", "--name"]
@@ -1065,13 +1101,36 @@ impl Feedback<'_> {
             args.push(OsString::from(&task));
             let out = self.run_hc(args)?;
             if out.success() {
-                return Ok((name, out));
+                return Ok(Started::Launched { name, out });
             }
             if !(is_name_taken(&out) && attempt < NAME_TRIES) {
                 return Err(Unreachable::Failed(hc_failure("run", &out)));
             }
+            if let Some(earlier) = self.live_agent_named(&name, cwd)? {
+                return Ok(Started::Earlier(earlier));
+            }
         }
         unreachable!("the last attempt returns")
+    }
+
+    /// The agent chute started earlier under `name` for this folder, if it is still alive.
+    fn live_agent_named(&self, name: &str, cwd: &Path) -> Result<Option<Agent>, Unreachable> {
+        let Some(info) = self.terminal(&TerminalId(name.to_owned()))? else {
+            return Ok(None);
+        };
+        let (Some(terminal), Some(launched_in)) = (info.address, info.cwd) else {
+            return Ok(None);
+        };
+        let same_folder = resolved(&launched_in) == resolved(cwd);
+        Ok(
+            (info.state == TerminalState::Live && same_folder).then(|| Agent {
+                terminal,
+                created_ms: info.created_ms,
+                name: Some(name.to_owned()),
+                workdir: cwd.to_owned(),
+                alive: true,
+            }),
+        )
     }
 
     fn agent_name(&self, pr: PrNumber, attempt: u32) -> String {
@@ -1108,7 +1167,10 @@ impl Feedback<'_> {
             .iter()
             .filter(|c| c.branch.as_deref() == Some(item.branch.as_str()))
             .collect();
-        if let Some(live) = holders.iter().find(|c| c.path.is_dir()) {
+        if let Some(live) = holders
+            .iter()
+            .find(|c| c.path.is_dir() && self.is_worktree_root(&c.path))
+        {
             return Ok(live.path.clone());
         }
         if let Some(locked) = holders.iter().find(|c| c.locked) {
@@ -1118,7 +1180,10 @@ impl Feedback<'_> {
             );
         }
         let dest = free_dest(&self.worktree_dest(item)?)?;
-        let record_without_folder = !holders.is_empty() || checkouts.iter().any(|c| c.path == dest);
+        let record_without_folder = !holders.is_empty()
+            || checkouts
+                .iter()
+                .any(|c| resolved(&c.path) == resolved(&dest));
         self.add_worktree(item, &dest, record_without_folder)
     }
 
@@ -1126,6 +1191,24 @@ impl Feedback<'_> {
         self.ext
             .git(dir, ["symbolic-ref", "--short", "-q", "HEAD"])
             .is_ok_and(|out| out.success() && out.stdout_text().trim() == branch)
+    }
+
+    fn is_worktree_root(&self, dir: &Path) -> bool {
+        self.ext
+            .git(dir, ["rev-parse", "--show-toplevel"])
+            .is_ok_and(|out| {
+                out.success() && resolved(Path::new(out.stdout_text().trim())) == resolved(dir)
+            })
+    }
+
+    /// True unless git says `commit` is not reachable from `reference`; a commit git cannot
+    /// find at all counts as reachable, so the reference is used.
+    fn contains_commit(&self, reference: &str, commit: &Sha) -> Result<bool> {
+        let out = self.ext.git(
+            &self.repo.path,
+            ["merge-base", "--is-ancestor", commit.as_str(), reference],
+        )?;
+        Ok(out.code != Some(1))
     }
 
     fn in_repo(&self, dir: &Path) -> bool {
@@ -1226,32 +1309,54 @@ impl Feedback<'_> {
                 .git(&self.repo.path, ["rev-parse", "--verify", "--quiet", &name])?
                 .success())
         };
-        let remote = format!("origin/{branch}");
+        let remote = format!("refs/remotes/origin/{branch}");
         let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
         // git refuses a branch that a worktree record still holds, even once that folder is gone.
         if holder_folder_gone {
             args.push("--force".into());
         }
+        let mut upstream = None;
         if has_ref(format!("refs/heads/{branch}"))? {
             args.extend([dest.as_os_str().to_owned(), branch.into()]);
-        } else if has_ref(format!("refs/remotes/{remote}"))? {
-            args.extend([
-                "--track".into(),
-                "-b".into(),
-                branch.into(),
-                dest.as_os_str().to_owned(),
-                remote.into(),
-            ]);
         } else {
+            let remote_exists = has_ref(remote.clone())?;
+            let start = if remote_exists && self.contains_commit(&remote, &item.head)? {
+                remote.as_str()
+            } else {
+                item.head.as_str()
+            };
             args.extend([
                 "-b".into(),
                 branch.into(),
                 dest.as_os_str().to_owned(),
-                item.head.as_str().into(),
+                start.into(),
             ]);
+            upstream = remote_exists.then_some(remote);
         }
         self.ext.git(&self.repo.path, args)?.ok()?;
+        if let Some(upstream) = upstream {
+            let _ = self
+                .ext
+                .git(dest, ["branch", &format!("--set-upstream-to={upstream}")]);
+        }
         Ok(dest.to_owned())
+    }
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return rest.iter().rev().fold(real, |dir, part| dir.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                at = parent;
+            }
+            _ => return path.to_owned(),
+        }
     }
 }
 

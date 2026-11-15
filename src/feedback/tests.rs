@@ -1409,6 +1409,13 @@ fn a_name_that_another_live_terminal_holds_gets_the_next_number() {
             .code(1)
             .stderr("{\"error\":{\"kind\":\"name_taken\",\"message\":\"taken\",\"hint\":\"\"}}"),
     );
+    lab.hc().respond(
+        "get chute-widget-pr12 --json",
+        Reply::ok(format!(
+            "{{\"address\":\"t1other\",\"state\":\"live\",\"created_ms\":5,\"cwd\":\"{}\"}}",
+            lab.sb.root().join("another-repo").display()
+        )),
+    );
     lab.stub_spawn();
     let written = lab.bounced(&item);
 
@@ -1439,6 +1446,12 @@ fn names_that_stay_taken_give_up_after_a_few_tries_and_other_errors_do_not_retry
         let item = lab.item(12, "feat/a");
         lab.hc()
             .respond("run *", Reply::ok("").code(1).stderr(stderr));
+        lab.hc().respond(
+            "get chute-*",
+            Reply::ok("")
+                .code(3)
+                .stderr("{\"error\":{\"kind\":\"not_found\"}}"),
+        );
         let written = lab.bounced(&item);
 
         let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -2343,4 +2356,198 @@ fn titles_with_newlines_cannot_forge_headings() {
                 .starts_with("# PR #12 반송 보고서: 첫 줄 ## 가짜 제목")
         );
     }
+}
+
+#[test]
+fn a_name_taken_by_this_prs_own_live_agent_is_adopted_not_duplicated() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let item = lab.item(12, "feat/a");
+    let dest = lab.worktrees.join("widget").join("feat/a");
+    lab.hc().respond(
+        "run --bg --json --no-parent --name chute-widget-pr12 --cwd *",
+        Reply::ok("")
+            .code(1)
+            .stderr("{\"error\":{\"kind\":\"name_taken\"}}"),
+    );
+    let live = |extra: &str| {
+        Reply::ok(format!(
+            "{{\"address\":\"t1a\",\"state\":\"live\",\"created_ms\":5,\"status\":{{\"app\":\"claude-code\",\"state\":\"done\"}},\"reported\":true{extra}}}"
+        ))
+    };
+    lab.hc()
+        .respond(
+            "get chute-widget-pr12 --json",
+            live(&format!(",\"cwd\":\"{}\"", dest.display())),
+        )
+        .respond("get t1a --json", live(""))
+        .respond("send t1a *", Reply::ok("{}"));
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let Delivery::Spawned(agent) = delivery else {
+        panic!("{delivery:?}")
+    };
+    assert_eq!(
+        (agent.terminal.0.as_str(), agent.created_ms, agent.workdir),
+        ("t1a", EpochMs(5), dest)
+    );
+    assert_eq!(
+        verbs(&lab.hc_calls()),
+        ["run", "get", "get", "send"],
+        "no second agent is started"
+    );
+}
+
+#[test]
+fn a_holder_folder_that_is_not_a_worktree_is_not_used() {
+    for how in ["recreated empty", "broken .git file"] {
+        let lab = Lab::new();
+        lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+        let held = worktree_add(&lab, "held", "feat/a");
+        fs::remove_dir_all(&held).unwrap();
+        fs::create_dir_all(&held).unwrap();
+        if how == "broken .git file" {
+            fs::write(
+                held.join(".git"),
+                "gitdir: /nonexistent/.git/worktrees/held\n",
+            )
+            .unwrap();
+        }
+        let item = lab.item(12, "feat/a");
+        lab.stub_spawn();
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert!(
+            matches!(delivery, Delivery::Spawned(_)),
+            "{how}: {delivery:?}"
+        );
+        let dest = lab.worktrees.join("widget").join("feat/a");
+        assert_eq!(lab.run_cwd(), dest, "{how}");
+        assert!(dest.join("a.txt").is_file(), "{how}");
+    }
+}
+
+#[test]
+fn a_live_pane_whose_foreground_is_a_shell_and_reports_nothing_gets_a_new_agent() {
+    for (why, foreground, sends) in [
+        ("a shell", Some("zsh"), false),
+        ("an agent", Some("claude"), true),
+        ("no foreground info", None, true),
+    ] {
+        let lab = Lab::new();
+        lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+        let mut item = lab.item(12, "feat/a");
+        item.agent = Some(lab.recorded_agent(&lab.sb.root().join("gone")));
+        let foreground = foreground
+            .map(|name| format!(",\"foreground\":{{\"argv\":[\"{name}\"],\"name\":\"{name}\"}}"))
+            .unwrap_or_default();
+        lab.hc()
+            .respond(
+                "get t1rs*",
+                Reply::ok(format!(
+                    "{{\"address\":\"t1rs\",\"state\":\"live\",\"created_ms\":{RECORDED_MS},\"status\":null,\"reported\":false{foreground}}}"
+                )),
+            )
+            .respond("send t1rs *", Reply::ok("{}"));
+        lab.stub_spawn();
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert_eq!(
+            matches!(delivery, Delivery::Sent { .. }),
+            sends,
+            "{why}: {delivery:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stale_remote_ref_does_not_set_the_worktree_back_and_a_tag_does_not_confuse_it() {
+    for (why, tag) in [
+        ("stale origin ref", false),
+        ("tag with the same short name", true),
+    ] {
+        let lab = Lab::new();
+        let old = lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+        lab.repo.git(&["checkout", "--quiet", "feat/a"]);
+        let registered = lab.repo.commit_file("b.txt", "b\n", "feat: 등록한 HEAD");
+        lab.repo.git(&["checkout", "--quiet", "main"]);
+        if tag {
+            lab.repo.git(&["push", "--quiet", "origin", "feat/a"]);
+            lab.repo.git(&["tag", "origin/feat/a", "main"]);
+        }
+        lab.repo.git(&["branch", "--quiet", "-D", "feat/a"]);
+        let mut item = lab.item(12, "feat/a");
+        item.head = sha(&registered);
+        lab.stub_spawn();
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert!(
+            matches!(delivery, Delivery::Spawned(_)),
+            "{why}: {delivery:?}"
+        );
+        let dest = lab.run_cwd();
+        let head = lab
+            .ext
+            .git(&dest, ["rev-parse", "HEAD"])
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert_eq!(head.trim(), registered, "{why} (old origin tip {old})");
+    }
+}
+
+#[test]
+fn a_symlinked_worktree_root_does_not_defeat_the_missing_folder_check() {
+    let mut lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let real = lab.sb.root().join("real-root");
+    fs::create_dir_all(&real).unwrap();
+    let link = lab.sb.root().join("link-root");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    lab.worktrees = link.clone();
+    let wanted = link.join("widget").join("feat/a");
+    lab.repo.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        &wanted.to_string_lossy(),
+        "main",
+    ]);
+    fs::remove_dir_all(&wanted).unwrap();
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert!(matches!(delivery, Delivery::Spawned(_)), "{delivery:?}");
+    assert_eq!(lab.run_cwd(), wanted);
+}
+
+#[test]
+fn the_line_stands_on_its_own_without_pointing_at_text_above() {
+    let lab = Lab::new();
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let line = lab.hc_calls()[1][2].clone();
+    assert!(!line.contains("위 "), "{line}");
+    assert!(line.contains("보고서의 재현 방법"), "{line}");
+    assert!(line.contains("따옴표"), "{line}");
 }
