@@ -1,13 +1,17 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Read};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
@@ -209,21 +213,37 @@ impl Ext {
             source,
         })?;
         let deadline = Instant::now() + timeout;
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
-
-        let status = match wait_until(&mut child, deadline) {
-            Ok(Some(status)) => status,
-            Ok(None) => return Err(time_out(&mut child, call, timeout)),
-            Err(source) => return Err(ExtError::Io { call, source }),
-        };
-        let until = Instant::now() + PIPE_GRACE;
-        let (stdout, stderr) = match (stdout.finish(until), stderr.finish(until)) {
-            (Ok(out), Ok(err)) => (out, err),
-            (Err(source), _) | (_, Err(source)) => return Err(ExtError::Io { call, source }),
-        };
+        let io_error = |call: String| move |source| ExtError::Io { call, source };
+        let mut pipes = [
+            Pipe::new(child.stdout.take().map(OwnedFd::from)).map_err(io_error(call.clone()))?,
+            Pipe::new(child.stderr.take().map(OwnedFd::from)).map_err(io_error(call.clone()))?,
+        ];
+        let mut exited = None;
+        let mut grace_end = deadline;
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if exited.is_none() {
+                exited = child.try_wait().map_err(io_error(call.clone()))?;
+                if exited.is_some() {
+                    grace_end = Instant::now() + PIPE_GRACE;
+                }
+            }
+            let now = Instant::now();
+            let limit = match exited {
+                Some(_) if pipes.iter().all(Pipe::is_closed) || now >= grace_end => break,
+                Some(_) => grace_end,
+                None if now >= deadline => return Err(time_out(&mut child, call, timeout)),
+                None => deadline,
+            };
+            wait_readable(&pipes, pause.min(limit - now)).map_err(io_error(call.clone()))?;
+            for pipe in &mut pipes {
+                pipe.read_available().map_err(io_error(call.clone()))?;
+            }
+            pause = (pause * 2).min(Duration::from_millis(20));
+        }
+        let [stdout, stderr] = pipes.map(|p| p.bytes);
         Ok(Output {
-            code: status.code(),
+            code: exited.and_then(|s| s.code()),
             stdout,
             stderr,
             call,
@@ -233,53 +253,67 @@ impl Ext {
 
 /// How long to wait for end-of-file after the process exits. A background grandchild may
 /// keep the pipe open forever; what the process itself wrote is read well within this.
+/// The pipes close when the call returns, so nothing keeps reading after that.
 const PIPE_GRACE: Duration = Duration::from_millis(500);
 
-struct Drain {
-    bytes: Arc<Mutex<Option<Vec<u8>>>>,
-    done: mpsc::Receiver<io::Result<()>>,
+struct Pipe {
+    file: Option<File>,
+    bytes: Vec<u8>,
 }
 
-impl Drain {
-    /// Takes what was read. A reader still blocked on a grandchild's pipe stops at its next
-    /// read and closes the pipe, so nothing keeps buffering after the call returns.
-    fn finish(self, until: Instant) -> io::Result<Vec<u8>> {
-        let wait = until.saturating_duration_since(Instant::now());
-        if let Ok(Err(e)) = self.done.recv_timeout(wait) {
-            return Err(e);
+impl Pipe {
+    fn new(fd: Option<OwnedFd>) -> io::Result<Pipe> {
+        let file = fd.map(File::from);
+        if let Some(file) = &file {
+            fcntl(file, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
         }
-        let taken = self.bytes.lock().unwrap_or_else(|e| e.into_inner()).take();
-        Ok(taken.unwrap_or_default())
+        Ok(Pipe {
+            file,
+            bytes: Vec::new(),
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.file.is_none()
+    }
+
+    fn read_available(&mut self) -> io::Result<()> {
+        let Some(file) = &mut self.file else {
+            return Ok(());
+        };
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => {
+                    self.file = None;
+                    return Ok(());
+                }
+                Ok(n) => self.bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
-fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
-    let bytes = Arc::new(Mutex::new(Some(Vec::new())));
-    let (tx, done) = mpsc::channel();
-    match pipe {
-        Some(mut pipe) => {
-            let bytes = Arc::clone(&bytes);
-            thread::spawn(move || {
-                let mut chunk = [0u8; 64 * 1024];
-                let result = loop {
-                    match pipe.read(&mut chunk) {
-                        Ok(0) => break Ok(()),
-                        Ok(n) => match bytes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                            Some(buf) => buf.extend_from_slice(&chunk[..n]),
-                            None => break Ok(()),
-                        },
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Err(e) => break Err(e),
-                    }
-                };
-                let _ = tx.send(result);
-            });
-        }
-        None => {
-            let _ = tx.send(Ok(()));
-        }
+fn wait_readable(pipes: &[Pipe], wait: Duration) -> io::Result<()> {
+    let mut fds: Vec<PollFd> = pipes
+        .iter()
+        .filter_map(|p| p.file.as_ref())
+        .map(|f| PollFd::new(f.as_fd(), PollFlags::POLLIN))
+        .collect();
+    if fds.is_empty() {
+        thread::sleep(wait);
+        return Ok(());
     }
-    Drain { bytes, done }
+    match poll(
+        &mut fds,
+        PollTimeout::try_from(wait).unwrap_or(PollTimeout::MAX),
+    ) {
+        Ok(_) | Err(Errno::EINTR) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Retries `ETXTBSY`: a script written a moment ago can still be open for writing in a
@@ -297,24 +331,6 @@ fn spawn(command: &mut Command) -> io::Result<Child> {
 }
 
 const SPAWN_TRIES: u32 = 50;
-
-fn wait_until(
-    child: &mut Child,
-    deadline: Instant,
-) -> io::Result<Option<std::process::ExitStatus>> {
-    let mut pause = Duration::from_millis(1);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(pause.min(deadline - now));
-        pause = (pause * 2).min(Duration::from_millis(20));
-    }
-}
 
 fn time_out(child: &mut Child, call: String, after: Duration) -> ExtError {
     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
@@ -404,27 +420,55 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    fn wait_for(path: &Path) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            if path.exists() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The grandchild writes after the call returned. The write fails only if chute closed its end.
+    fn late_writer(mark: &Path) -> String {
+        format!(
+            "sh -c \"trap '' PIPE; sleep 1; echo late || touch '{}'\"",
+            mark.display()
+        )
+    }
+
     #[test]
-    fn a_chatty_grandchild_stops_being_buffered_after_return() {
+    fn pipes_close_when_the_call_returns() {
         let sb = Sandbox::new();
-        let hc = sb.script("yes-hc", "yes xxxxxxxxxxxxxxxx &\necho started\nexit 0\n");
+        let mark = sb.root().join("pipe-closed");
+        let hc = sb.script(
+            "late-hc",
+            &format!("echo started\n{} &\nexit 0\n", late_writer(&mark)),
+        );
         let ext = Ext::from_vars(|k| (k == "CHUTE_HC").then(|| hc.clone().into()));
         let out = ext
-            .call(Tool::Hc, None, ["run"], Duration::from_secs(3))
+            .call(Tool::Hc, None, ["run"], Duration::from_secs(5))
             .unwrap();
-        assert!(out.stdout_text().contains("started\n"));
-        let rss = || {
-            std::fs::read_to_string("/proc/self/status")
-                .unwrap()
-                .lines()
-                .find_map(|l| l.strip_prefix("VmRSS:"))
-                .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
-                .unwrap()
-        };
-        drop(out);
-        let before = rss();
-        thread::sleep(Duration::from_millis(500));
-        assert!(rss() < before + 100_000, "호출이 끝난 뒤에도 출력이 쌓인다");
+        assert_eq!(out.stdout_text(), "started\n");
+        assert!(wait_for(&mark), "호출이 끝난 뒤에도 파이프가 열려 있다");
+    }
+
+    #[test]
+    fn pipes_close_after_a_timeout_even_for_an_escaped_grandchild() {
+        let sb = Sandbox::new();
+        let mark = sb.root().join("pipe-closed");
+        let gh = sb.script(
+            "escape-gh",
+            &format!("setsid {} &\nsleep 30\n", late_writer(&mark)),
+        );
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
+        let err = ext
+            .call(Tool::Gh, None, ["pr", "view"], Duration::from_millis(200))
+            .unwrap_err();
+        assert!(matches!(err, ExtError::Timeout { .. }), "{err}");
+        assert!(wait_for(&mark), "시간 초과 뒤에도 파이프가 열려 있다");
     }
 
     #[test]

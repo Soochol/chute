@@ -162,12 +162,22 @@ fn chute_git_selects_the_git_executable() {
     let sb = Sandbox::new();
     let git = sb.fake("git");
     git.respond(
+        "worktree list --porcelain",
+        support::Reply::ok("worktree /w/widget\nHEAD abc1234\nbranch refs/heads/main\n"),
+    )
+    .respond(
         "remote get-url origin",
         support::Reply::ok("https://github.com/acme/widget.git\n"),
     );
     let out = chute(&sb, sb.root(), &["status", "--json"]);
     assert_eq!(out.status.code(), Some(2));
-    assert_eq!(git.calls(), [["remote", "get-url", "origin"]]);
+    assert_eq!(
+        git.calls(),
+        [
+            vec!["worktree", "list", "--porcelain"],
+            vec!["remote", "get-url", "origin"]
+        ]
+    );
 }
 
 fn status_json(sb: &Sandbox, repo: &TestRepo) -> Value {

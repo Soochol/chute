@@ -6,6 +6,7 @@ use crate::ext::Ext;
 use crate::model::{RepoInfo, Slug};
 
 pub fn slug(ext: &Ext, dir: &Path) -> Result<Slug> {
+    work_tree(ext, dir)?;
     let url = origin_url(ext, dir)?;
     parse_slug(&url)
 }
@@ -132,7 +133,9 @@ mod tests {
         repo.git(&["-C", &bare_s, "worktree", "add", "--quiet", &wt_s, "main"]);
         let ext = Ext::from_vars(|k| sb.var(k));
 
-        assert!(discover(&ext, &wt).is_err());
-        assert!(discover(&ext, &bare).is_err());
+        for dir in [&wt, &bare] {
+            assert!(discover(&ext, dir).is_err());
+            assert!(slug(&ext, dir).is_err());
+        }
     }
 }
