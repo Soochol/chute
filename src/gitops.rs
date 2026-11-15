@@ -17,6 +17,10 @@ use crate::store::Home;
 
 pub const FAILED_REF_PREFIX: &str = "refs/chute/failed/";
 
+/// Hooks are for the user's own use of git. Run for chute they can rewrite a merge message,
+/// refuse the push of a verified commit, or repeat the verification inside the slot.
+const NO_HOOKS: [&str; 2] = ["-c", "core.hooksPath=/dev/null"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SlotName {
     Batch,
@@ -206,6 +210,17 @@ impl Gitops {
         remove_tree(&path).with_context(|| format!("지우지 못했다: {}", path.display()))?;
         // `worktree add` rewrites `.git/worktrees`, and two of them racing there can fail.
         let _admin = self.lock_worktree_admin()?;
+        // Any commit will do, since nothing is checked out and the slot is set right after.
+        // Without one git starts at the user's HEAD, which is missing on an unborn branch.
+        let start = self
+            .ext
+            .git(&self.repo, ["rev-list", "-n1", "--all"])?
+            .ok()?
+            .trim()
+            .to_owned();
+        if start.is_empty() {
+            bail!("저장소에 커밋이 하나도 없다: {}", self.repo.display());
+        }
         let args = [
             OsStr::new("worktree"),
             OsStr::new("add"),
@@ -216,6 +231,7 @@ impl Gitops {
             OsStr::new("--detach"),
             OsStr::new("--no-checkout"),
             path.as_os_str(),
+            OsStr::new(&start),
         ];
         self.ext
             .git(&self.repo, args)?
@@ -416,9 +432,10 @@ impl Slot {
                 out.stderr_text().trim()
             )
         };
-        // A refusal is worded differently by each server, and a race inside the push has its
-        // own wording, so ask whether main can still be fast-forwarded to the commit.
-        let Ok(tip) = self.fetch_base() else {
+        // Servers word a lost race each their own way, so ask whether main can still be
+        // fast-forwarded to the commit. Only the tip is wanted: the tracking ref stays as it is.
+        let tip = self.fetch(&format!("refs/heads/{}", git.default_branch));
+        let Ok(tip) = tip else {
             return Err(refused());
         };
         if tip != *commit && !self.is_ancestor(&tip, commit)? {
@@ -433,12 +450,12 @@ impl Slot {
         if self.is_ancestor(head, tip)? {
             return Ok(ItemResult::AlreadyMerged);
         }
+        // An earlier item can stop ignoring a path, which turns a cache file there into an
+        // untracked file that git refuses to overwrite.
+        self.run(&["clean", "--quiet", "-ffd"])?;
         let message = item.github_merge_message(&self.lock.git.owner);
-        // Hooks and rerere belong to the user's own commits. Here a hook can rewrite the
-        // message or reject the merge, and rerere can stage a conflict as resolved.
+        // rerere would stage a recorded resolution and so hide the conflict.
         let out = self.git(&[
-            "-c",
-            "core.hooksPath=/dev/null",
             "-c",
             "rerere.enabled=false",
             "merge",
@@ -556,14 +573,28 @@ impl Slot {
         })
     }
 
-    /// Moves `tracking` from `before` to `tip`. If another slot moved it in the meantime, that
-    /// slot fetched as recently as this one, so its value stays instead of being overwritten.
+    /// Moves `tracking` from `before` to `tip`. If another slot moved it in the meantime, its
+    /// value is kept when it is newer than `tip` or unrelated, and replaced when `tip` is newer.
     fn move_tracking_ref(&self, tracking: &str, before: &str, tip: &Sha) -> Result<()> {
-        let out = self.git(&["update-ref", tracking, tip.as_str(), before])?;
-        if out.success() || self.read_ref(tracking)? != before {
-            return Ok(());
+        let mut expected = before.to_owned();
+        for _ in 0..3 {
+            let out = self.git(&["update-ref", tracking, tip.as_str(), &expected])?;
+            if out.success() {
+                return Ok(());
+            }
+            let now = self.read_ref(tracking)?;
+            if now == expected {
+                bail!("{tracking}을 옮기지 못했다: {}", out.stderr_text().trim());
+            }
+            if !now.is_empty() {
+                let now_sha = Sha::try_from(now.clone()).map_err(|e| anyhow!(e))?;
+                if !self.is_ancestor(&now_sha, tip)? {
+                    return Ok(());
+                }
+            }
+            expected = now;
         }
-        bail!("{tracking}을 옮기지 못했다: {}", out.stderr_text().trim())
+        Ok(())
     }
 
     /// This process holds the slot lock, so a lock file in the slot's own git directory is
@@ -596,11 +627,12 @@ impl Slot {
     }
 
     fn git(&self, args: &[&str]) -> Result<Output> {
+        let args = NO_HOOKS.iter().chain(args);
         Ok(self.lock.git.ext.git(&self.path, args)?)
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
-        Ok(self.lock.git.ext.git(&self.path, args)?.ok()?)
+        Ok(self.git(args)?.ok()?)
     }
 }
 
@@ -1091,6 +1123,22 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_tracking_ref_does_not_turn_a_moved_main_into_an_error() {
+        let w = World::new();
+        let items = [w.open_pr(1, &[("a.txt", "a\n")])];
+        let slot = w.slot(SlotName::Batch);
+        let merged = w.merge(&slot, &items);
+        let theirs = w.advance_main(&[("n.txt", "n\n")], "feat: 그사이 머지된 변경");
+        let lock = w.repo.path().join(".git/refs/remotes/origin/main.lock");
+        fs::write(&lock, "").unwrap();
+
+        assert_eq!(slot.push(&merged.tip).unwrap(), PushOutcome::MainMoved);
+
+        assert_eq!(w.origin_main(), theirs);
+        fs::remove_file(&lock).unwrap();
+    }
+
+    #[test]
     fn fetch_base_returns_origin_main_and_keeps_the_tracking_ref_current() {
         let w = World::new();
         let moved = w.advance_main(&[("n.txt", "n\n")], "feat: 새 변경");
@@ -1272,6 +1320,25 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_tip_replaces_a_tracking_ref_another_slot_left_behind() {
+        let w = World::new();
+        let slot = w.slot(SlotName::Batch);
+        let stale = slot.fetch_base().unwrap();
+        let middle = w.advance_main(&[("n.txt", "1\n")], "feat: 첫째");
+        slot.fetch_base().unwrap();
+        let newest = w.advance_main(&[("n.txt", "2\n")], "feat: 둘째");
+        assert_eq!(slot.fetch_base().unwrap(), newest);
+        // Another slot moved the ref to `middle` after this one read `stale` and before it wrote.
+        w.repo
+            .git(&["update-ref", "refs/remotes/origin/main", middle.as_str()]);
+
+        slot.move_tracking_ref("refs/remotes/origin/main", stale.as_str(), &newest)
+            .unwrap();
+
+        assert_eq!(sha(&w.repo.git(&["rev-parse", "origin/main"])), newest);
+    }
+
+    #[test]
     fn a_relative_state_folder_still_puts_slots_outside_the_users_checkout() {
         let w = World::new();
         let info = repo::discover(&hermetic_ext(&w.sb), w.repo.path()).unwrap();
@@ -1415,6 +1482,7 @@ mod tests {
             "{ printf '[PROJ-1] '; cat \"$1\"; } > \"$1.new\" && mv \"$1.new\" \"$1\"",
         );
         install_hook(&w, "post-merge", &format!("touch '{}'", marker.display()));
+        install_hook(&w, "pre-push", "echo 'main is protected' >&2; exit 1");
         w.repo.git(&["config", "commit.cleanup", "strip"]);
         let MergeItem::Pr {
             pr, branch, head, ..
@@ -1438,6 +1506,8 @@ mod tests {
             "Merge pull request #1 from acme/pr-1\n\n#42 고친 것"
         );
         assert!(!marker.exists(), "post-merge 훅이 돌았다");
+        assert_eq!(slot.push(&merged.tip).unwrap(), PushOutcome::Pushed);
+        assert_eq!(w.origin_main(), merged.tip);
     }
 
     #[test]
@@ -1703,6 +1773,10 @@ mod tests {
                 .env("GIT_DIR", git_dir)
                 .env(HOOK_CHILD_REPO, w.repo.path())
                 .env(HOOK_CHILD_HEAD, &before.0)
+                // Configuration given through the environment is the user's and must still apply.
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "user.name")
+                .env("GIT_CONFIG_VALUE_0", "Env Person")
                 .current_dir(&agent)
                 .output()
                 .unwrap();
@@ -1715,5 +1789,178 @@ mod tests {
         );
         assert!(stdout.contains("1 passed"), "{stdout}");
         assert_eq!(state(), before, "에이전트의 worktree가 바뀌었다");
+        let slot = w.sb.chute_home().join("slots/acme__widget/preflight-1");
+        assert_eq!(
+            git(&w.sb, &slot, &["log", "-1", "--format=%cn"]),
+            "Env Person"
+        );
+    }
+
+    #[test]
+    fn a_pr_that_stops_an_earlier_one_ignoring_a_cache_path_still_merges() {
+        let w = World::new();
+        w.peer_git(&["fetch", "--quiet", "origin"]);
+        w.peer_git(&["checkout", "--quiet", "-B", "pr-1", "origin/main"]);
+        let first = w.commit_in_peer(&[(".gitignore", "\n")], "feat: change 1");
+        w.peer_git(&[
+            "push",
+            "--quiet",
+            "origin",
+            "pr-1:refs/heads/pr-1",
+            "pr-1:refs/pull/1/head",
+        ]);
+        w.peer_git(&["checkout", "--quiet", "-B", "pr-2", "pr-1"]);
+        let second = w.commit_in_peer(&[("target/cache.bin", "tracked\n")], "feat: change 2");
+        w.peer_git(&[
+            "push",
+            "--quiet",
+            "origin",
+            "pr-2:refs/heads/pr-2",
+            "pr-2:refs/pull/2/head",
+        ]);
+        let item = |n: u64, head: Sha| MergeItem::Pr {
+            pr: PrNumber(n),
+            branch: format!("pr-{n}"),
+            title: format!("feat: change {n}"),
+            head,
+        };
+        let items = [item(1, first), item(2, second)];
+        let slot = w.slot(SlotName::Batch);
+        let base = slot.fetch_base().unwrap();
+        slot.checkout(&base).unwrap();
+        fs::create_dir_all(slot.path().join("target")).unwrap();
+        fs::write(slot.path().join("target/cache.bin"), "cache").unwrap();
+
+        let merged = w.merge(&slot, &items);
+
+        assert!(
+            merged
+                .items
+                .iter()
+                .all(|o| matches!(o.result, ItemResult::Merged { .. }))
+        );
+        let cache = fs::read_to_string(slot.path().join("target/cache.bin")).unwrap();
+        assert_eq!(cache, "tracked\n");
+    }
+
+    #[test]
+    fn a_slot_can_be_made_while_the_users_checkout_is_on_an_unborn_branch() {
+        let w = World::new();
+        w.repo.git(&["checkout", "--quiet", "--orphan", "scratch"]);
+
+        let slot = w.slot(SlotName::Batch);
+        let base = slot.fetch_base().unwrap();
+        slot.checkout(&base).unwrap();
+
+        assert!(slot.path().join("shared.txt").exists());
+        w.repo.git(&["checkout", "--quiet", "--force", "main"]);
+    }
+
+    #[test]
+    fn a_branch_checked_out_by_hand_in_a_slot_is_not_moved() {
+        let w = World::new();
+        let slot = w.slot(SlotName::Batch);
+        let base = slot.fetch_base().unwrap();
+        slot.checkout(&base).unwrap();
+        w.in_slot(&slot, &["checkout", "--quiet", "-b", "by-hand"]);
+        let newer = w.advance_main(&[("n.txt", "n\n")], "feat: 새 변경");
+        assert_eq!(slot.fetch_base().unwrap(), newer);
+
+        slot.checkout(&newer).unwrap();
+
+        assert_eq!(slot.head().unwrap(), newer);
+        assert_eq!(sha(&w.repo.git(&["rev-parse", "refs/heads/by-hand"])), base);
+        w.repo.git(&["branch", "--quiet", "-D", "by-hand"]);
+    }
+
+    const LOCK_CHILD_HOME: &str = "CHUTE_TEST_LOCK_CHILD_HOME";
+
+    fn lock_only_gitops(home: &Path) -> Gitops {
+        let info = RepoInfo {
+            slug: crate::model::Slug::new("acme", "widget").unwrap(),
+            path: home.join("unused-checkout"),
+            remote: "unused".into(),
+            default_branch: "main".into(),
+        };
+        Gitops::new(&Ext::from_vars(|_| None), &Home::at(home), &info)
+    }
+
+    /// The child half of `a_slot_held_by_another_process_cannot_be_taken`: tries for the batch
+    /// slot, says whether it got it, and holds it until its stdin closes. A normal run has no
+    /// `LOCK_CHILD_HOME`, so it does nothing.
+    #[test]
+    fn lock_child() {
+        let Some(home) = std::env::var_os(LOCK_CHILD_HOME) else {
+            return;
+        };
+        let lock = lock_only_gitops(Path::new(&home))
+            .lock_slot(SlotName::Batch)
+            .unwrap();
+        println!("lock-child holds={}", lock.is_some());
+        std::io::stdin().read_line(&mut String::new()).unwrap();
+    }
+
+    struct LockChild {
+        child: std::process::Child,
+        stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl LockChild {
+        fn start(home: &Path) -> LockChild {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gitops::tests::lock_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(LOCK_CHILD_HOME, home)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+            LockChild { child, stdout }
+        }
+
+        fn got_the_slot(&mut self) -> bool {
+            use std::io::BufRead;
+            loop {
+                let mut line = String::new();
+                assert!(
+                    self.stdout.read_line(&mut line).unwrap() > 0,
+                    "자식이 답하지 않고 끝났다"
+                );
+                if let Some(answer) = line.trim().split("lock-child holds=").nth(1) {
+                    return answer == "true";
+                }
+            }
+        }
+
+        fn release(mut self) {
+            drop(self.child.stdin.take());
+            self.child.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_slot_held_by_another_process_cannot_be_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = lock_only_gitops(dir.path());
+
+        let mut holder = LockChild::start(dir.path());
+        assert!(holder.got_the_slot());
+        assert!(git.lock_slot(SlotName::Batch).unwrap().is_none());
+        let mut late = LockChild::start(dir.path());
+        assert!(!late.got_the_slot());
+        late.release();
+
+        holder.release();
+        let until = Instant::now() + Duration::from_secs(5);
+        while git.lock_slot(SlotName::Batch).unwrap().is_none() {
+            assert!(Instant::now() < until, "슬롯이 풀리지 않았다");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

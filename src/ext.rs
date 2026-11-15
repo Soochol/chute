@@ -267,14 +267,13 @@ impl Ext {
     }
 }
 
-/// `git rev-parse --local-env-vars`. git exports these to the hooks and `!` aliases it runs,
-/// so chute started from one inherits them. Left in place they point every git call at the
-/// repository that started chute instead of the call's own `cwd`.
-const GIT_REPO_ENV: [&str; 15] = [
+/// What git exports to the hooks and `!` aliases it runs to say which repository it is in, so
+/// chute started from one inherits them. Left in place they point every git call at that
+/// repository instead of the call's own `cwd`. This is `git rev-parse --local-env-vars` without
+/// `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`: those carry the user's own
+/// `git -c` and environment configuration, which git passes on and chute must keep.
+const GIT_REPO_ENV: [&str; 12] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
     "GIT_OBJECT_DIRECTORY",
     "GIT_DIR",
     "GIT_WORK_TREE",
