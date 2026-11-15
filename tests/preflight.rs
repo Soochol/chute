@@ -115,18 +115,28 @@ fn a_change_that_breaks_the_check_fails_alone_with_a_report() {
     let report = read(&doc["report"]);
     assert!(report.contains("단독"), "{report}");
     assert!(report.contains("bad_case"), "{report}");
+    let refs = failed_refs(&w);
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    let tree = report_doc_tree(&doc);
+    assert!(refs[0].ends_with(&tree), "{refs:?} {tree}");
     let plain = preflight(&w, &[]);
     assert_eq!(code(&plain), 1);
     let shown = text(&plain);
     assert!(shown.contains("검증 실패(단독)"), "{shown}");
     assert!(shown.contains("보고서: "), "{shown}");
-    let ref_name = "refs/chute/failed/preflight-feat_bad";
-    assert!(
-        !w.repo
-            .git(&["rev-parse", "--verify", "--quiet", ref_name])
-            .trim()
-            .is_empty()
-    );
+}
+
+fn failed_refs(w: &World) -> Vec<String> {
+    w.repo
+        .git(&["for-each-ref", "--format=%(refname)", "refs/chute/failed/"])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn report_doc_tree(doc: &Value) -> String {
+    let report: Value = serde_json::from_str(&read(&doc["report_json"])).unwrap();
+    report["step"]["tree"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -463,4 +473,101 @@ fn the_json_carries_head_base_partners_and_report() {
     assert_eq!(doc["base"], base);
     assert!(Path::new(doc["report"].as_str().unwrap()).is_file());
     assert!(PathBuf::from(doc["report_json"].as_str().unwrap()).is_file());
+}
+
+#[test]
+fn failures_of_branches_with_similar_names_keep_their_own_refs() {
+    let w = world("test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }");
+    let mut trees = Vec::new();
+    for (branch, file) in [("feat/x", "bad.txt"), ("feat.x", "bad.txt")] {
+        w.repo
+            .git(&["checkout", "--quiet", "-b", branch, "origin/main"]);
+        w.repo.commit_file(file, branch, &format!("feat: {branch}"));
+        let out = preflight(&w, &["--json"]);
+        assert_eq!(code(&out), 1);
+        trees.push(report_doc_tree(&json(&out)));
+    }
+    assert_ne!(trees[0], trees[1]);
+    let refs = failed_refs(&w);
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    for tree in &trees {
+        assert!(refs.iter().any(|r| r.ends_with(tree.as_str())), "{refs:?}");
+    }
+    w.repo.git(&["rm", "--quiet", "bad.txt"]);
+    w.repo.git(&["commit", "--quiet", "-m", "fix: 고친다"]);
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    assert_eq!(
+        failed_refs(&w).len(),
+        2,
+        "통과해도 다른 보고서의 참조는 남는다"
+    );
+}
+
+#[test]
+fn failed_refs_older_than_a_week_are_removed_and_fresh_ones_stay() {
+    let w = world("true");
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let old = format!("refs/chute/failed/preflight-1-{head}");
+    let fresh = format!("refs/chute/failed/preflight-{now_ms}-{head}");
+    let foreign = "refs/chute/failed/pr-12-abc";
+    for name in [&old, &fresh, &foreign.to_owned()] {
+        w.repo.git(&["update-ref", name, &head]);
+    }
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    let refs = failed_refs(&w);
+    assert!(!refs.contains(&old), "{refs:?}");
+    assert!(refs.contains(&fresh), "{refs:?}");
+    assert!(refs.contains(&foreign.to_owned()), "{refs:?}");
+}
+
+#[test]
+fn a_tag_named_like_the_branch_does_not_change_which_pr_is_the_callers() {
+    let w = world("true");
+    let head = queue_pr(&w, 7, "a.txt", "a\n", ItemState::Queued(None));
+    w.repo.git(&["tag", "feat/7", &head]);
+    w.repo.git(&["checkout", "--quiet", "feat/7"]);
+    let doc = json(&preflight(&w, &["--json"]));
+    assert_eq!(doc["with"], serde_json::json!([]));
+    assert!(w.state().preflights.contains_key("feat/7"));
+    assert_eq!(w.entry(7).unwrap()["preflight"]["result"], "pass");
+}
+
+#[test]
+fn a_head_that_cannot_be_laid_over_main_alone_is_a_combination_failure() {
+    let w = world("test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }");
+    w.repo.commit_file("f.txt", "orig\n", "chore: 원본");
+    w.repo.git(&["push", "--quiet", "origin", "main"]);
+    w.repo
+        .git(&["checkout", "--quiet", "-b", "feat/mine", "main"]);
+    w.repo.commit_file("f.txt", "same\n", "feat: 같은 내용");
+    w.repo.commit_file("bad.txt", "x\n", "feat: 깨뜨린다");
+    w.repo.git(&["checkout", "--quiet", "main"]);
+    w.repo.commit_file("f.txt", "main\n", "feat: main이 고친다");
+    w.repo.git(&["push", "--quiet", "origin", "main"]);
+    queue_pr(&w, 7, "f.txt", "same\n", ItemState::Queued(None));
+    w.repo.git(&["checkout", "--quiet", "feat/mine"]);
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "fail");
+    assert_eq!(doc["mode"], "combo");
+    assert_eq!(doc["with"], serde_json::json!([7]));
+    assert!(w.state().preflights.contains_key("feat/mine"));
+}
+
+#[test]
+fn untracked_files_count_even_when_git_is_set_to_hide_them() {
+    let marks = tempfile::tempdir().unwrap();
+    let mark = marks.path().join("ran");
+    let w = world(&format!("touch {}", mark.display()));
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    w.repo.git(&["config", "status.showUntrackedFiles", "no"]);
+    w.repo.write("new-file.txt", "untracked\n");
+    let out = preflight(&w, &[]);
+    assert_eq!(code(&out), 2);
+    assert!(!mark.exists(), "검증이 돌았다");
 }

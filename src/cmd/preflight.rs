@@ -10,8 +10,9 @@ use serde::Serialize;
 
 use super::{Ctx, REFUSED};
 use crate::config::Config;
+use crate::ext::Ext;
 use crate::feedback::{self, Feedback, Subject, Written};
-use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
+use crate::gitops::{FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
     Blocked, ConflictFile, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty, Partner,
     PrNumber, PreflightRecord, PreflightResult, QueueItem, RepoInfo, Sha, StepFailure, VerifyMode,
@@ -22,7 +23,7 @@ use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 const KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LOG_ROOT: &str = "preflight";
 const SHOWN_PATHS: usize = 5;
-const REF_KEY_LIMIT: usize = 80;
+const FAILED_REF_STEM: &str = "preflight-";
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -176,6 +177,7 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         target: &target,
         base: &base,
         together: &together,
+        at,
         log_dir: log_dir(&store, &target.head, at)?,
     };
     let judged = match &own.result {
@@ -187,15 +189,23 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     if let Err(e) = record(&store, &target, &report) {
         eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
     }
-    forget_failed_ref(&gitops, &target, &report);
-    prune(&store);
+    prune(&ctx.ext, &info, &store, &gitops);
     Ok(report)
 }
 
 fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
     let status = ctx
         .ext
-        .git(dir, ["--no-optional-locks", "status", "--porcelain"])?
+        .git(
+            dir,
+            [
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
+        )?
         .ok()?;
     if !status.trim().is_empty() {
         let lines: Vec<&str> = status.lines().collect();
@@ -220,12 +230,11 @@ fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
         .git(dir, ["rev-parse", "--verify", "HEAD^{commit}"])?
         .ok()?;
     let head = Sha::try_from(head.trim().to_owned()).map_err(|e| anyhow!(e))?;
-    let named = ctx
-        .ext
-        .git(dir, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let named = ctx.ext.git(dir, ["symbolic-ref", "--quiet", "HEAD"])?;
     let branch = named
         .success()
         .then(|| named.stdout_text().trim().to_owned())
+        .and_then(|full| full.strip_prefix("refs/heads/").map(str::to_owned))
         .filter(|name| !name.is_empty());
     Ok(Target { head, branch })
 }
@@ -262,6 +271,7 @@ struct Run<'a> {
     target: &'a Target,
     base: &'a Sha,
     together: &'a [(PrNumber, String, Sha)],
+    at: EpochMs,
     log_dir: PathBuf,
 }
 
@@ -359,11 +369,15 @@ impl Run<'_> {
                 head: self.target.head.clone(),
             }],
         )?;
-        if matches!(
+        let solo_conflicts = matches!(
             solo.items.first().map(|item| &item.result),
             Some(ItemResult::Conflict(_))
-        ) {
-            bail!("기준 위에 이 HEAD만 얹다가 충돌했다. 큐와 함께 합칠 때는 충돌하지 않았다");
+        );
+        if solo_conflicts {
+            let mode = VerifyMode::Combo {
+                partners: self.partners(tip)?,
+            };
+            return Ok((step_failure(&failed, mode, tip), tip.clone()));
         }
         match self.run_steps(&self.log_dir.join("solo"))? {
             Outcome::Passed { .. } => {
@@ -393,7 +407,7 @@ impl Run<'_> {
     }
 
     fn report_failure(&self, failure: &Failure, tree: &Sha) -> Result<Written> {
-        let name = failed_ref_name(self.target);
+        let name = failed_ref_name(self.at, tree);
         self.gitops.set_failed_ref(&name, tree)?;
         self.feedback
             .write_report(&self.subject(), failure, Some(&name))
@@ -427,23 +441,14 @@ fn step_failure(failed: &verify::Failed, mode: VerifyMode, tree: &Sha) -> Failur
     }
 }
 
-fn failed_ref_name(target: &Target) -> String {
-    let key = match &target.branch {
-        Some(branch) => branch.as_str(),
-        None => target.head.as_str(),
-    };
-    let plain: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(REF_KEY_LIMIT)
-        .collect();
-    format!("preflight-{plain}")
+fn failed_ref_name(at: EpochMs, tree: &Sha) -> String {
+    format!("{FAILED_REF_STEM}{}-{tree}", at.0)
+}
+
+fn failed_ref_made_at(name: &str) -> Option<EpochMs> {
+    let rest = name.strip_prefix(FAILED_REF_STEM)?;
+    let (at, _tree) = rest.split_once('-')?;
+    at.parse().ok().map(EpochMs)
 }
 
 fn log_dir(store: &RepoStore, head: &Sha, at: EpochMs) -> Result<PathBuf> {
@@ -525,16 +530,7 @@ fn record(store: &RepoStore, target: &Target, report: &Report) -> Result<()> {
     })
 }
 
-fn forget_failed_ref(gitops: &Gitops, target: &Target, report: &Report) {
-    if report.result == PreflightResult::Fail {
-        return;
-    }
-    if let Err(e) = gitops.delete_failed_ref(&failed_ref_name(target)) {
-        eprintln!("경고: 지난 실패 트리 참조를 지우지 못했다: {e:#}");
-    }
-}
-
-fn prune(store: &RepoStore) {
+fn prune(ext: &Ext, info: &RepoInfo, store: &RepoStore, gitops: &Gitops) {
     let logs = store.dir().join(LOG_ROOT);
     let reports = store.dir().join("reports");
     for (dir, only_commit_reports) in [(logs, false), (reports, true)] {
@@ -542,6 +538,29 @@ fn prune(store: &RepoStore) {
             eprintln!("경고: 오래된 기록을 지우지 못했다 ({}): {e}", dir.display());
         }
     }
+    if let Err(e) = remove_old_failed_refs(ext, info, gitops, EpochMs::now()) {
+        eprintln!("경고: 오래된 실패 트리 참조를 지우지 못했다: {e:#}");
+    }
+}
+
+fn remove_old_failed_refs(ext: &Ext, info: &RepoInfo, gitops: &Gitops, now: EpochMs) -> Result<()> {
+    let pattern = format!("{FAILED_REF_PREFIX}{FAILED_REF_STEM}*");
+    let listed = ext
+        .git(
+            &info.path,
+            ["for-each-ref", "--format=%(refname)", pattern.as_str()],
+        )?
+        .ok()?;
+    let cutoff = now.0.saturating_sub(KEEP_FOR.as_millis() as u64);
+    for full in listed.lines() {
+        let Some(name) = full.strip_prefix(FAILED_REF_PREFIX) else {
+            continue;
+        };
+        if failed_ref_made_at(name).is_some_and(|made| made.0 < cutoff) {
+            gitops.delete_failed_ref(name)?;
+        }
+    }
+    Ok(())
 }
 
 fn remove_old(dir: &Path, only_commit_reports: bool) -> io::Result<()> {
@@ -640,13 +659,6 @@ mod tests {
         Sha::try_from(text.to_owned()).unwrap()
     }
 
-    fn target(branch: Option<&str>) -> Target {
-        Target {
-            head: sha("0123456789abcdef0123456789abcdef01234567"),
-            branch: branch.map(str::to_owned),
-        }
-    }
-
     fn passed(with: &[u64]) -> Report {
         Report {
             result: PreflightResult::Pass,
@@ -666,32 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn the_failed_ref_name_is_a_valid_ref_for_any_branch() {
-        for branch in [
-            "feat/a.b",
-            "a..b",
-            "x.lock",
-            "한글/브랜치",
-            "-lead",
-            "a b~c",
-        ] {
-            let name = failed_ref_name(&target(Some(branch)));
-            assert!(name.starts_with("preflight-"));
-            assert!(
-                name.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-                "{name}"
-            );
-        }
-        assert!(failed_ref_name(&target(Some(&"a".repeat(500)))).len() < 100);
-    }
-
-    #[test]
-    fn a_detached_head_names_its_ref_after_the_commit() {
-        assert_eq!(
-            failed_ref_name(&target(None)),
-            "preflight-0123456789abcdef0123456789abcdef01234567"
-        );
+    fn a_failed_ref_name_carries_its_time_and_tree() {
+        let tree = sha("0123456789abcdef0123456789abcdef01234567");
+        let name = failed_ref_name(EpochMs(1700), &tree);
+        assert_eq!(name, format!("preflight-1700-{tree}"));
+        assert_eq!(failed_ref_made_at(&name), Some(EpochMs(1700)));
+        assert_eq!(failed_ref_made_at("preflight-x-abc"), None);
+        assert_eq!(failed_ref_made_at("other-1700-abc"), None);
     }
 
     #[test]
