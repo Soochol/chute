@@ -126,3 +126,33 @@ fn up_takes_another_name_when_a_finished_daemon_terminal_still_holds_it() {
         runs[1]
     );
 }
+
+#[test]
+fn agents_starting_the_daemon_at_the_same_moment_start_one() {
+    let lab = Lab::new("");
+    let calls = lab.sb.root().join("slow-hc-calls");
+    lab.sb.script(
+        "hc",
+        &format!(
+            "echo \"$*\" >> '{}'\nsleep 0.4\necho '{{\"address\":\"t1dd\"}}'\n",
+            calls.display()
+        ),
+    );
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let mut command = lab.sb.command(env!("CARGO_BIN_EXE_chute"));
+            command
+                .current_dir(lab.repo.path())
+                .arg("up")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command.spawn().unwrap()
+        })
+        .collect();
+    for mut child in handles {
+        assert!(child.wait().unwrap().success());
+    }
+
+    let started = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(started.lines().count(), 1, "{started}");
+}

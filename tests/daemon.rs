@@ -132,7 +132,13 @@ fn down_now_ends_the_running_verification_and_leaves_nothing_in_a_batch() {
     let said = ok(chute(&lab, &["down", "--now"]).output().unwrap());
 
     assert!(said.contains("멈췄다"), "{said}");
+    assert!(
+        !lab.store.daemon_running().unwrap(),
+        "--now는 데몬이 멈춘 뒤에 돌아온다"
+    );
     assert!(exits(&mut daemon) || daemon.0.wait().unwrap().success());
+    assert!(lab.hc_calls("send").is_empty(), "취소는 반송이 아니다");
+    assert!(lab.events().is_empty(), "{:?}", lab.events());
     wait_until("검증 프로세스가 남았다", || is_gone(verifying));
     let state = lab.state();
     assert!(state.batch.is_none());
@@ -150,4 +156,40 @@ fn down_without_a_daemon_says_so_and_leaves_no_stop_request() {
 
     assert!(said.contains("떠 있지 않다"), "{said}");
     assert!(!lab.store.dir().join("stop").exists());
+}
+
+#[test]
+fn a_stop_request_left_by_an_earlier_run_does_not_stop_the_new_daemon() {
+    let lab = Lab::new("");
+    std::fs::create_dir_all(lab.store.dir()).unwrap();
+    std::fs::write(lab.store.dir().join("stop"), "now").unwrap();
+
+    let mut daemon = start_daemon(&lab);
+    wait_until("데몬이 뜨지 않았다", || {
+        lab.store.daemon_running().unwrap()
+    });
+    thread::sleep(Duration::from_millis(600));
+
+    assert!(!exits(&mut daemon));
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+}
+
+#[test]
+fn up_starts_the_daemon_again_right_after_down() {
+    let lab = Lab::new("");
+    lab.sb
+        .fake("hc")
+        .respond("run *", support::Reply::ok(r#"{"address":"t1dd"}"#));
+    ok(chute(&lab, &["up"]).output().unwrap());
+    let mut daemon = start_daemon(&lab);
+    wait_until("데몬이 뜨지 않았다", || {
+        lab.store.daemon_running().unwrap()
+    });
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+
+    ok(chute(&lab, &["up"]).output().unwrap());
+
+    assert_eq!(lab.hc_calls("run").len(), 2);
 }

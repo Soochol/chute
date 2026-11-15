@@ -76,6 +76,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     let _ = fs::remove_file(store.dir().join(STOP_FILE));
+    super::up::clear_launch_marker(&store);
     let worktrees_root = feedback::worktrees_root(|key| std::env::var_os(key))?;
     let cancel = Cancel::new();
     let engine = Engine::new(
@@ -109,6 +110,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let _ = watcher.join();
     let _ = store.clear_daemon();
     let _ = fs::remove_file(store.dir().join(STOP_FILE));
+    super::up::clear_launch_marker(&store);
     served?;
     println!("chute 데몬을 멈췄다");
     Ok(ExitCode::SUCCESS)

@@ -35,6 +35,12 @@ fn up(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// The marker only bridges the moment between `hc run` and the daemon taking its lock, so
+/// the daemon removes it as soon as it holds the lock and again when it ends.
+pub fn clear_launch_marker(store: &RepoStore) {
+    let _ = fs::remove_file(store.dir().join(LAUNCH_MARKER));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Launch {
     Running,

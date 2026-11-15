@@ -14,7 +14,7 @@ use chute::queue;
 use engine_kit::Lab;
 use support::Reply;
 
-const BAD: &str = "[ -e BAD ] && fail \"BAD가 있다\"";
+const BAD: &str = "[ -e BAD ] && fail \"FAILED bad_test\"";
 
 fn done(pass: Pass) -> Summary {
     match pass {
@@ -175,6 +175,7 @@ fn one_failing_pr_among_four_is_found_alone_and_the_rest_merge() {
     };
     assert_eq!(step.mode, VerifyMode::Solo);
     assert_eq!(step.step, "check");
+    assert_eq!(step.failed_tests, ["bad_test"]);
     assert_eq!(lab.merge_commits_on_main().len(), 3);
     let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
     assert!(
@@ -426,6 +427,13 @@ fn when_the_base_itself_fails_nobody_is_bounced_and_the_queue_stops_until_main_c
     assert!(lab.hc_calls("send").is_empty());
     assert!(lab.state().batch.is_none());
     assert_eq!(chute_status(&lab)["blocked"]["reason"], "base_broken");
+    assert!(lab.events().iter().any(|e| matches!(
+        e,
+        EventKind::Blocked {
+            reason: BlockReason::BaseBroken,
+            ..
+        }
+    )));
 
     let runs = lab.verify_runs();
     assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
@@ -763,4 +771,56 @@ fn a_main_broken_by_someone_else_mid_batch_stops_the_queue_instead_of_blaming_a_
     assert_eq!(lab.item_state(3), Some(ItemState::Queued(None)));
     assert_eq!(lab.bounced_events(), [(2, BounceReason::Verify)]);
     assert_eq!(lab.state().blocked.unwrap().reason, BlockReason::BaseBroken);
+}
+
+#[test]
+fn the_time_verification_took_is_recorded() {
+    let lab = Lab::new("sleep 1.2");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.verify_s >= 1, "{}", record.verify_s);
+    assert!(chute_status(&lab)["today"]["verify_s"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn status_shows_the_bisecting_phase_while_the_batch_is_split() {
+    let lab = Lab::new(
+        "@STATUS@\ncp '@ROOT@/status-during.json' \"@ROOT@/st-$$\"\n[ -e BAD ] && fail \"FAILED bad_test\"",
+    );
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("BAD", "")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let phases: Vec<String> = fs::read_dir(lab.sb.root())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("st-"))
+        .map(|e| {
+            let json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(e.path()).unwrap()).unwrap();
+            json["batch"]["phase"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert!(phases.contains(&"verifying".to_owned()), "{phases:?}");
+    assert!(phases.contains(&"bisecting".to_owned()), "{phases:?}");
+}
+
+#[test]
+fn the_failed_ref_of_a_dropped_pr_is_pruned_when_the_next_batch_ends() {
+    let lab = Lab::new(BAD);
+    lab.open_pr(1, &[("BAD", "")]);
+    done(lab.engine().run_once().unwrap());
+    lab.store
+        .update(|s| Ok(queue::drop_item(s, PrNumber(1))?))
+        .unwrap();
+    lab.open_pr(2, &[("a.txt", "a\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let refs = lab.repo.git(&["for-each-ref", "refs/chute/failed/"]);
+    assert!(refs.trim().is_empty(), "{refs}");
 }
