@@ -622,6 +622,10 @@ pub enum EventKind {
         prs: Vec<PrNumber>,
         commit: Sha,
     },
+    GaveUp {
+        pr: PrNumber,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

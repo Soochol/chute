@@ -1,15 +1,15 @@
 use std::process::ExitCode;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone};
 
 use super::Ctx;
 use crate::config::{self, Config};
 use crate::model::{
-    Approval, DaemonView, EpochMs, Event, EventKind, ItemState, ItemView, RecentBatch, RepoInfo,
-    RepoView, SchemaV1, StatusView, Today, Warning, WarningKind,
+    Approval, DaemonView, EpochMs, Event, EventKind, ItemView, RecentBatch, RepoInfo, RepoView,
+    SchemaV1, StatusView, Today, Warning, WarningKind,
 };
-use crate::repo;
+use crate::queue;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -32,10 +32,7 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
             .map(|info| view(ctx, info, &now))
             .collect::<Result<Vec<_>>>()?
     } else {
-        let slug = repo::slug(&ctx.ext, &ctx.target_dir()?)?;
-        let info = ctx.home.repo(&slug).info()?.ok_or_else(|| {
-            anyhow!("chute에 등록되지 않은 저장소다: {slug}. 저장소에서 `chute init`을 실행한다")
-        })?;
+        let (info, _) = ctx.registered_repo()?;
         vec![view(ctx, &info, &now)?]
     };
     if args.json {
@@ -58,13 +55,20 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
     let store = ctx.home.repo(&info.slug);
     let state = store.load()?;
     let mut warnings = state.warnings.clone();
-    let rev = format!("origin/{}", info.default_branch);
-    let (approval, budget) = match Config::load_at(&ctx.ext, &info.path, &rev) {
-        Ok(c) => (c.approval, c.budget),
-        Err(e) => {
+    let loaded = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch);
+    let (approval, budget) = match loaded {
+        Ok(Some(c)) => (c.approval, c.budget),
+        failed => {
+            let message = match failed {
+                Ok(_) => format!(
+                    "설정을 읽지 못했다: chute.toml이 origin/{}에 없다. 기본 브랜치에 올렸는지 확인하고 `git fetch`를 먼저 실행한다",
+                    info.default_branch
+                ),
+                Err(e) => format!("{e:#}"),
+            };
             warnings.push(Warning {
                 kind: WarningKind::Config,
-                message: format!("{e:#}"),
+                message,
                 pr: None,
                 at_ms: EpochMs(now.timestamp_millis().max(0) as u64),
             });
@@ -155,7 +159,7 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
                 today.batches += 1;
                 today.verify_s += verify_s;
             }
-            EventKind::Reverted { .. } => {}
+            EventKind::Reverted { .. } | EventKind::GaveUp { .. } => {}
         }
     }
     leads.sort_unstable();
@@ -215,7 +219,7 @@ fn human(v: &StatusView) -> String {
         line(format!(
             "  {} {} · {} · {}",
             item.pr,
-            state_label(item.state),
+            queue::label(item.state),
             agent,
             item.title
         ));
@@ -230,34 +234,6 @@ fn human(v: &StatusView) -> String {
         line(format!("경고: {}", w.message));
     }
     out
-}
-
-fn state_label(state: ItemState) -> String {
-    use crate::model::{BounceReason as B, HumanReason as H, QueuedReason as Q};
-    match state {
-        ItemState::AwaitingApproval => "승인 대기".into(),
-        ItemState::Queued(None) => "대기".into(),
-        ItemState::Queued(Some(Q::CiPending)) => "대기(CI 기다림)".into(),
-        ItemState::InBatch => "검증 중".into(),
-        ItemState::Bounced(r) => format!(
-            "반송({})",
-            match r {
-                B::Conflict => "충돌",
-                B::Verify => "검증 실패",
-                B::Timeout => "시간 초과",
-                B::HeadChanged => "HEAD 바뀜",
-                B::Ci => "CI 실패",
-            }
-        ),
-        ItemState::NeedsHuman(r) => format!(
-            "사람 차례({})",
-            match r {
-                H::Budget => "예산 소진",
-                H::Unreachable => "전달 실패",
-                H::GaveUp => "포기",
-            }
-        ),
-    }
 }
 
 #[cfg(test)]
