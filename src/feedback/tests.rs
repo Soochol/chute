@@ -318,7 +318,7 @@ fn a_combo_report_lists_each_partner_with_its_files_and_diff() {
     let subject = Subject::from(&item);
     let partner = lab
         .fb()
-        .partner(&subject, &tree, PrNumber(9), "앞 PR 제목")
+        .partner_or_placeholder(&subject, &tree, PrNumber(9), "앞 PR 제목")
         .unwrap();
 
     assert_eq!(partner.files, ["a.txt"]);
@@ -369,7 +369,7 @@ fn a_partner_that_cannot_be_found_is_said_so_in_its_diff_file() {
 
     let partner = lab
         .fb()
-        .partner(&subject, &tree, PrNumber(77), "없는 PR")
+        .partner_or_placeholder(&subject, &tree, PrNumber(77), "없는 PR")
         .unwrap();
 
     assert!(partner.files.is_empty());
@@ -399,10 +399,13 @@ fn partner_diffs_of_different_failed_trees_do_not_overwrite_each_other() {
     let subject = Subject::from(&lab.item(12, "feat/b"));
     let other_tree = sha(&lab.repo.head());
 
-    let first = lab.fb().partner(&subject, &tree, PrNumber(9), "t").unwrap();
+    let first = lab
+        .fb()
+        .partner_or_placeholder(&subject, &tree, PrNumber(9), "t")
+        .unwrap();
     let second = lab
         .fb()
-        .partner(&subject, &other_tree, PrNumber(9), "t")
+        .partner_or_placeholder(&subject, &other_tree, PrNumber(9), "t")
         .unwrap();
 
     assert_ne!(first.diff, second.diff);
@@ -1111,7 +1114,7 @@ fn status_cases() -> [(&'static str, Option<&'static str>, bool); 3] {
             Some("{\"app\":\"claude-code\",\"state\":\"done\"}"),
             true,
         ),
-        ("no status key at all", None, true),
+        ("no status key, as in the scaffold fixture", None, true),
     ]
 }
 
@@ -1469,7 +1472,7 @@ fn a_partner_diff_keeps_bytes_that_are_not_utf8() {
 
     let partner = lab
         .fb()
-        .partner(
+        .partner_or_placeholder(
             &Subject::from(&lab.item(12, "feat/b")),
             &tree,
             PrNumber(9),

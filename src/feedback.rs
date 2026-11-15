@@ -17,7 +17,6 @@ use crate::model::{
 };
 use crate::store::RepoStore;
 
-/// Exit codes of `hc`, from `hc --skill`.
 const HC_NOT_FOUND: i32 = 3;
 const HC_BLOCKED: i32 = 9;
 const HC_FINISHED: i32 = 11;
@@ -28,6 +27,7 @@ const LISTED_FILES: usize = 30;
 const LISTED_TESTS: usize = 50;
 const LISTED_COMMITS: usize = 10;
 const HC_NAME_LIMIT: usize = 32;
+const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
 
 pub fn worktrees_root(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
@@ -158,8 +158,6 @@ impl<'a> Cause<'a> {
 }
 
 impl Feedback<'_> {
-    /// Writes `reports/.../<seq>.md` and `<seq>.json` and returns them. The sequence number
-    /// goes up for every report of the same PR (or commit); nothing earlier is overwritten.
     pub fn write_report(
         &self,
         subject: &Subject,
@@ -191,10 +189,7 @@ impl Feedback<'_> {
         Ok(Written { md, json, doc })
     }
 
-    /// One partner of a combo failure: its changed files, and its change written as a diff
-    /// file beside the reports of `subject`. A partner whose merge cannot be found in `tree`
-    /// still comes back, with no files and a diff file that says why.
-    pub fn partner(
+    pub fn partner_or_placeholder(
         &self,
         subject: &Subject,
         tree: &Sha,
@@ -281,7 +276,7 @@ impl Feedback<'_> {
             &PARTNER_SEARCH_DEPTH.to_string(),
             tree.as_str(),
         ])?;
-        let prefix = format!("Merge pull request {pr} from ");
+        let prefix = github_merge_subject_prefix(pr);
         let merge = log
             .lines()
             .find_map(|line| {
@@ -305,6 +300,10 @@ impl Feedback<'_> {
             .collect();
         Ok((files, diff.stdout))
     }
+}
+
+fn github_merge_subject_prefix(pr: PrNumber) -> String {
+    format!("Merge pull request {pr} from ")
 }
 
 fn claim_sequence(dir: &Path) -> Result<(u32, PathBuf)> {
@@ -350,7 +349,7 @@ fn log_tail(path: &Path) -> String {
         file.seek(SeekFrom::Start(start))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let text = clean_log(&String::from_utf8_lossy(&bytes));
+        let text = strip_terminal_noise(&String::from_utf8_lossy(&bytes));
         let mut lines: Vec<&str> = text.lines().collect();
         if start > 0 && lines.len() > 1 {
             lines.remove(0);
@@ -365,13 +364,12 @@ fn log_tail(path: &Path) -> String {
     read().unwrap_or_else(|e| format!("(로그를 읽지 못했다: {e})"))
 }
 
-/// Progress bars end lines with a lone `\r`; terminal escapes and control bytes do not
-/// belong in a report.
-fn clean_log(text: &str) -> String {
-    static ESCAPES: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]")
-            .expect("valid regex")
-    });
+fn strip_terminal_noise(text: &str) -> String {
+    const CSI: &str = r"\x1b\[[0-?]*[ -/]*[@-~]";
+    const OSC: &str = r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)";
+    const CHARSET: &str = r"\x1b[()][0-9A-Za-z]";
+    static ESCAPES: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!("{CSI}|{OSC}|{CHARSET}")).expect("valid regex"));
     let lines = text.replace("\r\n", "\n").replace('\r', "\n");
     ESCAPES
         .replace_all(&lines, "")
@@ -407,8 +405,7 @@ fn fence_for(text: &str) -> String {
     "`".repeat((longest_backtick_run(text) + 1).max(3))
 }
 
-/// Inline code that stays on one line and cannot be closed early by backticks inside it.
-fn code(text: &str) -> String {
+fn code_span(text: &str) -> String {
     let text = one_line(text);
     let longest = longest_backtick_run(&text);
     let ticks = "`".repeat(longest + 1);
@@ -506,7 +503,7 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
         } => {
             out.push(format!("# {label} 반송 보고서: {}", one_line(title)));
             out.push(String::new());
-            out.push(format!("- 대상: {label}, 브랜치 {}", code(branch)));
+            out.push(format!("- 대상: {label}, 브랜치 {}", code_span(branch)));
             out.push(format!("- 등록한 HEAD: `{head}`"));
         }
         Subject::Commit { commit } => {
@@ -542,7 +539,7 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
     out.push("## 충돌한 파일".to_owned());
     out.push(String::new());
     for file in files.iter().take(LISTED_FILES) {
-        out.push(format!("- {}", code(&file.path)));
+        out.push(format!("- {}", code_span(&file.path)));
         if file.main_commits.is_empty() {
             out.push("  - 이 파일을 고친 쪽의 커밋을 찾지 못했다".to_owned());
         }
@@ -572,10 +569,10 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
 fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, timed_out: bool) {
     out.push("## 실패한 단계".to_owned());
     out.push(String::new());
-    out.push(format!("- 단계: {}", code(&report.name)));
+    out.push(format!("- 단계: {}", code_span(&report.name)));
     out.push(format!(
         "- 명령: {} (검증 worktree에서 `sh -c`로 실행한다)",
-        code(&report.command)
+        code_span(&report.command)
     ));
     if timed_out {
         out.push(format!(
@@ -593,7 +590,10 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
             "- 범위: 조합. 기준 브랜치에 이 PR만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다".to_owned(),
         ),
     }
-    out.push(format!("- 로그: {}", code(&step.log.display().to_string())));
+    out.push(format!(
+        "- 로그: {}",
+        code_span(&step.log.display().to_string())
+    ));
     out.push(String::new());
 
     if let Some(tail) = &report.log_tail {
@@ -607,7 +607,7 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
         out.push(format!("### 실패한 시험 ({}개)", step.failed_tests.len()));
         out.push(String::new());
         for name in step.failed_tests.iter().take(LISTED_TESTS) {
-            out.push(format!("- {}", code(name)));
+            out.push(format!("- {}", code_span(name)));
         }
         if step.failed_tests.len() > LISTED_TESTS {
             out.push(format!(
@@ -628,7 +628,7 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
                 .files
                 .iter()
                 .take(LISTED_FILES)
-                .map(|f| code(f))
+                .map(|f| code_span(f))
                 .collect();
             if partner.files.len() > LISTED_FILES {
                 files.push(format!("…외 {}개", partner.files.len() - LISTED_FILES));
@@ -636,7 +636,7 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
             out.push(format!("- 바뀐 파일: {}", files.join(", ")));
             out.push(format!(
                 "- diff: {}",
-                code(&partner.diff.display().to_string())
+                code_span(&partner.diff.display().to_string())
             ));
             out.push(String::new());
         }
@@ -648,7 +648,7 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
         Some(git_ref) => out.push(format!(
             "실패한 트리: 커밋 `{}`, 참조 {}",
             report.tree,
-            code(git_ref)
+            code_span(git_ref)
         )),
         None => out.push(format!("실패한 트리: 커밋 `{}`", report.tree)),
     }
@@ -679,7 +679,7 @@ pub enum Notice<'a> {
 impl Notice<'_> {
     fn line(&self, item: &QueueItem) -> String {
         let label = format!("PR {}", item.pr);
-        inert(&match self {
+        without_shell_syntax(&match self {
             Notice::Bounced(written) => {
                 let steps: Vec<String> = written
                     .doc
@@ -707,13 +707,12 @@ impl Notice<'_> {
     }
 }
 
-/// `hc send` types into whatever runs in the pane, which can be a shell once the agent has
-/// left. Only letters, digits and a few plain marks survive, so such a line runs nothing.
-fn inert(text: &str) -> String {
+/// `hc send` pastes the text into the pane and presses Enter, whatever program is reading it.
+fn without_shell_syntax(text: &str) -> String {
     let plain: String = text
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() || ".,:/_-+=@%".contains(c) {
+            if c.is_alphanumeric() || c.is_whitespace() || PLAIN_MARKS.contains(c) {
                 c
             } else {
                 ' '
@@ -728,10 +727,7 @@ fn inert(text: &str) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivery {
-    Sent {
-        terminal: TerminalId,
-    },
-    /// The caller records the new agent on the item.
+    Sent { terminal: TerminalId },
     Spawned(Agent),
     Unreachable(Unreachable),
 }
@@ -774,20 +770,30 @@ impl fmt::Display for Unreachable {
 struct TerminalInfo {
     state: TerminalState,
     created_ms: EpochMs,
-    /// `Some(None)` is an explicit `null`: no program in the pane reports a status.
-    #[serde(default, deserialize_with = "present")]
-    status: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "status_of_program")]
+    status: ProgramStatus,
 }
 
-fn present<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<Option<serde_json::Value>>, D::Error> {
-    Option::<serde_json::Value>::deserialize(d).map(Some)
+#[derive(Default)]
+enum ProgramStatus {
+    #[default]
+    NotGiven,
+    NoProgram,
+    Reported,
+}
+
+fn status_of_program<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ProgramStatus, D::Error> {
+    Ok(match Option::<serde::de::IgnoredAny>::deserialize(d)? {
+        None => ProgramStatus::NoProgram,
+        Some(_) => ProgramStatus::Reported,
+    })
 }
 
 impl TerminalInfo {
-    fn reports_no_status(&self) -> bool {
-        matches!(self.status, Some(None))
+    fn is_live_agent(&self, recorded: EpochMs) -> bool {
+        self.state == TerminalState::Live
+            && self.created_ms == recorded
+            && !matches!(self.status, ProgramStatus::NoProgram)
     }
 }
 
@@ -819,9 +825,6 @@ enum Attempt {
 }
 
 impl Feedback<'_> {
-    /// A live agent with the recorded `created_ms` gets one `hc send`; a missing, finished or
-    /// different one, or a pane where nothing reports a status, is replaced by a new agent if
-    /// `respawn` allows.
     pub fn deliver(&self, item: &QueueItem, notice: &Notice<'_>) -> Delivery {
         if let Notice::Bounced(written) = notice
             && !matches!(&written.doc.subject, Subject::Pr { pr, .. } if *pr == item.pr)
@@ -875,10 +878,7 @@ impl Feedback<'_> {
     fn send(&self, agent: &Agent, line: &str) -> Attempt {
         match self.terminal(&agent.terminal) {
             Err(why) => return Attempt::Stuck(why),
-            Ok(Some(info))
-                if info.state == TerminalState::Live
-                    && info.created_ms == agent.created_ms
-                    && !info.reports_no_status() => {}
+            Ok(Some(info)) if info.is_live_agent(agent.created_ms) => {}
             Ok(_) => return Attempt::Gone,
         }
         let out = match self.run_hc(["send", agent.terminal.0.as_str(), line]) {
@@ -906,7 +906,7 @@ impl Feedback<'_> {
         let task = format!(
             "너는 chute(머지 큐)가 돌려보낸 PR의 담당 에이전트다. PR: {}, 브랜치: {}. 지금 폴더가 그 브랜치의 worktree다. 먼저 `git fetch origin`과 `git status`로 이 폴더가 PR의 최신 HEAD인지 본다. push는 `git push -u origin <브랜치>`로 한다. chute 사용법은 `chute --skill`로 읽는다. {line}",
             item.pr,
-            code(&item.branch)
+            code_span(&item.branch)
         );
         let mut args: Vec<OsString> = ["run", "--bg", "--json", "--no-parent", "--name"]
             .into_iter()
@@ -927,8 +927,6 @@ impl Feedback<'_> {
         }
         let launched: Launched = serde_json::from_slice(&out.stdout)
             .map_err(|e| Unreachable::Failed(format!("hc run의 출력을 읽지 못했다: {e}")))?;
-        // `first_message` is only reported when hc itself carried the task; a task given as
-        // an argument of the program is delivered with the launch.
         if let Some(FirstMessage {
             sent: false,
             reason,
@@ -1087,9 +1085,12 @@ impl Feedback<'_> {
         Ok(self.worktrees_root.join(self.repo.slug.name()).join(branch))
     }
 
-    /// `stale` means git still lists the branch at a folder that is gone; `--force` takes the
-    /// branch over without pruning other worktrees' records.
-    fn add_worktree(&self, item: &QueueItem, dest: &Path, stale: bool) -> Result<PathBuf> {
+    fn add_worktree(
+        &self,
+        item: &QueueItem,
+        dest: &Path,
+        holder_folder_gone: bool,
+    ) -> Result<PathBuf> {
         if dest.exists() {
             bail!(
                 "worktree를 만들 자리에 이미 무엇이 있다: {}",
@@ -1105,7 +1106,8 @@ impl Feedback<'_> {
         };
         let remote = format!("origin/{branch}");
         let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
-        if stale {
+        // git refuses a branch that a worktree record still holds, even once that folder is gone.
+        if holder_folder_gone {
             args.push("--force".into());
         }
         if has_ref(format!("refs/heads/{branch}"))? {
