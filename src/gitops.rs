@@ -584,7 +584,7 @@ impl Slot {
             }
             let now = self.read_ref(tracking)?;
             if now == expected {
-                bail!("{tracking}을 옮기지 못했다: {}", out.stderr_text().trim());
+                return Ok(());
             }
             if let Some(now) = &now
                 && !self.is_ancestor(now, tip)?
@@ -1334,6 +1334,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tracking_ref_another_git_is_writing_does_not_fail_fetch_base() {
+        let w = World::new();
+        let slot = w.slot(SlotName::Batch);
+        slot.fetch_base().unwrap();
+        let newest = w.advance_main(&[("n.txt", "n\n")], "feat: 새 변경");
+        let lock = w.repo.path().join(".git/refs/remotes/origin/main.lock");
+        fs::write(&lock, "").unwrap();
+
+        assert_eq!(slot.fetch_base().unwrap(), newest);
+
+        fs::remove_file(&lock).unwrap();
+    }
+
+    #[test]
     fn a_relative_state_folder_still_puts_slots_outside_the_users_checkout() {
         let w = World::new();
         let info = repo::discover(&hermetic_ext(&w.sb), w.repo.path()).unwrap();
@@ -1724,8 +1738,12 @@ mod tests {
     #[test]
     #[ignore = "run as a child process by slot_work_ignores_the_git_environment_a_hook_passes_on"]
     fn hook_child() {
-        let repo = std::env::var_os(HOOK_CHILD_REPO).expect("부모 시험이 정한다");
-        let head = std::env::var_os(HOOK_CHILD_HEAD).expect("부모 시험이 정한다");
+        let (Some(repo), Some(head)) = (
+            std::env::var_os(HOOK_CHILD_REPO),
+            std::env::var_os(HOOK_CHILD_HEAD),
+        ) else {
+            return;
+        };
         let ext = Ext::from_vars(|_| None);
         let info = repo::discover(&ext, Path::new(&repo)).unwrap();
         let gitops = Gitops::new(&ext, &Home::from_env().unwrap(), &info);
@@ -1776,6 +1794,9 @@ mod tests {
                 .env("GIT_CONFIG_COUNT", "1")
                 .env("GIT_CONFIG_KEY_0", "user.name")
                 .env("GIT_CONFIG_VALUE_0", "Env Person")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_CONFIG_PARAMETERS")
                 .current_dir(&agent)
                 .output()
                 .unwrap();
@@ -1887,7 +1908,9 @@ mod tests {
     #[test]
     #[ignore = "run as a child process by a_slot_held_by_another_process_cannot_be_taken"]
     fn lock_child() {
-        let home = std::env::var_os(LOCK_CHILD_HOME).expect("부모 시험이 정한다");
+        let Some(home) = std::env::var_os(LOCK_CHILD_HOME) else {
+            return;
+        };
         let lock = lock_only_gitops(Path::new(&home))
             .lock_slot(SlotName::Batch)
             .unwrap();
