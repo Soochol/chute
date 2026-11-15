@@ -517,9 +517,11 @@ fn numbers_keep_rising_after_older_reports_are_removed() {
 fn two_writers_never_claim_the_same_number() {
     let dir = tempfile::tempdir().unwrap();
     let claimed = Mutex::new(Vec::new());
+    let start = std::sync::Barrier::new(8);
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| {
+                start.wait();
                 for _ in 0..5 {
                     let (seq, _) = claim_sequence(dir.path()).unwrap();
                     claimed.lock().unwrap().push(seq);
@@ -2390,6 +2392,7 @@ fn a_name_taken_by_this_prs_own_live_agent_is_adopted_not_duplicated() {
     let Delivery::Spawned(agent) = delivery else {
         panic!("{delivery:?}")
     };
+    assert!(agent.alive);
     assert_eq!(
         (agent.terminal.0.as_str(), agent.created_ms, agent.workdir),
         ("t1a", EpochMs(5), dest)
@@ -3002,7 +3005,9 @@ fn a_worktree_locked_without_a_reason_is_not_taken_over_either() {
 
 #[test]
 fn every_known_shell_in_the_foreground_means_the_agent_has_left() {
-    for shell in SHELLS {
+    for shell in [
+        "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
+    ] {
         let lab = Lab::new();
         lab.repo.pr_branch("feat/a", "a.txt", "a\n");
         let mut item = lab.item(12, "feat/a");
@@ -3299,4 +3304,114 @@ fn a_leftover_repro_folder_stops_the_run_instead_of_running_in_an_edited_tree() 
 
     assert!(!second.status.success());
     assert!(!String::from_utf8_lossy(&second.stdout).contains("EDITED"));
+}
+
+#[test]
+fn a_short_log_keeps_its_first_line() {
+    let lab = Lab::new();
+
+    let tail = log_tail(&lab.log("compiling widget\nerror: boom\n"));
+
+    assert_eq!(tail, "compiling widget\nerror: boom");
+}
+
+fn conflict_with(files: usize, commits: usize) -> Failure {
+    Failure::Conflict {
+        files: NonEmpty::new(
+            (0..files)
+                .map(|i| ConflictFile {
+                    path: format!("src/f{i}.rs"),
+                    main_commits: (0..commits)
+                        .map(|j| CommitRef {
+                            sha: sha("abc1234"),
+                            title: format!("change {j}"),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    }
+}
+
+#[test]
+fn overflow_lines_count_what_was_left_out_and_appear_only_past_the_limit() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let md_of = |failure: &Failure| {
+        read(
+            &lab.fb()
+                .write_report(&Subject::from(&item), failure, None)
+                .unwrap()
+                .md,
+        )
+    };
+
+    let over = md_of(&conflict_with(35, 25));
+    assert!(over.contains("  - …외 15개. 전부 `.json`에 있다"), "{over}");
+    assert!(over.contains("- …외 5개. 전부 `.json`에 있다"), "{over}");
+
+    let exact = md_of(&conflict_with(30, 10));
+    assert!(!exact.contains("…외"), "{exact}");
+
+    let tests = |n: usize| {
+        let failure = Failure::Verify(StepFailure {
+            failed_tests: (0..n).map(|i| format!("t::n{i}")).collect(),
+            ..lab.step(VerifyMode::Solo, &[], lab.log("x\n"))
+        });
+        md_of(&failure)
+    };
+    assert!(!tests(50).contains("…외"));
+    assert!(tests(51).contains("- …외 1개. 전부 `.json`에 있다"));
+}
+
+#[test]
+fn a_report_has_its_header_numbered_steps_and_trees_line_without_a_ref() {
+    let lab = Lab::new();
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let partner = Partner {
+        pr: PrNumber(9),
+        title: "t".into(),
+        files: vec!["a.txt".into()],
+        diff: "/d".into(),
+    };
+    let failure = Failure::Verify(StepFailure {
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &["a::b"],
+            lab.log("x\n"),
+        )
+    });
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let md = read(&written.md);
+    let head = item.head.as_str();
+    assert!(md.contains(&format!("- 등록한 HEAD: `{head}`")), "{md}");
+    assert!(md.contains("- 결과: 실패\n"), "{md}");
+    assert!(
+        md.contains(&format!(
+            "실패한 트리: 커밋 `{}`\n",
+            written.doc.step.as_ref().unwrap().tree
+        )),
+        "{md}"
+    );
+    assert!(md.contains("\n1. 보고서의 재현 방법"), "{md}");
+    assert!(md.contains("\n2. 보고서의 diff 파일에서"), "{md}");
+    assert!(md.contains("\n3. 고쳐서 커밋하고 push한 뒤"), "{md}");
+    let line = lab.hc_calls()[1][2].clone();
+    assert!(
+        line.contains("1. 보고서의 재현 방법") && line.contains("2. 보고서의 diff 파일에서"),
+        "{line}"
+    );
 }
