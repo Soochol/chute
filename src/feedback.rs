@@ -1,1 +1,959 @@
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
+use anyhow::{Context, Result, anyhow, bail};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
+use crate::ext::{Ext, Output};
+use crate::model::{
+    Agent, ConflictFile, EpochMs, Failure, FailureRecord, NonEmpty, Partner, PrNumber, QueueItem,
+    RepoInfo, Sha, StepFailure, TerminalId, VerifyMode,
+};
+use crate::store::RepoStore;
+
+/// Exit codes of `hc`, from `hc --skill`.
+const HC_NOT_FOUND: i32 = 3;
+const HC_BLOCKED: i32 = 9;
+const HC_FINISHED: i32 = 11;
+
+const LOG_TAIL_BYTES: u64 = 16 * 1024;
+const LOG_TAIL_LINES: usize = 40;
+const LISTED_FILES: usize = 30;
+const LISTED_TESTS: usize = 50;
+const PARTNER_SEARCH_DEPTH: usize = 1000;
+
+pub fn worktrees_root(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
+    var("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".herdr/worktrees"))
+        .ok_or_else(|| anyhow!("HOME이 없어 새 worktree를 둘 곳을 정하지 못했다"))
+}
+
+#[derive(Clone, Copy)]
+pub struct Feedback<'a> {
+    pub ext: &'a Ext,
+    pub repo: &'a RepoInfo,
+    pub store: &'a RepoStore,
+    pub config: &'a Config,
+    /// Where a new agent's worktree goes: `<worktrees>/<repository>/<branch>`.
+    pub worktrees: &'a Path,
+}
+
+/// What a report is about. A queued PR reports under `reports/pr-<n>/`; a commit with no PR
+/// yet (preflight) under `reports/commit-<sha>/`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Subject {
+    Pr {
+        pr: PrNumber,
+        title: String,
+        branch: String,
+        head: Sha,
+    },
+    Commit {
+        commit: Sha,
+    },
+}
+
+impl From<&QueueItem> for Subject {
+    fn from(item: &QueueItem) -> Subject {
+        Subject::Pr {
+            pr: item.pr,
+            title: item.title.clone(),
+            branch: item.branch.clone(),
+            head: item.head.clone(),
+        }
+    }
+}
+
+impl Subject {
+    fn label(&self) -> String {
+        match self {
+            Subject::Pr { pr, .. } => format!("PR {pr}"),
+            Subject::Commit { commit } => format!("커밋 {}", short(commit)),
+        }
+    }
+
+    fn key(&self) -> String {
+        match self {
+            Subject::Pr { pr, .. } => format!("pr{}", pr.0),
+            Subject::Commit { commit } => short(commit).to_owned(),
+        }
+    }
+}
+
+fn short(sha: &Sha) -> &str {
+    &sha.as_str()[..sha.as_str().len().min(12)]
+}
+
+/// The report as data. The Markdown and the JSON file are both rendered from this one value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportDoc {
+    pub seq: u32,
+    pub at_ms: EpochMs,
+    pub subject: Subject,
+    pub summary: String,
+    /// A combo failure's partners carry the files and the diff path found while writing.
+    pub failure: Failure,
+    pub step: Option<StepReport>,
+    pub next: Vec<String>,
+}
+
+/// What only a failed verification step has: how to run it again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepReport {
+    pub name: String,
+    pub command: String,
+    pub timeout_s: u64,
+    /// The end of the log, kept only when no failed test name was found.
+    pub log_tail: Option<String>,
+    pub tree: Sha,
+    pub git_ref: Option<String>,
+    pub repro: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Written {
+    pub md: PathBuf,
+    pub json: PathBuf,
+    pub doc: ReportDoc,
+}
+
+impl Written {
+    pub fn record(&self) -> FailureRecord {
+        FailureRecord {
+            failure: self.doc.failure.clone(),
+            summary: self.doc.summary.clone(),
+            report: self.md.clone(),
+            at_ms: self.doc.at_ms,
+        }
+    }
+}
+
+/// The failures a report can describe. Remote CI failures are added by `ci-gate`.
+enum Cause<'a> {
+    Conflict(&'a [ConflictFile]),
+    Step {
+        timed_out: bool,
+        step: &'a StepFailure,
+    },
+}
+
+impl<'a> Cause<'a> {
+    fn of(failure: &'a Failure) -> Result<Cause<'a>> {
+        match failure {
+            Failure::Conflict { files } => Ok(Cause::Conflict(files)),
+            Failure::Verify(step) => Ok(Cause::Step {
+                timed_out: false,
+                step,
+            }),
+            Failure::Timeout(step) => Ok(Cause::Step {
+                timed_out: true,
+                step,
+            }),
+            Failure::Ci { .. } => bail!("원격 CI 실패의 보고서는 아직 만들 수 없다"),
+        }
+    }
+}
+
+impl Feedback<'_> {
+    /// Writes `reports/.../<seq>.md` and `<seq>.json` and returns them. The sequence number
+    /// goes up for every report of the same PR (or commit); nothing earlier is overwritten.
+    /// For a combo failure the partners' `files` and `diff` in `failure` are ignored and
+    /// found again from the failed tree; `Written::doc` holds the resolved failure.
+    pub fn write_report(
+        &self,
+        subject: &Subject,
+        failure: &Failure,
+        failed_ref: Option<&str>,
+    ) -> Result<Written> {
+        Cause::of(failure)?;
+        let dir = match subject {
+            Subject::Pr { pr, .. } => self.store.report_dir(*pr),
+            Subject::Commit { commit } => self.store.commit_report_dir(commit),
+        };
+        fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
+        let failure = match failure {
+            Failure::Verify(step) => Failure::Verify(self.with_partner_diffs(&dir, step)?),
+            Failure::Timeout(step) => Failure::Timeout(self.with_partner_diffs(&dir, step)?),
+            other => other.clone(),
+        };
+        let cause = Cause::of(&failure)?;
+        let (seq, md) = claim_sequence(&dir)?;
+        let step = match &cause {
+            Cause::Step { step, .. } => Some(self.step_report(subject, step, failed_ref, seq)?),
+            Cause::Conflict(_) => None,
+        };
+        let doc = ReportDoc {
+            seq,
+            at_ms: EpochMs::now(),
+            subject: subject.clone(),
+            summary: summarize(&cause),
+            next: next_steps(subject, &cause, &self.repo.default_branch),
+            step,
+            failure,
+        };
+        let json = dir.join(format!("{seq}.json"));
+        let mut text = serde_json::to_string_pretty(&doc)?;
+        text.push('\n');
+        write_file(&json, &text)?;
+        write_file(&md, &render(&doc, &Cause::of(&doc.failure)?))?;
+        Ok(Written { md, json, doc })
+    }
+
+    fn step_report(
+        &self,
+        subject: &Subject,
+        step: &StepFailure,
+        failed_ref: Option<&str>,
+        seq: u32,
+    ) -> Result<StepReport> {
+        let configured = self
+            .config
+            .verify
+            .iter()
+            .find(|s| s.name == step.step)
+            .ok_or_else(|| anyhow!("chute.toml에 검증 단계 {:?}이 없다", step.step))?;
+        let dir = format!("\"${{TMPDIR:-/tmp}}/chute-repro-{}-{seq}\"", subject.key());
+        let rev = failed_ref.unwrap_or(step.tree.as_str());
+        Ok(StepReport {
+            name: step.step.clone(),
+            command: configured.run.clone(),
+            timeout_s: configured.timeout.as_secs(),
+            log_tail: step.failed_tests.is_empty().then(|| log_tail(&step.log)),
+            tree: step.tree.clone(),
+            git_ref: failed_ref.map(str::to_owned),
+            repro: vec![
+                format!("git worktree add --detach {dir} {}", shell_word(rev)),
+                format!("cd {dir}"),
+                format!("sh -c {}", shell_word(&configured.run)),
+                format!("cd - && git worktree remove --force {dir}"),
+            ],
+        })
+    }
+
+    fn with_partner_diffs(&self, dir: &Path, step: &StepFailure) -> Result<StepFailure> {
+        let VerifyMode::Combo { partners } = &step.mode else {
+            return Ok(step.clone());
+        };
+        let mut found = Vec::with_capacity(partners.len());
+        for partner in partners.iter() {
+            let diff = dir.join(format!(
+                "partner-pr{}-{}.diff",
+                partner.pr.0,
+                short(&step.tree)
+            ));
+            let (files, text) = match self.partner_change(&step.tree, partner.pr) {
+                Ok(change) => change,
+                Err(e) => (Vec::new(), format!("diff를 만들지 못했다: {e:#}\n")),
+            };
+            write_file(&diff, &text)?;
+            found.push(Partner {
+                pr: partner.pr,
+                title: partner.title.clone(),
+                files,
+                diff,
+            });
+        }
+        Ok(StepFailure {
+            mode: VerifyMode::Combo {
+                partners: NonEmpty::new(found).ok_or_else(|| anyhow!("상대 PR 목록이 비었다"))?,
+            },
+            ..step.clone()
+        })
+    }
+
+    /// A partner's change is its merge commit in the failed tree's first-parent history,
+    /// found by the GitHub-format subject `gitops` writes (`Merge pull request #N from …`).
+    fn partner_change(&self, tree: &Sha, pr: PrNumber) -> Result<(Vec<String>, String)> {
+        let git = |args: &[&str]| -> Result<String> {
+            Ok(self.ext.git(&self.repo.path, args.iter().copied())?.ok()?)
+        };
+        let log = git(&[
+            "log",
+            "--first-parent",
+            "--format=%H\t%s",
+            "-n",
+            &PARTNER_SEARCH_DEPTH.to_string(),
+            tree.as_str(),
+        ])?;
+        let prefix = format!("Merge pull request {pr} from ");
+        let merge = log
+            .lines()
+            .find_map(|line| {
+                let (sha, subject) = line.split_once('\t')?;
+                subject.starts_with(&prefix).then_some(sha)
+            })
+            .ok_or_else(|| anyhow!("{tree}의 이력에서 {pr}의 머지 커밋을 찾지 못했다"))?;
+        let parent = format!("{merge}^1");
+        let files = git(&["diff", "--name-only", "-z", "--no-ext-diff", &parent, merge])?;
+        let diff = git(&["diff", "--no-color", "--no-ext-diff", &parent, merge])?;
+        let files = files
+            .split('\0')
+            .filter(|f| !f.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok((files, diff))
+    }
+}
+
+fn claim_sequence(dir: &Path) -> Result<(u32, PathBuf)> {
+    let mut next = highest_sequence(dir)? + 1;
+    loop {
+        let md = dir.join(format!("{next}.md"));
+        match OpenOptions::new().write(true).create_new(true).open(&md) {
+            Ok(_) => return Ok((next, md)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => next += 1,
+            Err(e) => return Err(e).with_context(|| format!("만들지 못했다: {}", md.display())),
+        }
+    }
+}
+
+fn highest_sequence(dir: &Path) -> Result<u32> {
+    let mut highest = 0;
+    for entry in fs::read_dir(dir).with_context(|| format!("읽지 못했다: {}", dir.display()))?
+    {
+        let path = entry?.path();
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("md" | "json")
+        ) && let Some(seq) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            highest = highest.max(seq);
+        }
+    }
+    Ok(highest)
+}
+
+fn write_file(path: &Path, text: &str) -> Result<()> {
+    fs::write(path, text).with_context(|| format!("쓰지 못했다: {}", path.display()))
+}
+
+fn log_tail(path: &Path) -> String {
+    let read = || -> io::Result<String> {
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(LOG_TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines: Vec<&str> = text.lines().collect();
+        if start > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let from = lines.len().saturating_sub(LOG_TAIL_LINES);
+        let tail = lines[from..].join("\n");
+        Ok(strip_ansi(tail.trim_end()))
+    };
+    read().unwrap_or_else(|e| format!("(로그를 읽지 못했다: {e})"))
+}
+
+fn strip_ansi(text: &str) -> String {
+    static ANSI: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("\x1b\\[[0-9;?]*[A-Za-z]").expect("valid regex"));
+    ANSI.replace_all(text, "").into_owned()
+}
+
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+-".contains(&b));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn fence_for(text: &str) -> String {
+    let longest = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    "`".repeat((longest + 1).max(3))
+}
+
+fn mode_label(mode: &VerifyMode) -> String {
+    match mode {
+        VerifyMode::Solo => "단독".to_owned(),
+        VerifyMode::Combo { partners } => {
+            let prs: Vec<String> = partners.iter().map(|p| p.pr.to_string()).collect();
+            format!("조합: {}", prs.join(", "))
+        }
+    }
+}
+
+fn file_names(files: &[ConflictFile]) -> String {
+    let shown: Vec<&str> = files.iter().take(3).map(|f| f.path.as_str()).collect();
+    match files.len().saturating_sub(shown.len()) {
+        0 => shown.join(", "),
+        more => format!("{} 외 {more}개", shown.join(", ")),
+    }
+}
+
+fn summarize(cause: &Cause) -> String {
+    match cause {
+        Cause::Conflict(files) => format!("충돌: {}", file_names(files)),
+        Cause::Step { timed_out, step } => {
+            let what = if *timed_out {
+                "시간 초과"
+            } else {
+                "검증 실패"
+            };
+            let mut text = format!("{what}({}): {} 단계", mode_label(&step.mode), step.step);
+            if !step.failed_tests.is_empty() {
+                text.push_str(&format!(", 실패한 시험 {}개", step.failed_tests.len()));
+            }
+            text
+        }
+    }
+}
+
+fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<String> {
+    let merge = format!("`git fetch origin && git merge origin/{default_branch}`");
+    let (fix, give_up) = match subject {
+        Subject::Pr { .. } => (
+            "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",
+            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. 사람 차례로 넘어간다.",
+        ),
+        Subject::Commit { .. } => (
+            "고쳐서 커밋한 뒤 `chute preflight`를 다시 실행한다. 통과하면 push하고 `chute submit`을 실행한다.",
+            "못 풀겠으면 하던 일을 멈추고 사용자에게 이유를 알린다.",
+        ),
+    };
+    let mut steps = match cause {
+        Cause::Conflict(_) => vec![format!(
+            "{merge}로 기준 브랜치를 합치고 충돌한 파일을 푼다. 충돌 상대가 아직 머지되지 않은 큐의 PR이면 그 PR이 머지된 뒤에 합쳐도 된다."
+        )],
+        Cause::Step { timed_out, step } => {
+            let mut steps =
+                vec!["위 재현 방법으로 같은 단계를 돌려 실패를 직접 확인한다.".to_owned()];
+            if *timed_out {
+                steps.push("시간 제한은 `chute.toml`의 `timeout`이다. 값을 늘려서 풀지 않는다(그 파일을 고친 PR은 사람 승인을 기다린다). 로그 끝부분에서 멈춘 곳을 찾는다.".to_owned());
+            }
+            if let VerifyMode::Combo { .. } = step.mode {
+                steps.push(format!(
+                    "상대 PR의 변경과 이 PR의 변경이 어디서 어긋나는지 diff에서 찾는다. 상대 PR은 이 PR이 맞춘다. 상대가 이미 머지됐으면 {merge}로 합친 뒤 확인한다."
+                ));
+            }
+            steps
+        }
+    };
+    steps.push(fix.to_owned());
+    steps.push(give_up.to_owned());
+    steps
+}
+
+fn render(doc: &ReportDoc, cause: &Cause) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let label = doc.subject.label();
+    match &doc.subject {
+        Subject::Pr {
+            title,
+            branch,
+            head,
+            ..
+        } => {
+            out.push(format!("# {label} 반송 보고서: {}", one_line(title)));
+            out.push(String::new());
+            out.push(format!("- 대상: {label}, 브랜치 `{}`", one_line(branch)));
+            out.push(format!("- 등록한 HEAD: `{head}`"));
+        }
+        Subject::Commit { commit } => {
+            out.push(format!("# {label} 검증 보고서"));
+            out.push(String::new());
+            out.push(format!("- 대상: 커밋 `{commit}` (PR 없음, preflight)"));
+        }
+    }
+    out.push(format!("- 결과: {}", doc.summary));
+    out.push(format!("- 보고서 번호: {}", doc.seq));
+    out.push(String::new());
+    out.push("이 파일만 읽고 고칠 수 있게 썼다. 같은 내용이 `<번호>.json`에도 있다.".to_owned());
+    out.push(String::new());
+
+    match (cause, &doc.step) {
+        (Cause::Conflict(files), _) => render_conflict(&mut out, files),
+        (Cause::Step { timed_out, step }, Some(report)) => {
+            render_step(&mut out, step, report, *timed_out)
+        }
+        (Cause::Step { .. }, None) => {}
+    }
+
+    out.push("## 다음에 할 일".to_owned());
+    out.push(String::new());
+    for (i, step) in doc.next.iter().enumerate() {
+        out.push(format!("{}. {step}", i + 1));
+    }
+    out.push(String::new());
+    out.join("\n")
+}
+
+fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
+    out.push("## 충돌한 파일".to_owned());
+    out.push(String::new());
+    for file in files {
+        out.push(format!("- `{}`", file.path));
+        if file.main_commits.is_empty() {
+            out.push("  - 이 파일을 고친 기준 브랜치 쪽 커밋을 찾지 못했다".to_owned());
+        }
+        for commit in &file.main_commits {
+            out.push(format!(
+                "  - 기준 브랜치 쪽에서 고친 커밋: `{}` {}",
+                short(&commit.sha),
+                one_line(&commit.title)
+            ));
+        }
+    }
+    out.push(String::new());
+}
+
+fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, timed_out: bool) {
+    out.push("## 실패한 단계".to_owned());
+    out.push(String::new());
+    out.push(format!("- 단계: `{}`", report.name));
+    out.push(format!(
+        "- 명령: `{}` (검증 worktree에서 `sh -c`로 실행한다)",
+        report.command
+    ));
+    if timed_out {
+        out.push(format!(
+            "- 결과: **시간 초과**. {}초 안에 끝나지 않아 chute가 멈췄다",
+            report.timeout_s
+        ));
+    } else {
+        out.push("- 결과: 실패".to_owned());
+    }
+    match &step.mode {
+        VerifyMode::Solo => out.push(
+            "- 범위: **단독**. 기준 브랜치에 이 PR만 얹어도 같은 단계가 실패한다. 이 PR의 변경이 원인이다".to_owned(),
+        ),
+        VerifyMode::Combo { .. } => out.push(
+            "- 범위: **조합**. 기준 브랜치에 이 PR만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다".to_owned(),
+        ),
+    }
+    out.push(format!("- 로그: `{}`", step.log.display()));
+    out.push(String::new());
+
+    if step.failed_tests.is_empty() {
+        out.push("실패한 시험 이름을 뽑지 못했다. 로그 끝부분이다.".to_owned());
+        out.push(String::new());
+        let tail = report.log_tail.as_deref().unwrap_or_default();
+        let fence = fence_for(tail);
+        out.push(format!("{fence}text"));
+        out.push(tail.to_owned());
+        out.push(fence);
+    } else {
+        out.push(format!("### 실패한 시험 ({}개)", step.failed_tests.len()));
+        out.push(String::new());
+        for name in step.failed_tests.iter().take(LISTED_TESTS) {
+            out.push(format!("- `{name}`"));
+        }
+        if step.failed_tests.len() > LISTED_TESTS {
+            out.push(format!(
+                "- …외 {}개. 전부 `.json`에 있다",
+                step.failed_tests.len() - LISTED_TESTS
+            ));
+        }
+    }
+    out.push(String::new());
+
+    if let VerifyMode::Combo { partners } = &step.mode {
+        out.push("## 함께 묶였던 PR".to_owned());
+        out.push(String::new());
+        for partner in partners.iter() {
+            out.push(format!("### {} {}", partner.pr, one_line(&partner.title)));
+            out.push(String::new());
+            let mut files: Vec<String> = partner
+                .files
+                .iter()
+                .take(LISTED_FILES)
+                .map(|f| format!("`{f}`"))
+                .collect();
+            if partner.files.len() > LISTED_FILES {
+                files.push(format!("…외 {}개", partner.files.len() - LISTED_FILES));
+            }
+            out.push(format!("- 바뀐 파일: {}", files.join(", ")));
+            out.push(format!("- diff: `{}`", partner.diff.display()));
+            out.push(String::new());
+        }
+    }
+
+    out.push("## 재현".to_owned());
+    out.push(String::new());
+    match &report.git_ref {
+        Some(git_ref) => out.push(format!(
+            "실패한 트리: 커밋 `{}`, 참조 `{git_ref}`",
+            report.tree
+        )),
+        None => out.push(format!("실패한 트리: 커밋 `{}`", report.tree)),
+    }
+    out.push(String::new());
+    out.push("저장소의 아무 worktree에서 실행한다. 마지막 줄은 다 쓴 뒤 지운다.".to_owned());
+    out.push(String::new());
+    out.push("```sh".to_owned());
+    out.extend(report.repro.iter().cloned());
+    out.push("```".to_owned());
+    out.push(String::new());
+}
+
+/// What to tell an agent. A bounce comes with its report; a changed HEAD has none.
+#[derive(Clone, Copy, Debug)]
+pub enum Notice<'a> {
+    Bounced(&'a Written),
+    HeadChanged {
+        registered: &'a Sha,
+        current: &'a Sha,
+    },
+}
+
+impl Notice<'_> {
+    fn line(&self, item: &QueueItem) -> String {
+        let label = format!("PR {}", item.pr);
+        match self {
+            Notice::Bounced(written) => {
+                let steps: Vec<String> = written
+                    .doc
+                    .next
+                    .iter()
+                    .enumerate()
+                    .map(|(i, step)| format!("{}) {step}", i + 1))
+                    .collect();
+                format!(
+                    "chute 반송: {label} — {}. 보고서: {}. 할 일: {}",
+                    written.doc.summary,
+                    written.md.display(),
+                    steps.join(" ")
+                )
+            }
+            Notice::HeadChanged {
+                registered,
+                current,
+            } => format!(
+                "chute 알림: {label}의 HEAD가 바뀌었다(등록 {}, 지금 {}). 머지는 등록한 HEAD만 한다. 고칠 것이 끝났으면 `chute submit`을 다시 실행한다.",
+                short(registered),
+                short(current)
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Sent {
+        terminal: TerminalId,
+    },
+    /// A new agent got the message. The caller records it on the item.
+    Spawned(Agent),
+    Unreachable(Unreachable),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unreachable {
+    Blocked {
+        terminal: TerminalId,
+    },
+    NoRespawn,
+    FirstMessageNotSent {
+        terminal: TerminalId,
+        reason: String,
+    },
+    Failed(String),
+}
+
+impl fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unreachable::Blocked { terminal } => write!(
+                f,
+                "{}이 권한 확인을 기다려 보내지 않았다. 사람이 풀어야 한다",
+                terminal.0
+            ),
+            Unreachable::NoRespawn => {
+                f.write_str("chute.toml의 respawn이 비어 있어 새 에이전트를 띄우지 않았다")
+            }
+            Unreachable::FirstMessageNotSent { terminal, reason } => write!(
+                f,
+                "새 에이전트 {}에게 첫 일이 전달되지 않았다: {reason}",
+                terminal.0
+            ),
+            Unreachable::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TerminalInfo {
+    state: TerminalState,
+    created_ms: EpochMs,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TerminalState {
+    Live,
+    Finished,
+}
+
+#[derive(Deserialize)]
+struct Launched {
+    address: TerminalId,
+    first_message: Option<FirstMessage>,
+}
+
+#[derive(Deserialize)]
+struct FirstMessage {
+    sent: bool,
+    reason: Option<String>,
+}
+
+enum Attempt {
+    Sent,
+    Gone,
+    Stuck(Unreachable),
+}
+
+impl Feedback<'_> {
+    /// Tells the item's agent. A live agent with the recorded `created_ms` gets one `hc send`;
+    /// a missing, finished or different one is replaced by a new agent if `respawn` allows.
+    /// `notice` must be about `item`.
+    pub fn deliver(&self, item: &QueueItem, notice: &Notice<'_>) -> Delivery {
+        let line = notice.line(item);
+        if let Some(agent) = &item.agent {
+            match self.send(agent, &line) {
+                Attempt::Sent => {
+                    return Delivery::Sent {
+                        terminal: agent.terminal.clone(),
+                    };
+                }
+                Attempt::Stuck(why) => return Delivery::Unreachable(why),
+                Attempt::Gone => {}
+            }
+        }
+        match self.respawn(item, &line) {
+            Ok(delivery) => delivery,
+            Err(why) => Delivery::Unreachable(why),
+        }
+    }
+
+    fn run_hc<I, S>(&self, args: I) -> Result<Output, Unreachable>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.ext
+            .hc(args)
+            .map_err(|e| Unreachable::Failed(e.to_string()))
+    }
+
+    fn terminal(&self, id: &TerminalId) -> Result<Option<TerminalInfo>, Unreachable> {
+        let out = self.run_hc(["get", id.0.as_str(), "--json"])?;
+        match out.code {
+            Some(0) => serde_json::from_slice(&out.stdout).map(Some).map_err(|e| {
+                Unreachable::Failed(format!("hc get {}의 출력을 읽지 못했다: {e}", id.0))
+            }),
+            Some(HC_NOT_FOUND) => Ok(None),
+            _ => Err(Unreachable::Failed(hc_failure("get", &out))),
+        }
+    }
+
+    fn send(&self, agent: &Agent, line: &str) -> Attempt {
+        match self.terminal(&agent.terminal) {
+            Err(why) => return Attempt::Stuck(why),
+            Ok(Some(info))
+                if info.state == TerminalState::Live && info.created_ms == agent.created_ms => {}
+            Ok(_) => return Attempt::Gone,
+        }
+        let out = match self.run_hc(["send", agent.terminal.0.as_str(), line]) {
+            Ok(out) => out,
+            Err(why) => return Attempt::Stuck(why),
+        };
+        match out.code {
+            Some(0) => Attempt::Sent,
+            Some(HC_BLOCKED) => Attempt::Stuck(Unreachable::Blocked {
+                terminal: agent.terminal.clone(),
+            }),
+            Some(HC_NOT_FOUND | HC_FINISHED) => Attempt::Gone,
+            _ => Attempt::Stuck(Unreachable::Failed(hc_failure("send", &out))),
+        }
+    }
+
+    fn respawn(&self, item: &QueueItem, line: &str) -> Result<Delivery, Unreachable> {
+        if self.config.respawn.is_empty() {
+            return Err(Unreachable::NoRespawn);
+        }
+        let cwd = self
+            .workdir(item)
+            .map_err(|e| Unreachable::Failed(format!("{e:#}")))?;
+        let name = format!("chute-pr{}", item.pr.0);
+        let task = format!(
+            "너는 chute(머지 큐)가 돌려보낸 PR의 담당 에이전트다. PR: {}, 브랜치: `{}`. 지금 폴더가 그 브랜치의 worktree다. chute 사용법은 `chute --skill`로 읽는다. {line}",
+            item.pr,
+            one_line(&item.branch)
+        );
+        let mut args: Vec<OsString> = ["run", "--bg", "--json", "--no-parent", "--name"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        args.extend([
+            OsString::from(&name),
+            OsString::from("--cwd"),
+            cwd.clone().into_os_string(),
+            OsString::from("--"),
+        ]);
+        args.extend(self.config.respawn.iter().map(OsString::from));
+        args.push(OsString::from(task));
+
+        let out = self.run_hc(args)?;
+        if !out.success() {
+            return Err(Unreachable::Failed(hc_failure("run", &out)));
+        }
+        let launched: Launched = serde_json::from_slice(&out.stdout)
+            .map_err(|e| Unreachable::Failed(format!("hc run의 출력을 읽지 못했다: {e}")))?;
+        // `first_message` is only reported when hc itself carried the task; a task given as
+        // an argument of the program is delivered with the launch.
+        if let Some(FirstMessage {
+            sent: false,
+            reason,
+        }) = launched.first_message
+        {
+            return Err(Unreachable::FirstMessageNotSent {
+                terminal: launched.address,
+                reason: reason.unwrap_or_else(|| "이유를 알 수 없다".to_owned()),
+            });
+        }
+        let info = self.terminal(&launched.address)?.ok_or_else(|| {
+            Unreachable::Failed(format!(
+                "에이전트 {}가 떴지만 hc get이 찾지 못했다",
+                launched.address.0
+            ))
+        })?;
+        Ok(Delivery::Spawned(Agent {
+            terminal: launched.address,
+            created_ms: info.created_ms,
+            name: Some(name),
+            workdir: cwd,
+            alive: true,
+        }))
+    }
+
+    /// Where a new agent works: the recorded folder if it is still on the PR's branch, else
+    /// the worktree that has the branch, else a new worktree under `self.worktrees`.
+    fn workdir(&self, item: &QueueItem) -> Result<PathBuf> {
+        if let Some(agent) = &item.agent
+            && self.on_branch(&agent.workdir, &item.branch)
+        {
+            return Ok(agent.workdir.clone());
+        }
+        let checkouts = self.checkouts()?;
+        let holders: Vec<&Checkout> = checkouts
+            .iter()
+            .filter(|c| c.branch.as_deref() == Some(item.branch.as_str()))
+            .collect();
+        if let Some(live) = holders.iter().find(|c| c.path.is_dir()) {
+            return Ok(live.path.clone());
+        }
+        if !holders.is_empty() {
+            self.ext.git(&self.repo.path, ["worktree", "prune"])?.ok()?;
+        }
+        self.add_worktree(item)
+    }
+
+    fn on_branch(&self, dir: &Path, branch: &str) -> bool {
+        self.ext
+            .git(dir, ["symbolic-ref", "--short", "-q", "HEAD"])
+            .is_ok_and(|out| out.success() && out.stdout_text().trim() == branch)
+    }
+
+    fn checkouts(&self) -> Result<Vec<Checkout>> {
+        let text = self
+            .ext
+            .git(&self.repo.path, ["worktree", "list", "--porcelain"])?
+            .ok()?;
+        Ok(text
+            .split("\n\n")
+            .filter_map(|block| {
+                let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
+                let branch = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("branch refs/heads/"))
+                    .map(str::to_owned);
+                Some(Checkout {
+                    path: PathBuf::from(path),
+                    branch,
+                })
+            })
+            .collect())
+    }
+
+    fn add_worktree(&self, item: &QueueItem) -> Result<PathBuf> {
+        let branch = item.branch.as_str();
+        let plain = !branch.starts_with('-')
+            && !branch.is_empty()
+            && Path::new(branch)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)));
+        if !plain {
+            bail!("브랜치 이름으로 worktree 자리를 정할 수 없다: {branch:?}");
+        }
+        let dest = self.worktrees.join(self.repo.slug.name()).join(branch);
+        if dest.exists() {
+            bail!(
+                "worktree를 만들 자리에 이미 무엇이 있다: {}",
+                dest.display()
+            );
+        }
+        let ref_name = format!("refs/heads/{branch}");
+        let exists = self
+            .ext
+            .git(
+                &self.repo.path,
+                ["rev-parse", "--verify", "--quiet", &ref_name],
+            )?
+            .success();
+        let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
+        if exists {
+            args.extend([dest.clone().into_os_string(), branch.into()]);
+        } else {
+            args.extend([
+                "-b".into(),
+                branch.into(),
+                dest.clone().into_os_string(),
+                item.head.as_str().into(),
+            ]);
+        }
+        self.ext.git(&self.repo.path, args)?.ok()?;
+        Ok(dest)
+    }
+}
+
+struct Checkout {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn hc_failure(verb: &str, out: &Output) -> String {
+    format!(
+        "hc {verb}가 실패했다(종료 코드 {:?}): {}",
+        out.code,
+        out.stderr_text().trim()
+    )
+}
+
+#[cfg(test)]
+mod tests;
