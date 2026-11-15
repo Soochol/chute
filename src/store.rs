@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::model::{BatchId, DaemonInfo, Event, PrNumber, RepoInfo, Slug, State};
+use crate::model::{BatchId, DaemonInfo, Event, PrNumber, RepoInfo, Sha, Slug, State};
 
 #[derive(Clone, Debug)]
 pub struct Home {
@@ -116,6 +116,12 @@ impl RepoStore {
 
     pub fn report_dir(&self, pr: PrNumber) -> PathBuf {
         self.dir.join("reports").join(format!("pr-{}", pr.0))
+    }
+
+    /// Reports about a commit that has no PR yet (preflight).
+    pub fn commit_report_dir(&self, commit: &Sha) -> PathBuf {
+        let short = &commit.as_str()[..commit.as_str().len().min(12)];
+        self.dir.join("reports").join(format!("commit-{short}"))
     }
 
     pub fn register(&self, info: &RepoInfo) -> Result<()> {
