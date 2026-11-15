@@ -325,3 +325,27 @@ fn down_now_also_ends_a_step_process_that_left_the_process_group() {
         is_gone(leaked)
     });
 }
+
+#[test]
+fn a_new_daemon_clears_an_engine_warning_an_earlier_one_left() {
+    let lab = Lab::new("");
+    lab.store
+        .update(|s| {
+            s.warnings.push(chute::model::Warning {
+                kind: chute::model::WarningKind::Engine,
+                message: "낡은 경고".to_owned(),
+                pr: None,
+                at_ms: chute::model::EpochMs::now(),
+            });
+            Ok(())
+        })
+        .unwrap();
+
+    let mut daemon = start_daemon(&lab);
+    wait_until("낡은 경고가 지워지지 않았다", || {
+        lab.state().warnings.is_empty()
+    });
+
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+}

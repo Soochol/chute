@@ -853,3 +853,53 @@ fn the_failed_ref_of_a_dropped_pr_is_pruned_when_the_next_batch_ends() {
     let refs = lab.repo.git(&["for-each-ref", "refs/chute/failed/"]);
     assert!(refs.trim().is_empty(), "{refs}");
 }
+
+#[test]
+fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged() {
+    let lab = Lab::new("");
+    lab.strand_in_batch();
+    let landed = engine_kit::sha(&lab.origin_main());
+    lab.store
+        .write_batch(&chute::model::BatchRecord {
+            id: chute::model::BatchId("b-crashed".into()),
+            base: landed.clone(),
+            prs: prs(&[1, 2, 3]),
+            started_ms: chute::model::EpochMs::now(),
+            finished_ms: None,
+            merges: vec![chute::model::MergeRef {
+                pr: PrNumber(2),
+                commit: landed.clone(),
+            }],
+            bounced: prs(&[1]),
+            flaky: Vec::new(),
+            verify_s: 7,
+            pushed: vec![landed],
+            verifications: 3,
+        })
+        .unwrap();
+
+    lab.engine().recover().unwrap();
+
+    let record = lab
+        .store
+        .read_batch(&chute::model::BatchId("b-crashed".into()))
+        .unwrap()
+        .unwrap();
+    assert!(record.finished_ms.is_some());
+    assert_eq!(record.bounced, prs(&[1]));
+    assert_eq!(record.merges.len(), 1);
+    let finished: Vec<_> = lab
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::BatchFinished {
+                merged,
+                bounced,
+                verify_s,
+                ..
+            } => Some((merged, bounced, verify_s)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, [(prs(&[2]), prs(&[1]), 7)]);
+}

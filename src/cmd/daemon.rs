@@ -104,6 +104,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         let (store, flags, cancel) = (store.clone(), flags.clone(), cancel.clone());
         thread::spawn(move || watch(&store, &flags, &cancel))
     };
+    engine_warning(&store, None);
     println!("chute 데몬을 시작한다: {} (pid {})", info.slug, me.pid);
     let served = serve(&engine, &store, &mut me, &flags);
     flags.done.store(true, Ordering::SeqCst);

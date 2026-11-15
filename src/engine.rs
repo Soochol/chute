@@ -173,7 +173,7 @@ impl Engine {
         })?;
         let (merged, batch) = gone;
         let batch_id = batch.as_ref().map(|b| b.id.clone());
-        let merged_prs: Vec<PrNumber> = merged.iter().map(|(item, _)| item.pr).collect();
+        let recovered_prs: Vec<PrNumber> = merged.iter().map(|(item, _)| item.pr).collect();
         for (item, commit) in merged {
             self.history(EventKind::Merged {
                 pr: item.pr,
@@ -194,13 +194,18 @@ impl Engine {
                 }
             }
             record.finished_ms = Some(now);
-            record.bounced = Vec::new();
             self.store.write_batch(&record)?;
-            if !merged_prs.is_empty() {
+            let mut merged_prs: Vec<PrNumber> = record.merges.iter().map(|m| m.pr).collect();
+            for pr in recovered_prs {
+                if !merged_prs.contains(&pr) {
+                    merged_prs.push(pr);
+                }
+            }
+            if !merged_prs.is_empty() || !record.bounced.is_empty() {
                 self.history(EventKind::BatchFinished {
                     batch: batch.id.clone(),
                     merged: merged_prs,
-                    bounced: Vec::new(),
+                    bounced: record.bounced.clone(),
                     seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
                     verify_s: record.verify_s,
                 })?;
@@ -604,6 +609,7 @@ impl Run<'_> {
 
     fn save_record(&mut self) -> Result<()> {
         self.record.bounced = self.bounced.clone();
+        self.record.verify_s = self.verify_time.as_secs();
         self.engine.store.write_batch(&self.record)
     }
 
