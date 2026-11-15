@@ -201,7 +201,7 @@ impl Ext {
             .stderr(Stdio::piped())
             .process_group(0);
         if tool == Tool::Git {
-            for var in GIT_REPO_ENV {
+            for var in REPO_LOCATING_ENV {
                 command.env_remove(var);
             }
         }
@@ -267,12 +267,11 @@ impl Ext {
     }
 }
 
-/// What git exports to the hooks and `!` aliases it runs to say which repository it is in, so
-/// chute started from one inherits them. Left in place they point every git call at that
-/// repository instead of the call's own `cwd`. This is `git rev-parse --local-env-vars` without
-/// `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`: those carry the user's own
-/// `git -c` and environment configuration, which git passes on and chute must keep.
-const GIT_REPO_ENV: [&str; 12] = [
+/// What git exports to the hooks and `!` aliases it runs to say which repository it is in.
+/// Inherited, they point every git call at that repository instead of the call's own `cwd`.
+/// This is `git rev-parse --local-env-vars` without `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS` and
+/// `GIT_CONFIG_COUNT`.
+const REPO_LOCATING_ENV: [&str; 12] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_OBJECT_DIRECTORY",
     "GIT_DIR",
