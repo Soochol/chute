@@ -100,6 +100,12 @@ struct Target {
     branch: Option<String>,
 }
 
+enum Alone {
+    Conflicts(NonEmpty<ConflictFile>),
+    Passes,
+    Fails(verify::Failed, Sha),
+}
+
 struct Judged {
     result: PreflightResult,
     with: Vec<PrNumber>,
@@ -181,7 +187,7 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         log_dir: log_dir(&store, &target.head, at)?,
     };
     let judged = match &own.result {
-        ItemResult::Conflict(files) => run.conflict(files)?,
+        ItemResult::Conflict(files) => run.conflict(files, run.with())?,
         ItemResult::Merged { .. } | ItemResult::AlreadyMerged => run.verify(&merged.tip)?,
     };
 
@@ -203,7 +209,7 @@ fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
                 "status",
                 "--porcelain",
                 "--untracked-files=normal",
-                "--ignore-submodules=none",
+                "--ignore-submodules=untracked",
             ],
         )?
         .ok()?;
@@ -233,7 +239,7 @@ fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
     let named = ctx.ext.git(dir, ["symbolic-ref", "--quiet", "HEAD"])?;
     let branch = named
         .success()
-        .then(|| named.stdout_text().trim().to_owned())
+        .then(|| named.stdout_text().trim_end_matches('\n').to_owned())
         .and_then(|full| full.strip_prefix("refs/heads/").map(str::to_owned))
         .filter(|name| !name.is_empty());
     Ok(Target { head, branch })
@@ -286,7 +292,7 @@ impl Run<'_> {
         self.together.iter().map(|(pr, ..)| *pr).collect()
     }
 
-    fn conflict(&self, files: &NonEmpty<ConflictFile>) -> Result<Judged> {
+    fn conflict(&self, files: &NonEmpty<ConflictFile>, with: Vec<PrNumber>) -> Result<Judged> {
         let owners = self.commit_owners()?;
         let named: Vec<ConflictFile> = files
             .iter()
@@ -311,7 +317,7 @@ impl Run<'_> {
                 .write_report(&self.subject(), &Failure::Conflict { files }, None)?;
         Ok(Judged {
             result: PreflightResult::Conflict,
-            with: self.with(),
+            with,
             flaky: Vec::new(),
             written: Some(written),
         })
@@ -351,7 +357,18 @@ impl Run<'_> {
         let (failure, tree) = if with.is_empty() {
             (step_failure(&failed, VerifyMode::Solo, tip), tip.clone())
         } else {
-            self.tell_solo_from_combo(failed, tip)?
+            match self.verify_alone()? {
+                Alone::Conflicts(files) => return self.conflict(&files, Vec::new()),
+                Alone::Passes => {
+                    let mode = VerifyMode::Combo {
+                        partners: self.partners(tip)?,
+                    };
+                    (step_failure(&failed, mode, tip), tip.clone())
+                }
+                Alone::Fails(alone, solo_tip) => {
+                    (step_failure(&alone, VerifyMode::Solo, &solo_tip), solo_tip)
+                }
+            }
         };
         let written = self.report_failure(&failure, &tree)?;
         Ok(Judged {
@@ -362,33 +379,19 @@ impl Run<'_> {
         })
     }
 
-    fn tell_solo_from_combo(&self, failed: verify::Failed, tip: &Sha) -> Result<(Failure, Sha)> {
+    fn verify_alone(&self) -> Result<Alone> {
         let solo = self.slot.merge(
             self.base,
             &[MergeItem::Local {
                 head: self.target.head.clone(),
             }],
         )?;
-        let solo_conflicts = matches!(
-            solo.items.first().map(|item| &item.result),
-            Some(ItemResult::Conflict(_))
-        );
-        if solo_conflicts {
-            let mode = VerifyMode::Combo {
-                partners: self.partners(tip)?,
-            };
-            return Ok((step_failure(&failed, mode, tip), tip.clone()));
+        if let Some(ItemResult::Conflict(files)) = solo.items.first().map(|item| &item.result) {
+            return Ok(Alone::Conflicts(files.clone()));
         }
         match self.run_steps(&self.log_dir.join("solo"))? {
-            Outcome::Passed { .. } => {
-                let partners = self.partners(tip)?;
-                let mode = VerifyMode::Combo { partners };
-                Ok((step_failure(&failed, mode, tip), tip.clone()))
-            }
-            Outcome::Failed(alone) => Ok((
-                step_failure(&alone, VerifyMode::Solo, &solo.tip),
-                solo.tip.clone(),
-            )),
+            Outcome::Passed { .. } => Ok(Alone::Passes),
+            Outcome::Failed(failed) => Ok(Alone::Fails(failed, solo.tip)),
             Outcome::Cancelled => bail!("검증이 취소됐다"),
         }
     }

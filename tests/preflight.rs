@@ -537,7 +537,7 @@ fn a_tag_named_like_the_branch_does_not_change_which_pr_is_the_callers() {
 }
 
 #[test]
-fn a_head_that_cannot_be_laid_over_main_alone_is_a_combination_failure() {
+fn a_head_that_cannot_be_laid_over_main_alone_is_reported_as_a_conflict() {
     let w = world("test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }");
     w.repo.commit_file("f.txt", "orig\n", "chore: 원본");
     w.repo.git(&["push", "--quiet", "origin", "main"]);
@@ -553,10 +553,80 @@ fn a_head_that_cannot_be_laid_over_main_alone_is_a_combination_failure() {
     let out = preflight(&w, &["--json"]);
     assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
     let doc = json(&out);
-    assert_eq!(doc["result"], "fail");
-    assert_eq!(doc["mode"], "combo");
+    assert_eq!(doc["result"], "conflict");
+    assert_eq!(doc["with"], serde_json::json!([]));
+    let report = read(&doc["report"]);
+    assert!(report.contains("f.txt"), "{report}");
+    assert!(report.contains("main이 고친다"), "{report}");
+    assert!(!report.contains("통과하지만"), "{report}");
+    assert_eq!(
+        serde_json::to_value(w.state().preflights["feat/mine"].result).unwrap(),
+        "conflict"
+    );
+}
+
+#[test]
+fn a_branch_name_ending_in_a_unicode_space_is_not_taken_for_another_branch() {
+    let w = world("true");
+    queue_pr(&w, 7, "a.txt", "a\n", ItemState::Queued(None));
+    let odd = "feat/7\u{a0}";
+    w.repo
+        .git(&["checkout", "--quiet", "-b", odd, "origin/main"]);
+    w.repo.commit_file("mine.txt", "x\n", "feat: 내 것");
+    let doc = json(&preflight(&w, &["--json"]));
     assert_eq!(doc["with"], serde_json::json!([7]));
-    assert!(w.state().preflights.contains_key("feat/mine"));
+    let keys: Vec<String> = w.state().preflights.keys().cloned().collect();
+    assert_eq!(keys, vec![odd.to_owned()]);
+}
+
+#[test]
+fn untracked_content_inside_a_submodule_does_not_block_a_preflight() {
+    let w = world("true");
+    let sub = w.sb.root().join("sub-origin");
+    fs::create_dir_all(&sub).unwrap();
+    let git_in = |dir: &Path, args: &[&str]| {
+        let out =
+            w.sb.command("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git_in(&sub, &["init", "--quiet", "--initial-branch=main"]);
+    fs::write(sub.join("s.txt"), "s\n").unwrap();
+    git_in(&sub, &["add", "."]);
+    git_in(&sub, &["commit", "--quiet", "-m", "init"]);
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    git_in(
+        w.repo.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            &sub.to_string_lossy(),
+            "sub",
+        ],
+    );
+    git_in(
+        w.repo.path(),
+        &["commit", "--quiet", "-m", "feat: 서브모듈"],
+    );
+    fs::write(w.repo.path().join("sub/build.o"), "junk\n").unwrap();
+    let out = preflight(&w, &[]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    fs::write(w.repo.path().join("sub/s.txt"), "changed\n").unwrap();
+    assert_eq!(
+        code(&preflight(&w, &[])),
+        2,
+        "추적 파일을 고친 서브모듈은 거절한다"
+    );
 }
 
 #[test]
