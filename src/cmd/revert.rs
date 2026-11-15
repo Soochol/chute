@@ -182,7 +182,7 @@ fn revert_all(
             let detail = format!("{}{}", out.stdout_text(), out.stderr_text());
             return if conflicted.trim().is_empty() {
                 refuse(format!(
-                    "#{}을 되돌리지 못했다. 아무것도 올리지 않았다: {}",
+                    "#{}을 되돌려도 바뀌는 것이 없거나 git이 되돌리지 못했다(뒤의 변경이 이미 같은 내용을 되돌렸을 수 있다). 아무것도 올리지 않았다.\ngit의 말: {}",
                     target.pr.0,
                     detail.trim()
                 ))
