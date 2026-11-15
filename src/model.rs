@@ -536,7 +536,6 @@ pub enum WarningKind {
     NoChecks,
     Config,
     History,
-    /// The daemon's last batch failed with an error that is not any PR's fault.
     Engine,
 }
 
@@ -582,10 +581,8 @@ pub struct BatchRecord {
     pub bounced: Vec<PrNumber>,
     pub flaky: Vec<Flaky>,
     pub verify_s: u64,
-    /// Every commit this batch pushed to the default branch, in order.
     #[serde(default)]
     pub pushed: Vec<Sha>,
-    /// How many times the verification steps ran, bisection and base checks included.
     #[serde(default)]
     pub verifications: u32,
 }

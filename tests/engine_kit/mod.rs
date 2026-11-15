@@ -18,9 +18,6 @@ use crate::support::{Reply, Sandbox, TestRepo};
 
 pub const AGENT_CREATED_MS: u64 = 1763188200000;
 
-/// A repository with a bare origin, a verify script that logs the tree of every run it
-/// passes, a stateful fake `gh` that reports a PR as merged once its head is in origin's
-/// `main`, and a fake `hc`.
 pub struct Lab {
     pub sb: Sandbox,
     pub repo: TestRepo,
@@ -42,7 +39,6 @@ impl Lab {
         Lab::build(verify_body, "", 60)
     }
 
-    /// `top` is extra top-level `chute.toml` keys.
     pub fn build(verify_body: &str, top: &str, timeout_s: u64) -> Lab {
         let sb = Sandbox::new();
         let repo = TestRepo::new(&sb, "acme/widget");
@@ -154,9 +150,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         }
     }
 
-    /// Pushes a PR branch and `refs/pull/<n>/head` to origin, tells the fake `gh` the head
-    /// and queues the PR the way `chute submit` does. The PR is cut from origin's `main`
-    /// as it is now.
     pub fn open_pr(&self, n: u64, files: &[(&str, &str)]) -> Sha {
         self.open_pr_for(n, files, Some(self.agent()), Approval::Agent)
     }
@@ -197,7 +190,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         sha(&head)
     }
 
-    /// A PR cut from origin's `main` that deletes `path`.
     pub fn open_pr_removing(&self, n: u64, path: &str) -> Sha {
         let branch = format!("pr-{n}");
         self.repo.git(&["fetch", "--quiet", "origin"]);
@@ -241,7 +233,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         fs::write(self.gh_dir.join(format!("{n}.head")), head).unwrap();
     }
 
-    /// GitHub keeps showing the PR as open even once its head is in `main`.
     pub fn gh_never_shows_merged(&self, n: u64) {
         fs::write(self.gh_dir.join(format!("{n}.stuck")), "").unwrap();
     }
@@ -256,7 +247,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             .unwrap_or(0)
     }
 
-    /// A commit another person pushes to origin's `main`.
     pub fn main_commit(&self, files: &[(&str, &str)], message: &str) -> String {
         self.repo.git(&["fetch", "--quiet", "origin"]);
         self.repo
@@ -301,7 +291,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         self.origin_git(&["rev-parse", "main"])
     }
 
-    /// The merge commits on `main`'s first-parent line, oldest first.
     pub fn merge_commits_on_main(&self) -> Vec<String> {
         let text = self.origin_git(&[
             "rev-list",
@@ -313,7 +302,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         text.lines().map(str::to_owned).collect()
     }
 
-    /// What a daemon killed in the middle of a batch leaves: queued PRs taken into a batch.
     pub fn strand_in_batch(&self) {
         self.store
             .update(|s| {
@@ -414,8 +402,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             .unwrap_or(0)
     }
 
-    /// Every commit a batch pushed to `main` has the tree a verification run passed on, and
-    /// `main` is what the last of them pushed or a commit someone else added after it.
     pub fn assert_every_pushed_commit_was_verified(&self) -> usize {
         let verified = self.verified_trees();
         let mut checked = 0;

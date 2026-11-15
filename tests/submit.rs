@@ -85,8 +85,6 @@ fn submit(w: &World, args: &[&str]) -> Output {
     submit_as(w, None, args)
 }
 
-/// The calls that look an agent up. Starting the daemon adds an `hc run` that these tests
-/// do not care about.
 fn hc_lookups(w: &World) -> Vec<Vec<String>> {
     w.sb.fake("hc")
         .calls()

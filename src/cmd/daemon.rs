@@ -21,15 +21,11 @@ const IDLE_POLL: Duration = Duration::from_secs(1);
 const BLOCKED_POLL: Duration = Duration::from_secs(15);
 const ERROR_POLL: Duration = Duration::from_secs(10);
 const MAX_ERROR_POLL: Duration = Duration::from_secs(600);
-/// A stop request older than this predates the daemon; a newer one may be a `chute down`
-/// that saw the daemon take its lock.
 const STALE_STOP: Duration = Duration::from_secs(2);
 
 #[derive(clap::Args, Debug)]
 pub struct Args {}
 
-/// How `chute down` asks the daemon to stop. The request is a file in the state folder,
-/// like everything else the CLI and the daemon say to each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
     AfterBatch,
@@ -176,8 +172,6 @@ fn prs(list: &[PrNumber]) -> String {
     }
 }
 
-/// Shows an error that is nobody's PR's fault, such as a push the server refuses, in the
-/// state, where `chute status` and the Herdr board read it. `None` clears it.
 fn engine_warning(store: &RepoStore, message: Option<&str>) {
     let result = store.update(|s| {
         s.warnings.retain(|w| w.kind != WarningKind::Engine);

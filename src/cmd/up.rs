@@ -35,8 +35,6 @@ fn up(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The marker only bridges the moment between `hc run` and the daemon taking its lock, so
-/// the daemon removes it as soon as it holds the lock and again when it ends.
 pub fn clear_launch_marker(store: &RepoStore) {
     let _ = fs::remove_file(store.dir().join(LAUNCH_MARKER));
 }
@@ -44,13 +42,10 @@ pub fn clear_launch_marker(store: &RepoStore) {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Launch {
     Running,
-    /// Another process started the daemon a moment ago and it has not taken its lock yet.
     Pending,
     Started(Option<TerminalId>),
 }
 
-/// Starts the daemon in an hc terminal unless one runs or was just started. Shared with
-/// `submit`, which has agents calling it at the same moment.
 pub fn ensure_daemon(ctx: &Ctx, info: &RepoInfo, store: &RepoStore) -> Result<Launch> {
     let _launching = store.lock_launch()?;
     if store.daemon_running()? {

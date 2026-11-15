@@ -1,6 +1,3 @@
-//! Batch processing. The invariant everything here protects: the commit pushed to the default
-//! branch is the very tree the verification steps passed on.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,7 +32,6 @@ const VERIFIED_BASES_KEPT: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct Timing {
-    /// How long to wait, after a push, for GitHub to show the PRs as merged.
     pub merged_check: Duration,
     pub merged_poll: Duration,
 }
@@ -51,11 +47,8 @@ impl Default for Timing {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pass {
-    /// Nothing was waiting in the queue.
     Idle,
-    /// The queue is stopped: the default branch still sits on the commit that failed.
     Blocked,
-    /// A stop was asked for while the batch ran. Its PRs are back in the queue.
     Cancelled,
     Done(Summary),
 }
@@ -64,7 +57,6 @@ pub enum Pass {
 pub struct Summary {
     pub batch: BatchId,
     pub merged: Vec<PrNumber>,
-    /// Every PR sent back to its agent or to a human.
     pub bounced: Vec<PrNumber>,
 }
 
@@ -225,8 +217,6 @@ impl Engine {
         Ok(out.code == Some(0))
     }
 
-    /// The merge commit of a PR that is already in `main`, found by the title GitHub and
-    /// `gitops` both give it. `None` when the PR got in some other way.
     fn merge_commit_of(&self, item: &QueueItem, main: &str) -> Result<Option<Sha>> {
         let title = format!("Merge pull request #{} from ", item.pr.0);
         let out = self.ext.git(
@@ -244,8 +234,6 @@ impl Engine {
         Ok(Sha::try_from(out.stdout_text().trim().to_owned()).ok())
     }
 
-    /// Failed-tree refs matter only while their PR is in the queue. `chute drop` and a merge
-    /// leave them, so this sweep, run after every batch and on start, removes them.
     fn prune_failed_refs(&self) -> Result<()> {
         let queued: BTreeSet<u64> = self.store.load()?.queue.iter().map(|i| i.pr.0).collect();
         let listed = self
@@ -268,8 +256,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Processes one batch: the first `max_batch` waiting PRs. Waiting and repeating belong
-    /// to the daemon.
     pub fn run_once(&self) -> Result<Pass> {
         let waiting =
             |s: &crate::model::State| s.queue.iter().any(|i| i.state == ItemState::Queued(None));
@@ -440,9 +426,7 @@ struct Landed {
 struct Build {
     base: Sha,
     tip: Sha,
-    /// PRs that got their own merge commit.
     landing: Vec<(PrNumber, Sha)>,
-    /// Landing PRs plus those already contained in the tree, minus conflicts.
     members: Vec<PrNumber>,
 }
 
@@ -471,7 +455,6 @@ struct Run<'e> {
     items: BTreeMap<PrNumber, QueueItem>,
     fetched: BTreeSet<PrNumber>,
     conflicted: BTreeSet<PrNumber>,
-    /// PRs sent back before any push, because their head moved.
     sent_back: BTreeSet<PrNumber>,
     landed: Vec<Landed>,
     merged: Vec<PrNumber>,
@@ -492,9 +475,6 @@ impl Run<'_> {
         self.recheck_conflicts()
     }
 
-    /// The gate every PR passes before it can join the batch, and the one place a check of
-    /// a PR's own state on GitHub belongs. It returns the PRs fit to merge; the others have
-    /// left the batch by the time it returns.
     fn admit(&mut self, taken: &[QueueItem]) -> Result<Vec<PrNumber>> {
         let mut ready = Vec::new();
         for item in taken {
@@ -556,10 +536,6 @@ impl Run<'_> {
         }
     }
 
-    /// Tells the agent first and writes the outcome after, in one state update. A daemon that
-    /// dies in between leaves the PR `in_batch`, so the next run tells the agent again; the
-    /// other order would leave a bounced PR nobody ever told about. The second return value
-    /// says why the agent could not be reached, when the PR went to a human for that.
     fn deliver_and_record(
         &self,
         item: &QueueItem,
@@ -602,8 +578,6 @@ impl Run<'_> {
             .write_report(&Subject::from(&item), &failure, failed_ref)?;
         let budget = self.config.budget;
         let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
-        // `record_failure` sends the PR back while the budget lasts and to a human after, and a
-        // human is told nothing.
         let (to, unreachable) = if item.attempts < budget {
             self.deliver_and_record(&item, &Notice::Bounced(&written), record)?
         } else {
@@ -659,8 +633,6 @@ impl Run<'_> {
         }
     }
 
-    /// Fetches the PR heads once per batch. A head that moved since the PR was registered
-    /// sends the PR back instead of merging whatever is there now.
     fn fetch_heads(&mut self, group: &[PrNumber]) -> Result<Vec<PrNumber>> {
         let mut fit = Vec::new();
         for &pr in group {
@@ -831,7 +803,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The PRs of `b` are in the default branch now, by a push or because they already were.
     fn land(&mut self, b: &Build) -> Result<()> {
         let engine = self.engine;
         let pushed = !b.landing.is_empty();
@@ -876,9 +847,6 @@ impl Run<'_> {
         self.save_record()
     }
 
-    /// Blames one PR for a failing tree. Rule 7 and 8 of the plan: first whether the PR fails
-    /// alone or only together with PRs this batch merged before it, then whether the commit it
-    /// failed on was fit to blame anyone.
     fn convict(&mut self, pr: PrNumber, b: &Build, failed: Failed) -> Result<()> {
         let together = (failed.clone(), b.tip.clone());
         let (failed, tip, blame) = if b.base == self.start_base || self.landed.is_empty() {
@@ -893,8 +861,6 @@ impl Run<'_> {
             let start = self.start_base.clone();
             match self.check_alone(pr, &start)? {
                 Alone::Pass => (together.0, together.1, Blame::Combo(self.landed.clone())),
-                // It cannot even be put on the starting main, so nothing says the PRs merged
-                // before it have a part in this failure.
                 Alone::Conflict => (
                     together.0,
                     together.1,
@@ -909,8 +875,6 @@ impl Run<'_> {
                     if self.base_sound(&start)? {
                         (alone, alone_tip, Blame::Solo { base: start })
                     } else {
-                        // The starting main was broken and a PR of this batch fixed it; the
-                        // PR fails on the commit that was verified afterwards.
                         (
                             together.0,
                             together.1,
@@ -950,7 +914,6 @@ impl Run<'_> {
         self.bounce(pr, failure, Some(&name))
     }
 
-    /// Puts `pr` alone on `base` and verifies it.
     fn check_alone(&mut self, pr: PrNumber, base: &Sha) -> Result<Alone> {
         let item = self.merge_item(pr);
         let result = self.slot.merge(base, &[item])?;
@@ -968,8 +931,6 @@ impl Run<'_> {
         }
     }
 
-    /// A PR failing on a commit that never passed verification may only be a victim, so the
-    /// commit is verified by itself first. `false` means it fails too.
     fn base_sound(&mut self, base: &Sha) -> Result<bool> {
         let engine = self.engine;
         if engine.store.load()?.verified_bases.contains(base) {
@@ -988,7 +949,6 @@ impl Run<'_> {
         }
     }
 
-    /// Nobody is blamed for a failure on a base that fails by itself: the queue stops.
     fn require_sound_base(&mut self, base: &Sha) -> Result<()> {
         if self.base_sound(base)? {
             return Ok(());
@@ -1009,8 +969,6 @@ impl Run<'_> {
         Err(Halt::Blocked.into())
     }
 
-    /// PRs that conflicted inside the batch meet the main the batch left behind. Conflicts
-    /// with a PR that was never merged are gone by now.
     fn recheck_conflicts(&mut self) -> Result<()> {
         let conflicted: Vec<PrNumber> = std::mem::take(&mut self.conflicted).into_iter().collect();
         if conflicted.is_empty() {
@@ -1044,7 +1002,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Always runs, after success, a stop or an error: nothing stays `in_batch`.
     fn wind_down(&mut self) -> Result<()> {
         let engine = self.engine;
         let prs: Vec<PrNumber> = self.items.keys().copied().collect();
@@ -1079,8 +1036,6 @@ impl Run<'_> {
         self.confirm_merged()
     }
 
-    /// A merge commit pushed to the default branch should make GitHub show the PR as merged.
-    /// Fake and real `gh` differ here, so the first real run is where it is confirmed.
     fn confirm_merged(&self) -> Result<()> {
         let engine = self.engine;
         let mut waiting: Vec<PrNumber> = self.landed.iter().map(|l| l.pr).collect();
@@ -1131,10 +1086,6 @@ fn step_failure(failed: &Failed, mode: VerifyMode, tree: &Sha) -> Failure {
     }
 }
 
-/// Ends the verification processes a killed daemon left in the batch slot. A step runs in
-/// its own process group, so killing the daemon leaves it running with its lock released;
-/// the next verification would then overlap it. Only processes that carry `CHUTE_RUN_ID`
-/// and stand in the slot are touched, so a shell someone opened there is left alone.
 fn reap_orphans(slot: &Path) -> Result<()> {
     let Ok(slot) = fs::canonicalize(slot) else {
         return Ok(());

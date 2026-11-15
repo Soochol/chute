@@ -216,8 +216,6 @@ impl RepoStore {
         read_json(&self.batch_dir(id).join(BATCH_FILE))
     }
 
-    /// Held while a process checks for a daemon and starts one, so that agents submitting
-    /// at the same moment start a single daemon between them.
     pub fn lock_launch(&self) -> Result<FileLock> {
         self.lock(LAUNCH_LOCK_FILE)
     }

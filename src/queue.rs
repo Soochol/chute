@@ -414,7 +414,6 @@ pub fn merged(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionEr
     take_out(state, pr, Action::Merge)
 }
 
-/// The PR was closed on GitHub while the batch held it.
 pub fn closed(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
     take_out(state, pr, Action::Close)
 }
