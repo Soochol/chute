@@ -720,8 +720,8 @@ test("random malformed status never breaks the board", () => {
   const SECTION_OF = new Map(Object.entries({ awaiting_approval: "human", needs_human: "human", queued: "waiting", bounced: "bounced", in_batch: "batch" }));
   const validPr = (pr) => Number.isSafeInteger(pr) && pr > 0;
   for (let run = 0; run < 20000; run++) {
-    const data = rnd() < 0.1 ? garbage() : rnd() < 0.5 ? [statusView(), statusView()] : [statusView()];
-    const text = JSON.stringify(data);
+    const text = JSON.stringify(rnd() < 0.1 ? garbage() : rnd() < 0.5 ? [statusView(), statusView()] : [statusView()]);
+    const data = JSON.parse(text);
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
