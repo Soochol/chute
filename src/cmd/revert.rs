@@ -52,16 +52,17 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
     for _ in 0..PUSH_TRIES {
         let base = slot.fetch_base()?;
         slot.checkout(&base)?;
-        if let Some(record) = already_on_main(ctx, &slot, &base, &targets)? {
+        let done = revert_all(ctx, &slot, &base, &targets, &all, batch)?;
+        if done.made.is_empty() {
+            let record = locate_reverts(ctx, &slot, &base, &targets)?;
             record_push(&store, &id, &record)?;
             println!(
-                "batch {}는 이미 {}에서 되돌려져 있다. 기록만 마저 남겼다.",
+                "batch {}의 변경은 이미 {}에 없다. 되돌리기를 다시 올리지 않고 기록만 남겼다.",
                 id.0, info.default_branch
             );
-            print!("{}", report(&info, &id, &record));
+            print!("{}", report(&info, &id, &record, &done.skipped));
             return Ok(());
         }
-        let made = revert_all(ctx, &slot, &base, &targets, &all, batch)?;
         let tip = slot.head()?;
         if !args.no_verify {
             verify_tree(ctx, &info, &store, &slot, &id)?;
@@ -72,7 +73,7 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
                 let record = RevertRecord {
                     at_ms: EpochMs::now(),
                     tip,
-                    prs: made,
+                    prs: done.made,
                     verified: !args.no_verify,
                 };
                 record_push(&store, &id, &record).with_context(|| {
@@ -81,7 +82,7 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
                         record.tip
                     )
                 })?;
-                print!("{}", report(&info, &id, &record));
+                print!("{}", report(&info, &id, &record, &done.skipped));
                 return Ok(());
             }
         }
@@ -142,7 +143,7 @@ fn revert_all(
     targets: &[MergeRef],
     all: &[Loaded],
     batch: &Loaded,
-) -> Result<Vec<RevertedPr>> {
+) -> Result<Done> {
     let order = first_parent_order(ctx, slot, base)?;
     let mut ranked = Vec::with_capacity(targets.len());
     for target in targets {
@@ -156,7 +157,7 @@ fn revert_all(
     }
     ranked.sort_by_key(|(at, _)| *at);
 
-    let mut made = Vec::new();
+    let mut done = Done::default();
     for (_, target) in ranked {
         let out = ctx.ext.git(
             slot.path(),
@@ -166,9 +167,9 @@ fn revert_all(
                 "-c",
                 "rerere.enabled=false",
                 "revert",
+                "--no-commit",
                 "-m",
                 "1",
-                "--no-edit",
                 target.commit.as_str(),
             ],
         )?;
@@ -182,7 +183,7 @@ fn revert_all(
             let detail = format!("{}{}", out.stdout_text(), out.stderr_text());
             return if conflicted.trim().is_empty() {
                 refuse(format!(
-                    "#{}을 되돌려도 바뀌는 것이 없거나 git이 되돌리지 못했다(뒤의 변경이 이미 같은 내용을 되돌렸을 수 있다). 아무것도 올리지 않았다.\ngit의 말: {}",
+                    "#{}을 git이 되돌리지 못했다. 아무것도 올리지 않았다.\ngit의 말: {}",
                     target.pr.0,
                     detail.trim()
                 ))
@@ -190,23 +191,54 @@ fn revert_all(
                 refuse(conflict_message(target.pr, &conflicted, all, batch))
             };
         }
-        made.push(RevertedPr {
+        let nothing_staged = ctx
+            .ext
+            .git(slot.path(), ["diff", "--cached", "--quiet"])?
+            .success();
+        if nothing_staged {
+            // Nothing of this merge is left in main, so there is nothing to undo.
+            let _ = ctx.ext.git(slot.path(), ["revert", "--abort"]);
+            slot.checkout(&slot.head()?)?;
+            done.skipped.push(target.pr);
+            continue;
+        }
+        ctx.ext
+            .git(
+                slot.path(),
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--quiet",
+                    "--no-edit",
+                ],
+            )?
+            .ok()?;
+        done.made.push(RevertedPr {
             pr: target.pr,
             merge: target.commit.clone(),
             revert: slot.head()?,
         });
     }
-    Ok(made)
+    Ok(done)
 }
 
-/// A run cut short after its push leaves main reverted and the batch unrecorded. The revert
-/// commits say which merge they undo, so a rerun finds them instead of reverting again.
-fn already_on_main(
+#[derive(Default)]
+struct Done {
+    made: Vec<RevertedPr>,
+    /// PRs whose merge no longer changes main.
+    skipped: Vec<PrNumber>,
+}
+
+/// Finds the revert commits already on main, for the record only. The commit message names
+/// the merge it undoes. Whether main still holds the batch was decided by `revert_all`, so a
+/// miss here costs a detail in the record, never a wrong push.
+fn locate_reverts(
     ctx: &Ctx,
     slot: &Slot,
     base: &Sha,
     targets: &[MergeRef],
-) -> Result<Option<RevertRecord>> {
+) -> Result<RevertRecord> {
     let order = first_parent_order(ctx, slot, base)?;
     let mut found = Vec::new();
     for target in targets {
@@ -227,9 +259,7 @@ fn already_on_main(
                 ],
             )?
             .ok()?;
-        let revert = out.trim();
-        if !revert.is_empty() {
-            let revert = Sha::try_from(revert.to_owned()).map_err(|e| anyhow!(e))?;
+        if let Ok(revert) = Sha::try_from(out.trim().to_owned()) {
             found.push(RevertedPr {
                 pr: target.pr,
                 merge: target.commit.clone(),
@@ -237,28 +267,17 @@ fn already_on_main(
             });
         }
     }
-    if found.is_empty() {
-        return Ok(None);
-    }
-    if found.len() != targets.len() {
-        let names: Vec<String> = found.iter().map(|p| format!("#{}", p.pr.0)).collect();
-        return refuse(format!(
-            "{}만 이미 되돌려져 있고 나머지는 아니다. 사람이 {}의 이력을 확인해야 한다",
-            names.join(" "),
-            base
-        ));
-    }
     let newest = found
         .iter()
         .filter_map(|p| order.iter().position(|c| *c == p.revert))
         .min()
         .map_or_else(|| base.clone(), |at| order[at].clone());
-    Ok(Some(RevertRecord {
+    Ok(RevertRecord {
         at_ms: EpochMs::now(),
         tip: newest,
         prs: found,
         verified: false,
-    }))
+    })
 }
 
 fn first_parent_order(ctx: &Ctx, slot: &Slot, base: &Sha) -> Result<Vec<Sha>> {
@@ -342,7 +361,7 @@ fn record_push(store: &RepoStore, id: &BatchId, record: &RevertRecord) -> Result
     Ok(())
 }
 
-fn report(info: &RepoInfo, id: &BatchId, record: &RevertRecord) -> String {
+fn report(info: &RepoInfo, id: &BatchId, record: &RevertRecord, skipped: &[PrNumber]) -> String {
     let branch = &info.default_branch;
     let mut out = format!(
         "batch {}를 되돌려 {branch}에 올렸다 ({})\n",
@@ -353,6 +372,9 @@ fn report(info: &RepoInfo, id: &BatchId, record: &RevertRecord) -> String {
         out.push_str("--no-verify라서 검증하지 않았다.\n");
     }
     out.push_str("\n되돌린 PR:\n");
+    if record.prs.is_empty() {
+        out.push_str("  (되돌린 커밋을 main의 이력에서 찾지 못했다)\n");
+    }
     for p in &record.prs {
         out.push_str(&format!("  #{}  revert 커밋 {}\n", p.pr.0, p.revert));
     }
@@ -360,6 +382,13 @@ fn report(info: &RepoInfo, id: &BatchId, record: &RevertRecord) -> String {
         "\n다시 올리는 방법: 되돌린 PR의 커밋은 {branch}의 이력에 남아 있어서 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다.\n\
          PR 브랜치에서 {branch}를 합친 뒤 revert 커밋을 되돌리고, 고쳐서 다시 submit한다.\n"
     ));
+    if !skipped.is_empty() {
+        let names: Vec<String> = skipped.iter().map(|p| format!("#{}", p.0)).collect();
+        out.push_str(&format!(
+            "\n{}은 {branch}에 남은 변경이 없어 건너뛰었다.\n",
+            names.join(" ")
+        ));
+    }
     for p in &record.prs {
         out.push_str(&format!(
             "  #{}: git merge origin/{branch} && git revert {}\n",

@@ -310,22 +310,67 @@ fn a_rerun_after_a_crash_between_push_and_record_finishes_the_record_without_pus
 }
 
 #[test]
-fn a_batch_reverted_by_hand_for_only_some_of_its_prs_is_refused() {
+fn a_pr_already_undone_by_hand_is_skipped_and_the_rest_are_reverted() {
     let lab = Lab::new("");
     let id = merge_batch(&lab, &[(1, "a.txt", "a\n"), (2, "b.txt", "b\n")]);
     let record = lab.store.read_batch(&id).unwrap().unwrap();
-    let first = record.merges[0].commit.as_str().to_owned();
-    lab.repo.git(&["fetch", "--quiet", "origin"]);
-    lab.repo
-        .git(&["checkout", "--quiet", "-B", "main", "origin/main"]);
-    lab.repo
-        .git(&["revert", "-m", "1", "--no-edit", first.as_str()]);
-    lab.repo.git(&["push", "--quiet", "origin", "main"]);
-    let main_before = lab.origin_main();
+    hand_revert(&lab, record.merges[0].commit.as_str());
 
     let out = chute(&lab, &["revert", &id.0]);
 
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert_eq!(lab.origin_main(), main_before);
-    assert!(stderr(&out).contains("나머지는 아니다"), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!on_main(&lab, "a.txt") && !on_main(&lab, "b.txt"));
+    let text = stdout(&out);
+    assert!(
+        text.contains("#1은") && text.contains("건너뛰었다"),
+        "{text}"
+    );
+    assert!(text.contains("#2  revert 커밋"), "{text}");
+}
+
+#[test]
+fn a_commit_message_that_quotes_the_revert_marker_does_not_make_a_batch_look_reverted() {
+    let lab = Lab::new("");
+    let id = merge_batch(&lab, &[(1, "a.txt", "a\n")]);
+    let record = lab.store.read_batch(&id).unwrap().unwrap();
+    let merge = record.merges[0].commit.clone();
+    lab.main_commit(
+        &[("n.txt", "n\n")],
+        &format!("docs: note\n\nWe decided against what\nThis reverts commit {merge}\nsays"),
+    );
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!on_main(&lab, "a.txt"));
+    assert!(on_main(&lab, "n.txt"));
+}
+
+#[test]
+fn a_revert_that_was_itself_reverted_does_not_hide_a_batch_that_is_live_again() {
+    let lab = Lab::new("");
+    let id = merge_batch(&lab, &[(1, "a.txt", "a\n")]);
+    let record = lab.store.read_batch(&id).unwrap().unwrap();
+    hand_revert(&lab, record.merges[0].commit.as_str());
+    let undo = lab.repo.head();
+    hand_revert_plain(&lab, &undo);
+    assert!(on_main(&lab, "a.txt"));
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!on_main(&lab, "a.txt"));
+}
+
+fn hand_revert(lab: &Lab, merge: &str) {
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "main", "origin/main"]);
+    lab.repo.git(&["revert", "-m", "1", "--no-edit", merge]);
+    lab.repo.git(&["push", "--quiet", "origin", "main"]);
+}
+
+fn hand_revert_plain(lab: &Lab, commit: &str) {
+    lab.repo.git(&["revert", "--no-edit", commit]);
+    lab.repo.git(&["push", "--quiet", "origin", "main"]);
 }
