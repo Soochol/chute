@@ -357,7 +357,13 @@ impl Run<'_> {
         let (failure, tree) = if with.is_empty() {
             (step_failure(&failed, VerifyMode::Solo, tip), tip.clone())
         } else {
-            match self.verify_alone()? {
+            let alone = self.verify_alone().with_context(|| {
+                format!(
+                    "큐와 함께 한 검증은 {} 단계에서 실패했다. 이 HEAD만으로는 검증하지 못해 보고서를 쓰지 못했다",
+                    failed.step
+                )
+            })?;
+            match alone {
                 Alone::Conflicts(files) => return self.conflict(&files, Vec::new()),
                 Alone::Passes => {
                     let mode = VerifyMode::Combo {
