@@ -27,6 +27,7 @@ const LISTED_FILES: usize = 30;
 const LISTED_TESTS: usize = 50;
 const LISTED_COMMITS: usize = 10;
 const HC_NAME_LIMIT: usize = 32;
+const FAILED_REF_PREFIX: &str = "refs/chute/failed/";
 const NAME_TRIES: u32 = 5;
 const SIBLING_TRIES: u32 = 20;
 const NAME_SUFFIX_ROOM: usize = 2;
@@ -75,6 +76,13 @@ impl From<&QueueItem> for Subject {
 }
 
 impl Subject {
+    fn this(&self) -> &'static str {
+        match self {
+            Subject::Pr { .. } => "이 PR",
+            Subject::Commit { .. } => "이 커밋",
+        }
+    }
+
     fn label(&self) -> String {
         match self {
             Subject::Pr { pr, .. } => format!("PR {pr}"),
@@ -228,6 +236,29 @@ impl Feedback<'_> {
         })
     }
 
+    /// `name` is the full `refs/...` name or the short name under `refs/chute/failed/`.
+    fn failed_ref_at(&self, name: &str, tree: &Sha) -> Result<String> {
+        let full = if name.starts_with("refs/") {
+            name.to_owned()
+        } else {
+            format!("{FAILED_REF_PREFIX}{name}")
+        };
+        let out = self.ext.git(
+            &self.repo.path,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{full}^{{commit}}"),
+            ],
+        )?;
+        if out.success() && out.stdout_text().trim().starts_with(tree.as_str()) {
+            Ok(full)
+        } else {
+            bail!("실패한 트리 참조 {full}이 커밋 {tree}를 가리키지 않는다")
+        }
+    }
+
     fn report_dir(&self, subject: &Subject) -> PathBuf {
         match subject {
             Subject::Pr { pr, .. } => self.store.report_dir(*pr),
@@ -247,22 +278,26 @@ impl Feedback<'_> {
             .iter()
             .find(|s| s.name == step.step)
             .ok_or_else(|| anyhow!("chute.toml에 검증 단계 {:?}이 없다", step.step))?;
-        let id = format!(
-            "{}-{}-{}",
-            self.repo.slug.dir_name(),
-            subject.key(),
-            short(&step.tree)
-        );
+        let (key, tree) = (subject.key(), short(&step.tree));
+        let slug = self.repo.slug.dir_name();
+        let id = if key == tree {
+            format!("{slug}-{key}")
+        } else {
+            format!("{slug}-{key}-{tree}")
+        };
         let dir = format!("\"${{TMPDIR:-/tmp}}/chute-repro-{id}\"");
         let repo = shell_word(&self.repo.path.to_string_lossy());
-        let rev = failed_ref.unwrap_or(step.tree.as_str());
+        let failed_ref = failed_ref
+            .map(|name| self.failed_ref_at(name, &step.tree))
+            .transpose()?;
+        let rev = failed_ref.as_deref().unwrap_or(step.tree.as_str());
         Ok(StepReport {
             name: step.step.clone(),
             command: configured.run.clone(),
             timeout_s: configured.timeout.as_secs(),
             log_tail: step.failed_tests.is_empty().then(|| log_tail(&step.log)),
             tree: step.tree.clone(),
-            git_ref: failed_ref.map(str::to_owned),
+            git_ref: failed_ref.clone(),
             repro: vec![
                 format!(
                     "git -C {repo} worktree add --detach {dir} {}",
@@ -493,6 +528,7 @@ fn summarize(cause: &Cause) -> String {
 }
 
 fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<String> {
+    let this = subject.this();
     let merge = format!("`git fetch origin`, `git merge origin/{default_branch}` 순서로 실행해");
     let (fix, give_up) = match subject {
         Subject::Pr { .. } => (
@@ -516,7 +552,7 @@ fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<Str
             }
             if let VerifyMode::Combo { .. } = step.mode {
                 steps.push(format!(
-                    "diff에서 상대 PR의 변경과 이 PR의 변경이 어디서 어긋나는지 찾아 이 PR을 맞춘다. 상대 PR이 이미 머지됐으면 {merge} 합친 뒤 확인한다."
+                    "diff에서 상대 PR의 변경과 {this}의 변경이 어디서 어긋나는지 찾아 {this}을 맞춘다. 상대 PR이 이미 머지됐으면 {merge} 합친 뒤 확인한다."
                 ));
             }
             steps
@@ -557,7 +593,7 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
     match (cause, &doc.step) {
         (Cause::Conflict(files), _) => render_conflict(&mut out, files),
         (Cause::Step { timed_out, step }, Some(report)) => {
-            render_step(&mut out, step, report, *timed_out)
+            render_step(&mut out, &doc.subject, step, report, *timed_out)
         }
         (Cause::Step { .. }, None) => {}
     }
@@ -602,7 +638,14 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
     out.push(String::new());
 }
 
-fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, timed_out: bool) {
+fn render_step(
+    out: &mut Vec<String>,
+    subject: &Subject,
+    step: &StepFailure,
+    report: &StepReport,
+    timed_out: bool,
+) {
+    let this = subject.this();
     out.push("## 실패한 단계".to_owned());
     out.push(String::new());
     out.push(format!("- 단계: {}", code_span(&report.name)));
@@ -624,12 +667,12 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
         out.push("- 결과: 실패".to_owned());
     }
     match &step.mode {
-        VerifyMode::Solo => out.push(
-            "- 범위: 단독. 기준 브랜치에 이 PR만 얹어도 같은 단계가 실패한다. 이 PR의 변경이 원인이다".to_owned(),
-        ),
-        VerifyMode::Combo { .. } => out.push(
-            "- 범위: 조합. 기준 브랜치에 이 PR만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다".to_owned(),
-        ),
+        VerifyMode::Solo => out.push(format!(
+            "- 범위: 단독. 기준 브랜치에 {this}만 얹어도 같은 단계가 실패한다. {this}의 변경이 원인이다"
+        )),
+        VerifyMode::Combo { .. } => out.push(format!(
+            "- 범위: 조합. 기준 브랜치에 {this}만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다"
+        )),
     }
     out.push(format!(
         "- 로그: {}",

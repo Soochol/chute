@@ -194,6 +194,8 @@ fn a_solo_verify_report_has_what_an_agent_needs_to_fix_it() {
     let lab = Lab::new();
     let item = lab.item(12, "feat/a");
     let log = lab.log("running\ntest a::b ... FAILED\n");
+    lab.repo
+        .git(&["update-ref", "refs/chute/failed/pr-12-1", "HEAD"]);
     let failure = Failure::Verify(lab.step(VerifyMode::Solo, &["a::b", "c::d"], log.clone()));
 
     let written = lab
@@ -2087,4 +2089,258 @@ fn the_repro_leaves_the_shell_where_it_was_so_the_cleanup_cannot_strand_it() {
         last.canonicalize().unwrap(),
         lab.sb.root().canonicalize().unwrap()
     );
+}
+
+#[test]
+fn the_failed_ref_must_point_at_the_failed_tree_and_may_be_given_by_short_name() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let subject = Subject::from(&item);
+    lab.repo
+        .git(&["update-ref", "refs/chute/failed/pr-12-1", "HEAD"]);
+    let elsewhere = lab.repo.commit_file("x.txt", "x\n", "chore: 다른 커밋");
+    lab.repo
+        .git(&["update-ref", "refs/chute/failed/pr-12-2", &elsewhere]);
+    let failure = Failure::Verify(StepFailure {
+        tree: sha(&elsewhere),
+        ..lab.step(VerifyMode::Solo, &["a::b"], lab.log("x"))
+    });
+    let at_head = |lab: &Lab| {
+        Failure::Verify(StepFailure {
+            tree: sha(lab.repo.git(&["rev-parse", "HEAD~1"]).trim()),
+            ..lab.step(VerifyMode::Solo, &["a::b"], lab.log("x"))
+        })
+    };
+
+    let short_name = lab
+        .fb()
+        .write_report(&subject, &at_head(&lab), Some("pr-12-1"))
+        .unwrap();
+    assert_eq!(
+        short_name.doc.step.unwrap().git_ref.as_deref(),
+        Some("refs/chute/failed/pr-12-1")
+    );
+    for (why, name) in [
+        ("points at another commit", "refs/chute/failed/pr-12-1"),
+        ("does not exist", "refs/chute/failed/nope"),
+        ("short name that does not exist", "nope"),
+    ] {
+        let err = lab
+            .fb()
+            .write_report(&subject, &failure, Some(name))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("가리키지 않는다"), "{why}: {err}");
+    }
+    assert!(
+        lab.fb()
+            .write_report(&subject, &failure, Some("pr-12-2"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_preflight_report_talks_about_a_commit_not_a_pr_and_names_the_folder_once() {
+    let lab = Lab::new();
+    let commit = sha(&lab.repo.head());
+    let subject = Subject::Commit {
+        commit: commit.clone(),
+    };
+
+    let solo = lab
+        .fb()
+        .write_report(&subject, &lab.solo(&["a::b"]), None)
+        .unwrap();
+
+    let md = read(&solo.md);
+    assert!(md.contains("기준 브랜치에 이 커밋만 얹어도"), "{md}");
+    assert!(!md.contains("이 PR"), "{md}");
+    let repro = solo.doc.step.unwrap().repro.join("\n");
+    let twice = format!("{0}-{0}", short(&commit));
+    assert!(!repro.contains(&twice), "{repro}");
+}
+
+#[test]
+fn hc_run_is_asked_for_json_because_it_prints_text_when_piped() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert!(lab.run_call().iter().any(|a| a == "--json"));
+}
+
+#[test]
+fn an_exit_code_hc_does_not_define_never_starts_a_second_agent() {
+    for code in [1, 7, 10, 124] {
+        let lab = Lab::new();
+        let mut item = lab.item(12, "feat/a");
+        item.agent = Some(lab.recorded_agent(lab.repo.path()));
+        lab.hc()
+            .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+            .respond("send t1rs *", Reply::ok("").code(code).stderr("odd"));
+        lab.stub_spawn();
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert!(
+            matches!(delivery, Delivery::Unreachable(Unreachable::Failed(_))),
+            "{code}: {delivery:?}"
+        );
+        assert_eq!(verbs(&lab.hc_calls()), ["get", "send"], "{code}");
+    }
+}
+
+#[test]
+fn the_repro_runs_for_a_repository_path_with_spaces_quotes_and_dollars() {
+    let lab = Lab::new();
+    let weird = lab.sb.root().join("we ird's \"q\" $HOME `id`");
+    std::os::unix::fs::symlink(lab.repo.path(), &weird).unwrap();
+    let mut info = lab.info.clone();
+    info.path = weird;
+    let fb = Feedback {
+        repo: &info,
+        ..lab.fb()
+    };
+    let item = lab.item(12, "feat/a");
+    let step = fb
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+
+    let out = lab
+        .sb
+        .command("sh")
+        .arg("-c")
+        .arg(format!("{}\n{}", step.repro.join("\n"), step.cleanup))
+        .current_dir(lab.sb.root())
+        .env("TMPDIR", &tmp)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!lab.repo.git(&["worktree", "list"]).contains("chute-repro"));
+}
+
+#[test]
+fn long_lists_in_a_report_are_cut_and_point_to_the_json() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/b");
+    let partner = Partner {
+        pr: PrNumber(9),
+        title: "t".into(),
+        files: (0..45).map(|i| format!("src/f{i}.rs")).collect(),
+        diff: "/d".into(),
+    };
+    let tests: Vec<String> = (0..60).map(|i| format!("t::n{i}")).collect();
+    let failure = Failure::Verify(StepFailure {
+        failed_tests: tests,
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &[],
+            lab.log("x\n"),
+        )
+    });
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    let md = read(&written.md);
+    assert!(md.contains("`t::n49`") && !md.contains("`t::n50`"), "{md}");
+    assert!(md.contains("- …외 10개. 전부 `.json`에 있다"), "{md}");
+    assert!(
+        md.contains("`src/f29.rs`") && !md.contains("`src/f30.rs`"),
+        "{md}"
+    );
+    assert!(md.contains("…외 15개"), "{md}");
+    assert_eq!(written.doc.failure, failure, "the data keeps everything");
+}
+
+#[test]
+fn a_log_tail_starts_at_a_line_boundary() {
+    let lab = Lab::new();
+    let text: String = (0..200)
+        .map(|i| format!("line {i} {}\n", "x".repeat(500)))
+        .collect();
+
+    let tail = log_tail(&lab.log(&text));
+
+    let lines: Vec<&str> = tail.lines().collect();
+    assert!(
+        (10..LOG_TAIL_LINES).contains(&lines.len()),
+        "the window holds fewer lines than the cap: {}",
+        lines.len()
+    );
+    assert!(
+        lines.iter().all(|l| l.starts_with("line ")),
+        "{:?}",
+        lines[0]
+    );
+}
+
+#[test]
+fn titles_with_newlines_cannot_forge_headings() {
+    let lab = Lab::new();
+    let mut item = lab.item(12, "feat/b");
+    item.title = "첫 줄\n## 가짜 제목\n1. evil".into();
+    let partner = Partner {
+        pr: PrNumber(9),
+        title: "상대\n## 가짜 상대".into(),
+        files: vec!["a.txt".into()],
+        diff: "/d".into(),
+    };
+    let combo = Failure::Verify(StepFailure {
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &["t::x"],
+            lab.log("x\n"),
+        )
+    });
+    let conflict = Failure::Conflict {
+        files: one(ConflictFile {
+            path: "a.rs".into(),
+            main_commits: vec![CommitRef {
+                sha: sha("abc1234"),
+                title: "커밋\n## 가짜 커밋".into(),
+            }],
+        }),
+    };
+
+    for failure in [combo, conflict] {
+        let written = lab
+            .fb()
+            .write_report(&Subject::from(&item), &failure, None)
+            .unwrap();
+
+        let md = read(&written.md);
+        assert!(
+            md.lines()
+                .all(|l| !l.starts_with("## 가짜") && !l.starts_with("1. evil")),
+            "{md}"
+        );
+        assert!(
+            md.lines()
+                .next()
+                .unwrap()
+                .starts_with("# PR #12 반송 보고서: 첫 줄 ## 가짜 제목")
+        );
+    }
 }
