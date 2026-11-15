@@ -1,1 +1,1 @@
-{"id":"t1rs","name":"impl-a","state":"live","created_ms":1763188200000}
+{"address":"t1rs","name":"impl-a","state":"live","created_ms":1763188200000,"cwd":"/w/launch","foreground":{"argv":["claude"],"cwd":"/w/impl-a","name":"claude","pid":4242}}

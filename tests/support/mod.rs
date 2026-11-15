@@ -64,10 +64,17 @@ impl Sandbox {
             set("GIT_CONFIG_GLOBAL", self.gitconfig()),
             (OsString::from("GIT_CONFIG_NOSYSTEM"), Some("1".into())),
             (OsString::from("XDG_STATE_HOME"), None),
+            (OsString::from("HC_TERMINAL_ID"), None),
             (OsString::from("GIT_DIR"), None),
             (OsString::from("GIT_WORK_TREE"), None),
             (OsString::from("GIT_INDEX_FILE"), None),
         ];
+        for (key, _) in std::env::vars_os() {
+            let is_git = key.to_str().is_some_and(|k| k.starts_with("GIT_"));
+            if is_git && !envs.iter().any(|(k, _)| *k == key) {
+                envs.push((key, None));
+            }
+        }
         for (tool, var) in [("git", "CHUTE_GIT"), ("gh", "CHUTE_GH"), ("hc", "CHUTE_HC")] {
             let path = self.root().join("bin").join(tool);
             envs.push((var.into(), path.exists().then(|| path.into_os_string())));

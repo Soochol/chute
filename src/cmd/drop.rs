@@ -2,8 +2,9 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use super::{Ctx, not_implemented};
+use super::{Ctx, finish};
 use crate::model::PrNumber;
+use crate::queue;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -11,16 +12,13 @@ pub struct Args {
     pub pr: PrNumber,
 }
 
-pub fn run(_args: Args, _ctx: &Ctx) -> Result<ExitCode> {
-    not_implemented("drop")
+pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    finish(drop_pr(&args, ctx))
 }
 
-#[cfg(test)]
-mod tests {
-    use std::process::ExitCode;
-
-    #[test]
-    fn not_implemented_yet() {
-        assert_eq!(super::super::run_args(&["drop", "12"]), ExitCode::from(2));
-    }
+fn drop_pr(args: &Args, ctx: &Ctx) -> Result<()> {
+    let (_, store) = ctx.registered_repo()?;
+    let item = store.update(|state| Ok(queue::drop_item(state, args.pr)?))?;
+    println!("큐에서 뺐다: {} ({})", item.pr, item.title);
+    Ok(())
 }
