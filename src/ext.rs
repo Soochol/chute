@@ -309,7 +309,13 @@ impl Pipe {
                 }
                 Ok(n) => {
                     let room = MAX_OUTPUT - self.bytes.len();
-                    self.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                    let take = n.min(room);
+                    let need = self.bytes.len() + take;
+                    if need > self.bytes.capacity() {
+                        let grown = (self.bytes.capacity() * 2).max(need).min(MAX_OUTPUT);
+                        self.bytes.reserve_exact(grown - self.bytes.len());
+                    }
+                    self.bytes.extend_from_slice(&chunk[..take]);
                     if n > room {
                         self.overflowed = true;
                         return Ok(());
@@ -545,6 +551,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_just_under_the_limit_is_kept_without_doubling_the_buffer() {
+        let sb = Sandbox::new();
+        let total = MAX_OUTPUT - 1000;
+        let gh = sb.script(
+            "seed-gh",
+            &format!(
+                "head -c 65535 /dev/zero\nsleep 0.2\nhead -c {} /dev/zero\n",
+                total - 65535
+            ),
+        );
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
+        let out = ext.gh(sb.root(), ["api"]).unwrap();
+        assert_eq!(out.stdout.len(), total);
+        assert!(
+            out.stdout.capacity() <= MAX_OUTPUT,
+            "{}",
+            out.stdout.capacity()
         );
     }
 
