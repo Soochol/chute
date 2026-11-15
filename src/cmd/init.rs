@@ -46,14 +46,18 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let previous = store.info()?;
     store.register(&info)?;
     match previous {
-        None => println!("등록했다: {} → {}", info.slug, store.dir().display()),
+        None => println!(
+            "등록했다: {} (상태 폴더 {})",
+            info.slug,
+            store.dir().display()
+        ),
         Some(old) if old == info => println!(
-            "이미 등록돼 있다: {} → {}",
+            "이미 등록돼 있다: {} (상태 폴더 {})",
             info.slug,
             store.dir().display()
         ),
         Some(old) => println!(
-            "등록을 바꿨다: {} {} → {}",
+            "등록 경로를 바꿨다: {} (이전 {}, 지금 {})",
             info.slug,
             old.path.display(),
             info.path.display()
