@@ -903,3 +903,56 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
         .collect();
     assert_eq!(finished, [(prs(&[2]), prs(&[1]), 7)]);
 }
+
+#[test]
+fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() {
+    let lab = Lab::new("");
+    let head = lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.strand_in_batch();
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "main", "origin/main"]);
+    lab.repo.git(&[
+        "merge",
+        "--no-ff",
+        "--quiet",
+        "-m",
+        "Merge pull request #1 from acme/pr-1\n\nfeat: change 1",
+        head.as_str(),
+    ]);
+    lab.repo.git(&["push", "--quiet", "origin", "main"]);
+    let landed = engine_kit::sha(&lab.origin_main());
+    lab.store
+        .write_batch(&chute::model::BatchRecord {
+            id: chute::model::BatchId("b-crashed".into()),
+            base: landed.clone(),
+            prs: prs(&[1]),
+            started_ms: chute::model::EpochMs::now(),
+            finished_ms: None,
+            merges: Vec::new(),
+            bounced: Vec::new(),
+            flaky: Vec::new(),
+            verify_s: 0,
+            pushed: Vec::new(),
+            verifications: 0,
+        })
+        .unwrap();
+    let history = lab.store.dir().join("history.jsonl");
+    fs::create_dir_all(&history).unwrap();
+
+    assert!(lab.engine().recover().is_err());
+    fs::remove_dir(&history).unwrap();
+    lab.engine().recover().unwrap();
+    lab.engine().recover().unwrap();
+
+    let record = lab
+        .store
+        .read_batch(&chute::model::BatchId("b-crashed".into()))
+        .unwrap()
+        .unwrap();
+    assert!(record.finished_ms.is_some());
+    assert_eq!(record.merges.len(), 1);
+    assert_eq!(lab.merged_prs(), [1]);
+    assert!(lab.state().queue.is_empty());
+    assert!(lab.state().batch.is_none());
+}

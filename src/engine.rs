@@ -148,17 +148,72 @@ impl Engine {
         slot.fetch_base()?;
         let state = self.store.load()?;
         let main = format!("refs/remotes/origin/{}", self.info.default_branch);
-        let mut settled = Vec::new();
+        let mut settled: Vec<(QueueItem, Option<Sha>)> = Vec::new();
         for item in state.queue.iter().filter(|i| i.state == ItemState::InBatch) {
             if self.is_ancestor(&item.head, &main)? {
-                settled.push((item.pr, self.merge_commit_of(item, &main)?));
+                settled.push((item.clone(), self.merge_commit_of(item, &main)?));
             }
         }
-        let settled_commits: Vec<(PrNumber, Option<Sha>)> = settled.clone();
-        let gone = self.store.update(|s| {
-            let mut gone = Vec::new();
-            for (pr, commit) in &settled {
-                gone.push((queue::merged(s, *pr)?, commit.clone()));
+        // The queue is written last, so a run cut short anywhere in here still finds its
+        // `batch` and `in_batch` items, and repeats what is left. Each step before it can be
+        // repeated without a trace.
+        let batch_id = state.batch.as_ref().map(|b| b.id.clone());
+        let already_told: Vec<(PrNumber, BatchId)> = self
+            .store
+            .history()?
+            .events
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::Merged { pr, batch, .. } => Some((pr, batch)),
+                _ => None,
+            })
+            .collect();
+        let id_for_events = batch_id.clone().unwrap_or(BatchId(String::new()));
+        for (item, commit) in &settled {
+            if !already_told.contains(&(item.pr, id_for_events.clone())) {
+                self.history(EventKind::Merged {
+                    pr: item.pr,
+                    batch: id_for_events.clone(),
+                    commit: commit.clone().unwrap_or_else(|| item.head.clone()),
+                    submitted_ms: item.submitted_ms,
+                })?;
+            }
+        }
+        if let Some(id) = &batch_id
+            && let Some(mut record) = self.store.read_batch(id)?
+            && record.finished_ms.is_none()
+        {
+            let now = EpochMs::now();
+            for (item, commit) in &settled {
+                let known = record.merges.iter().any(|m| m.pr == item.pr);
+                if let (Some(commit), false) = (commit, known) {
+                    record.merges.push(MergeRef {
+                        pr: item.pr,
+                        commit: commit.clone(),
+                    });
+                }
+            }
+            record.finished_ms = Some(now);
+            self.store.write_batch(&record)?;
+            let mut merged_prs: Vec<PrNumber> = record.merges.iter().map(|m| m.pr).collect();
+            for (item, _) in &settled {
+                if !merged_prs.contains(&item.pr) {
+                    merged_prs.push(item.pr);
+                }
+            }
+            if !merged_prs.is_empty() || !record.bounced.is_empty() {
+                self.history(EventKind::BatchFinished {
+                    batch: id.clone(),
+                    merged: merged_prs,
+                    bounced: record.bounced.clone(),
+                    seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
+                    verify_s: record.verify_s,
+                })?;
+            }
+        }
+        self.store.update(|s| {
+            for (item, _) in &settled {
+                queue::merged(s, item.pr)?;
             }
             let leftovers: Vec<PrNumber> = s
                 .queue
@@ -169,48 +224,9 @@ impl Engine {
             for pr in leftovers {
                 queue::requeue(s, pr)?;
             }
-            Ok((gone, s.batch.take()))
+            s.batch = None;
+            Ok(())
         })?;
-        let (merged, batch) = gone;
-        let batch_id = batch.as_ref().map(|b| b.id.clone());
-        let recovered_prs: Vec<PrNumber> = merged.iter().map(|(item, _)| item.pr).collect();
-        for (item, commit) in merged {
-            self.history(EventKind::Merged {
-                pr: item.pr,
-                batch: batch_id.clone().unwrap_or(BatchId(String::new())),
-                commit: commit.unwrap_or_else(|| item.head.clone()),
-                submitted_ms: item.submitted_ms,
-            })?;
-        }
-        if let Some(batch) = batch
-            && let Some(mut record) = self.store.read_batch(&batch.id)?
-            && record.finished_ms.is_none()
-        {
-            let now = EpochMs::now();
-            for (pr, commit) in settled_commits {
-                let known = record.merges.iter().any(|m| m.pr == pr);
-                if let (Some(commit), false) = (commit, known) {
-                    record.merges.push(MergeRef { pr, commit });
-                }
-            }
-            record.finished_ms = Some(now);
-            self.store.write_batch(&record)?;
-            let mut merged_prs: Vec<PrNumber> = record.merges.iter().map(|m| m.pr).collect();
-            for pr in recovered_prs {
-                if !merged_prs.contains(&pr) {
-                    merged_prs.push(pr);
-                }
-            }
-            if !merged_prs.is_empty() || !record.bounced.is_empty() {
-                self.history(EventKind::BatchFinished {
-                    batch: batch.id.clone(),
-                    merged: merged_prs,
-                    bounced: record.bounced.clone(),
-                    seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
-                    verify_s: record.verify_s,
-                })?;
-            }
-        }
         self.prune_failed_refs()
     }
 

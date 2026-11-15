@@ -349,3 +349,40 @@ fn a_new_daemon_clears_an_engine_warning_an_earlier_one_left() {
     ok(chute(&lab, &["down", "--now"]).output().unwrap());
     wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
 }
+
+#[test]
+fn a_daemon_whose_state_write_failed_after_telling_the_agent_recovers_the_pr_by_itself() {
+    let lab = Lab::new("[ -e BAD ] && fail \"FAILED bad_test\"");
+    lab.open_pr(1, &[("BAD", "")]);
+    let root = lab.sb.root();
+    let store_dir = lab.store.dir().to_path_buf();
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hc/get.json");
+    lab.sb.script(
+        "hc",
+        &format!(
+            "echo \"$*\" >> '{root}/hc-calls'\ncase \"$1\" in\nget) cat '{fixture}';;\nsend)\n  if [ ! -e '{root}/fault-made' ]; then touch '{root}/fault-made'; mkdir -p '{store}/.state.json.tmp-'$PPID; echo $PPID > '{root}/fault-pid'; fi;;\n*) exit 97;;\nesac\n",
+            root = root.display(),
+            fixture = fixture.display(),
+            store = store_dir.display(),
+        ),
+    );
+
+    let mut daemon = start_daemon(&lab);
+    wait_until("상태 쓰기가 실패하지 않았다", || {
+        root.join("fault-pid").exists()
+    });
+    let pid = std::fs::read_to_string(root.join("fault-pid")).unwrap();
+    wait_until("경고 없이 장애가 이어졌다", || {
+        std::fs::read_to_string(root.join("hc-calls")).is_ok_and(|t| t.contains("send "))
+    });
+    std::fs::remove_dir(store_dir.join(format!(".state.json.tmp-{}", pid.trim()))).unwrap();
+
+    wait_until("데몬이 스스로 PR을 되살리지 못했다", || {
+        lab.item_state(1) == Some(ItemState::Bounced(chute::model::BounceReason::Verify))
+            && lab.state().batch.is_none()
+    });
+
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+}

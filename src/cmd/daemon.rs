@@ -241,6 +241,9 @@ fn serve(engine: &Engine, store: &RepoStore, me: &mut DaemonInfo, flags: &Flags)
             }
             Ok(Pass::Cancelled) => break,
             Err(e) => {
+                // A failed state write can leave the batch's PRs `in_batch`, and only
+                // recovery puts them back.
+                recovered = false;
                 doing(store, me, "오류 뒤 기다리는 중");
                 fail("batch를 처리하지 못했다", e, &mut failures, &mut warned);
             }
