@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 
 use super::Ctx;
 
-/// The agent manual, embedded at build time. `chute --skill` prints it unchanged.
 pub const MANUAL: &str = include_str!("../../skill/manual.md");
 
 pub fn run(_ctx: &Ctx) -> Result<ExitCode> {

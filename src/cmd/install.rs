@@ -14,7 +14,6 @@ pub struct Args {}
 
 const SKILL_MD: &str = include_str!("../../skill/SKILL.md");
 
-/// The mod files Herdr loads. The tests and `package.json` stay in the repository.
 const MOD_FILES: [(&str, &str); 3] = [
     ("main.js", include_str!("../../mod/chute/main.js")),
     ("board.js", include_str!("../../mod/chute/board.js")),
@@ -89,8 +88,6 @@ pub fn install(layout: &Layout) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Writes `text` through a temporary file so a reader never sees half a file. Leaves a file
-/// that already holds `text` alone, which keeps its modification time and makes reruns quiet.
 fn sync(path: &Path, text: &str) -> Result<Entry> {
     let outcome = match fs::read_to_string(path) {
         Ok(current) if current == text => Outcome::Unchanged,
