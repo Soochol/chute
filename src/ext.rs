@@ -66,6 +66,8 @@ pub enum ExtError {
         code: Option<i32>,
         stderr: String,
     },
+    #[error("`{call}`의 출력이 {limit}바이트를 넘어 멈췄다")]
+    TooMuchOutput { call: String, limit: usize },
     #[error("`{call}`의 출력을 읽지 못했다")]
     Io { call: String, source: io::Error },
 }
@@ -239,6 +241,13 @@ impl Ext {
             for pipe in &mut pipes {
                 pipe.read_available().map_err(io_error(call.clone()))?;
             }
+            if pipes.iter().any(|p| p.bytes.len() > MAX_OUTPUT) {
+                kill_group(&mut child);
+                return Err(ExtError::TooMuchOutput {
+                    call,
+                    limit: MAX_OUTPUT,
+                });
+            }
             pause = (pause * 2).min(Duration::from_millis(20));
         }
         let [stdout, stderr] = pipes.map(|p| p.bytes);
@@ -255,6 +264,12 @@ impl Ext {
 /// keep the pipe open forever; what the process itself wrote is read well within this.
 /// The pipes close when the call returns, so nothing keeps reading after that.
 const PIPE_GRACE: Duration = Duration::from_millis(500);
+
+/// Per pipe. Past this the group is killed instead of growing memory without bound.
+const MAX_OUTPUT: usize = 256 * 1024 * 1024;
+
+/// Reads per pipe per turn, so the deadline is checked even while a writer never pauses.
+const CHUNKS_PER_TURN: usize = 16;
 
 struct Pipe {
     file: Option<File>,
@@ -282,7 +297,7 @@ impl Pipe {
             return Ok(());
         };
         let mut chunk = [0u8; 64 * 1024];
-        loop {
+        for _ in 0..CHUNKS_PER_TURN {
             match file.read(&mut chunk) {
                 Ok(0) => {
                     self.file = None;
@@ -294,6 +309,7 @@ impl Pipe {
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
     }
 }
 
@@ -333,9 +349,13 @@ fn spawn(command: &mut Command) -> io::Result<Child> {
 const SPAWN_TRIES: u32 = 50;
 
 fn time_out(child: &mut Child, call: String, after: Duration) -> ExtError {
+    kill_group(child);
+    ExtError::Timeout { call, after }
+}
+
+fn kill_group(child: &mut Child) {
     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
     let _ = child.wait();
-    ExtError::Timeout { call, after }
 }
 
 #[cfg(test)]
@@ -469,6 +489,40 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ExtError::Timeout { .. }), "{err}");
         assert!(wait_for(&mark), "시간 초과 뒤에도 파이프가 열려 있다");
+    }
+
+    #[test]
+    fn writers_that_never_pause_still_time_out() {
+        let sb = Sandbox::new();
+        let gh = sb.script("flood-gh", "cat /dev/zero & cat /dev/zero & wait\n");
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
+        let started = Instant::now();
+        let err = ext
+            .call(Tool::Gh, None, ["api"], Duration::from_millis(200))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExtError::Timeout { .. } | ExtError::TooMuchOutput { .. }
+            ),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn endless_output_stops_at_the_limit() {
+        let sb = Sandbox::new();
+        let gh = sb.script("endless-gh", "exec cat /dev/zero\n");
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
+        let err = ext
+            .call(Tool::Gh, None, ["api"], Duration::from_secs(60))
+            .unwrap_err();
+        assert!(matches!(err, ExtError::TooMuchOutput { .. }), "{err}");
     }
 
     #[test]
