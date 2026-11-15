@@ -565,3 +565,57 @@ fn turning_the_option_off_clears_every_no_checks_warning_and_wait_mark() {
         .count();
     assert_eq!(marked, 0);
 }
+
+#[test]
+fn a_ci_waiter_does_not_jump_ahead_of_an_earlier_pr_in_merge_order() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("x.txt", "one\n")]);
+    lab.open_pr(2, &[("x.txt", "two\n")]);
+    lab.gh_checks(1, &[("build", "pass")]);
+    lab.gh_checks(2, &[("build", "pass")]);
+    mark_ci_pending(&lab, &[2]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(summary.bounced, prs(&[2]));
+    assert_eq!(lab.bounced_events(), [(2, BounceReason::Conflict)]);
+}
+
+#[test]
+fn a_no_checks_warning_does_not_outlive_the_queued_state_of_its_pr() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    make_submitted_minutes_ago(&lab, 1, 11);
+    lab.engine().run_once().unwrap();
+    assert_eq!(lab.state().warnings.len(), 1);
+    lab.store
+        .update(|s| {
+            s.queue[0].state = ItemState::NeedsHuman(HumanReason::GaveUp);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Idle);
+
+    assert!(
+        lab.state().warnings.is_empty(),
+        "{:?}",
+        lab.state().warnings
+    );
+}
+
+#[test]
+fn failed_gh_reads_with_only_ci_waiters_leave_no_batch_records_behind() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    mark_ci_pending(&lab, &[1]);
+    lab.gh_checks_error(1, 2);
+
+    for _ in 0..3 {
+        assert!(lab.engine().run_once().is_err());
+    }
+
+    assert!(lab.batch_ids().is_empty(), "{:?}", lab.batch_ids());
+    assert_eq!(lab.item_state(1), Some(CI_PENDING));
+}

@@ -374,21 +374,30 @@ impl Engine {
     }
 
     fn prune_no_checks_warnings(&self, require_ci: Option<bool>) -> Result<()> {
+        let queued = |s: &State, pr: Option<PrNumber>| {
+            s.queue
+                .iter()
+                .any(|i| Some(i.pr) == pr && matches!(i.state, ItemState::Queued(_)))
+        };
         let stale = |s: &State| {
             s.warnings.iter().any(|w| {
-                w.kind == WarningKind::NoChecks
-                    && (require_ci == Some(false) || !s.queue.iter().any(|i| Some(i.pr) == w.pr))
+                w.kind == WarningKind::NoChecks && (require_ci == Some(false) || !queued(s, w.pr))
             })
         };
         if !stale(&self.store.load()?) {
             return Ok(());
         }
         self.store.update(|s| {
-            let in_queue: BTreeSet<PrNumber> = s.queue.iter().map(|i| i.pr).collect();
-            s.warnings.retain(|w| {
-                w.kind != WarningKind::NoChecks
-                    || (require_ci != Some(false) && w.pr.is_some_and(|pr| in_queue.contains(&pr)))
-            });
+            let keep: Vec<bool> = s
+                .warnings
+                .iter()
+                .map(|w| {
+                    w.kind != WarningKind::NoChecks
+                        || (require_ci != Some(false) && queued(s, w.pr))
+                })
+                .collect();
+            let mut keep = keep.into_iter();
+            s.warnings.retain(|_| keep.next().unwrap_or(true));
             Ok(())
         })
     }
@@ -420,32 +429,36 @@ impl Engine {
         let config = self.load_config()?;
         self.prune_no_checks_warnings(Some(config.require_ci))?;
         let id = self.new_batch_id();
-        let (taken, was_waiting_on_ci): (Vec<QueueItem>, BTreeSet<PrNumber>) =
-            self.store.update(|s| {
-                let waiting_on_ci: BTreeSet<PrNumber> = s
-                    .queue
-                    .iter()
-                    .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
-                    .map(|i| i.pr)
-                    .collect();
-                let prs = queue::take_batch(s, config.max_batch, ci_due);
-                if !prs.is_empty() {
-                    s.batch = Some(Batch {
-                        id: id.clone(),
-                        base: base.clone(),
-                        prs: prs.clone(),
-                        phase: Phase::Building,
-                        step: None,
-                        round: 0,
-                        started_ms: EpochMs::now(),
-                    });
-                }
-                let items = prs
-                    .iter()
-                    .filter_map(|pr| s.queue.iter().find(|i| i.pr == *pr).cloned())
-                    .collect();
-                Ok((items, waiting_on_ci))
-            })?;
+        let (taken, was_waiting_on_ci, queue_position): (
+            Vec<QueueItem>,
+            BTreeSet<PrNumber>,
+            BTreeMap<PrNumber, usize>,
+        ) = self.store.update(|s| {
+            let waiting_on_ci: BTreeSet<PrNumber> = s
+                .queue
+                .iter()
+                .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
+                .map(|i| i.pr)
+                .collect();
+            let prs = queue::take_batch(s, config.max_batch, ci_due);
+            if !prs.is_empty() {
+                s.batch = Some(Batch {
+                    id: id.clone(),
+                    base: base.clone(),
+                    prs: prs.clone(),
+                    phase: Phase::Building,
+                    step: None,
+                    round: 0,
+                    started_ms: EpochMs::now(),
+                });
+            }
+            let items = prs
+                .iter()
+                .filter_map(|pr| s.queue.iter().find(|i| i.pr == *pr).cloned())
+                .collect();
+            let position = s.queue.iter().enumerate().map(|(n, i)| (i.pr, n)).collect();
+            Ok((items, waiting_on_ci, position))
+        })?;
         if taken.is_empty() {
             return Ok(Pass::Idle);
         }
@@ -476,6 +489,7 @@ impl Engine {
             bounced: Vec::new(),
             deferred: BTreeSet::new(),
             was_waiting_on_ci,
+            queue_position,
             bisecting: false,
             verify_time: Duration::ZERO,
         };
@@ -617,6 +631,7 @@ struct Run<'e> {
     bounced: Vec<PrNumber>,
     deferred: BTreeSet<PrNumber>,
     was_waiting_on_ci: BTreeSet<PrNumber>,
+    queue_position: BTreeMap<PrNumber, usize>,
     bisecting: bool,
     verify_time: Duration,
 }
@@ -628,7 +643,8 @@ impl Run<'_> {
 
     fn execute(&mut self, taken: &[QueueItem]) -> Result<()> {
         self.save_record()?;
-        let group = self.admit(taken)?;
+        let mut group = self.admit(taken)?;
+        group.sort_by_key(|pr| self.queue_position[pr]);
         self.solve(group)?;
         self.recheck_conflicts()
     }
@@ -771,10 +787,16 @@ impl Run<'_> {
     }
 
     fn only_deferred(&self) -> bool {
-        !self.deferred.is_empty()
-            && self.deferred.len() == self.items.len()
+        !self.items.is_empty()
+            && self
+                .items
+                .keys()
+                .all(|pr| self.was_waiting_on_ci.contains(pr) || self.deferred.contains(pr))
             && self.merged.is_empty()
             && self.bounced.is_empty()
+            && self.landed.is_empty()
+            && self.record.verifications == 0
+            && self.record.pushed.is_empty()
     }
 
     fn head_changed(&mut self, item: &QueueItem, current: &Sha) -> Result<()> {
