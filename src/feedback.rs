@@ -321,13 +321,11 @@ impl Feedback<'_> {
             log_tail: step.failed_tests.is_empty().then(|| log_tail(&step.log)),
             tree: step.tree.clone(),
             git_ref: failed_ref.clone(),
-            repro: vec![
-                format!("git -C {repo} worktree add --detach {dir} {}", step.tree),
-                format!(
-                    "(cd {dir} && CHUTE_RUN_ID=repro_{run_id}_$$ {limit}sh -c {})",
-                    shell_word(&configured.run)
-                ),
-            ],
+            repro: vec![format!(
+                "git -C {repo} worktree add --detach {dir} {} && (cd {dir} && CHUTE_RUN_ID=repro_{run_id}_$$_$(date +%s) {limit}sh -c {})",
+                step.tree,
+                shell_word(&configured.run)
+            )],
             cleanup: format!("git -C {repo} worktree remove --force {dir}"),
         })
     }
@@ -379,13 +377,16 @@ impl Feedback<'_> {
                 &parent,
                 merge,
             ],
-        )?;
-        let text = match (diff.success(), diff.stdout.is_empty()) {
-            (false, _) => {
+        );
+        let text = match diff {
+            Err(e) => format!("diff를 만들지 못했다: {e}\n").into_bytes(),
+            Ok(diff) if !diff.success() => {
                 format!("diff를 만들지 못했다: {}\n", diff.stderr_text().trim()).into_bytes()
             }
-            (true, true) => "이 머지 커밋은 바뀐 파일이 없다\n".as_bytes().to_vec(),
-            (true, false) => diff.stdout,
+            Ok(diff) if diff.stdout.is_empty() => {
+                "이 머지 커밋은 바뀐 파일이 없다\n".as_bytes().to_vec()
+            }
+            Ok(diff) => diff.stdout,
         };
         Ok((files, text))
     }

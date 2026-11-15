@@ -2793,7 +2793,7 @@ fn the_repro_of_a_timeout_is_bounded_by_the_step_limit() {
         .step
         .unwrap();
     assert!(
-        step.repro[1].contains("timeout 1 sh -c 'sleep 20'"),
+        step.repro[0].contains("timeout 1 sh -c 'sleep 20'"),
         "{step:?}"
     );
     let tmp = lab.sb.root().join("tmp");
@@ -2825,7 +2825,7 @@ fn the_repro_of_a_timeout_is_bounded_by_the_step_limit() {
         .step
         .unwrap();
     assert!(
-        !verify.repro[1].contains("timeout "),
+        !verify.repro[0].contains("timeout "),
         "only a timeout is bounded"
     );
 }
@@ -2891,7 +2891,7 @@ fn the_repro_checks_out_the_commit_not_the_ref_that_may_move_or_vanish() {
 
     let step = written.doc.step.unwrap();
     assert!(
-        step.repro[0].ends_with(step.tree.as_str()),
+        step.repro[0].contains(&format!("{} && (", step.tree)),
         "{}",
         step.repro[0]
     );
@@ -3196,4 +3196,107 @@ fn partners_and_failed_refs_work_with_what_gitops_really_writes() {
         written.doc.step.unwrap().git_ref.as_deref(),
         Some("refs/chute/failed/pr-12-1")
     );
+}
+
+#[test]
+fn a_diff_that_ext_gives_up_on_still_leaves_the_file_list() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a change\n");
+    let tree = merge_branch_into_batch(&lab, "feat/a", 9);
+    let gitconfig = lab.sb.var("GIT_CONFIG_GLOBAL").unwrap();
+    lab.sb.script(
+        "git",
+        &format!(
+            "export HOME='{}' GIT_CONFIG_GLOBAL='{}' GIT_CONFIG_NOSYSTEM=1\ncase \"$*\" in *--no-textconv*) sleep 5 ;; esac\nexec git \"$@\"\n",
+            lab.sb.home().display(),
+            PathBuf::from(gitconfig).display()
+        ),
+    );
+    let ext = Ext::from_vars(|k| lab.sb.var(k)).with_timeout(std::time::Duration::from_secs(2));
+    let fb = Feedback {
+        ext: &ext,
+        ..lab.fb()
+    };
+
+    let partner = fb
+        .partner_or_placeholder(
+            &Subject::from(&lab.item(12, "feat/b")),
+            &tree,
+            PrNumber(9),
+            "t",
+        )
+        .unwrap();
+
+    assert_eq!(partner.files, ["a.txt"]);
+    assert!(read(&partner.diff).contains("diff를 만들지 못했다"));
+}
+
+#[test]
+fn two_repro_runs_in_one_shell_get_different_run_ids() {
+    let lab = Lab::with_config(
+        "respawn = []\n[[verify]]\nname = \"test\"\nrun = \"echo RUNID=$CHUTE_RUN_ID\"\n",
+    );
+    let item = lab.item(12, "feat/a");
+    let step = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let once = format!("{}\n{}", step.repro.join("\n"), step.cleanup);
+
+    let out = lab
+        .sb
+        .command("sh")
+        .arg("-c")
+        .arg(format!("{once}\nsleep 1\n{once}"))
+        .current_dir(lab.sb.root())
+        .env("TMPDIR", &tmp)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let ids: Vec<&str> = stdout.lines().filter(|l| l.starts_with("RUNID=")).collect();
+    assert_eq!(ids.len(), 2, "{stdout}");
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn a_leftover_repro_folder_stops_the_run_instead_of_running_in_an_edited_tree() {
+    let lab =
+        Lab::with_config("respawn = []\n[[verify]]\nname = \"test\"\nrun = \"cat README.md\"\n");
+    let item = lab.item(12, "feat/a");
+    let step = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let run = || {
+        lab.sb
+            .command("sh")
+            .arg("-c")
+            .arg(step.repro.join("\n"))
+            .current_dir(lab.sb.root())
+            .env("TMPDIR", &tmp)
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    let left = tmp.join(format!(
+        "chute-repro-acme__widget-pr12-{}",
+        short(&step.tree)
+    ));
+    fs::write(left.join("README.md"), "EDITED BY THE AGENT\n").unwrap();
+
+    let second = run();
+
+    assert!(!second.status.success());
+    assert!(!String::from_utf8_lossy(&second.stdout).contains("EDITED"));
 }
