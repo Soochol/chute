@@ -396,8 +396,6 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
     move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
 }
 
-/// Items waiting for remote CI come after every other queued item, so they never crowd
-/// a ready PR out of a full batch.
 pub fn take_batch(state: &mut State, max_batch: u32) -> Vec<PrNumber> {
     let mut taken = Vec::new();
     for waiting_on_ci in [false, true] {

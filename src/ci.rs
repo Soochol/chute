@@ -32,8 +32,6 @@ pub struct Check {
     pub bucket: Bucket,
 }
 
-/// A failed or cancelled check fails the PR even while others still run. Skipped and neutral
-/// checks count as passed.
 pub fn judge(checks: &[Check]) -> Verdict {
     let failed: Vec<FailedCheck> = checks
         .iter()

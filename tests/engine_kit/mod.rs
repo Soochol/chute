@@ -243,8 +243,6 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         fs::write(self.gh_dir.join(format!("{n}.head")), head).unwrap();
     }
 
-    /// Makes the fake `gh pr checks` answer with these `(name, bucket)` pairs, exiting the way
-    /// the real one does: 1 when a check failed, 8 while one runs, else 0.
     pub fn gh_checks(&self, n: u64, checks: &[(&str, &str)]) {
         let list: Vec<String> = checks
             .iter()

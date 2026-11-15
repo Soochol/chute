@@ -362,8 +362,6 @@ impl Engine {
         Ok(())
     }
 
-    /// PRs waiting on remote CI are looked at again only after `ci_recheck`, so a queue
-    /// holding nothing else does not poll GitHub in a loop.
     fn ci_look_due(&self) -> bool {
         let looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
         looked.is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
@@ -627,9 +625,6 @@ impl Run<'_> {
         Ok(ready)
     }
 
-    /// The remote-CI gate in front of the batch, on only when `require_ci` is set. A PR whose
-    /// checks are still running or absent goes back to the queue marked `ci_pending`; a failed
-    /// one is sent back. The merged tree is still judged by local verification alone.
     fn passes_ci_gate(&mut self, item: &QueueItem) -> Result<bool> {
         if !self.config.require_ci {
             return Ok(true);
@@ -702,7 +697,6 @@ impl Run<'_> {
         })
     }
 
-    /// True when the run did nothing but put PRs back to wait on CI.
     fn only_deferred(&self) -> bool {
         !self.deferred.is_empty()
             && self.deferred.len() == self.items.len()
