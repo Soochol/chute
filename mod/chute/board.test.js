@@ -83,19 +83,40 @@ test("buttons: approve and drop on awaiting approval, retry and drop on needs_hu
   }
 });
 
-test("button commands are [verb, pr, --repo, path]", () => {
+test("approve carries the HEAD the card showed; retry and drop are [verb, pr, --repo, path]", () => {
   const repo = only([fixture]);
   const human = Object.fromEntries(section(repo, "human").items.map((item) => [item.pr, item.actions]));
   const path = fixture.repo.path;
   assert.deepEqual(human[21].map((a) => a.args), [
-    ["approve", "21", "--repo", path],
+    ["approve", "21", "--head", itemOf(21).head, "--repo", path],
     ["drop", "21", "--repo", path],
   ]);
   assert.deepEqual(human[9].map((a) => a.args), [
     ["retry", "9", "--repo", path],
     ["drop", "9", "--repo", path],
   ]);
-  assert.deepEqual(actionArgs("approve", 7, "/r"), ["approve", "7", "--repo", "/r"]);
+  assert.deepEqual(actionArgs("approve", 7, "/r", "abc1234"), ["approve", "7", "--head", "abc1234", "--repo", "/r"]);
+  assert.deepEqual(actionArgs("drop", 7, "/r", "abc1234"), ["drop", "7", "--repo", "/r"]);
+});
+
+test("an awaiting item whose head is missing or unsafe gets no approve button, only drop", () => {
+  const unsafe = [undefined, null, "", "abc", "ABC1234", "abc123g", "--repo", "abc 1234", " abc1234", "a".repeat(65), 1234, ["abc1234"]];
+  for (const head of unsafe) {
+    const item = section(only(withQueue({ ...itemOf(21), head })), "human").items[0];
+    assert.deepEqual(item.actions.map((a) => a.verb), ["drop"], JSON.stringify(head));
+  }
+  for (const head of ["abcd", "a".repeat(64), "09e5678"]) {
+    const item = section(only(withQueue({ ...itemOf(21), head })), "human").items[0];
+    assert.deepEqual(item.actions[0].args.slice(0, 4), ["approve", "21", "--head", head], head);
+  }
+});
+
+test("a needs_human item keeps retry and drop even without a head", () => {
+  const item = section(only(withQueue({ ...itemOf(9), head: undefined })), "human").items[0];
+  assert.deepEqual(item.actions.map((a) => a.args), [
+    ["retry", "9", "--repo", fixture.repo.path],
+    ["drop", "9", "--repo", fixture.repo.path],
+  ]);
 });
 
 test("a repo without a path gets no buttons rather than a command aimed at the current folder", () => {
@@ -249,7 +270,7 @@ test("several repos from --all, and a single object", () => {
   second.repo = { ...second.repo, slug: "Soochol/other", path: "/home/dev/code/other" };
   const result = board([fixture, second]);
   assert.deepEqual(result.repos.map((r) => r.slug), ["Soochol/chute", "Soochol/other"]);
-  assert.equal(section(result.repos[1], "human").items[0].actions[0].args[3], "/home/dev/code/other");
+  assert.equal(section(result.repos[1], "human").items[0].actions[0].args.at(-1), "/home/dev/code/other");
   assert.equal(board(fixture).repos.length, 1);
   const keys = result.repos.map((r) => section(r, "human").items[0].key);
   assert.equal(new Set(keys).size, 2, keys.join());
@@ -762,7 +783,11 @@ test("random malformed status never breaks the board", () => {
         for (const item of items) {
           for (const action of item.actions ?? []) {
             assert.equal(id, "human", `buttons outside human :: ${ctx}`);
-            const [verb, pr, flag, repoPath] = action.args;
+            const [verb, pr] = action.args;
+            const flag = action.args.at(-2);
+            const repoPath = action.args.at(-1);
+            if (verb === "approve") assert.ok(action.args[2] === "--head" && /^[0-9a-f]{4,64}$/.test(action.args[3]) && action.args.length === 6, `approve head :: ${ctx}`);
+            else assert.equal(action.args.length, 4, ctx);
             assert.ok(action.verb === verb && ["approve", "retry", "drop"].includes(verb), `verb :: ${ctx}`);
             assert.ok(/^[1-9][0-9]*$/.test(pr) && flag === "--repo" && repoPath === path && path !== "", `args ${action.args} :: ${ctx}`);
             assert.equal(pr, String(item.pr), ctx);
@@ -772,6 +797,10 @@ test("random malformed status never breaks the board", () => {
       for (const card of shown.human ?? []) {
         const want = card.state === "awaiting_approval" ? ["approve", "drop"] : ["retry", "drop"];
         const got = card.actions.map((a) => a.verb);
+        if (card.state === "awaiting_approval" && got.length === 1 && validPr(card.pr) && path) {
+          assert.deepEqual(got, ["drop"], `awaiting without a safe head :: ${ctx}`);
+          continue;
+        }
         assert.deepEqual(got, validPr(card.pr) && path ? want : [], `human buttons :: ${ctx}`);
       }
 
