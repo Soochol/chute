@@ -296,7 +296,7 @@ fn passing_prs_beyond_max_batch_go_back_to_the_queue_and_merge_next_time() {
 
     let first = done(lab.engine().run_once().unwrap());
     assert_eq!(first.merged, prs(&[1]));
-    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+    assert_eq!(lab.item_state(2), Some(CI_PENDING));
     assert_eq!(lab.gh_check_reads(), 1);
 
     let second = done(lab.engine().run_once().unwrap());
@@ -412,4 +412,69 @@ fn eight_prs_without_checks_do_not_keep_a_ninth_green_pr_from_merging() {
     let summary = done(lab.engine().run_once().unwrap());
 
     assert_eq!(summary.merged, prs(&[9]));
+}
+
+fn mark_ci_pending(lab: &Lab, prs: &[u64]) {
+    for n in prs {
+        lab.store
+            .update(|s| Ok(chute::queue::set_ci_pending(s, PrNumber(*n))?))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_ci_waiter_that_did_not_fit_is_no_batch_member_and_keeps_its_wait_mark() {
+    let lab = Lab::build("@STATUS@", "require_ci = true\nmax_batch = 1", 60);
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    lab.gh_checks(1, &[("build", "pass")]);
+    lab.gh_checks(2, &[("build", "pending")]);
+    mark_ci_pending(&lab, &[1, 2]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    let during = std::fs::read_to_string(lab.sb.root().join("status-during.json")).unwrap();
+    let during: serde_json::Value = serde_json::from_str(&during).unwrap();
+    assert_eq!(during["batch"]["prs"], serde_json::json!([1]));
+    assert_eq!(during["queue"][1]["state"], "queued");
+    assert_eq!(during["queue"][1]["state_reason"], "ci_pending");
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.prs, prs(&[1]));
+    assert_eq!(lab.item_state(2), Some(CI_PENDING));
+}
+
+#[test]
+fn ci_waiters_are_read_once_per_interval_even_while_other_prs_keep_arriving() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 1", 60);
+    for n in 1..=6 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+        lab.gh_checks(n, &[("build", "pending")]);
+    }
+    let engine = lab.engine_rechecking_ci_every(Duration::from_secs(3600));
+
+    for _ in 0..6 {
+        engine.run_once().unwrap();
+    }
+
+    assert_eq!(lab.gh_check_reads(), 6);
+}
+
+#[test]
+fn a_no_checks_warning_is_written_once_even_when_its_pr_is_pushed_out_of_a_batch() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 1", 60);
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    lab.gh_checks(1, &[("build", "pending")]);
+    mark_ci_pending(&lab, &[1, 2]);
+    make_submitted_minutes_ago(&lab, 2, 11);
+    lab.engine().run_once().unwrap();
+    let first = lab.state().warnings;
+    assert_eq!(first.len(), 1, "{first:?}");
+
+    lab.gh_checks(1, &[("build", "pass")]);
+    done(lab.engine().run_once().unwrap());
+    lab.engine().run_once().unwrap();
+
+    assert_eq!(lab.state().warnings, first);
+    assert_eq!(lab.item_state(2), Some(CI_PENDING));
 }

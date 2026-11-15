@@ -395,10 +395,11 @@ impl Engine {
 
     pub fn run_once(&self) -> Result<Pass> {
         self.prune_no_checks_warnings()?;
+        let ci_due = self.ci_look_due();
         let waiting = |s: &crate::model::State| {
             s.queue.iter().any(|i| match i.state {
                 ItemState::Queued(None) => true,
-                ItemState::Queued(Some(_)) => self.ci_look_due(),
+                ItemState::Queued(Some(_)) => ci_due,
                 _ => false,
             })
         };
@@ -418,25 +419,32 @@ impl Engine {
         }
         let config = self.load_config()?;
         let id = self.new_batch_id();
-        let taken: Vec<QueueItem> = self.store.update(|s| {
-            let prs = queue::take_batch(s, config.max_batch);
-            if !prs.is_empty() {
-                s.batch = Some(Batch {
-                    id: id.clone(),
-                    base: base.clone(),
-                    prs: prs.clone(),
-                    phase: Phase::Building,
-                    step: None,
-                    round: 0,
-                    started_ms: EpochMs::now(),
-                });
-            }
-            Ok(s.queue
-                .iter()
-                .filter(|i| prs.contains(&i.pr))
-                .cloned()
-                .collect())
-        })?;
+        let (taken, was_waiting_on_ci): (Vec<QueueItem>, BTreeSet<PrNumber>) =
+            self.store.update(|s| {
+                let waiting_on_ci: BTreeSet<PrNumber> = s
+                    .queue
+                    .iter()
+                    .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
+                    .map(|i| i.pr)
+                    .collect();
+                let prs = queue::take_batch(s, config.max_batch, ci_due);
+                if !prs.is_empty() {
+                    s.batch = Some(Batch {
+                        id: id.clone(),
+                        base: base.clone(),
+                        prs: prs.clone(),
+                        phase: Phase::Building,
+                        step: None,
+                        round: 0,
+                        started_ms: EpochMs::now(),
+                    });
+                }
+                let items = prs
+                    .iter()
+                    .filter_map(|pr| s.queue.iter().find(|i| i.pr == *pr).cloned())
+                    .collect();
+                Ok((items, waiting_on_ci))
+            })?;
         if taken.is_empty() {
             return Ok(Pass::Idle);
         }
@@ -466,6 +474,7 @@ impl Engine {
             merged: Vec::new(),
             bounced: Vec::new(),
             deferred: BTreeSet::new(),
+            was_waiting_on_ci,
             bisecting: false,
             verify_time: Duration::ZERO,
         };
@@ -606,6 +615,7 @@ struct Run<'e> {
     merged: Vec<PrNumber>,
     bounced: Vec<PrNumber>,
     deferred: BTreeSet<PrNumber>,
+    was_waiting_on_ci: BTreeSet<PrNumber>,
     bisecting: bool,
     verify_time: Duration,
 }
@@ -626,7 +636,9 @@ impl Run<'_> {
         let mut ready = Vec::new();
         for item in taken {
             match self.engine.inspect(item)? {
-                Inspection::Ready if ready.len() >= self.config.max_batch as usize => {}
+                Inspection::Ready if ready.len() >= self.config.max_batch as usize => {
+                    self.release(item.pr)?
+                }
                 Inspection::Ready if self.passes_ci_gate(item)? => ready.push(item.pr),
                 Inspection::Ready => {}
                 Inspection::Closed => {
@@ -685,6 +697,24 @@ impl Run<'_> {
                 Ok(false)
             }
         }
+    }
+
+    /// Puts a PR the batch has no room for back in the queue, still marked if it was waiting
+    /// on CI, so it neither counts as a member nor loses its place.
+    fn release(&mut self, pr: PrNumber) -> Result<()> {
+        let keep_mark = self.was_waiting_on_ci.contains(&pr);
+        self.engine.store.update(|s| {
+            queue::requeue(s, pr)?;
+            if keep_mark {
+                queue::set_ci_pending(s, pr)?;
+            }
+            if let Some(batch) = &mut s.batch {
+                batch.prs.retain(|p| *p != pr);
+            }
+            Ok(())
+        })?;
+        self.record.prs.retain(|p| *p != pr);
+        self.save_record()
     }
 
     fn defer(&mut self, pr: PrNumber, warn_no_checks: bool) -> Result<()> {

@@ -396,12 +396,15 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
     move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
 }
 
-pub fn take_batch(state: &mut State, max_batch: u32) -> Vec<PrNumber> {
+pub fn take_batch(state: &mut State, max_batch: u32, waiting_on_ci: bool) -> Vec<PrNumber> {
     let mut taken = Vec::new();
-    for waiting_on_ci in [false, true] {
+    for ci_pass in [false, true] {
+        if ci_pass && !waiting_on_ci {
+            break;
+        }
         for item in &mut state.queue {
             let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
-            if is_waiting != waiting_on_ci || (!is_waiting && taken.len() >= max_batch as usize) {
+            if is_waiting != ci_pass || (!is_waiting && taken.len() >= max_batch as usize) {
                 continue;
             }
             if let Some(Next::To(to)) = step(item.state, Action::Take) {
@@ -729,7 +732,7 @@ mod tests {
             (4, QUEUED),
             (5, QUEUED),
         ]);
-        let taken = take_batch(&mut state, 3);
+        let taken = take_batch(&mut state, 3, true);
         assert_eq!(prs(&taken), [7, 3, 9]);
         assert_eq!(state_of(&state, 7), IN_BATCH);
         assert_eq!(state_of(&state, 9), IN_BATCH);
@@ -748,21 +751,23 @@ mod tests {
             (6, QUEUED),
         ]);
         let before = state.clone();
-        assert_eq!(prs(&take_batch(&mut state, 8)), [6]);
+        assert_eq!(prs(&take_batch(&mut state, 8, true)), [6]);
         assert_eq!(state_of(&state, 6), IN_BATCH);
         for pr in 1..=5 {
             assert_eq!(state_of(&state, pr), state_of(&before, pr), "#{pr}");
         }
-        assert!(take_batch(&mut state, 8).is_empty());
+        assert!(take_batch(&mut state, 8, true).is_empty());
     }
 
     #[test]
-    fn take_batch_takes_every_ci_waiter_after_the_others_and_caps_only_the_others() {
+    fn take_batch_takes_ci_waiters_after_the_others_and_only_when_asked() {
         let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED), (3, CI_PENDING), (4, QUEUED)]);
-        assert_eq!(prs(&take_batch(&mut state, 1)), [2, 1, 3]);
+        assert_eq!(prs(&take_batch(&mut state, 1, true)), [2, 1, 3]);
         assert_eq!(state_of(&state, 4), QUEUED);
         let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED)]);
-        assert_eq!(prs(&take_batch(&mut state, 1)), [2, 1]);
+        assert_eq!(prs(&take_batch(&mut state, 8, false)), [2]);
+        assert_eq!(state_of(&state, 1), CI_PENDING);
+        assert_eq!(prs(&take_batch(&mut state, 1, true)), [1]);
     }
 
     #[test]
@@ -774,7 +779,7 @@ mod tests {
         clear_ci_pending(&mut state, PrNumber(1)).unwrap();
         clear_ci_pending(&mut state, PrNumber(1)).unwrap();
         assert_eq!(state_of(&state, 1), QUEUED);
-        assert_eq!(prs(&take_batch(&mut state, 8)), [1]);
+        assert_eq!(prs(&take_batch(&mut state, 8, true)), [1]);
         assert!(set_ci_pending(&mut state, PrNumber(1)).is_err());
     }
 
@@ -816,7 +821,7 @@ mod tests {
     }
 
     fn fail_once(state: &mut State, pr: u64, kind: FailureKind, budget: u32) -> ItemState {
-        assert!(prs(&take_batch(state, 8)).contains(&pr));
+        assert!(prs(&take_batch(state, 8, true)).contains(&pr));
         record_failure(state, PrNumber(pr), failure(kind), budget).unwrap()
     }
 
@@ -868,7 +873,7 @@ mod tests {
         }
 
         let mut state = queue_of(&[(1, QUEUED)]);
-        take_batch(&mut state, 8);
+        take_batch(&mut state, 8, true);
         head_changed(&mut state, PrNumber(1)).unwrap();
         assert_eq!(
             state_of(&state, 1),
@@ -882,7 +887,7 @@ mod tests {
     fn head_changed_does_not_use_up_budget_even_when_it_is_gone() {
         let mut state = queue_of(&[(1, QUEUED)]);
         state.queue[0].attempts = 3;
-        take_batch(&mut state, 8);
+        take_batch(&mut state, 8, true);
         head_changed(&mut state, PrNumber(1)).unwrap();
         assert_eq!(
             state_of(&state, 1),

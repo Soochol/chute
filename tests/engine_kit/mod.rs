@@ -348,7 +348,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
     pub fn strand_in_batch(&self) {
         self.store
             .update(|s| {
-                let taken = queue::take_batch(s, 8);
+                let taken = queue::take_batch(s, 8, true);
                 s.batch = Some(Batch {
                     id: BatchId("b-crashed".into()),
                     base: sha(&self.origin_main()),
