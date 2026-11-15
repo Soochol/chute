@@ -527,6 +527,12 @@ pub struct PreflightRecord {
     pub result: PreflightResult,
     pub report: Option<PathBuf>,
     pub at_ms: EpochMs,
+    /// The default-branch tip the run started from. Records written before it was kept have none.
+    #[serde(default)]
+    pub base: Option<Sha>,
+    /// The queued PRs the head was verified together with.
+    #[serde(default)]
+    pub with: Vec<PrNumber>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

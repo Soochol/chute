@@ -1144,6 +1144,8 @@ mod tests {
             result: crate::model::PreflightResult::Pass,
             report: None,
             at_ms: EpochMs(1),
+            base: None,
+            with: Vec::new(),
         }
     }
 

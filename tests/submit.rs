@@ -677,6 +677,8 @@ fn preflight_at(w: &World, head: &str) {
                     result: PreflightResult::Pass,
                     report: None,
                     at_ms: EpochMs(5),
+                    base: None,
+                    with: Vec::new(),
                 },
             );
             Ok(())
