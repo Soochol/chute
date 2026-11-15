@@ -1,7 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, props, run, theme, watchFolder } from "herdr";
-import { firstLine, interpret } from "./board.js";
+import { failureText, firstLine, interpret } from "./board.js";
 
 const FALLBACK_MS = 15000;
 const MIN_READ_GAP_MS = 1000;
@@ -12,51 +12,52 @@ export default class Chute extends View {
     const bin = props()?.bin;
     this.bin = typeof bin === "string" && bin ? bin : "chute";
     this.result = null;
-    this.loading = false;
+    this.reading = false;
     this.dirty = false;
-    this.scheduled = false;
-    this.last = 0;
     this.watching = new Set();
-    this.busy = new Set();
+    this.busy = new Map();
     this.errors = new Map();
     this.request(cx);
     cx.timer.every(FALLBACK_MS, (cx) => this.request(cx));
   }
 
   request(cx) {
-    if (this.loading) {
+    if (this.reading) {
       this.dirty = true;
       return;
     }
-    if (this.scheduled) return;
-    this.scheduled = true;
-    cx.timer.after(Math.max(0, this.last + MIN_READ_GAP_MS - Date.now()), (cx) => {
-      this.scheduled = false;
-      this.load(cx);
+    this.reading = true;
+    cx.spawn(async (cx) => {
+      try {
+        let result;
+        try {
+          const r = await exec(this.bin, ["status", "--json", "--all"]);
+          result = { code: r.code, stdout: r.stdout, stderr: r.stderr };
+        } catch (e) {
+          result = { spawnError: String(e?.message ?? e) };
+        }
+        this.result = result;
+        this.settle(interpret(result), cx);
+        cx.notify();
+      } finally {
+        cx.timer.after(MIN_READ_GAP_MS, (cx) => {
+          this.reading = false;
+          if (this.dirty) {
+            this.dirty = false;
+            this.request(cx);
+          }
+        });
+      }
     });
   }
 
-  load(cx) {
-    this.loading = true;
-    cx.spawn(async (cx) => {
-      let result;
-      try {
-        const r = await exec(this.bin, ["status", "--json", "--all"]);
-        result = { code: r.code, stdout: r.stdout, stderr: r.stderr };
-      } catch (e) {
-        result = { spawnError: String(e?.message ?? e) };
-      }
-      this.result = result;
-      this.last = Date.now();
-      this.loading = false;
-      const board = interpret(result);
-      if (board.kind === "board") for (const repo of board.repos) this.watch(repo.stateDir, cx);
-      cx.notify();
-      if (this.dirty) {
-        this.dirty = false;
-        this.request(cx);
-      }
-    });
+  settle(board, cx) {
+    if (board.kind !== "board") return;
+    const cards = board.repos.flatMap((repo) => repo.sections).filter((s) => s.id === "human").flatMap((s) => s.items);
+    for (const [key, error] of this.errors) {
+      if (!cards.some((card) => card.key === key && card.state === error.state)) this.errors.delete(key);
+    }
+    for (const repo of board.repos) this.watch(repo.stateDir, cx);
   }
 
   // watchFolder rejects a tree with more than 4096 folders (Linux); the fallback timer covers it.
@@ -76,19 +77,20 @@ export default class Chute extends View {
   }
 
   act(card, action, cx) {
-    const key = `${card.key}:${action.verb}`;
-    if (this.busy.has(key)) return;
-    this.busy.add(key);
+    if (this.busy.has(card.key)) return;
+    this.busy.set(card.key, action.verb);
     this.errors.delete(card.key);
     cx.notify();
     cx.spawn(async (cx) => {
+      let text = "";
       try {
         const r = await exec(this.bin, action.args);
-        if (r.code !== 0) this.errors.set(card.key, firstLine(r.stderr) || firstLine(r.stdout) || `종료 코드 ${r.code}`);
+        if (r.code !== 0) text = failureText(r);
       } catch (e) {
-        this.errors.set(card.key, firstLine(e?.message ?? e));
+        text = firstLine(e?.message ?? e) || "명령을 실행하지 못했다";
       }
-      this.busy.delete(key);
+      if (text) this.errors.set(card.key, { text, state: card.state });
+      this.busy.delete(card.key);
       cx.notify();
       this.request(cx);
     });
@@ -178,7 +180,7 @@ export default class Chute extends View {
   }
 
   cardView(card, t, { human }) {
-    const error = this.errors.get(card.key);
+    const error = this.errors.get(card.key)?.text;
     return v_flex()
       .gap(5)
       .p(9)
@@ -206,7 +208,7 @@ export default class Chute extends View {
         h_flex()
           .gap(8)
           .items_start()
-          .child(agentChip(card.agent, t))
+          .child(agentChip(card.agent, t, card.key))
           .child(div().flex_none().text_size(12).text_color(t.dim).child(`재시도 ${card.retries}`)),
       )
       .when(Boolean(card.failure?.report), (el) =>
@@ -234,7 +236,7 @@ export default class Chute extends View {
   }
 
   button(card, action, primary, t) {
-    const pending = this.busy.has(`${card.key}:${action.verb}`);
+    const running = this.busy.get(card.key);
     return div()
       .id(`act-${card.key}-${action.verb}`)
       .px(10)
@@ -247,10 +249,10 @@ export default class Chute extends View {
       .border_color(primary ? t.solid : t.border)
       .bg(primary ? t.solid : t.surface)
       .text_color(primary ? t.solid_foreground : t.foreground)
-      .when(pending, (el) => el.opacity(0.5))
+      .when(running !== undefined, (el) => el.opacity(0.5))
       .hover((s) => s.bg(primary ? t.solid : t.hover))
       .on_click((_e, cx) => this.act(card, action, cx))
-      .child(pending ? "처리 중…" : action.label);
+      .child(running === action.verb ? "처리 중…" : action.label);
   }
 }
 
@@ -288,7 +290,7 @@ function titleLine(card, t) {
     .child(div().flex_1().min_w(0).whitespace_normal().child(card.title));
 }
 
-function agentChip(agent, t) {
+function agentChip(agent, t, cardKey) {
   if (!agent) return div().flex_1().min_w(0).text_size(12).text_color(t.dim).child("에이전트 없음");
   const label = h_flex()
     .flex_1()
@@ -307,7 +309,7 @@ function agentChip(agent, t) {
     );
   if (!agent.alive) return label;
   return label
-    .id(`peek-${agent.terminal}`)
+    .id(`peek-${cardKey}-${agent.terminal}`)
     .cursor_pointer()
     .rounded(4)
     .hover((s) => s.bg(t.hover))
