@@ -1,6 +1,7 @@
 # chute v1 플랜
 
 > 작성일 2026-11-15. 플랜 에이전트가 쓴 설계다. 승인 시점의 기록이며 구현 중 바뀐 것은 반영하지 않는다.
+> 같은 날 사용자가 8절의 결정 네 건에 답했고, 그 답을 반영했다.
 
 chute는 herdr 에이전트들이 main에 합류하는 관문이다. 에이전트는 PR을 올리기 전에 chute에 묻고, chute는 통과한 PR을 묶어 머지하고, 막힌 PR은 이유와 함께 만든 에이전트에게 돌려보낸다. 사람은 Herdr 창에서 흐름을 본다.
 
@@ -26,6 +27,15 @@ chute는 검증을 로컬에서 묶음 단위로 한 번에 돌리고, 실패와
 | 대상 | GitHub 전용, 1인 개발자, 로컬 PC |
 
 합의된 동작은 열 가지다. preflight, submit, batch, 로컬 검증, 이분 탐색, 반송, 재시도 예산과 flaky 판별, 현황판(mod), 스킬, batch 되돌리기.
+
+플랜 초안을 본 뒤 사용자가 더 정한 것은 네 가지다. 원문과 해석은 8절에 있다.
+
+| 항목 | 결정 |
+|---|---|
+| flaky로 판정된 batch | 머지하고 기록한다 |
+| 에이전트가 없을 때 띄울 명령 | 기본값 `["claude", "--dangerously-skip-permissions"]` |
+| mod 작업자의 화면 확인 | 사용자의 Herdr 창에 설치해 확인해도 된다 |
+| 원격 CI | 옵션으로 두고 기본값은 꺼짐이다(`require_ci`) |
 
 ## 3. 확인한 사실
 
@@ -106,7 +116,7 @@ chute는 검증을 로컬에서 묶음 단위로 한 번에 돌리고, 실패와
 - 충돌: 충돌한 파일, 그 파일을 고친 main 쪽 커밋(SHA, 제목), 해결 방법(main을 합치고 다시 submit).
 - 재현: 실패한 트리의 커밋을 `refs/chute/failed/…` 참조로 남겨 둔다. 에이전트는 그 커밋을 체크아웃해 단계 명령을 그대로 실행하면 된다. PR이 머지되거나 큐에서 빠지면 참조를 지운다.
 
-**전달.** 기록한 주소의 터미널이 살아 있고 `created_ms`가 같으면 `hc send`로 요약 한 줄과 보고서 경로를 보낸다. 없으면 `chute.toml`의 `respawn` 명령을 `hc run --bg --no-parent`로 띄우고 첫 일로 같은 내용을 준다. 작업 폴더는 원래 에이전트의 worktree가 남아 있으면 그곳이고, 없으면 `~/.herdr/worktrees/<저장소>/<브랜치>`에 PR 브랜치의 worktree를 만든다(Herdr의 worktree 규칙과 같은 자리). 새 에이전트에는 `herdr.space`·`herdr.tab` 라벨을 붙이지 않는다. 붙이면 사용자의 탭에 pane이 끼어든다. 현황판에서 주소를 눌러 들여다볼 수 있게 한다.
+**전달.** 기록한 주소의 터미널이 살아 있고 `created_ms`가 같으면 `hc send`로 요약 한 줄과 보고서 경로를 보낸다. 없으면 `chute.toml`의 `respawn` 명령을 `hc run --bg --no-parent`로 띄우고 첫 일로 같은 내용을 준다. `respawn`의 기본값은 사용자가 정한 `["claude", "--dangerously-skip-permissions"]`다. 이 값은 새 에이전트가 권한 확인 없이 명령을 실행하게 한다. 무인으로 뜨는 에이전트가 권한 대화상자에서 멈추지 않게 하려는 선택이고, `chute init`이 쓰는 초안의 주석과 README, 설명서가 이 사실을 밝힌다. 작업 폴더는 원래 에이전트의 worktree가 남아 있으면 그곳이고, 없으면 `~/.herdr/worktrees/<저장소>/<브랜치>`에 PR 브랜치의 worktree를 만든다(Herdr의 worktree 규칙과 같은 자리). 새 에이전트에는 `herdr.space`·`herdr.tab` 라벨을 붙이지 않는다. 붙이면 사용자의 탭에 pane이 끼어든다. 현황판에서 주소를 눌러 들여다볼 수 있게 한다.
 
 **전달하지 못하면 사람 차례다.** 대상이 `blocked`이거나, `respawn`이 비어 있거나, 띄운 에이전트에 첫 일이 전달되지 않았으면 그 PR을 사람 차례에 올린다(`unreachable`).
 
@@ -114,7 +124,7 @@ chute는 검증을 로컬에서 묶음 단위로 한 번에 돌리고, 실패와
 
 **재시도 예산.** PR마다 연속 반송 횟수를 센다. 반송을 `budget`번(기본 3) 보낸 뒤 또 실패하면 반송하지 않고 사람 차례에 올린다(`budget`). 머지되거나 사람이 `chute retry`를 하면 0으로 돌아간다.
 
-**flaky.** 4.2의 5번으로 판정한다. 그 batch는 통과로 보고 머지하며, 단계·시험 이름·트리를 기록해 현황판에 보인다. 에이전트에게는 보내지 않는다. 8절의 1번 결정이 이 처리를 바꿀 수 있다.
+**flaky.** 4.2의 5번으로 판정한다. 그 batch는 통과로 보고 머지하며, 단계·시험 이름·트리를 기록해 현황판에 보인다. 에이전트에게는 보내지 않는다. 사용자가 이 처리를 확정했다. 흔들리는 시험을 새로 만든 PR도 머지될 수 있다는 점은 받아들인 것이다.
 
 ### 4.4 사람 확인 옵션
 
@@ -136,7 +146,7 @@ submit은 preflight 통과를 강제하지 않는다. 최종 판정은 batch 검
 
 ### 4.7 현황판과 스킬
 
-**mod는 `chute status --json --all`의 출력만 그린다.** 상태 파일을 직접 읽지 않는다. 상태 폴더의 변화(`watchFolder`)와 느린 타이머는 새로 고칠 때를 알려 줄 뿐이다. 버튼은 `chute approve`, `chute retry`, `chute drop`을 실행한다. 되돌리기는 CLI에만 둔다. 화면 순서는 사람 차례, 검증 중 batch, 대기, 반송, 오늘의 숫자다.
+**mod는 `chute status --json --all`의 출력만 그린다.** 상태 파일을 직접 읽지 않는다. 상태 폴더의 변화(`watchFolder`)와 느린 타이머는 새로 고칠 때를 알려 줄 뿐이다. 버튼은 `chute approve`, `chute retry`, `chute drop`을 실행한다. 되돌리기는 CLI에만 둔다. mod는 props의 `bin`이 있으면 `chute` 대신 그 실행 파일을 부른다. `chute`가 Herdr의 PATH에 없을 때 쓰고, 작업자가 fixture를 출력하는 가짜 실행 파일로 화면을 확인할 때도 쓴다. 화면 순서는 사람 차례, 검증 중 batch, 대기, 반송, 오늘의 숫자다.
 
 **상태 JSON이 엔진과 mod 사이의 계약이다.** 모든 상태를 담은 fixture 파일을 저장소에 두고, Rust 쪽은 fixture가 상태 타입으로 읽히고 다시 같은 JSON으로 써지는지 시험하고, mod 쪽은 같은 fixture로 표시 항목을 만든다. 필드 이름이 바뀌면 시험이 깨진다.
 
@@ -148,7 +158,21 @@ submit은 preflight 통과를 강제하지 않는다. 최종 판정은 batch 검
 
 ### 4.8 저장소 운영
 
-**GitHub Actions CI를 두지 않는다.** "로컬 검증이 최종"이 이 프로젝트의 전제다. 저장소 루트에 chute 자신의 `chute.toml`을 두어 검증 명령(`cargo fmt --check`, `cargo clippy`, `cargo test`)을 한곳에 적는다. 작업자는 CI 대신 최종 HEAD의 로컬 전체 시험 결과를 근거로 보고한다.
+**chute 저장소에는 GitHub Actions CI를 두지 않는다.** "로컬 검증이 최종"이 이 프로젝트의 전제다. 저장소 루트에 chute 자신의 `chute.toml`을 두어 검증 명령(`cargo fmt --check`, `cargo clippy`, `cargo test`)을 한곳에 적는다. 작업자는 CI 대신 최종 HEAD의 로컬 전체 시험 결과를 근거로 보고한다.
+
+### 4.9 원격 CI 옵션
+
+사용자는 CI에 대해 "옵션 처리, 기본값은 off"라고 답했다. 이것을 chute의 기능으로 해석했다(8절의 4번). `chute.toml`의 `require_ci`가 그 옵션이고 기본값은 `false`다.
+
+- 꺼져 있으면 chute는 GitHub의 check를 보지 않는다. 지금까지의 설계 그대로다.
+- 켜면 batch에 넣기 전에 PR마다 등록된 HEAD의 GitHub check를 `gh`로 읽는다.
+  - 모두 통과했으면 batch에 넣는다. 건너뛴 check와 중립은 통과로 본다.
+  - 도는 중이거나 아직 check가 하나도 없으면 `queued`로 두고 이번 batch에서 뺀다(사유 `ci_pending`). 다음 batch 때 다시 본다. check가 10분 넘게 하나도 없으면 현황판에 경고를 남긴다. CI가 없는 저장소에서 옵션만 켠 경우를 알리기 위해서다.
+  - 실패했거나 취소됐으면 반송한다(사유 `ci`). 보고서에는 실패한 check의 이름과 링크가 들어간다. 재시도 예산을 한 번 쓴다.
+- 보는 것은 PR 자신의 HEAD에 대한 check다. 합친 트리는 여전히 로컬 검증이 판정한다. **로컬 검증이 최종이라는 원칙은 그대로이고, 이 옵션은 그 앞의 추가 관문이다.**
+- preflight는 이 옵션과 무관하다. PR을 올리기 전이라 check가 없다.
+
+이 옵션의 동작은 별도 작업(`ci-gate`)으로 뗐다. 기본값이 꺼짐이라 나머지 작업은 이것 없이 완결된다. 해석이 틀렸을 때 걷어 내는 방법은 8절에 있다.
 
 ## 5. 계약
 
@@ -182,7 +206,10 @@ approval = "agent"      # "agent" 또는 "human"
 budget = 3              # 연속 반송 한도
 max_batch = 8           # 한 batch의 PR 수 상한
 serialize = false       # true면 검증을 한 번에 하나만 돈다
-respawn = ["claude"]    # 에이전트가 없을 때 띄울 명령. 빈 배열이면 띄우지 않는다
+require_ci = false      # true면 GitHub check가 통과한 PR만 batch에 넣는다
+# 에이전트가 없을 때 띄울 명령. 빈 배열이면 띄우지 않는다.
+# 기본값은 새 에이전트가 권한 확인 없이 명령을 실행하게 한다.
+respawn = ["claude", "--dangerously-skip-permissions"]
 
 [[verify]]
 name = "test"
@@ -215,9 +242,9 @@ slots/<owner>__<name>/      검증 worktree (batch, preflight-<k>, revert)
 | 상태 | 뜻 | 다음 |
 |---|---|---|
 | `awaiting_approval` | 사람 승인을 기다린다 | `approve` → `queued` |
-| `queued` | batch를 기다린다 | 데몬이 가져가면 `in_batch` |
+| `queued` | batch를 기다린다. 사유가 `ci_pending`이면 원격 CI를 기다리는 중이다 | 데몬이 가져가면 `in_batch` |
 | `in_batch` | 지금 batch에 들어 있다 | 머지되면 큐에서 빠진다. 실패하면 `bounced`나 `needs_human`. 충돌이 풀리면 `queued` |
-| `bounced` | 에이전트에게 돌려보냈다. 사유는 `conflict`, `verify`, `timeout`, `head_changed` | 다시 submit하면 `queued`(또는 `awaiting_approval`) |
+| `bounced` | 에이전트에게 돌려보냈다. 사유는 `conflict`, `verify`, `timeout`, `head_changed`, `ci` | 다시 submit하면 `queued`(또는 `awaiting_approval`) |
 | `needs_human` | 사람 차례. 사유는 `budget`, `unreachable`, `gave_up` | `retry` → `queued`, `drop` → 빠진다 |
 
 큐 전체가 멈춘 상태는 항목이 아니라 저장소에 붙는다(`blocked: base_broken`).
@@ -247,7 +274,7 @@ slots/<owner>__<name>/      검증 worktree (batch, preflight-<k>, revert)
 }
 ```
 
-`--all`은 이 객체의 배열이다. `phase`는 `building`, `verifying`, `bisecting`, `pushing` 가운데 하나다. `median_lead_s`는 오늘 머지된 PR의 submit부터 머지까지 걸린 시간의 중앙값이다.
+`--all`은 이 객체의 배열이다. 항목의 사유는 `state_reason`에 들어간다(5.4의 값). `last_failure.kind`는 `conflict`, `verify`, `timeout`, `ci` 가운데 하나다. `phase`는 `building`, `verifying`, `bisecting`, `pushing` 가운데 하나다. `median_lead_s`는 오늘 머지된 PR의 submit부터 머지까지 걸린 시간의 중앙값이다.
 
 ### 5.6 소스 배치
 
@@ -262,6 +289,7 @@ slots/<owner>__<name>/      검증 worktree (batch, preflight-<k>, revert)
 | `src/queue.rs` | 큐 상태 전이 | queue |
 | `src/feedback.rs` | 보고서와 전달 | feedback |
 | `src/engine.rs` | batch 처리와 데몬 | engine |
+| `src/ci.rs` | GitHub check 읽기와 판정 | ci-gate |
 | `mod/chute/` | Herdr mod | mod |
 | `skill/` | 설명서와 스킬 파일 | skill-install |
 | `tests/fixtures/` | 상태 JSON fixture | scaffold |
@@ -270,7 +298,7 @@ slots/<owner>__<name>/      검증 worktree (batch, preflight-<k>, revert)
 
 ## 6. 작업 나누기
 
-작업은 10개이고 PR 하나씩이다. 프로필은 모두 `implementer`다.
+작업은 11개이고 PR 하나씩이다. 프로필은 모두 `implementer`다.
 
 | # | 작업 ID | 맡는 것 | 기다리는 작업 |
 |---|---|---|---|
@@ -283,13 +311,14 @@ slots/<owner>__<name>/      검증 worktree (batch, preflight-<k>, revert)
 | 7 | `engine` | batch 처리(검증, flaky, 이분 탐색, 기준 확인, 예산), 데몬, `up`·`down` | verify, gitops, queue, feedback |
 | 8 | `preflight` | `chute preflight` | verify, gitops, queue, feedback |
 | 9 | `revert` | `chute revert`, `chute batches` | engine |
-| 10 | `skill-install` | `chute --skill` 설명서, `chute install`, README | mod, engine, preflight |
+| 10 | `ci-gate` | 원격 CI 옵션(`require_ci`): check 읽기, batch 앞의 관문, CI 실패 반송 | engine |
+| 11 | `skill-install` | `chute --skill` 설명서, `chute install`, README | mod, engine, preflight |
 
 ```
 scaffold ─┬─ verify ───┐
           ├─ gitops ───┼─┬─ engine ────┬─ revert
-          ├─ queue ────┤ └─ preflight ─┼─ skill-install
-          ├─ feedback ─┘               │
+          ├─ queue ────┤ │             ├─ ci-gate
+          ├─ feedback ─┘ └─ preflight ─┼─ skill-install
           └─ mod ──────────────────────┘
 ```
 
@@ -299,13 +328,16 @@ scaffold ─┬─ verify ───┐
 - `engine`이 2~5를 기다린다: 검증 실행기, 합치기, 큐 전이, 반송을 호출해 하나의 흐름으로 엮는다.
 - `preflight`가 2~5를 기다린다: 합치기와 검증 실행기를 호출하고, 큐를 읽고, 보고서 형식을 쓴다.
 - `revert`가 `engine`을 기다린다: engine이 쓰는 batch 기록을 읽고, 검증 뒤 push하는 경로를 다시 쓴다.
+- `ci-gate`가 `engine`을 기다린다: engine이 batch를 만들기 전에 PR을 살피는 자리에 관문을 끼운다.
 - `skill-install`이 `mod`, `engine`, `preflight`를 기다린다: 설명서는 실제 명령의 동작을 적고, `install`은 mod 파일을 바이너리에 넣는다.
 
 **병렬로 둔 이유**
 
 - 2~6은 서로 다른 파일을 맡는다. `src/model.rs`와 `Cargo.toml`에 몇 줄 더하는 일이 겹칠 수 있어 지시서에 최소 변경으로 하라고 적었다. `Cargo.lock` 충돌을 줄이려고 `scaffold`가 뒤 작업이 쓸 의존성을 미리 넣는다.
 - `engine`과 `preflight`는 다른 파일을 맡고, 둘 다 2~5의 함수를 부르기만 한다.
-- `revert`와 `skill-install`은 다른 파일을 맡는다. 설명서의 revert 설명은 이 문서의 4.6을 따른다.
+- `revert`, `ci-gate`, `skill-install`은 다른 파일을 맡는다. `ci-gate`는 `src/engine.rs`와 `src/feedback.rs`에 몇 줄을 더하고, `revert`도 batch 기록 때문에 `src/engine.rs`에 몇 줄을 더할 수 있어 두 지시서에 최소 변경으로 하라고 적었다. 설명서의 revert와 원격 CI 설명은 이 문서의 4.6과 4.9를 따른다.
+
+**원격 CI 옵션을 나눈 방식.** 설정 키와 상태 값(`ci_pending`, `ci`)은 `scaffold`가 처음부터 넣는다. 그래야 mod가 fixture만으로 "CI 대기"와 "CI 실패"를 그릴 수 있고 상태 JSON이 뒤에 바뀌지 않는다. 동작은 `ci-gate`가 넣는다. `ci-gate`가 병합되기 전에는 `require_ci = true`를 써도 관문이 없다.
 
 ## 7. 범위 밖
 
@@ -328,7 +360,22 @@ scaffold ─┬─ verify ───┐
 
 ## 8. 사용자가 정해야 하는 결정
 
-1. **flaky로 판정된 batch를 머지할 것인가.** 추천은 머지하고 기록하는 것이다(지금 플랜). 대안은 머지하지 않고 사람 차례에 올리는 것이다. 추천안은 흔들리는 시험을 새로 만든 PR도 머지될 수 있다. 대안은 흔들림이 생길 때마다 큐가 사람을 기다린다.
-2. **에이전트가 없을 때 띄울 명령(`respawn`)과 그 권한.** 추천 기본값은 `["claude"]`이고 권한 모드는 사용자의 Claude 설정을 따른다. 무인 실행이라 권한 대화상자에서 멈출 수 있고, 그때는 사람 차례에 올라온다. orch 작업자처럼 `--permission-mode bypassPermissions`를 붙일지는 사용자가 `chute.toml`에서 정한다.
-3. **mod 작업자가 사용자의 Herdr 창에 mod를 설치해 화면을 확인해도 되는가.** 지금 지시서는 `herdr-app check`(창을 건드리지 않음)까지만 허용한다. 허용하면 작업자가 `~/.config/herdr-app/mods/chute/`에 설치하고 `herdr-app shot`으로 확인한다. 이때 사용자의 창에 패널이 하나 붙는다. 허용하지 않으면 화면 확인은 사용자가 `chute install` 뒤에 한다.
-4. **GitHub Actions CI를 둘 것인가.** 추천은 두지 않는 것이다(4.8). 두려면 `scaffold`에 fmt·clippy·test 워크플로를 더한다.
+남은 것은 없다. 초안이 물은 네 가지에 사용자가 2026-11-15에 답했다. 원문은 다음과 같다.
+
+```
+1.머지하고 기록
+2. 샌드박스 오버라이딩 --dangerously-skip-permissions
+3. 확인 가능
+4. 옵션 처리, 기본값은 off
+```
+
+| # | 물은 것 | 답과 반영 |
+|---|---|---|
+| 1 | flaky로 판정된 batch를 머지할 것인가 | 머지하고 기록한다. 초안 그대로다(4.3) |
+| 2 | 에이전트가 없을 때 띄울 명령과 권한 | `respawn`의 기본값을 `["claude", "--dangerously-skip-permissions"]`로 한다(4.3, 5.2). 새 에이전트가 권한 확인 없이 명령을 실행한다는 사실을 `chute.toml` 초안의 주석, README, 설명서에 밝힌다 |
+| 3 | mod 작업자가 사용자의 Herdr 창에서 화면을 확인해도 되는가 | 된다. 작업자는 mod를 창에 설치해 `herdr-app shot`으로 확인하고, 끝나면 설치한 것을 지우고 창을 원래대로 돌린다. 최종 설치는 사용자가 `chute install`로 한다 |
+| 4 | GitHub Actions CI를 둘 것인가 | 아래 해석대로 반영했다(4.8, 4.9) |
+
+**4번의 해석.** 초안의 질문은 "chute 저장소에 GitHub Actions CI를 둘 것인가"였고 답은 "옵션 처리, 기본값은 off"였다. 저장소의 CI는 켜고 끄는 옵션으로 두기 어려운 것이라, 오케스트레이터와 플랜 에이전트는 이 답을 chute의 기능에 대한 것으로 읽었다. chute 저장소에는 GitHub Actions를 두지 않는다. chute에 "원격 CI도 통과해야 batch에 넣는다"는 설정 `require_ci`를 두고 기본값을 꺼짐으로 한다(4.9). 로컬 검증이 최종이라는 원칙은 그대로다.
+
+이 해석이 틀렸다면, 예를 들어 "chute 저장소에 워크플로 파일을 두되 꺼 둔다"는 뜻이었다면, `ci-gate` 작업을 빼고 `scaffold`에서 `require_ci`와 `ci_pending`·`ci` 값을 지우면 된다. 다른 작업은 이 옵션에 기대지 않는다.
