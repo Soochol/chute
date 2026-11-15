@@ -180,7 +180,8 @@ export default class Chute extends View {
   }
 
   cardView(card, t, { human }) {
-    const error = this.errors.get(card.key)?.text;
+    const failure = this.errors.get(card.key);
+    const error = failure?.state === card.state ? failure.text : null;
     return v_flex()
       .gap(5)
       .p(9)

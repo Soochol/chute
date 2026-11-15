@@ -51,12 +51,25 @@ const PREFLIGHT = table({
   conflict: { text: "preflight 충돌", tone: "error" },
 });
 
-const plain = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+const plain = (v) => {
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v) ?? "";
+  } catch {
+    return "(표시할 수 없는 값)";
+  }
+};
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const list = (v) => (Array.isArray(v) ? v : []);
 const str = (v) => (typeof v === "string" ? v : "");
 const num = (v) => (Number.isFinite(v) ? String(v) : "—");
-const named = (names, code) => (code == null ? null : (names[code] ?? plain(code)));
+const prOf = (v) => (Number.isSafeInteger(v) && v > 0 ? v : "?");
+const rawText = (v) => (v == null || v === "" ? null : plain(v));
+const named = (names, code) => {
+  if (code == null || code === "") return null;
+  const key = plain(code);
+  return names[key] ?? key;
+};
 
 export const firstLine = (value) =>
   String(value ?? "")
@@ -104,7 +117,8 @@ function failureOf(item) {
 function preflightOf(item) {
   const record = item.preflight;
   if (!isObject(record)) return { text: "preflight 없음", tone: "muted", stale: false };
-  const known = PREFLIGHT[record.result] ?? { text: `preflight ${plain(record.result)}`, tone: "muted" };
+  const result = record.result == null ? "?" : plain(record.result);
+  const known = PREFLIGHT[result] ?? { text: `preflight ${result}`, tone: "muted" };
   const stale = record.head !== item.head;
   return {
     text: stale ? `${known.text} (이전 HEAD)` : known.text,
@@ -141,7 +155,7 @@ function cardOf(item, repoPath) {
   } else if (item.state === "needs_human") {
     card.reason = named(HUMAN_REASON, item.state_reason) ?? "사람 차례";
   } else if (item.state === "bounced") {
-    card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind) ?? "사유 없음";
+    card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind || null) ?? "사유 없음";
   }
   return card;
 }
@@ -150,10 +164,10 @@ function alertsOf(view, now) {
   const alerts = [];
   if (view.blocked) {
     const blocked = isObject(view.blocked) ? view.blocked : { reason: view.blocked };
-    const reason = str(blocked.reason);
+    const reason = rawText(blocked.reason) ?? "";
     const parts = [];
     if (str(blocked.base)) parts.push(`기준 ${blocked.base}`);
-    if (Number.isFinite(blocked.since_ms)) parts.push(`${formatDuration((now - blocked.since_ms) / 1000)} 전부터`);
+    if (Number.isFinite(blocked.since_ms) && now >= blocked.since_ms) parts.push(`${formatDuration((now - blocked.since_ms) / 1000)} 전부터`);
     alerts.push({
       kind: "blocked",
       tone: "error",
@@ -175,13 +189,13 @@ function batchOf(batch, members, now) {
   if (!isObject(batch) && members.length === 0) return [];
   const b = isObject(batch) ? batch : {};
   const byPr = new Map(members.map((item) => [item.pr, item]));
-  const prs = list(b.prs).map((pr) => ({ pr, title: str(byPr.get(pr)?.title) }));
+  const prs = list(b.prs).map((pr) => ({ pr: prOf(pr), title: str(byPr.get(pr)?.title) }));
+  const listed = new Set(list(b.prs));
   for (const item of members) {
-    if (!prs.some((entry) => entry.pr === item.pr)) prs.push({ pr: item.pr, title: str(item.title) });
+    if (!listed.has(item.pr)) prs.push({ pr: item.pr, title: str(item.title) });
   }
   return [
     {
-      id: str(b.id) || null,
       prs,
       phase: b.phase == null ? null : named(PHASE, b.phase),
       step: str(b.step) || null,
@@ -203,12 +217,20 @@ function todayOf(today) {
   ];
 }
 
-const bySubmission = (a, b) => (a.submitted_ms ?? Infinity) - (b.submitted_ms ?? Infinity) || a.pr - b.pr;
+const submittedAt = (item) => (Number.isFinite(item.submitted_ms) ? item.submitted_ms : Infinity);
+const bySubmission = (a, b) => {
+  const [x, y] = [submittedAt(a), submittedAt(b)];
+  if (x !== y) return x < y ? -1 : 1;
+  return Number.isInteger(a.pr) && Number.isInteger(b.pr) ? a.pr - b.pr : 0;
+};
 
 function repoBoard(view, now) {
   const repo = isObject(view.repo) ? view.repo : {};
   const path = str(repo.path);
-  const queue = list(view.queue).filter(isObject).sort(bySubmission);
+  const queue = list(view.queue)
+    .filter(isObject)
+    .map((item) => ({ ...item, pr: prOf(item.pr), state: rawText(item.state), state_reason: rawText(item.state_reason) }))
+    .sort(bySubmission);
   const placed = Object.fromEntries(SECTION_ORDER.map((id) => [id, []]));
   const inBatch = [];
   for (const item of queue) {
@@ -223,16 +245,15 @@ function repoBoard(view, now) {
         position: placed.waiting.length + 1,
         ciPending,
         label: ciPending ? "CI 대기" : "대기",
-        note: item.state_reason && !ciPending ? plain(item.state_reason) : null,
-        agent: agentOf(item.agent),
+        note: item.state_reason && !ciPending ? item.state_reason : null,
       });
     } else if (section === "unknown") {
       placed.unknown.push({
         key: `${path}#${item.pr}`,
         pr: item.pr,
         title: str(item.title),
-        state: item.state == null ? "(없음)" : plain(item.state),
-        reason: item.state_reason == null ? null : plain(item.state_reason),
+        state: item.state ?? "(없음)",
+        reason: item.state_reason,
       });
     } else placed[section].push(cardOf(item, path));
   }
@@ -255,7 +276,8 @@ function repoBoard(view, now) {
 
 const failed = (detail) => ({ kind: "failed", title: "상태를 읽지 못했다", detail, hint: "" });
 
-export function interpret(run, now = Date.now()) {
+export function interpret(run, clock = Date.now()) {
+  const now = Number.isFinite(clock) ? clock : Date.now();
   const r = isObject(run) ? run : {};
   if (r.spawnError != null) {
     return {

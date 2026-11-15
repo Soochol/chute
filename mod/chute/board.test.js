@@ -14,6 +14,7 @@ const only = (data) => board(data).repos[0];
 const section = (repo, id) => repo.sections.find((s) => s.id === id);
 const prs = (s) => s.items.map((item) => item.pr);
 const withQueue = (...items) => ({ ...clone(fixture), queue: items.map(clone) });
+const queueOnly = (...items) => ({ ...withQueue(...items), blocked: null, warnings: [], batch: null });
 const itemOf = (pr) => clone(fixture.queue.find((item) => item.pr === pr));
 
 test("every fixture item lands in one of the six sections", () => {
@@ -21,6 +22,7 @@ test("every fixture item lands in one of the six sections", () => {
   assert.equal(result.kind, "board");
   const repo = result.repos[0];
   assert.deepEqual(repo.sections.map((s) => s.id), ["alerts", "human", "batch", "waiting", "bounced", "today"]);
+  assert.deepEqual(repo.sections.map((s) => s.title), ["멈춤·경고", "사람 차례", "검증 중", "대기", "반송", "오늘"]);
   assert.deepEqual(prs(section(repo, "human")), [9, 10, 11, 21]);
   assert.deepEqual(section(repo, "batch").items[0].prs.map((p) => p.pr), [12, 13]);
   assert.deepEqual(prs(section(repo, "waiting")), [19, 20]);
@@ -199,6 +201,8 @@ test("human cards carry reason, agent, retries and the last failure", () => {
   const items = section(only([fixture]), "human").items;
   const budget = items.find((i) => i.pr === 9);
   assert.equal(budget.retries, "3/3");
+  assert.equal(budget.state, "needs_human");
+  assert.equal(items.find((i) => i.pr === 21).state, "awaiting_approval");
   assert.deepEqual(budget.agent, { terminal: "t1rp", name: "impl-h", alive: true, label: "impl-h (t1rp)" });
   assert.equal(budget.failure.summary, "test 단계 실패: skill::tests::prints_manual");
   assert.equal(items.find((i) => i.pr === 10).agent.alive, false);
@@ -247,6 +251,8 @@ test("several repos from --all, and a single object", () => {
   assert.deepEqual(result.repos.map((r) => r.slug), ["Soochol/chute", "Soochol/other"]);
   assert.equal(section(result.repos[1], "human").items[0].actions[0].args[3], "/home/dev/code/other");
   assert.equal(board(fixture).repos.length, 1);
+  const keys = result.repos.map((r) => section(r, "human").items[0].key);
+  assert.equal(new Set(keys).size, 2, keys.join());
   assert.equal(result.repos[0].stateDir, fixture.repo.state_dir);
   assert.equal(result.repos[0].approval, "에이전트 신뢰");
 });
@@ -338,6 +344,7 @@ test("formatDuration", () => {
   assert.equal(formatDuration(125), "2분 5초");
   assert.equal(formatDuration(3600), "1시간");
   assert.equal(formatDuration(3660), "1시간 1분");
+  assert.equal(formatDuration(59.6), "1분");
   assert.equal(formatDuration(null), "—");
   assert.equal(formatDuration(-1), "—");
 });
@@ -385,9 +392,10 @@ test("an item without a PR number gets no buttons", () => {
   const items = section(only(withQueue(noPr, itemOf(9))), "human").items;
   assert.equal(items.length, 2);
   for (const item of items) {
-    if (item.pr === undefined) assert.deepEqual(item.actions, []);
+    if (item.pr === "?") assert.deepEqual(item.actions, []);
     else assert.equal(item.actions.length, 2);
   }
+  assert.ok(items.some((item) => item.pr === "?"));
 });
 
 test("an exit code that is not a number is reported without printing null", () => {
@@ -411,4 +419,228 @@ test("a blocked queue and a stopped daemon are both announced, blocked first", (
 test("an unknown failure mode is shown as it is", () => {
   const data = withQueue({ ...itemOf(15), last_failure: { ...itemOf(15).last_failure, mode: "triple" } });
   assert.equal(section(only(data), "bounced").items[0].failure.mode, "triple");
+});
+
+test("objects where numbers or strings belong never reach the screen code as objects", () => {
+  const hostile = JSON.parse('{"toString": 1}');
+  const data = withQueue(
+    { ...itemOf(21), pr: hostile },
+    { ...itemOf(9), pr: 40, state_reason: hostile },
+    { ...itemOf(20), pr: 41, state: hostile },
+    { ...itemOf(15), pr: 42, submitted_ms: hostile, last_failure: { ...itemOf(15).last_failure, mode: hostile } },
+    { ...itemOf(20), pr: 43, state_reason: hostile },
+  );
+  data.batch = { ...data.batch, phase: hostile, prs: [hostile, 12], round: hostile };
+  data.blocked = { reason: hostile, base: hostile, since_ms: hostile };
+  data.approval = hostile;
+  const leaves = [];
+  const walk = (value) => {
+    if (value !== null && typeof value === "object") Object.values(value).forEach(walk);
+    else leaves.push(value);
+  };
+  const result = board(data);
+  assert.equal(result.kind, "board");
+  walk(result);
+  assert.ok(leaves.length > 50);
+  for (const leaf of leaves) assert.doesNotThrow(() => `${leaf}`);
+  assert.deepEqual(
+    result.repos[0].sections.find((s) => s.id === "unknown").items.map((i) => i.state),
+    ['{"toString":1}'],
+  );
+});
+
+test("every batch phase and approval label is pinned", () => {
+  const phases = { building: "합치는 중", verifying: "검증 중", bisecting: "이분 탐색 중", pushing: "push 중" };
+  for (const [code, label] of Object.entries(phases)) {
+    const data = clone(fixture);
+    data.batch.phase = code;
+    assert.equal(section(only(data), "batch").items[0].phase, label, code);
+  }
+  for (const [code, label] of Object.entries({ agent: "에이전트 신뢰", human: "사람 확인" })) {
+    assert.equal(only({ ...clone(fixture), approval: code }).approval, label, code);
+  }
+});
+
+test("every preflight result has its text and tone", () => {
+  const cases = [
+    ["pass", "preflight 통과", "ok"],
+    ["fail", "preflight 실패", "error"],
+    ["conflict", "preflight 충돌", "error"],
+  ];
+  for (const [result, text, tone] of cases) {
+    const item = section(only(withQueue({ ...itemOf(21), preflight: { result, head: "21e5678" } })), "human").items[0];
+    assert.deepEqual([item.preflight.text, item.preflight.tone], [text, tone], result);
+  }
+  const empty = section(only(withQueue({ ...itemOf(21), preflight: {} })), "human").items[0];
+  assert.equal(empty.preflight.text, "preflight ? (이전 HEAD)");
+});
+
+test("alerts keep their text, kind and tone", () => {
+  const alerts = section(only([fixture]), "alerts").items;
+  assert.deepEqual(alerts.map((a) => [a.kind, a.tone]), [
+    ["blocked", "error"],
+    ["warning", "warn"],
+    ["warning", "warn"],
+    ["warning", "warn"],
+  ]);
+  assert.equal(alerts[0].text, "기준 커밋이 검증에 실패해 큐가 멈췄다");
+
+  const data = {
+    ...clone(fixture),
+    blocked: null,
+    daemon: { running: false, terminal: null, pid: null },
+    warnings: ["문자열 경고", { kind: "config" }, { message: "" }, {}],
+  };
+  assert.deepEqual(section(only(data), "alerts").items.map((a) => [a.kind, a.tone, a.text]), [
+    ["daemon", "error", "데몬이 꺼져 있다"],
+    ["warning", "warn", "문자열 경고"],
+    ["warning", "warn", "config"],
+    ["warning", "warn", "경고"],
+    ["warning", "warn", "경고"],
+  ]);
+});
+
+test("a blocked reason that is not a known word is shown as it is, and a future time adds no age", () => {
+  const data = clone(fixture);
+  data.blocked = { reason: 5, base: "abc", since_ms: NOW + 10_000 };
+  const [alert] = section(only(data), "alerts").items;
+  assert.equal(alert.text, "큐가 멈췄다: 5");
+  assert.equal(alert.detail, "기준 abc");
+  data.blocked = { reason: { x: 1 } };
+  assert.equal(section(only(data), "alerts").items[0].text, '큐가 멈췄다: {"x":1}');
+  data.blocked = {};
+  assert.equal(section(only(data), "alerts").items[0].text, "큐가 멈췄다: 사유 모름");
+  data.blocked = "base_broken";
+  assert.equal(section(only(data), "alerts").items[0].text, "기준 커밋이 검증에 실패해 큐가 멈췄다");
+});
+
+test("a daemon record that does not say running:false raises no alert", () => {
+  for (const daemon of [{}, null, { running: true }, { running: null }]) {
+    const data = { ...clone(fixture), blocked: null, warnings: [], daemon };
+    assert.equal(section(only(data), "alerts"), undefined, JSON.stringify(daemon));
+  }
+});
+
+test("a batch that has not started its first round shows no round, and one that starts in the future shows no negative time", () => {
+  const data = clone(fixture);
+  data.batch.round = 0;
+  data.batch.started_ms = NOW + 60_000;
+  const [batch] = section(only(data), "batch").items;
+  assert.equal(batch.round, null);
+  assert.equal(batch.elapsed, "0초");
+});
+
+test("a clock that is not a number falls back to the real clock", () => {
+  const [alert] = section(only([fixture], NaN), "alerts").items;
+  assert.ok(!alert.detail.includes("—"), alert.detail);
+});
+
+test("a waiting item that waits for CI shows no raw reason", () => {
+  assert.equal(section(only([fixture]), "waiting").items.find((i) => i.pr === 19).note, null);
+});
+
+test("the unknown section sits between bounced and today, in submission order, with title and raw state", () => {
+  const data = queueOnly(
+    { ...itemOf(20), pr: 31, title: "둘째", state: "zeta", submitted_ms: 2 },
+    { ...itemOf(20), pr: 30, title: "첫째", state: "", submitted_ms: 1 },
+    itemOf(15),
+  );
+  const repo = only(data);
+  assert.deepEqual(repo.sections.map((s) => s.id), ["bounced", "unknown", "today"]);
+  assert.equal(section(repo, "unknown").title, "알 수 없는 상태");
+  assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.title, i.state, i.reason]), [
+    [30, "첫째", "(없음)", null],
+    [31, "둘째", "zeta", null],
+  ]);
+});
+
+test("array-wrapped states are unknown, not routed as the word inside", () => {
+  const data = queueOnly(
+    { ...itemOf(9), pr: 40, state: ["needs_human"], state_reason: ["budget"] },
+    { ...itemOf(21), pr: 41, state: ["awaiting_approval"] },
+    { ...itemOf(20), pr: 42, state: [["queued"]] },
+  );
+  const repo = only(data);
+  assert.deepEqual(repo.sections.map((s) => s.id), ["unknown", "today"]);
+  assert.deepEqual(
+    section(repo, "unknown").items.map((i) => i.state).sort(),
+    ['["awaiting_approval"]', '["needs_human"]', '[["queued"]]'],
+  );
+});
+
+test("items are ordered by submission time, then PR number, and unknown times go last", () => {
+  const data = withQueue(
+    { ...itemOf(20), pr: 9, submitted_ms: 5 },
+    { ...itemOf(20), pr: 3, submitted_ms: 5 },
+    { ...itemOf(20), pr: 8, submitted_ms: "x" },
+    { ...itemOf(20), pr: 7, submitted_ms: undefined },
+    { ...itemOf(20), pr: 4, submitted_ms: 1 },
+  );
+  assert.deepEqual(prs(section(only(data), "waiting")), [4, 3, 9, 7, 8]);
+});
+
+test("a bounced item without a reason falls back to the failure kind, then to a plain note", () => {
+  const failure = itemOf(15).last_failure;
+  const data = withQueue(
+    { ...itemOf(15), pr: 97, state_reason: null, last_failure: { ...failure, kind: "ci" } },
+    { ...itemOf(15), pr: 98, state_reason: "", last_failure: { ...failure, kind: "" } },
+    { ...itemOf(15), pr: 99, state_reason: null, last_failure: null },
+  );
+  const reasons = Object.fromEntries(section(only(data), "bounced").items.map((i) => [i.pr, i.reason]));
+  assert.deepEqual(reasons, { 97: "CI 실패", 98: "사유 없음", 99: "사유 없음" });
+});
+
+test("a needs_human item with an empty reason is just the human's turn", () => {
+  const data = withQueue({ ...itemOf(9), state_reason: "" });
+  assert.equal(section(only(data), "human").items[0].reason, "사람 차례");
+});
+
+test("failure text prefers stderr, then stdout, then the exit code", () => {
+  assert.equal(interpret({ code: 2, stdout: "out line\nmore", stderr: "" }, NOW).detail, "out line");
+  assert.equal(interpret({ code: 2, stdout: "out", stderr: "err\n" }, NOW).detail, "err");
+  assert.equal(interpret({ code: 2, stdout: "", stderr: "" }, NOW).detail, "종료 코드 2");
+  assert.equal(interpret({ code: 2, stdout: "", stderr: "\n   spaced out  \n" }, NOW).detail, "spaced out");
+  assert.equal(interpret({ code: 0, stdout: `${"x".repeat(300)}\nmore` }, NOW).detail.length < 200, true);
+  assert.equal(interpret({ spawnError: "" }, NOW).kind, "missing");
+});
+
+test("batch members come from the batch record even when the queue lacks them", () => {
+  const data = { ...clone(fixture), queue: [] };
+  assert.deepEqual(section(only(data), "batch").items[0].prs, [
+    { pr: 12, title: "" },
+    { pr: 13, title: "" },
+  ]);
+});
+
+test("in_batch items are all shown, also when they have no usable PR number", () => {
+  const data = withQueue({ ...itemOf(12), pr: undefined, title: "A" }, { ...itemOf(13), pr: -3, title: "B" }, { ...itemOf(12), pr: 12, title: "C" });
+  data.batch.prs = [];
+  const shown = section(only(data), "batch").items[0].prs.map((p) => [p.pr, p.title]);
+  assert.deepEqual(shown.sort((a, b) => a[1].localeCompare(b[1])), [["?", "A"], ["?", "B"], [12, "C"]]);
+});
+
+test("a PR number that is not a positive safe integer gets no buttons and shows as ?", () => {
+  for (const pr of [-3, 0, 1.5, 1e21, 9007199254740993, "7", null]) {
+    const item = section(only(withQueue({ ...itemOf(21), pr })), "human").items[0];
+    assert.equal(item.pr, "?", String(pr));
+    assert.deepEqual(item.actions, [], String(pr));
+  }
+  assert.equal(section(only(withQueue({ ...itemOf(21), pr: 9007199254740991 })), "human").items[0].actions.length, 2);
+});
+
+test("a very deeply nested value is shown without throwing", () => {
+  const depth = 20000;
+  const text = JSON.stringify({ ...clone(fixture), queue: [{ ...itemOf(20), pr: 30, state: "@@DEEP@@" }] }).replace(
+    '"@@DEEP@@"',
+    `${"[".repeat(depth)}"x"${"]".repeat(depth)}`,
+  );
+  const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
+  assert.equal(result.kind, "board");
+  assert.equal(section(result.repos[0], "unknown").items[0].state, "(표시할 수 없는 값)");
+});
+
+test("a batch record with garbage in its PR list does not leak objects", () => {
+  const data = clone(fixture);
+  data.batch.prs = [12, { a: 1 }, null, "13"];
+  assert.deepEqual(section(only(data), "batch").items[0].prs.map((p) => p.pr), [12, "?", "?", "?", 13]);
 });
