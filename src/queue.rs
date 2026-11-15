@@ -1,1 +1,1231 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::num::NonZeroUsize;
 
+use crate::model::{
+    Agent, Approval, BounceReason, EpochMs, FailureKind, FailureRecord, HumanReason, ItemState,
+    PrNumber, PreflightRecord, QueueItem, QueuedReason, Sha, State,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Approve,
+    Resubmit {
+        head_changed: bool,
+        needs_approval: bool,
+    },
+    Take,
+    Requeue,
+    Merge,
+    Bounce(BounceReason),
+    Escalate(HumanReason),
+    Retry,
+    Drop,
+    MarkCiPending,
+    ClearCiPending,
+}
+
+impl Action {
+    fn verb(self) -> &'static str {
+        match self {
+            Action::Approve => "승인",
+            Action::Resubmit { .. } => "다시 submit",
+            Action::Take => "batch로 가져가기",
+            Action::Requeue => "큐로 되돌리기",
+            Action::Merge => "머지 처리",
+            Action::Bounce(_) => "반송",
+            Action::Escalate(_) => "사람 차례로 올리기",
+            Action::Retry => "다시 넣기",
+            Action::Drop => "큐에서 빼기",
+            Action::MarkCiPending | Action::ClearCiPending => "CI 대기 표시 바꾸기",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    To(ItemState),
+    Remove,
+}
+
+pub fn step(from: ItemState, action: Action) -> Option<Next> {
+    use Action::*;
+    use HumanReason as H;
+    use ItemState::*;
+    let to = |state| Some(Next::To(state));
+    match (from, action) {
+        (AwaitingApproval, Approve) => to(Queued(None)),
+        (
+            AwaitingApproval | Queued(_),
+            Resubmit {
+                head_changed: false,
+                ..
+            },
+        ) => to(from),
+        (
+            AwaitingApproval | Queued(_),
+            Resubmit {
+                head_changed: true,
+                needs_approval,
+            },
+        ) => to(entry_state(needs_approval)),
+        (
+            Bounced(_),
+            Resubmit {
+                head_changed,
+                needs_approval,
+            },
+        ) => to(if head_changed {
+            entry_state(needs_approval)
+        } else {
+            Queued(None)
+        }),
+        (Queued(None), Take) => to(InBatch),
+        (InBatch, Requeue) => to(Queued(None)),
+        (InBatch, Merge) => Some(Next::Remove),
+        (InBatch, Bounce(reason)) => to(Bounced(reason)),
+        (InBatch, Escalate(H::Budget)) => to(NeedsHuman(H::Budget)),
+        (Bounced(_), Escalate(H::Unreachable)) => to(NeedsHuman(H::Unreachable)),
+        (AwaitingApproval | Queued(_) | Bounced(_), Escalate(H::GaveUp)) => {
+            to(NeedsHuman(H::GaveUp))
+        }
+        (NeedsHuman(_), Retry) => to(Queued(None)),
+        (AwaitingApproval | Queued(_) | Bounced(_) | NeedsHuman(_), Drop) => Some(Next::Remove),
+        (Queued(_), MarkCiPending) => to(Queued(Some(QueuedReason::CiPending))),
+        (Queued(_), ClearCiPending) => to(Queued(None)),
+        _ => None,
+    }
+}
+
+pub fn entry_state(needs_approval: bool) -> ItemState {
+    if needs_approval {
+        ItemState::AwaitingApproval
+    } else {
+        ItemState::Queued(None)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransitionError {
+    NotQueued(PrNumber),
+    NotAllowed {
+        pr: PrNumber,
+        from: ItemState,
+        action: Action,
+    },
+    HeadMoved {
+        pr: PrNumber,
+        seen: String,
+        now: Sha,
+    },
+    BadHead {
+        pr: PrNumber,
+        given: String,
+    },
+}
+
+impl fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransitionError::NotQueued(pr) => write!(f, "{pr}: 큐에 없다"),
+            TransitionError::NotAllowed { pr, from, action } => {
+                f.write_str(&explain(*pr, *from, *action))
+            }
+            TransitionError::HeadMoved { pr, seen, now } => write!(
+                f,
+                "{pr}: HEAD가 바뀌어 승인하지 않았다. 승인하려던 HEAD {seen}, 지금 HEAD {now}. 바뀐 내용을 확인한 뒤 다시 승인한다"
+            ),
+            TransitionError::BadHead { pr, given } => {
+                let shown: String = given.chars().take(60).collect();
+                let cut = if shown.len() < given.len() { "…" } else { "" };
+                write!(
+                    f,
+                    "{pr}: 승인하지 않았다. `--head`는 4자 이상의 16진수 커밋 SHA이고 지금 HEAD보다 길 수 없다. 받은 값: `{shown}{cut}`"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransitionError {}
+
+fn explain(pr: PrNumber, from: ItemState, action: Action) -> String {
+    use Action::*;
+    use ItemState::*;
+    let now = label(from);
+    match (from, action) {
+        (InBatch, Resubmit { .. } | Escalate(HumanReason::GaveUp) | Drop) => {
+            format!("{pr}: 지금 batch에서 검증 중이다. batch가 끝난 뒤 다시 한다")
+        }
+        (NeedsHuman(_), Resubmit { .. }) => format!(
+            "{pr}: 사람 차례다. 사람이 `chute retry`나 `chute drop`으로 풀어야 한다. 지금 상태는 {now}"
+        ),
+        (NeedsHuman(_), Escalate(HumanReason::GaveUp)) => {
+            format!("{pr}: 이미 사람 차례다. 지금 상태는 {now}")
+        }
+        (_, Approve) => {
+            format!("{pr}: 승인을 기다리는 PR만 승인할 수 있다. 지금 상태는 {now}")
+        }
+        (Bounced(_), Retry) => format!(
+            "{pr}: 에이전트에게 돌려보낸 PR이다. 에이전트가 고쳐서 다시 submit해야 한다. 지금 상태는 {now}"
+        ),
+        (_, Retry) => {
+            format!("{pr}: 사람 차례의 PR만 다시 넣을 수 있다. 지금 상태는 {now}")
+        }
+        _ => format!("{pr}: {}할 수 없다. 지금 상태는 {now}", action.verb()),
+    }
+}
+
+pub fn label(state: ItemState) -> String {
+    use crate::model::{BounceReason as B, HumanReason as H, QueuedReason as Q};
+    match state {
+        ItemState::AwaitingApproval => "승인 대기".into(),
+        ItemState::Queued(None) => "대기".into(),
+        ItemState::Queued(Some(Q::CiPending)) => "대기(CI 기다림)".into(),
+        ItemState::InBatch => "검증 중".into(),
+        ItemState::Bounced(r) => format!(
+            "반송({})",
+            match r {
+                B::Conflict => "충돌",
+                B::Verify => "검증 실패",
+                B::Timeout => "시간 초과",
+                B::HeadChanged => "HEAD 바뀜",
+                B::Ci => "CI 실패",
+            }
+        ),
+        ItemState::NeedsHuman(r) => format!(
+            "사람 차례({})",
+            match r {
+                H::Budget => "예산 소진",
+                H::Unreachable => "전달 실패",
+                H::GaveUp => "포기",
+            }
+        ),
+    }
+}
+
+fn item_mut(state: &mut State, pr: PrNumber) -> Result<&mut QueueItem, TransitionError> {
+    state
+        .queue
+        .iter_mut()
+        .find(|i| i.pr == pr)
+        .ok_or(TransitionError::NotQueued(pr))
+}
+
+fn moved(pr: PrNumber, from: ItemState, action: Action) -> Result<ItemState, TransitionError> {
+    match step(from, action) {
+        Some(Next::To(to)) => Ok(to),
+        _ => Err(TransitionError::NotAllowed { pr, from, action }),
+    }
+}
+
+fn move_to(
+    state: &mut State,
+    pr: PrNumber,
+    action: Action,
+) -> Result<&mut QueueItem, TransitionError> {
+    let item = item_mut(state, pr)?;
+    item.state = moved(pr, item.state, action)?;
+    Ok(item)
+}
+
+fn take_out(state: &mut State, pr: PrNumber, action: Action) -> Result<QueueItem, TransitionError> {
+    let at = state
+        .queue
+        .iter()
+        .position(|i| i.pr == pr)
+        .ok_or(TransitionError::NotQueued(pr))?;
+    let from = state.queue[at].state;
+    match step(from, action) {
+        Some(Next::Remove) => Ok(state.queue.remove(at)),
+        _ => Err(TransitionError::NotAllowed { pr, from, action }),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Submission {
+    pub pr: PrNumber,
+    pub title: String,
+    pub branch: String,
+    pub head: Sha,
+    pub agent: Option<Agent>,
+    pub touches_config: bool,
+    pub approval: Approval,
+    pub now: EpochMs,
+}
+
+impl Submission {
+    pub fn needs_approval(&self) -> bool {
+        self.approval == Approval::Human || self.touches_config
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Change {
+    Added,
+    Requeued,
+    HeadUpdated,
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Submitted {
+    pub state: ItemState,
+    pub position: NonZeroUsize,
+    pub change: Change,
+}
+
+pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionError> {
+    let needs_approval = s.needs_approval();
+    let Some(at) = state.queue.iter().position(|i| i.pr == s.pr) else {
+        let entry = entry_state(needs_approval);
+        forget_other_heads(&mut state.preflights, &s.branch, &s.head);
+        state.queue.push(QueueItem {
+            pr: s.pr,
+            title: s.title,
+            branch: s.branch,
+            head: s.head,
+            state: entry,
+            agent: s.agent,
+            attempts: 0,
+            submitted_ms: s.now,
+            touches_config: s.touches_config,
+            last_failure: None,
+        });
+        return Ok(Submitted {
+            state: entry,
+            position: place(state.queue.len() - 1),
+            change: Change::Added,
+        });
+    };
+    let item = &mut state.queue[at];
+    let head_changed = item.head != s.head;
+    let was_bounced = matches!(item.state, ItemState::Bounced(_));
+    let to = moved(
+        s.pr,
+        item.state,
+        Action::Resubmit {
+            head_changed,
+            needs_approval,
+        },
+    )?;
+    let change = match (was_bounced, head_changed) {
+        (true, _) => Change::Requeued,
+        (false, true) => Change::HeadUpdated,
+        (false, false) => {
+            return Ok(Submitted {
+                state: item.state,
+                position: place(at),
+                change: Change::Unchanged,
+            });
+        }
+    };
+    forget_other_heads(&mut state.preflights, &s.branch, &s.head);
+    item.state = to;
+    item.head = s.head;
+    item.title = s.title;
+    item.touches_config = s.touches_config;
+    if s.agent.is_some() {
+        item.agent = s.agent;
+    }
+    Ok(Submitted {
+        state: to,
+        position: place(at),
+        change,
+    })
+}
+
+fn forget_other_heads(
+    preflights: &mut BTreeMap<String, PreflightRecord>,
+    branch: &str,
+    head: &Sha,
+) {
+    preflights.retain(|b, p| b != branch || &p.head == head);
+}
+
+fn place(zero_based_index: usize) -> NonZeroUsize {
+    NonZeroUsize::MIN.saturating_add(zero_based_index)
+}
+
+/// `seen_head` is the HEAD the approver looked at, as a full SHA or a prefix of one.
+pub fn approve(
+    state: &mut State,
+    pr: PrNumber,
+    seen_head: Option<&str>,
+) -> Result<(), TransitionError> {
+    let item = item_mut(state, pr)?;
+    let to = moved(pr, item.state, Action::Approve)?;
+    if let Some(given) = seen_head {
+        let bad = || TransitionError::BadHead {
+            pr,
+            given: given.to_owned(),
+        };
+        let seen = Sha::try_from(given.trim().to_ascii_lowercase()).map_err(|_| bad())?;
+        if seen.as_str().len() > item.head.as_str().len() {
+            return Err(bad());
+        }
+        if !item.head.as_str().starts_with(seen.as_str()) {
+            return Err(TransitionError::HeadMoved {
+                pr,
+                seen: seen.to_string(),
+                now: item.head.clone(),
+            });
+        }
+    }
+    item.state = to;
+    Ok(())
+}
+
+pub fn retry(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::Retry)?.attempts = 0;
+    Ok(())
+}
+
+pub fn drop_item(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
+    take_out(state, pr, Action::Drop)
+}
+
+pub fn give_up(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::Escalate(HumanReason::GaveUp)).map(|_| ())
+}
+
+pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
+}
+
+pub fn take_batch(state: &mut State, max_batch: u32) -> Vec<PrNumber> {
+    let mut taken = Vec::new();
+    for item in &mut state.queue {
+        if taken.len() >= max_batch as usize {
+            break;
+        }
+        if let Some(Next::To(to)) = step(item.state, Action::Take) {
+            item.state = to;
+            taken.push(item.pr);
+        }
+    }
+    taken
+}
+
+pub fn merged(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
+    take_out(state, pr, Action::Merge)
+}
+
+pub fn record_failure(
+    state: &mut State,
+    pr: PrNumber,
+    failure: FailureRecord,
+    budget: u32,
+) -> Result<ItemState, TransitionError> {
+    let item = item_mut(state, pr)?;
+    let counted = item.attempts < budget;
+    let action = if counted {
+        Action::Bounce(bounce_reason(failure.failure.shape().kind()))
+    } else {
+        Action::Escalate(HumanReason::Budget)
+    };
+    let to = moved(pr, item.state, action)?;
+    item.state = to;
+    if counted {
+        item.attempts += 1;
+    }
+    item.last_failure = Some(failure);
+    Ok(to)
+}
+
+pub fn head_changed(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::Bounce(BounceReason::HeadChanged)).map(|_| ())
+}
+
+pub fn requeue(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::Requeue).map(|_| ())
+}
+
+pub fn set_ci_pending(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::MarkCiPending).map(|_| ())
+}
+
+pub fn clear_ci_pending(state: &mut State, pr: PrNumber) -> Result<(), TransitionError> {
+    move_to(state, pr, Action::ClearCiPending).map(|_| ())
+}
+
+fn bounce_reason(kind: FailureKind) -> BounceReason {
+    match kind {
+        FailureKind::Conflict => BounceReason::Conflict,
+        FailureKind::Verify => BounceReason::Verify,
+        FailureKind::Timeout => BounceReason::Timeout,
+        FailureKind::Ci => BounceReason::Ci,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        CommitRef, ConflictFile, FailedCheck, Failure, NonEmpty, StepFailure, VerifyMode,
+    };
+
+    const AWAITING: ItemState = ItemState::AwaitingApproval;
+    const QUEUED: ItemState = ItemState::Queued(None);
+    const CI_PENDING: ItemState = ItemState::Queued(Some(QueuedReason::CiPending));
+    const IN_BATCH: ItemState = ItemState::InBatch;
+
+    const BOUNCE_REASONS: [BounceReason; 5] = [
+        BounceReason::Conflict,
+        BounceReason::Verify,
+        BounceReason::Timeout,
+        BounceReason::HeadChanged,
+        BounceReason::Ci,
+    ];
+    const HUMAN_REASONS: [HumanReason; 3] = [
+        HumanReason::Budget,
+        HumanReason::Unreachable,
+        HumanReason::GaveUp,
+    ];
+
+    fn bounced_states() -> Vec<ItemState> {
+        BOUNCE_REASONS.map(ItemState::Bounced).to_vec()
+    }
+
+    fn human_states() -> Vec<ItemState> {
+        HUMAN_REASONS.map(ItemState::NeedsHuman).to_vec()
+    }
+
+    fn all_states() -> Vec<ItemState> {
+        let mut states = vec![AWAITING, QUEUED, CI_PENDING, IN_BATCH];
+        states.extend(bounced_states());
+        states.extend(human_states());
+        states
+    }
+
+    fn all_actions() -> Vec<Action> {
+        let mut actions = vec![
+            Action::Approve,
+            Action::Take,
+            Action::Requeue,
+            Action::Merge,
+            Action::Retry,
+            Action::Drop,
+            Action::MarkCiPending,
+            Action::ClearCiPending,
+        ];
+        for head_changed in [false, true] {
+            for needs_approval in [false, true] {
+                actions.push(Action::Resubmit {
+                    head_changed,
+                    needs_approval,
+                });
+            }
+        }
+        actions.extend(BOUNCE_REASONS.map(Action::Bounce));
+        actions.extend(HUMAN_REASONS.map(Action::Escalate));
+        actions
+    }
+
+    fn resubmit(head_changed: bool, needs_approval: bool) -> Action {
+        Action::Resubmit {
+            head_changed,
+            needs_approval,
+        }
+    }
+
+    fn allow(
+        table: &mut Vec<(ItemState, Action, Next)>,
+        from: &[ItemState],
+        action: Action,
+        next: Next,
+    ) {
+        table.extend(from.iter().map(|&f| (f, action, next)));
+    }
+
+    fn plan_table() -> Vec<(ItemState, Action, Next)> {
+        use Next::{Remove, To};
+        let mut t = Vec::new();
+        let waiting = [vec![AWAITING, QUEUED, CI_PENDING], bounced_states()].concat();
+
+        allow(&mut t, &[AWAITING], Action::Approve, To(QUEUED));
+
+        for needs_approval in [false, true] {
+            allow(
+                &mut t,
+                &[AWAITING],
+                resubmit(false, needs_approval),
+                To(AWAITING),
+            );
+            allow(
+                &mut t,
+                &[QUEUED],
+                resubmit(false, needs_approval),
+                To(QUEUED),
+            );
+            allow(
+                &mut t,
+                &[CI_PENDING],
+                resubmit(false, needs_approval),
+                To(CI_PENDING),
+            );
+            allow(
+                &mut t,
+                &bounced_states(),
+                resubmit(false, needs_approval),
+                To(QUEUED),
+            );
+        }
+        allow(&mut t, &waiting, resubmit(true, true), To(AWAITING));
+        allow(&mut t, &waiting, resubmit(true, false), To(QUEUED));
+
+        allow(&mut t, &[QUEUED], Action::Take, To(IN_BATCH));
+        allow(&mut t, &[IN_BATCH], Action::Requeue, To(QUEUED));
+        allow(&mut t, &[IN_BATCH], Action::Merge, Remove);
+        for reason in BOUNCE_REASONS {
+            allow(
+                &mut t,
+                &[IN_BATCH],
+                Action::Bounce(reason),
+                To(ItemState::Bounced(reason)),
+            );
+        }
+        allow(
+            &mut t,
+            &[IN_BATCH],
+            Action::Escalate(HumanReason::Budget),
+            To(ItemState::NeedsHuman(HumanReason::Budget)),
+        );
+        allow(
+            &mut t,
+            &bounced_states(),
+            Action::Escalate(HumanReason::Unreachable),
+            To(ItemState::NeedsHuman(HumanReason::Unreachable)),
+        );
+        allow(
+            &mut t,
+            &waiting,
+            Action::Escalate(HumanReason::GaveUp),
+            To(ItemState::NeedsHuman(HumanReason::GaveUp)),
+        );
+        allow(&mut t, &human_states(), Action::Retry, To(QUEUED));
+        allow(
+            &mut t,
+            &[waiting.clone(), human_states()].concat(),
+            Action::Drop,
+            Remove,
+        );
+        allow(
+            &mut t,
+            &[QUEUED, CI_PENDING],
+            Action::MarkCiPending,
+            To(CI_PENDING),
+        );
+        allow(
+            &mut t,
+            &[QUEUED, CI_PENDING],
+            Action::ClearCiPending,
+            To(QUEUED),
+        );
+        t
+    }
+
+    #[test]
+    fn transition_table_matches_the_plan_and_refuses_everything_else() {
+        let table = plan_table();
+        for (i, (from, action, _)) in table.iter().enumerate() {
+            assert!(
+                !table[..i].iter().any(|(f, a, _)| f == from && a == action),
+                "표에 {from:?} + {action:?}가 두 번 있다"
+            );
+        }
+        let mut checked = 0;
+        for from in all_states() {
+            for action in all_actions() {
+                let expected = table
+                    .iter()
+                    .find(|(f, a, _)| *f == from && *a == action)
+                    .map(|(_, _, next)| *next);
+                assert_eq!(step(from, action), expected, "{from:?} + {action:?}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 12 * 20);
+    }
+
+    #[test]
+    fn nothing_leaves_a_batch_except_by_merge_bounce_escalation_or_requeue() {
+        for action in all_actions() {
+            let allowed = step(IN_BATCH, action).is_some();
+            let expected = matches!(
+                action,
+                Action::Requeue
+                    | Action::Merge
+                    | Action::Bounce(_)
+                    | Action::Escalate(HumanReason::Budget)
+            );
+            assert_eq!(allowed, expected, "{action:?}");
+        }
+    }
+
+    fn sha(s: &str) -> Sha {
+        Sha::try_from(s.to_owned()).unwrap()
+    }
+
+    fn item(pr: u64, state: ItemState) -> QueueItem {
+        QueueItem {
+            pr: PrNumber(pr),
+            title: format!("PR {pr}"),
+            branch: format!("feat/{pr}"),
+            head: sha("abc1234"),
+            state,
+            agent: None,
+            attempts: 0,
+            submitted_ms: EpochMs(pr),
+            touches_config: false,
+            last_failure: None,
+        }
+    }
+
+    fn queue_of(items: &[(u64, ItemState)]) -> State {
+        State {
+            queue: items.iter().map(|&(pr, s)| item(pr, s)).collect(),
+            ..State::default()
+        }
+    }
+
+    fn state_of(state: &State, pr: u64) -> ItemState {
+        state
+            .queue
+            .iter()
+            .find(|i| i.pr == PrNumber(pr))
+            .unwrap()
+            .state
+    }
+
+    fn prs(taken: &[PrNumber]) -> Vec<u64> {
+        taken.iter().map(|p| p.0).collect()
+    }
+
+    #[test]
+    fn take_batch_keeps_submit_order_and_stops_at_max_batch() {
+        let mut state = queue_of(&[
+            (7, QUEUED),
+            (3, QUEUED),
+            (9, QUEUED),
+            (4, QUEUED),
+            (5, QUEUED),
+        ]);
+        let taken = take_batch(&mut state, 3);
+        assert_eq!(prs(&taken), [7, 3, 9]);
+        assert_eq!(state_of(&state, 7), IN_BATCH);
+        assert_eq!(state_of(&state, 9), IN_BATCH);
+        assert_eq!(state_of(&state, 4), QUEUED);
+        assert_eq!(state_of(&state, 5), QUEUED);
+    }
+
+    #[test]
+    fn take_batch_takes_only_waiting_prs_without_a_ci_wait() {
+        let mut state = queue_of(&[
+            (1, AWAITING),
+            (2, CI_PENDING),
+            (3, IN_BATCH),
+            (4, ItemState::Bounced(BounceReason::Verify)),
+            (5, ItemState::NeedsHuman(HumanReason::Budget)),
+            (6, QUEUED),
+        ]);
+        let before = state.clone();
+        assert_eq!(prs(&take_batch(&mut state, 8)), [6]);
+        assert_eq!(state_of(&state, 6), IN_BATCH);
+        for pr in 1..=5 {
+            assert_eq!(state_of(&state, pr), state_of(&before, pr), "#{pr}");
+        }
+        assert!(take_batch(&mut state, 8).is_empty());
+    }
+
+    #[test]
+    fn a_ci_wait_can_be_set_cleared_and_set_again_without_error() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        set_ci_pending(&mut state, PrNumber(1)).unwrap();
+        set_ci_pending(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(state_of(&state, 1), CI_PENDING);
+        assert!(take_batch(&mut state, 8).is_empty());
+        clear_ci_pending(&mut state, PrNumber(1)).unwrap();
+        clear_ci_pending(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(prs(&take_batch(&mut state, 8)), [1]);
+        assert!(set_ci_pending(&mut state, PrNumber(1)).is_err());
+    }
+
+    fn failure(kind: FailureKind) -> FailureRecord {
+        let step = || StepFailure {
+            step: "test".into(),
+            mode: VerifyMode::Solo,
+            failed_tests: vec![],
+            log: "/log".into(),
+            tree: sha("abc1234"),
+        };
+        let failure = match kind {
+            FailureKind::Conflict => Failure::Conflict {
+                files: NonEmpty::new(vec![ConflictFile {
+                    path: "src/a.rs".into(),
+                    main_commits: vec![CommitRef {
+                        sha: sha("def5678"),
+                        title: "t".into(),
+                    }],
+                }])
+                .unwrap(),
+            },
+            FailureKind::Verify => Failure::Verify(step()),
+            FailureKind::Timeout => Failure::Timeout(step()),
+            FailureKind::Ci => Failure::Ci {
+                checks: NonEmpty::new(vec![FailedCheck {
+                    name: "build".into(),
+                    link: "https://example.invalid/1".into(),
+                }])
+                .unwrap(),
+            },
+        };
+        FailureRecord {
+            failure,
+            summary: format!("{kind:?}"),
+            report: "/report.md".into(),
+            at_ms: EpochMs(1),
+        }
+    }
+
+    fn fail_once(state: &mut State, pr: u64, kind: FailureKind, budget: u32) -> ItemState {
+        assert!(prs(&take_batch(state, 8)).contains(&pr));
+        record_failure(state, PrNumber(pr), failure(kind), budget).unwrap()
+    }
+
+    fn resubmit_same_head(state: &mut State, pr: u64) {
+        submit(state, submission(pr, "abc1234", Approval::Agent, false)).unwrap();
+    }
+
+    fn attempts(state: &State, pr: u64) -> u32 {
+        state
+            .queue
+            .iter()
+            .find(|i| i.pr == PrNumber(pr))
+            .unwrap()
+            .attempts
+    }
+
+    #[test]
+    fn the_failure_after_budget_bounces_goes_to_a_human() {
+        let budget = 3;
+        let mut state = queue_of(&[(1, QUEUED)]);
+        for round in 1..=budget {
+            let to = fail_once(&mut state, 1, FailureKind::Verify, budget);
+            assert_eq!(to, ItemState::Bounced(BounceReason::Verify), "{round}번째");
+            assert_eq!(attempts(&state, 1), round);
+            resubmit_same_head(&mut state, 1);
+        }
+        let to = fail_once(&mut state, 1, FailureKind::Verify, budget);
+        assert_eq!(to, ItemState::NeedsHuman(HumanReason::Budget));
+        assert_eq!(attempts(&state, 1), budget);
+        assert!(state.queue[0].last_failure.is_some());
+    }
+
+    #[test]
+    fn every_failure_kind_but_head_changed_uses_up_one_bounce() {
+        for (kind, reason) in [
+            (FailureKind::Conflict, BounceReason::Conflict),
+            (FailureKind::Verify, BounceReason::Verify),
+            (FailureKind::Timeout, BounceReason::Timeout),
+            (FailureKind::Ci, BounceReason::Ci),
+        ] {
+            let mut state = queue_of(&[(1, QUEUED)]);
+            let to = fail_once(&mut state, 1, kind, 3);
+            assert_eq!(to, ItemState::Bounced(reason));
+            assert_eq!(attempts(&state, 1), 1, "{kind:?}");
+            assert_eq!(
+                state.queue[0].last_failure.as_ref().unwrap().summary,
+                format!("{kind:?}")
+            );
+        }
+
+        let mut state = queue_of(&[(1, QUEUED)]);
+        take_batch(&mut state, 8);
+        head_changed(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(
+            state_of(&state, 1),
+            ItemState::Bounced(BounceReason::HeadChanged)
+        );
+        assert_eq!(attempts(&state, 1), 0);
+        assert!(state.queue[0].last_failure.is_none());
+    }
+
+    #[test]
+    fn head_changed_does_not_use_up_budget_even_when_it_is_gone() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        state.queue[0].attempts = 3;
+        take_batch(&mut state, 8);
+        head_changed(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(
+            state_of(&state, 1),
+            ItemState::Bounced(BounceReason::HeadChanged)
+        );
+        assert_eq!(attempts(&state, 1), 3);
+    }
+
+    #[test]
+    fn a_budget_of_zero_sends_the_first_failure_to_a_human() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        let to = fail_once(&mut state, 1, FailureKind::Conflict, 0);
+        assert_eq!(to, ItemState::NeedsHuman(HumanReason::Budget));
+        assert_eq!(attempts(&state, 1), 0);
+    }
+
+    #[test]
+    fn a_refused_transition_changes_nothing() {
+        let mut state = queue_of(&[(1, QUEUED), (2, AWAITING)]);
+        let before = state.clone();
+        assert!(record_failure(&mut state, PrNumber(1), failure(FailureKind::Verify), 3).is_err());
+        assert!(merged(&mut state, PrNumber(1)).is_err());
+        assert!(approve(&mut state, PrNumber(1), None).is_err());
+        assert!(retry(&mut state, PrNumber(2)).is_err());
+        assert!(requeue(&mut state, PrNumber(2)).is_err());
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn merge_leaves_no_count_behind_and_retry_resets_it() {
+        let mut state = queue_of(&[
+            (1, IN_BATCH),
+            (2, ItemState::NeedsHuman(HumanReason::Budget)),
+        ]);
+        state.queue[0].attempts = 2;
+        state.queue[1].attempts = 3;
+
+        let done = merged(&mut state, PrNumber(1)).unwrap();
+        assert_eq!((done.pr, done.attempts), (PrNumber(1), 2));
+        assert!(state.queue.iter().all(|i| i.pr != PrNumber(1)));
+        submit(&mut state, submission(1, "abc1234", Approval::Agent, false)).unwrap();
+        assert_eq!(attempts(&state, 1), 0);
+
+        retry(&mut state, PrNumber(2)).unwrap();
+        assert_eq!((state_of(&state, 2), attempts(&state, 2)), (QUEUED, 0));
+    }
+
+    #[test]
+    fn a_retried_pr_gets_a_whole_new_budget() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        for _ in 0..3 {
+            fail_once(&mut state, 1, FailureKind::Verify, 3);
+            resubmit_same_head(&mut state, 1);
+        }
+        let to = fail_once(&mut state, 1, FailureKind::Verify, 3);
+        assert_eq!(to, ItemState::NeedsHuman(HumanReason::Budget));
+        retry(&mut state, PrNumber(1)).unwrap();
+        let to = fail_once(&mut state, 1, FailureKind::Verify, 3);
+        assert_eq!(to, ItemState::Bounced(BounceReason::Verify));
+        assert_eq!(attempts(&state, 1), 1);
+    }
+
+    #[test]
+    fn requeue_and_unreachable_and_give_up_follow_the_table() {
+        let mut state = queue_of(&[
+            (1, IN_BATCH),
+            (2, ItemState::Bounced(BounceReason::Conflict)),
+            (3, AWAITING),
+        ]);
+        requeue(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(state_of(&state, 1), QUEUED);
+        unreachable(&mut state, PrNumber(2)).unwrap();
+        assert_eq!(
+            state_of(&state, 2),
+            ItemState::NeedsHuman(HumanReason::Unreachable)
+        );
+        give_up(&mut state, PrNumber(3)).unwrap();
+        assert_eq!(
+            state_of(&state, 3),
+            ItemState::NeedsHuman(HumanReason::GaveUp)
+        );
+        assert!(unreachable(&mut state, PrNumber(1)).is_err());
+        assert!(give_up(&mut state, PrNumber(2)).is_err());
+    }
+
+    #[test]
+    fn drop_returns_the_item_and_refuses_a_pr_in_a_batch() {
+        let mut state = queue_of(&[(1, QUEUED), (2, IN_BATCH)]);
+        let gone = drop_item(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(gone.pr, PrNumber(1));
+        let err = drop_item(&mut state, PrNumber(2)).unwrap_err();
+        assert!(err.to_string().contains("batch가 끝난 뒤"), "{err}");
+        assert_eq!(
+            drop_item(&mut state, PrNumber(9)).unwrap_err(),
+            TransitionError::NotQueued(PrNumber(9))
+        );
+    }
+
+    #[test]
+    fn refusals_say_why_in_korean() {
+        let mut state = queue_of(&[
+            (1, QUEUED),
+            (2, ItemState::Bounced(BounceReason::Verify)),
+            (3, ItemState::NeedsHuman(HumanReason::GaveUp)),
+        ]);
+        let said = |e: TransitionError| e.to_string();
+        assert!(
+            said(approve(&mut state, PrNumber(1), None).unwrap_err()).contains("승인을 기다리는")
+        );
+        assert!(said(retry(&mut state, PrNumber(2)).unwrap_err()).contains("다시 submit"));
+        assert!(said(retry(&mut state, PrNumber(1)).unwrap_err()).contains("사람 차례의 PR만"));
+        let again = submission(3, "abc1234", Approval::Agent, false);
+        assert!(said(submit(&mut state, again).unwrap_err()).contains("chute retry"));
+        assert!(said(give_up(&mut state, PrNumber(3)).unwrap_err()).contains("이미 사람 차례"));
+        assert_eq!(
+            said(approve(&mut state, PrNumber(9), None).unwrap_err()),
+            "#9: 큐에 없다"
+        );
+    }
+
+    fn agent(terminal: &str) -> Agent {
+        Agent {
+            terminal: crate::model::TerminalId(terminal.into()),
+            created_ms: EpochMs(1),
+            name: Some(terminal.into()),
+            workdir: "/w".into(),
+            alive: true,
+        }
+    }
+
+    fn submission(pr: u64, head: &str, approval: Approval, touches_config: bool) -> Submission {
+        Submission {
+            pr: PrNumber(pr),
+            title: format!("PR {pr} v2"),
+            branch: format!("feat/{pr}"),
+            head: sha(head),
+            agent: None,
+            touches_config,
+            approval,
+            now: EpochMs(1000 + pr),
+        }
+    }
+
+    #[test]
+    fn a_new_pr_starts_waiting_or_awaiting_approval() {
+        for (approval, touches_config, expected) in [
+            (Approval::Agent, false, QUEUED),
+            (Approval::Human, false, AWAITING),
+            (Approval::Agent, true, AWAITING),
+            (Approval::Human, true, AWAITING),
+        ] {
+            let mut state = queue_of(&[(1, QUEUED)]);
+            let mut s = submission(2, "def5678", approval, touches_config);
+            s.agent = Some(agent("t1rs"));
+            let done = submit(&mut state, s).unwrap();
+            assert_eq!(
+                done,
+                Submitted {
+                    state: expected,
+                    position: place(1),
+                    change: Change::Added
+                }
+            );
+            let added = &state.queue[1];
+            assert_eq!(added.head, sha("def5678"));
+            assert_eq!(added.agent, Some(agent("t1rs")));
+            assert_eq!((added.attempts, added.submitted_ms), (0, EpochMs(1002)));
+            assert_eq!(added.touches_config, touches_config);
+            assert!(added.last_failure.is_none());
+        }
+    }
+
+    #[test]
+    fn submitting_the_same_head_again_changes_nothing() {
+        for state_before in [QUEUED, CI_PENDING, AWAITING] {
+            let mut state = queue_of(&[(1, state_before)]);
+            state.queue[0].agent = Some(agent("t1rs"));
+            let before = state.clone();
+            let mut s = submission(1, "abc1234", Approval::Human, true);
+            s.agent = Some(agent("t1other"));
+            let done = submit(&mut state, s).unwrap();
+            assert_eq!(done.change, Change::Unchanged);
+            assert_eq!((done.state, done.position), (state_before, place(0)));
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn a_new_head_asks_for_approval_again_only_when_approval_is_needed() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED)]);
+        let human = submit(&mut state, submission(1, "def5678", Approval::Human, false)).unwrap();
+        assert_eq!((human.state, human.change), (AWAITING, Change::HeadUpdated));
+        let trust = submit(&mut state, submission(2, "def5678", Approval::Agent, false)).unwrap();
+        assert_eq!((trust.state, trust.change), (QUEUED, Change::HeadUpdated));
+        let config = submit(&mut state, submission(3, "def5678", Approval::Agent, true)).unwrap();
+        assert_eq!(config.state, AWAITING);
+        assert!(state.queue[2].touches_config);
+        assert_eq!(state.queue[0].head, sha("def5678"));
+        assert_eq!(state.queue[0].title, "PR 1 v2");
+
+        approve(&mut state, PrNumber(1), None).unwrap();
+        let same = submit(&mut state, submission(1, "def5678", Approval::Human, false)).unwrap();
+        assert_eq!((same.state, same.change), (QUEUED, Change::Unchanged));
+    }
+
+    #[test]
+    fn a_new_head_clears_a_ci_wait() {
+        let mut state = queue_of(&[(1, CI_PENDING)]);
+        submit(&mut state, submission(1, "def5678", Approval::Agent, false)).unwrap();
+        assert_eq!(state_of(&state, 1), QUEUED);
+    }
+
+    #[test]
+    fn a_bounced_pr_goes_back_to_waiting_keeping_its_count_and_place() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED)]);
+        fail_once(&mut state, 1, FailureKind::Verify, 3);
+        assert_eq!(attempts(&state, 1), 1);
+        state.queue[0].agent = Some(agent("t1old"));
+
+        let mut s = submission(1, "def5678", Approval::Agent, false);
+        s.agent = Some(agent("t1new"));
+        let done = submit(&mut state, s).unwrap();
+        assert_eq!(
+            done,
+            Submitted {
+                state: QUEUED,
+                position: place(0),
+                change: Change::Requeued
+            }
+        );
+        assert_eq!(attempts(&state, 1), 1);
+        assert_eq!(state.queue[0].agent, Some(agent("t1new")));
+        assert_eq!(state.queue[0].submitted_ms, EpochMs(1));
+        assert_eq!(state.queue[0].head, sha("def5678"));
+        assert!(state.queue[0].last_failure.is_some());
+    }
+
+    #[test]
+    fn a_bounced_pr_without_a_new_agent_keeps_the_old_one() {
+        let mut state = queue_of(&[(1, ItemState::Bounced(BounceReason::HeadChanged))]);
+        state.queue[0].agent = Some(agent("t1old"));
+        submit(&mut state, submission(1, "def5678", Approval::Agent, false)).unwrap();
+        assert_eq!(state.queue[0].agent, Some(agent("t1old")));
+    }
+
+    #[test]
+    fn a_bounced_pr_needs_approval_again_only_for_a_new_head() {
+        let bounced = ItemState::Bounced(BounceReason::Verify);
+        let mut state = queue_of(&[(1, bounced), (2, bounced)]);
+        let same = submit(&mut state, submission(1, "abc1234", Approval::Human, false)).unwrap();
+        assert_eq!(same.state, QUEUED);
+        let new = submit(&mut state, submission(2, "def5678", Approval::Human, false)).unwrap();
+        assert_eq!(new.state, AWAITING);
+    }
+
+    #[test]
+    fn submit_is_refused_while_in_a_batch_or_on_a_humans_turn() {
+        for refused in [IN_BATCH, ItemState::NeedsHuman(HumanReason::Unreachable)] {
+            let mut state = queue_of(&[(1, refused)]);
+            let before = state.clone();
+            let err =
+                submit(&mut state, submission(1, "def5678", Approval::Agent, false)).unwrap_err();
+            assert!(matches!(err, TransitionError::NotAllowed { .. }));
+            assert_eq!(state, before);
+        }
+    }
+
+    fn preflight(head: &str) -> PreflightRecord {
+        PreflightRecord {
+            head: sha(head),
+            result: crate::model::PreflightResult::Pass,
+            report: None,
+            at_ms: EpochMs(1),
+        }
+    }
+
+    #[test]
+    fn registering_a_head_drops_preflight_results_of_other_heads_of_that_branch() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        for branch in ["feat/1", "feat/2", "feat/3", "feat/other"] {
+            state.preflights.insert(branch.into(), preflight("0d0d0d0"));
+        }
+
+        submit(&mut state, submission(1, "def5678", Approval::Agent, false)).unwrap();
+        submit(&mut state, submission(2, "def5678", Approval::Agent, false)).unwrap();
+        state
+            .preflights
+            .insert("feat/3".into(), preflight("def5678"));
+        submit(&mut state, submission(3, "def5678", Approval::Agent, false)).unwrap();
+
+        assert!(!state.preflights.contains_key("feat/1"));
+        assert!(!state.preflights.contains_key("feat/2"));
+        assert_eq!(state.preflights["feat/3"], preflight("def5678"));
+        assert_eq!(state.preflights["feat/other"], preflight("0d0d0d0"));
+    }
+
+    #[test]
+    fn resubmitting_the_same_head_keeps_every_preflight_result() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        state
+            .preflights
+            .insert("feat/1".into(), preflight("def5678"));
+        let before = state.clone();
+        submit(&mut state, submission(1, "abc1234", Approval::Agent, false)).unwrap();
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn approval_applies_only_to_the_head_the_approver_saw() {
+        let waiting = || queue_of(&[(1, AWAITING)]);
+        let mut state = waiting();
+        let before = state.clone();
+
+        for seen in ["def5678", "abd1"] {
+            let err = approve(&mut state, PrNumber(1), Some(seen)).unwrap_err();
+            assert!(matches!(err, TransitionError::HeadMoved { .. }), "{seen:?}");
+            assert_eq!(state, before, "{seen:?}");
+        }
+        let err = approve(&mut state, PrNumber(1), Some("def5678")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("승인하려던 HEAD def5678, 지금 HEAD abc1234"),
+            "{err}"
+        );
+
+        let too_long = ["abc12340", &"a".repeat(65), &"a".repeat(100_000)];
+        for given in ["", "a", "abc", "abd", "zzzz", "abc 1234", "-abc1"]
+            .into_iter()
+            .chain(too_long)
+        {
+            let err = approve(&mut state, PrNumber(1), Some(given)).unwrap_err();
+            assert!(matches!(err, TransitionError::BadHead { .. }), "{given:?}");
+            assert!(err.to_string().contains("4자 이상"), "{err}");
+            assert!(err.to_string().chars().count() < 200, "{err}");
+            assert_eq!(state, before, "{given:?}");
+        }
+
+        for seen in [
+            Some("abc1234"),
+            Some("abc123"),
+            Some("abc1"),
+            Some("ABC1234"),
+            Some(" abc1234 "),
+            None,
+        ] {
+            let mut state = waiting();
+            approve(&mut state, PrNumber(1), seen).unwrap();
+            assert_eq!(state_of(&state, 1), QUEUED, "{seen:?}");
+        }
+    }
+
+    #[test]
+    fn a_pr_that_is_not_waiting_is_refused_for_its_state_before_its_head() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        let err = approve(&mut state, PrNumber(1), Some("def5678")).unwrap_err();
+        assert!(matches!(err, TransitionError::NotAllowed { .. }), "{err}");
+    }
+
+    #[test]
+    fn labels_match_the_plain_text_status() {
+        assert_eq!(label(AWAITING), "승인 대기");
+        assert_eq!(label(CI_PENDING), "대기(CI 기다림)");
+        assert_eq!(
+            label(ItemState::Bounced(BounceReason::HeadChanged)),
+            "반송(HEAD 바뀜)"
+        );
+        assert_eq!(
+            label(ItemState::NeedsHuman(HumanReason::GaveUp)),
+            "사람 차례(포기)"
+        );
+    }
+}

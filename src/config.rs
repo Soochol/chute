@@ -138,6 +138,29 @@ impl Config {
         })
     }
 
+    /// Reads `chute.toml` from `refs/remotes/origin/<branch>`, or returns `None` when that ref
+    /// or the file is missing. The exact ref is named on purpose: `origin/<branch>` resolves
+    /// to a local branch or tag of that name first, and even the full ref name falls back to
+    /// `refs/tags/<name>` and `refs/heads/<name>` when the remote-tracking ref is absent.
+    pub fn load_remote_branch(ext: &Ext, repo: &Path, branch: &str) -> Result<Option<Config>> {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        let found = ext.git(
+            repo,
+            ["show-ref", "--verify", "--hash", remote_ref.as_str()],
+        )?;
+        let commit = found.stdout_text().trim().to_owned();
+        if !found.success() || commit.is_empty() {
+            return Ok(None);
+        }
+        let spec = format!("{commit}:{FILE_NAME}");
+        if !ext.git(repo, ["cat-file", "-e", spec.as_str()])?.success() {
+            return Ok(None);
+        }
+        Config::load_at(ext, repo, &commit)
+            .map(Some)
+            .with_context(|| format!("origin/{branch}의 설정을 읽지 못했다"))
+    }
+
     pub fn load_at(ext: &Ext, repo: &Path, rev: &str) -> Result<Config> {
         let spec = format!("{rev}:{FILE_NAME}");
         let out = ext.git(repo, ["show", spec.as_str()])?;
