@@ -153,10 +153,11 @@ impl Config {
             return Ok(None);
         }
         let spec = format!("{commit}:{FILE_NAME}");
-        if !ext.git(repo, ["cat-file", "-e", spec.as_str()])?.success() {
+        let shown = ext.git(repo, ["--no-replace-objects", "show", spec.as_str()])?;
+        if !shown.success() {
             return Ok(None);
         }
-        Config::load_at(ext, repo, &commit)
+        Config::parse(&shown.stdout_text())
             .map(Some)
             .with_context(|| format!("origin/{branch}의 설정을 읽지 못했다"))
     }

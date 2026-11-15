@@ -930,3 +930,27 @@ fn a_config_that_cannot_be_read_names_the_remote_branch_it_came_from() {
     );
     assert_eq!(w.state(), State::default());
 }
+
+#[test]
+fn a_git_replace_ref_cannot_swap_the_config_of_the_remote_default_branch() {
+    let w = World::human();
+    let remote_commit = w
+        .repo
+        .git(&["rev-parse", "refs/remotes/origin/main"])
+        .trim()
+        .to_owned();
+    w.repo.git(&["checkout", "--quiet", "-b", "scratch"]);
+    let forged = w.repo.commit_file(
+        "chute.toml",
+        &chute::config::draft("true"),
+        "local config that trusts agents",
+    );
+    w.repo.git(&["replace", &remote_commit, &forged]);
+    w.repo.git(&["checkout", "--quiet", "main"]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    assert_eq!(code(&submit(&w, &["12"])), Some(0));
+
+    assert_eq!(w.state().queue[0].state, ItemState::AwaitingApproval);
+    assert_eq!(w.status(w.repo.path())["approval"], "human");
+}
