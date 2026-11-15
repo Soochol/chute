@@ -225,7 +225,9 @@ const submittedAt = (item) => (Number.isFinite(item.submitted_ms) ? item.submitt
 const bySubmission = (a, b) => {
   const [x, y] = [submittedAt(a), submittedAt(b)];
   if (x !== y) return x < y ? -1 : 1;
-  return Number.isInteger(a.pr) && Number.isInteger(b.pr) ? a.pr - b.pr : 0;
+  const [p, q] = [Number.isInteger(a.pr), Number.isInteger(b.pr)];
+  if (p && q) return a.pr - b.pr;
+  return p === q ? 0 : p ? -1 : 1;
 };
 
 function repoBoard(view, now) {

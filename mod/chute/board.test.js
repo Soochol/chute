@@ -725,12 +725,15 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight"]);
     const leaves = [];
-    const walk = (value, path) => {
-      if (value !== null && typeof value === "object") Object.entries(value).forEach(([k, v]) => walk(v, `${path}.${k}`));
-      else leaves.push([path, value]);
+    const walk = (value, path, key) => {
+      if (value !== null && typeof value === "object") {
+        assert.ok(key === "" || /^\d+$/.test(key) || CONTAINERS.has(key), `${path} holds an object where text belongs :: ${ctx}`);
+        Object.entries(value).forEach(([k, v]) => walk(v, `${path}.${k}`, k));
+      } else leaves.push([path, value]);
     };
-    walk(result, "");
+    walk(result, "", "");
     for (const [path, leaf] of leaves) {
       assert.ok(leaf === null || ["string", "boolean"].includes(typeof leaf) || Number.isFinite(leaf), `${path} is ${leaf} :: ${ctx}`);
       if (typeof leaf === "string") {
@@ -811,4 +814,13 @@ test("numbers that overflow to infinity are not printed as numbers", () => {
   const text = '[{"today":{"merged":1e999,"bounced":2,"median_lead_s":1e999,"verify_s":5400}}]';
   const today = Object.fromEntries(section(interpret({ code: 0, stdout: text }, NOW).repos[0], "today").items.map((s) => [s.key, s.value]));
   assert.deepEqual([today.merged, today.bounced, today.lead, today.verify], ["—", "2", "—", "1시간 30분"]);
+});
+
+test("the waiting order does not depend on the input order", () => {
+  const [a, b, c] = [1, 2, "x"].map((pr) => ({ ...itemOf(20), pr, submitted_ms: 5 }));
+  const orders = new Set();
+  for (const perm of [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]) {
+    orders.add(JSON.stringify(prs(section(only(queueOnly(...perm)), "waiting"))));
+  }
+  assert.deepEqual([...orders], ['[1,2,"?"]']);
 });
