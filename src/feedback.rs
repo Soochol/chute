@@ -548,7 +548,7 @@ fn file_names(files: &[ConflictFile]) -> String {
 }
 
 fn check_names(checks: &[FailedCheck]) -> String {
-    let shown: Vec<String> = checks.iter().take(3).map(|c| one_line(&c.name)).collect();
+    let shown: Vec<String> = checks.iter().take(3).map(|c| code_span(&c.name)).collect();
     match checks.len().saturating_sub(shown.len()) {
         0 => shown.join(", "),
         more => format!("{} 외 {more}개", shown.join(", ")),
@@ -878,6 +878,7 @@ impl Notice<'_> {
 fn line_summary(doc: &ReportDoc) -> String {
     match &doc.failure {
         Failure::Conflict { files } => format!("충돌: 파일 {}개", files.len()),
+        Failure::Ci { checks } => format!("원격 CI 실패: check {}개", checks.len()),
         _ => doc.summary.clone(),
     }
 }

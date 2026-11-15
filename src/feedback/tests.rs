@@ -592,7 +592,7 @@ fn a_remote_ci_report_lists_the_failed_checks_and_no_local_repro() {
 
     let md = read(&written.md);
     for needed in [
-        "원격 CI 실패: build, lint",
+        "원격 CI 실패: `build`, `lint`",
         "등록한 HEAD",
         "`build`",
         "https://example.invalid/runs/1",
@@ -615,7 +615,8 @@ fn a_remote_ci_report_lists_the_failed_checks_and_no_local_repro() {
         .respond("send t1rs *", Reply::ok("{}"));
     lab.fb().deliver(&item, &Notice::Bounced(&written));
     let sent = lab.hc_calls().into_iter().find(|c| c[0] == "send").unwrap();
-    assert!(sent[2].contains("원격 CI 실패"), "{}", sent[2]);
+    assert!(sent[2].contains("원격 CI 실패: check 2개"), "{}", sent[2]);
+    assert!(!sent[2].contains("build"), "{}", sent[2]);
     assert!(sent[2].contains(&written.md.display().to_string()));
 }
 
