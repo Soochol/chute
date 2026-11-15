@@ -1,5 +1,3 @@
-//! Identifies the target repository from a directory inside it or one of its worktrees.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,17 +5,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::ext::Ext;
 use crate::model::{RepoInfo, Slug};
 
-/// The `owner/name` of `origin`, from any work tree of the repository.
 pub fn slug(ext: &Ext, dir: &Path) -> Result<Slug> {
     let url = origin_url(ext, dir)?;
     parse_slug(&url)
 }
 
-/// Everything `repo.json` records. Asks `origin` for its default branch.
 pub fn discover(ext: &Ext, dir: &Path) -> Result<RepoInfo> {
     let remote = origin_url(ext, dir)?;
     let slug = parse_slug(&remote)?;
-    let path = main_worktree(ext, dir)?;
+    let path = work_tree(ext, dir)?;
     let default_branch = default_branch(ext, &path)?;
     Ok(RepoInfo {
         slug,
@@ -39,13 +35,25 @@ fn origin_url(ext: &Ext, dir: &Path) -> Result<String> {
     Ok(out.stdout_text().trim().to_owned())
 }
 
-fn main_worktree(ext: &Ext, dir: &Path) -> Result<PathBuf> {
+/// The main work tree, or the current one when the repository itself is bare.
+fn work_tree(ext: &Ext, dir: &Path) -> Result<PathBuf> {
     let text = ext.git(dir, ["worktree", "list", "--porcelain"])?.ok()?;
-    text.lines()
-        .next()
-        .and_then(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("git worktree list의 출력을 읽지 못했다: {text:?}"))
+    let main = text.split("\n\n").next().unwrap_or_default();
+    let path = main
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .ok_or_else(|| anyhow!("git worktree list의 출력을 읽지 못했다: {text:?}"))?;
+    if !main.lines().any(|line| line == "bare") {
+        return Ok(PathBuf::from(path));
+    }
+    let top = ext.git(dir, ["rev-parse", "--show-toplevel"])?;
+    if !top.success() {
+        bail!(
+            "bare 저장소 안이다. worktree 안에서 실행한다: {}",
+            dir.display()
+        );
+    }
+    Ok(PathBuf::from(top.stdout_text().trim()))
 }
 
 fn default_branch(ext: &Ext, repo: &Path) -> Result<String> {
@@ -62,8 +70,6 @@ fn default_branch(ext: &Ext, repo: &Path) -> Result<String> {
         })
 }
 
-/// The last two path segments of a remote URL: `https://github.com/o/n.git`,
-/// `git@github.com:o/n`, or a local path ending in `o/n.git`.
 pub fn parse_slug(url: &str) -> Result<Slug> {
     let trimmed = url.trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
@@ -116,5 +122,36 @@ mod tests {
         assert_eq!(info.path, repo.path().canonicalize().unwrap());
         assert_eq!(info.default_branch, "main");
         assert_eq!(Path::new(&info.remote), repo.origin());
+    }
+
+    #[test]
+    fn a_bare_repository_uses_the_worktree_it_runs_in() {
+        let sb = Sandbox::new();
+        let repo = TestRepo::new(&sb, "acme/widget");
+        let bare = sb.root().join("bare.git");
+        let wt = sb.root().join("bare-wt");
+        repo.git(&[
+            "clone",
+            "--quiet",
+            "--bare",
+            &repo.origin().to_string_lossy(),
+            &bare.to_string_lossy(),
+        ]);
+        repo.git(&[
+            "-C",
+            &bare.to_string_lossy(),
+            "worktree",
+            "add",
+            "--quiet",
+            &wt.to_string_lossy(),
+            "main",
+        ]);
+        let ext = Ext::from_vars(|k| sb.var(k));
+
+        assert_eq!(
+            discover(&ext, &wt).unwrap().path,
+            wt.canonicalize().unwrap()
+        );
+        assert!(discover(&ext, &bare).is_err());
     }
 }

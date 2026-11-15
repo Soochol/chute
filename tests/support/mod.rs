@@ -1,8 +1,3 @@
-//! Test helpers shared by unit tests (`crate::testkit`) and integration tests (`mod support`).
-//! Nothing here depends on the chute crate, so both can include this file.
-//!
-//! Every helper keeps tests away from the user's environment: `CHUTE_HOME`, `HOME`, and the
-//! git config point into a temporary folder, `gh` and `hc` are fakes, and remotes are local bare repositories.
 #![allow(dead_code)]
 
 use std::ffi::OsString;
@@ -60,7 +55,6 @@ impl Sandbox {
         self.root().join("gitconfig")
     }
 
-    /// The environment a chute process sees in this sandbox. `None` removes the variable.
     pub fn envs(&self) -> Vec<(OsString, Option<OsString>)> {
         let set = |k: &str, v: PathBuf| (OsString::from(k), Some(v.into_os_string()));
         let mut envs = vec![
@@ -81,7 +75,6 @@ impl Sandbox {
         envs
     }
 
-    /// One variable of `envs`, for code that reads variables through a lookup function.
     pub fn var(&self, key: &str) -> Option<OsString> {
         self.envs()
             .into_iter()
@@ -100,7 +93,6 @@ impl Sandbox {
         cmd
     }
 
-    /// A fake executable in `bin/`. Installing `git` makes `CHUTE_GIT` point at it.
     pub fn fake(&self, name: &str) -> FakeTool {
         let dir = self.root().join("fakes").join(name);
         let path = self.root().join("bin").join(name);
@@ -115,7 +107,6 @@ impl Sandbox {
         FakeTool { dir, path }
     }
 
-    /// An executable `sh` script with the given body.
     pub fn script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.root().join("bin").join(name);
         write_executable(&path, &format!("#!/bin/sh\n{body}"));
@@ -128,8 +119,6 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Records each call as its arguments, each followed by US (0x1f), then RS (0x1e).
-/// Answers with the first rule whose `sh` glob matches the arguments joined by spaces.
 const FAKE_SCRIPT: &str = r#"#!/bin/sh
 d='@DIR@'
 us=$(printf '\037')
@@ -171,7 +160,6 @@ impl Reply {
         }
     }
 
-    /// Standard output read from a fixture file, relative to the crate root.
     pub fn file(path: impl AsRef<Path>) -> Reply {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
         Reply::ok(fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
@@ -193,7 +181,6 @@ impl FakeTool {
         &self.path
     }
 
-    /// Adds a rule. `pattern` is an `sh` glob over the arguments joined by spaces.
     pub fn respond(&self, pattern: &str, reply: Reply) -> &FakeTool {
         assert!(
             !pattern.contains(['\t', '\n']),
@@ -217,7 +204,6 @@ impl FakeTool {
         self
     }
 
-    /// Every call so far, in order, as its argument list.
     pub fn calls(&self) -> Vec<Vec<String>> {
         let Ok(text) = fs::read_to_string(self.dir.join("calls")) else {
             return Vec::new();
@@ -235,8 +221,6 @@ impl FakeTool {
     }
 }
 
-/// A work clone of a local bare origin at `remotes/<owner>/<name>.git`, so the origin URL
-/// ends in `<owner>/<name>.git` like a GitHub URL. `main` has one commit and is pushed.
 pub struct TestRepo {
     work: PathBuf,
     origin: PathBuf,
@@ -302,7 +286,6 @@ impl TestRepo {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    /// Runs git in the work clone and returns its standard output.
     pub fn git(&self, args: &[&str]) -> String {
         self.run_git(&self.work, args)
     }
@@ -317,7 +300,6 @@ impl TestRepo {
         self.git(&["rev-parse", "HEAD"]).trim().to_owned()
     }
 
-    /// Writes and commits one file on the current branch and returns the new HEAD.
     pub fn commit_file(&self, path: &str, content: &str, message: &str) -> String {
         self.write(path, content);
         self.git(&["add", path]);
@@ -325,8 +307,6 @@ impl TestRepo {
         self.head()
     }
 
-    /// Creates `branch` from `main` with one commit, pushes it, returns to `main`, and
-    /// returns the branch HEAD, as a PR branch would look.
     pub fn pr_branch(&self, branch: &str, path: &str, content: &str) -> String {
         self.git(&["checkout", "--quiet", "-b", branch, "main"]);
         let head = self.commit_file(path, content, &format!("feat: {branch}"));

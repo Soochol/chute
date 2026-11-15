@@ -196,3 +196,132 @@ fn chute_git_selects_the_git_executable() {
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(git.calls(), [["remote", "get-url", "origin"]]);
 }
+
+fn status_json(sb: &Sandbox, repo: &TestRepo) -> Value {
+    serde_json::from_str(&ok(chute(sb, repo.path(), &["status", "--json"]))).unwrap()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn status_shows_the_daemon_that_holds_the_lock() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    let dir = sb.chute_home().join("repos/acme__widget");
+    fs::write(
+        dir.join("daemon.json"),
+        r#"{"pid": 4242, "terminal": "t1zz", "doing": null, "started_ms": 0}"#,
+    )
+    .unwrap();
+    let lock = fs::File::create(dir.join("daemon.lock")).unwrap();
+
+    let idle = status_json(&sb, &repo);
+    assert_eq!(
+        idle["daemon"],
+        serde_json::json!({"running": false, "terminal": null, "pid": null})
+    );
+
+    lock.lock().unwrap();
+    let running = status_json(&sb, &repo);
+    assert_eq!(
+        running["daemon"],
+        serde_json::json!({"running": true, "terminal": "t1zz", "pid": 4242})
+    );
+}
+
+#[test]
+fn status_counts_today_from_history() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    let now = now_ms();
+    let history = format!(
+        "{{\"at_ms\":{now},\"event\":\"merged\",\"pr\":3,\"batch\":\"b1\",\"commit\":\"abc1234\",\"submitted_ms\":{}}}\n\
+         {{\"at_ms\":{now},\"event\":\"batch_finished\",\"batch\":\"b1\",\"merged\":[3],\"bounced\":[],\"seconds\":40,\"verify_s\":30}}\n\
+         {{\"at_ms\":{now},\"event\":\"bou",
+        now - 90_000
+    );
+    fs::write(
+        sb.chute_home().join("repos/acme__widget/history.jsonl"),
+        history,
+    )
+    .unwrap();
+
+    let status = status_json(&sb, &repo);
+    assert_eq!(status["today"]["merged"], 1);
+    assert_eq!(status["today"]["batches"], 1);
+    assert_eq!(status["today"]["median_lead_s"], 90);
+    assert_eq!(status["recent"][0]["batch"], "b1");
+    let kinds: Vec<&str> = status["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"history"), "{kinds:?}");
+}
+
+#[test]
+fn status_without_json_prints_a_summary() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    let text = ok(chute(&sb, repo.path(), &["status"]));
+    assert!(serde_json::from_str::<Value>(&text).is_err(), "{text}");
+    assert!(text.starts_with("acme/widget (main)"), "{text}");
+    assert!(text.contains("큐가 비어 있다"), "{text}");
+}
+
+#[test]
+fn status_all_skips_stray_files_in_the_state_folder() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    fs::write(sb.chute_home().join("repos/.DS_Store"), "").unwrap();
+    let all: Value =
+        serde_json::from_str(&ok(chute(&sb, sb.root(), &["status", "--json", "--all"]))).unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn init_leaves_agents_md_alone() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    repo.write("AGENTS.md", "# rules\n");
+    ok(chute(&sb, repo.path(), &["init"]));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("AGENTS.md")).unwrap(),
+        "# rules\n"
+    );
+}
+
+#[test]
+fn init_does_not_redraft_a_config_already_on_the_default_branch() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    repo.commit_file(
+        "chute.toml",
+        "[[verify]]\nname = \"t\"\nrun = \"true\"\n",
+        "chore: chute 설정",
+    );
+    repo.git(&["push", "--quiet", "origin", "main"]);
+    repo.git(&["checkout", "--quiet", "-b", "old", "HEAD~1"]);
+
+    ok(chute(&sb, repo.path(), &["init"]));
+    assert!(!repo.path().join("chute.toml").exists());
+}
+
+#[test]
+fn a_missing_repo_folder_is_reported_as_missing() {
+    let sb = Sandbox::new();
+    let out = chute(&sb, sb.root(), &["--repo", "nope", "status"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("폴더가 없다"), "{err}");
+}

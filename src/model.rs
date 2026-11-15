@@ -18,7 +18,6 @@ impl fmt::Display for PrNumber {
 impl std::str::FromStr for PrNumber {
     type Err = String;
 
-    /// Accepts `12` and `#12`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.strip_prefix('#')
             .unwrap_or(s)
@@ -86,7 +85,6 @@ impl EpochMs {
     }
 }
 
-/// GitHub `owner/name`. The state folder name is `owner__name`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Slug {
@@ -96,14 +94,17 @@ pub struct Slug {
 
 impl Slug {
     pub fn new(owner: &str, name: &str) -> Result<Slug, String> {
-        let valid = |s: &str| {
-            !s.is_empty()
-                && s != "."
-                && s != ".."
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        };
-        if valid(owner) && valid(name) {
+        let owner_ok = !owner.is_empty()
+            && owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let name_ok = !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        if owner_ok && name_ok {
             Ok(Slug {
                 owner: owner.to_owned(),
                 name: name.to_owned(),
@@ -157,7 +158,6 @@ pub enum Approval {
     Human,
 }
 
-/// `repo.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub slug: Slug,
@@ -166,7 +166,6 @@ pub struct RepoInfo {
     pub default_branch: String,
 }
 
-/// `daemon.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub pid: u32,
@@ -175,8 +174,6 @@ pub struct DaemonInfo {
     pub started_ms: EpochMs,
 }
 
-/// A queue item's state and its reason, written as the flat pair
-/// `"state"` / `"state_reason"` so a reason can only appear where the state allows one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawItemState", into = "RawItemState")]
 pub enum ItemState {
@@ -268,8 +265,8 @@ impl From<ItemState> for RawItemState {
     }
 }
 
-/// The agent that submitted a PR. An hc address alone may be reused, so a bounce
-/// goes to the same agent only when `terminal` and `created_ms` both match a live terminal.
+/// hc does not promise that terminal addresses are never reused, so an agent is the same
+/// only when `terminal` and `created_ms` both match a live terminal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub terminal: TerminalId,
@@ -284,12 +281,10 @@ pub struct QueueItem {
     pub pr: PrNumber,
     pub title: String,
     pub branch: String,
-    /// The HEAD recorded at submit. Only this commit is merged.
     pub head: Sha,
     #[serde(flatten)]
     pub state: ItemState,
     pub agent: Option<Agent>,
-    /// Consecutive bounces. Reset on merge and on `chute retry`.
     pub attempts: u32,
     pub submitted_ms: EpochMs,
     pub touches_config: bool,
@@ -308,37 +303,124 @@ pub enum FailureKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Failure {
-    Conflict { files: Vec<ConflictFile> },
+    Conflict { files: NonEmpty<ConflictFile> },
     Verify(StepFailure),
     Timeout(StepFailure),
-    Ci { checks: Vec<FailedCheck> },
+    Ci { checks: NonEmpty<FailedCheck> },
 }
 
 impl Failure {
-    pub fn kind(&self) -> FailureKind {
+    pub fn shape(&self) -> FailureShape {
+        let mode = |step: &StepFailure| match step.mode {
+            VerifyMode::Solo => Mode::Solo,
+            VerifyMode::Combo { .. } => Mode::Combo,
+        };
         match self {
-            Failure::Conflict { .. } => FailureKind::Conflict,
-            Failure::Verify(_) => FailureKind::Verify,
-            Failure::Timeout(_) => FailureKind::Timeout,
-            Failure::Ci { .. } => FailureKind::Ci,
+            Failure::Conflict { .. } => FailureShape::Conflict,
+            Failure::Verify(step) => FailureShape::Verify(mode(step)),
+            Failure::Timeout(step) => FailureShape::Timeout(mode(step)),
+            Failure::Ci { .. } => FailureShape::Ci,
         }
     }
+}
 
-    pub fn mode(&self) -> Option<Mode> {
+/// A failure's kind and mode, written as the flat pair `"kind"` / `"mode"`:
+/// verification failures have a mode, conflicts and CI failures do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawFailureShape", into = "RawFailureShape")]
+pub enum FailureShape {
+    Conflict,
+    Verify(Mode),
+    Timeout(Mode),
+    Ci,
+}
+
+impl FailureShape {
+    pub fn kind(self) -> FailureKind {
         match self {
-            Failure::Verify(step) | Failure::Timeout(step) => Some(match step.mode {
-                VerifyMode::Solo => Mode::Solo,
-                VerifyMode::Combo { .. } => Mode::Combo,
-            }),
-            Failure::Conflict { .. } | Failure::Ci { .. } => None,
+            FailureShape::Conflict => FailureKind::Conflict,
+            FailureShape::Verify(_) => FailureKind::Verify,
+            FailureShape::Timeout(_) => FailureKind::Timeout,
+            FailureShape::Ci => FailureKind::Ci,
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawFailureShape {
+    kind: FailureKind,
+    mode: Option<Mode>,
+}
+
+impl TryFrom<RawFailureShape> for FailureShape {
+    type Error = String;
+
+    fn try_from(raw: RawFailureShape) -> Result<Self, Self::Error> {
+        match (raw.kind, raw.mode) {
+            (FailureKind::Conflict, None) => Ok(FailureShape::Conflict),
+            (FailureKind::Ci, None) => Ok(FailureShape::Ci),
+            (FailureKind::Verify, Some(m)) => Ok(FailureShape::Verify(m)),
+            (FailureKind::Timeout, Some(m)) => Ok(FailureShape::Timeout(m)),
+            (kind, mode) => Err(format!("실패 {kind:?}에 mode {mode:?}가 올 수 없다")),
+        }
+    }
+}
+
+impl From<FailureShape> for RawFailureShape {
+    fn from(shape: FailureShape) -> Self {
+        let mode = match shape {
+            FailureShape::Verify(m) | FailureShape::Timeout(m) => Some(m),
+            FailureShape::Conflict | FailureShape::Ci => None,
+        };
+        RawFailureShape {
+            kind: shape.kind(),
+            mode,
+        }
+    }
+}
+
+/// A list with at least one element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonEmpty<T>(Vec<T>);
+
+impl<T> NonEmpty<T> {
+    pub fn new(items: Vec<T>) -> Option<NonEmpty<T>> {
+        (!items.is_empty()).then_some(NonEmpty(items))
+    }
+
+    pub fn first(&self) -> &T {
+        &self.0[0]
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T> std::ops::Deref for NonEmpty<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T: Serialize> Serialize for NonEmpty<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for NonEmpty<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        NonEmpty::new(Vec::deserialize(d)?)
+            .ok_or_else(|| serde::de::Error::custom("빈 목록이 올 수 없다"))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictFile {
     pub path: String,
-    /// Commits on the default branch that changed this file.
     pub main_commits: Vec<CommitRef>,
 }
 
@@ -353,10 +435,8 @@ pub struct StepFailure {
     pub step: String,
     #[serde(flatten)]
     pub mode: VerifyMode,
-    /// Names matched by the step's `failed` regex. Empty when the step has none.
     pub failed_tests: Vec<String>,
     pub log: PathBuf,
-    /// The failing tree, kept under `refs/chute/failed/…` for reproduction.
     pub tree: Sha,
 }
 
@@ -364,7 +444,7 @@ pub struct StepFailure {
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum VerifyMode {
     Solo,
-    Combo { partners: Vec<Partner> },
+    Combo { partners: NonEmpty<Partner> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,7 +486,6 @@ pub enum Phase {
     Pushing,
 }
 
-/// The batch in progress.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Batch {
     pub id: BatchId,
@@ -450,12 +529,10 @@ pub struct PreflightRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningKind {
-    /// After a push, GitHub did not report the PR as MERGED.
     NotMerged,
-    /// `require_ci` is on but a PR has had no checks for over ten minutes.
     NoChecks,
-    /// `chute.toml` on the default branch could not be read.
     Config,
+    History,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,15 +543,12 @@ pub struct Warning {
     pub at_ms: EpochMs,
 }
 
-/// `state.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub queue: Vec<QueueItem>,
     pub batch: Option<Batch>,
     pub blocked: Option<Blocked>,
-    /// Base commits whose verification passed. Commits chute pushed are verified by construction.
     pub verified_bases: Vec<Sha>,
-    /// Latest preflight per branch.
     pub preflights: BTreeMap<String, PreflightRecord>,
     pub warnings: Vec<Warning>,
 }
@@ -492,7 +566,6 @@ pub struct Flaky {
     pub tree: Sha,
 }
 
-/// `batches/<id>/batch.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchRecord {
     pub id: BatchId,
@@ -500,14 +573,12 @@ pub struct BatchRecord {
     pub prs: Vec<PrNumber>,
     pub started_ms: EpochMs,
     pub finished_ms: Option<EpochMs>,
-    /// Merge commits pushed to the default branch, in push order.
     pub merges: Vec<MergeRef>,
     pub bounced: Vec<PrNumber>,
     pub flaky: Vec<Flaky>,
     pub verify_s: u64,
 }
 
-/// One line of `history.jsonl`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub at_ms: EpochMs,
@@ -550,7 +621,6 @@ pub enum EventKind {
     },
 }
 
-/// The `schema` field of the status JSON. Only version 1 exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct SchemaV1;
@@ -635,8 +705,8 @@ pub struct PreflightView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureView {
-    pub kind: FailureKind,
-    pub mode: Option<Mode>,
+    #[serde(flatten)]
+    pub shape: FailureShape,
     pub summary: String,
     pub report: PathBuf,
 }
@@ -682,8 +752,7 @@ impl ItemView {
                 head: p.head.clone(),
             }),
             last_failure: item.last_failure.as_ref().map(|f| FailureView {
-                kind: f.failure.kind(),
-                mode: f.failure.mode(),
+                shape: f.failure.shape(),
                 summary: f.summary.clone(),
                 report: f.report.clone(),
             }),
@@ -729,7 +798,7 @@ mod tests {
         let kinds: Vec<FailureKind> = view
             .queue
             .iter()
-            .filter_map(|i| i.last_failure.as_ref().map(|f| f.kind))
+            .filter_map(|i| i.last_failure.as_ref().map(|f| f.shape.kind()))
             .collect();
         for kind in [
             FailureKind::Conflict,
@@ -740,6 +809,13 @@ mod tests {
             assert!(kinds.contains(&kind), "fixture에 실패 {kind:?}가 없다");
         }
         assert!(view.queue.iter().any(|i| i.agent.is_none()));
+        let submitted: Vec<EpochMs> = view.queue.iter().map(|i| i.submitted_ms).collect();
+        assert!(submitted.is_sorted(), "큐는 submit 순서여야 한다");
+        let merged: Vec<PrNumber> = view.recent.iter().flat_map(|r| r.merged.clone()).collect();
+        assert!(
+            view.queue.iter().all(|i| !merged.contains(&i.pr)),
+            "머지된 PR은 큐에 남지 않는다"
+        );
         assert!(view.blocked.is_some());
         assert!(view.batch.is_some());
         assert!(!view.warnings.is_empty());
@@ -758,6 +834,63 @@ mod tests {
         );
     }
 
+    fn one<T>(item: T) -> NonEmpty<T> {
+        NonEmpty::new(vec![item]).unwrap()
+    }
+
+    #[test]
+    fn failure_view_rejects_a_mode_that_does_not_fit_its_kind() {
+        let parse = |kind: &str, mode: Value| {
+            serde_json::from_value::<FailureView>(
+                json!({"kind": kind, "mode": mode, "summary": "s", "report": "/r"}),
+            )
+        };
+        assert!(parse("conflict", json!("solo")).is_err());
+        assert!(parse("ci", json!("combo")).is_err());
+        assert!(parse("verify", Value::Null).is_err());
+        assert!(parse("timeout", Value::Null).is_err());
+        assert_eq!(
+            parse("timeout", json!("combo")).unwrap().shape,
+            FailureShape::Timeout(Mode::Combo)
+        );
+    }
+
+    #[test]
+    fn failures_need_their_files_checks_and_partners() {
+        let record = |failure: Value| {
+            let mut v = json!({"summary": "s", "report": "/r", "at_ms": 1});
+            v.as_object_mut()
+                .unwrap()
+                .extend(failure.as_object().unwrap().clone());
+            serde_json::from_value::<FailureRecord>(v)
+        };
+        let step = json!({"step": "t", "failed_tests": [], "log": "/l", "tree": "abc1234"});
+        let with = |extra: Value| {
+            let mut v = step.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        assert!(record(json!({"kind": "conflict", "files": []})).is_err());
+        assert!(record(json!({"kind": "ci", "checks": []})).is_err());
+        assert!(
+            record(with(
+                json!({"kind": "verify", "mode": "combo", "partners": []})
+            ))
+            .is_err()
+        );
+        assert!(record(with(json!({"kind": "verify", "mode": "solo"}))).is_ok());
+    }
+
+    #[test]
+    fn slug_owner_cannot_make_folder_names_collide() {
+        assert!(Slug::new("a__b", "c").is_err());
+        assert!(Slug::new("github.com", "solo").is_err());
+        assert_eq!(Slug::new("a", "b__c").unwrap().dir_name(), "a__b__c");
+        assert!(Slug::new("Soochol", "chute.rs_x-1").is_ok());
+    }
+
     #[test]
     fn stored_state_round_trips_every_failure() {
         let sha = |s: &str| Sha::try_from(s.to_owned()).unwrap();
@@ -770,28 +903,28 @@ mod tests {
         };
         let failures = [
             Failure::Conflict {
-                files: vec![ConflictFile {
+                files: one(ConflictFile {
                     path: "src/x.rs".into(),
                     main_commits: vec![CommitRef {
                         sha: sha("abc1234"),
                         title: "t".into(),
                     }],
-                }],
+                }),
             },
             Failure::Verify(step(VerifyMode::Solo)),
             Failure::Timeout(step(VerifyMode::Combo {
-                partners: vec![Partner {
+                partners: one(Partner {
                     pr: PrNumber(3),
                     title: "p".into(),
                     files: vec!["a".into()],
                     diff: "/s/d.diff".into(),
-                }],
+                }),
             })),
             Failure::Ci {
-                checks: vec![FailedCheck {
+                checks: one(FailedCheck {
                     name: "build".into(),
                     link: "https://x".into(),
-                }],
+                }),
             },
         ];
         let state = State {

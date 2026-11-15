@@ -31,229 +31,6 @@
   },
   "queue": [
     {
-      "pr": 21,
-      "title": "chute.toml에 lint 단계 추가",
-      "branch": "orch/feat-21",
-      "head": "21e5678",
-      "state": "awaiting_approval",
-      "state_reason": null,
-      "agent": {
-        "terminal": "t1s4",
-        "name": "impl-config",
-        "alive": true
-      },
-      "attempts": 0,
-      "budget": 3,
-      "submitted_ms": 1794724020000,
-      "touches_config": true,
-      "preflight": {
-        "result": "pass",
-        "head": "21e5678"
-      },
-      "last_failure": null
-    },
-    {
-      "pr": 20,
-      "title": "README 오타 수정",
-      "branch": "orch/feat-20",
-      "head": "20e5678",
-      "state": "queued",
-      "state_reason": null,
-      "agent": null,
-      "attempts": 0,
-      "budget": 3,
-      "submitted_ms": 1794723960000,
-      "touches_config": false,
-      "preflight": null,
-      "last_failure": null
-    },
-    {
-      "pr": 19,
-      "title": "CI 설정 정리",
-      "branch": "orch/feat-19",
-      "head": "19e5678",
-      "state": "queued",
-      "state_reason": "ci_pending",
-      "agent": {
-        "terminal": "t1s2",
-        "name": "impl-ci",
-        "alive": true
-      },
-      "attempts": 0,
-      "budget": 3,
-      "submitted_ms": 1794723300000,
-      "touches_config": false,
-      "preflight": {
-        "result": "fail",
-        "head": "18d0000"
-      },
-      "last_failure": null
-    },
-    {
-      "pr": 12,
-      "title": "큐 상태 전이 추가",
-      "branch": "orch/feat-12",
-      "head": "12e5678",
-      "state": "in_batch",
-      "state_reason": null,
-      "agent": {
-        "terminal": "t1rs",
-        "name": "impl-a",
-        "alive": true
-      },
-      "attempts": 1,
-      "budget": 3,
-      "submitted_ms": 1794723000000,
-      "touches_config": false,
-      "preflight": {
-        "result": "pass",
-        "head": "12e5678"
-      },
-      "last_failure": {
-        "kind": "verify",
-        "mode": "combo",
-        "summary": "test 단계 실패: queue::tests::retry_resets_budget",
-        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-12/1.md"
-      }
-    },
-    {
-      "pr": 13,
-      "title": "검증 실행기",
-      "branch": "orch/feat-13",
-      "head": "13e5678",
-      "state": "in_batch",
-      "state_reason": null,
-      "agent": {
-        "terminal": "t1rt",
-        "name": "impl-b",
-        "alive": true
-      },
-      "attempts": 0,
-      "budget": 3,
-      "submitted_ms": 1794723120000,
-      "touches_config": false,
-      "preflight": null,
-      "last_failure": null
-    },
-    {
-      "pr": 14,
-      "title": "gitops 슬롯",
-      "branch": "orch/feat-14",
-      "head": "14e5678",
-      "state": "bounced",
-      "state_reason": "conflict",
-      "agent": {
-        "terminal": "t1ru",
-        "name": "impl-c",
-        "alive": true
-      },
-      "attempts": 1,
-      "budget": 3,
-      "submitted_ms": 1794721800000,
-      "touches_config": false,
-      "preflight": null,
-      "last_failure": {
-        "kind": "conflict",
-        "mode": null,
-        "summary": "src/model.rs가 #9와 충돌",
-        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-14/1.md"
-      }
-    },
-    {
-      "pr": 15,
-      "title": "반송 보고서",
-      "branch": "orch/feat-15",
-      "head": "15e5678",
-      "state": "bounced",
-      "state_reason": "verify",
-      "agent": {
-        "terminal": "t1rv",
-        "name": "impl-d",
-        "alive": true
-      },
-      "attempts": 2,
-      "budget": 3,
-      "submitted_ms": 1794720900000,
-      "touches_config": false,
-      "preflight": {
-        "result": "conflict",
-        "head": "15e5678"
-      },
-      "last_failure": {
-        "kind": "verify",
-        "mode": "solo",
-        "summary": "test 단계 실패: feedback::tests::report_lists_partners",
-        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-15/2.md"
-      }
-    },
-    {
-      "pr": 16,
-      "title": "데몬 루프",
-      "branch": "orch/feat-16",
-      "head": "16e5678",
-      "state": "bounced",
-      "state_reason": "timeout",
-      "agent": {
-        "terminal": "t1rw",
-        "name": "impl-e",
-        "alive": true
-      },
-      "attempts": 1,
-      "budget": 3,
-      "submitted_ms": 1794722100000,
-      "touches_config": false,
-      "preflight": null,
-      "last_failure": {
-        "kind": "timeout",
-        "mode": "combo",
-        "summary": "test 단계가 1800초 안에 끝나지 않았다",
-        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-16/1.md"
-      }
-    },
-    {
-      "pr": 17,
-      "title": "mod 화면",
-      "branch": "orch/feat-17",
-      "head": "17e5678",
-      "state": "bounced",
-      "state_reason": "head_changed",
-      "agent": {
-        "terminal": "t1rx",
-        "name": "impl-f",
-        "alive": true
-      },
-      "attempts": 0,
-      "budget": 3,
-      "submitted_ms": 1794722700000,
-      "touches_config": false,
-      "preflight": null,
-      "last_failure": null
-    },
-    {
-      "pr": 18,
-      "title": "원격 CI 관문",
-      "branch": "orch/feat-18",
-      "head": "18e5678",
-      "state": "bounced",
-      "state_reason": "ci",
-      "agent": {
-        "terminal": "t1ry",
-        "name": "impl-g",
-        "alive": true
-      },
-      "attempts": 1,
-      "budget": 3,
-      "submitted_ms": 1794722400000,
-      "touches_config": false,
-      "preflight": null,
-      "last_failure": {
-        "kind": "ci",
-        "mode": null,
-        "summary": "GitHub check build 실패",
-        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-18/1.md"
-      }
-    },
-    {
       "pr": 9,
       "title": "설명서",
       "branch": "orch/feat-9",
@@ -320,6 +97,229 @@
         "summary": "src/engine.rs가 #8과 충돌",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-11/2.md"
       }
+    },
+    {
+      "pr": 15,
+      "title": "반송 보고서",
+      "branch": "orch/feat-15",
+      "head": "15e5678",
+      "state": "bounced",
+      "state_reason": "verify",
+      "agent": {
+        "terminal": "t1rv",
+        "name": "impl-d",
+        "alive": true
+      },
+      "attempts": 2,
+      "budget": 3,
+      "submitted_ms": 1794720900000,
+      "touches_config": false,
+      "preflight": {
+        "result": "conflict",
+        "head": "15e5678"
+      },
+      "last_failure": {
+        "kind": "verify",
+        "mode": "solo",
+        "summary": "test 단계 실패: feedback::tests::report_lists_partners",
+        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-15/2.md"
+      }
+    },
+    {
+      "pr": 14,
+      "title": "gitops 슬롯",
+      "branch": "orch/feat-14",
+      "head": "14e5678",
+      "state": "bounced",
+      "state_reason": "conflict",
+      "agent": {
+        "terminal": "t1ru",
+        "name": "impl-c",
+        "alive": true
+      },
+      "attempts": 1,
+      "budget": 3,
+      "submitted_ms": 1794721800000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": {
+        "kind": "conflict",
+        "mode": null,
+        "summary": "src/model.rs가 #9와 충돌",
+        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-14/1.md"
+      }
+    },
+    {
+      "pr": 16,
+      "title": "데몬 루프",
+      "branch": "orch/feat-16",
+      "head": "16e5678",
+      "state": "bounced",
+      "state_reason": "timeout",
+      "agent": {
+        "terminal": "t1rw",
+        "name": "impl-e",
+        "alive": true
+      },
+      "attempts": 1,
+      "budget": 3,
+      "submitted_ms": 1794722100000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": {
+        "kind": "timeout",
+        "mode": "combo",
+        "summary": "test 단계가 1800초 안에 끝나지 않았다",
+        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-16/1.md"
+      }
+    },
+    {
+      "pr": 18,
+      "title": "원격 CI 관문",
+      "branch": "orch/feat-18",
+      "head": "18e5678",
+      "state": "bounced",
+      "state_reason": "ci",
+      "agent": {
+        "terminal": "t1ry",
+        "name": "impl-g",
+        "alive": true
+      },
+      "attempts": 1,
+      "budget": 3,
+      "submitted_ms": 1794722400000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": {
+        "kind": "ci",
+        "mode": null,
+        "summary": "GitHub check build 실패",
+        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-18/1.md"
+      }
+    },
+    {
+      "pr": 17,
+      "title": "mod 화면",
+      "branch": "orch/feat-17",
+      "head": "17e5678",
+      "state": "bounced",
+      "state_reason": "head_changed",
+      "agent": {
+        "terminal": "t1rx",
+        "name": "impl-f",
+        "alive": true
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794722700000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": null
+    },
+    {
+      "pr": 12,
+      "title": "큐 상태 전이 추가",
+      "branch": "orch/feat-12",
+      "head": "12e5678",
+      "state": "in_batch",
+      "state_reason": null,
+      "agent": {
+        "terminal": "t1rs",
+        "name": "impl-a",
+        "alive": true
+      },
+      "attempts": 1,
+      "budget": 3,
+      "submitted_ms": 1794723000000,
+      "touches_config": false,
+      "preflight": {
+        "result": "pass",
+        "head": "12e5678"
+      },
+      "last_failure": {
+        "kind": "verify",
+        "mode": "combo",
+        "summary": "test 단계 실패: queue::tests::retry_resets_budget",
+        "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-12/1.md"
+      }
+    },
+    {
+      "pr": 13,
+      "title": "검증 실행기",
+      "branch": "orch/feat-13",
+      "head": "13e5678",
+      "state": "in_batch",
+      "state_reason": null,
+      "agent": {
+        "terminal": "t1rt",
+        "name": "impl-b",
+        "alive": true
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794723120000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": null
+    },
+    {
+      "pr": 19,
+      "title": "CI 설정 정리",
+      "branch": "orch/feat-19",
+      "head": "19e5678",
+      "state": "queued",
+      "state_reason": "ci_pending",
+      "agent": {
+        "terminal": "t1s2",
+        "name": "impl-ci",
+        "alive": true
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794723300000,
+      "touches_config": false,
+      "preflight": {
+        "result": "fail",
+        "head": "18d0000"
+      },
+      "last_failure": null
+    },
+    {
+      "pr": 20,
+      "title": "README 오타 수정",
+      "branch": "orch/feat-20",
+      "head": "20e5678",
+      "state": "queued",
+      "state_reason": null,
+      "agent": null,
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794723960000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": null
+    },
+    {
+      "pr": 21,
+      "title": "chute.toml에 lint 단계 추가",
+      "branch": "orch/feat-21",
+      "head": "21e5678",
+      "state": "awaiting_approval",
+      "state_reason": null,
+      "agent": {
+        "terminal": "t1s4",
+        "name": "impl-config",
+        "alive": true
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794724020000,
+      "touches_config": true,
+      "preflight": {
+        "result": "pass",
+        "head": "21e5678"
+      },
+      "last_failure": null
     }
   ],
   "today": {
@@ -334,8 +334,8 @@
     {
       "batch": "b20261115-150000",
       "merged": [
-        9,
-        10
+        7,
+        8
       ],
       "bounced": [
         11
@@ -346,8 +346,8 @@
     {
       "batch": "b20261115-143000",
       "merged": [
-        7,
-        8
+        5,
+        6
       ],
       "bounced": [],
       "seconds": 301,
@@ -366,6 +366,12 @@
       "message": "#19의 GitHub check가 10분 넘게 하나도 없다",
       "pr": 19,
       "at_ms": 1794723900000
+    },
+    {
+      "kind": "config",
+      "message": "설정을 읽지 못했다: origin/main:chute.toml",
+      "pr": null,
+      "at_ms": 1794724200000
     }
   ]
 }

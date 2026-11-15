@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde::Deserialize;
 
 use crate::ext::Ext;
-use crate::model::Approval;
+use crate::model::{Approval, NonEmpty};
 
 pub const FILE_NAME: &str = "chute.toml";
 pub const DEFAULT_BUDGET: u32 = 3;
@@ -18,12 +18,9 @@ pub struct Config {
     pub budget: u32,
     pub max_batch: u32,
     pub serialize: bool,
-    /// Read and carried only. The gate itself belongs to `ci-gate`.
     pub require_ci: bool,
-    /// Empty means no agent is spawned.
     pub respawn: Vec<String>,
-    /// Never empty.
-    pub verify: Vec<VerifyStep>,
+    pub verify: NonEmpty<VerifyStep>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,20 +79,32 @@ fn default_timeout() -> u64 {
 impl Config {
     pub fn parse(text: &str) -> Result<Config> {
         let raw: RawConfig = toml::from_str(text).context("chute.toml을 읽지 못했다")?;
-        if raw.verify.is_empty() {
-            bail!("chute.toml에 [[verify]] 단계가 하나도 없다");
-        }
         if raw.max_batch == 0 {
             bail!("chute.toml의 max_batch는 1 이상이어야 한다");
         }
+        if raw.respawn.iter().any(|arg| arg.trim().is_empty()) {
+            bail!("chute.toml의 respawn에 빈 항목이 있다. 띄우지 않으려면 respawn = []로 둔다");
+        }
         let mut names = BTreeSet::new();
-        let mut verify = Vec::with_capacity(raw.verify.len());
+        let mut steps = Vec::with_capacity(raw.verify.len());
         for step in raw.verify {
-            if step.name.trim().is_empty() || step.run.trim().is_empty() {
-                bail!("chute.toml의 [[verify]] 단계에 name이나 run이 비어 있다");
+            let name_ok = !step.name.is_empty()
+                && !step.name.starts_with('.')
+                && step
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+            if !name_ok {
+                bail!(
+                    "chute.toml의 verify 단계 이름 {:?}에는 영문, 숫자, '.', '_', '-'만 쓴다",
+                    step.name
+                );
             }
             if !names.insert(step.name.clone()) {
                 bail!("chute.toml의 verify 단계 이름 {:?}이 겹친다", step.name);
+            }
+            if step.run.trim().is_empty() {
+                bail!("verify 단계 {:?}의 run이 비어 있다", step.name);
             }
             if step.timeout == 0 {
                 bail!(
@@ -111,13 +120,21 @@ impl Config {
                 .with_context(|| {
                     format!("verify 단계 {:?}의 failed 정규식이 잘못됐다", step.name)
                 })?;
-            verify.push(VerifyStep {
+            if failed.as_ref().is_some_and(|re| re.captures_len() < 2) {
+                bail!(
+                    "verify 단계 {:?}의 failed 정규식에 시험 이름을 담을 괄호 묶음이 없다",
+                    step.name
+                );
+            }
+            steps.push(VerifyStep {
                 name: step.name,
                 run: step.run,
                 timeout: Duration::from_secs(step.timeout),
                 failed,
             });
         }
+        let verify = NonEmpty::new(steps)
+            .ok_or_else(|| anyhow!("chute.toml에 [[verify]] 단계가 하나도 없다"))?;
         Ok(Config {
             approval: raw.approval,
             budget: raw.budget,
@@ -129,8 +146,6 @@ impl Config {
         })
     }
 
-    /// Reads `chute.toml` from a git revision such as `origin/main`, never from the work tree,
-    /// so a PR cannot change the rules that judge it.
     pub fn load_at(ext: &Ext, repo: &Path, rev: &str) -> Result<Config> {
         let spec = format!("{rev}:{FILE_NAME}");
         let out = ext.git(repo, ["show", spec.as_str()])?;
@@ -144,7 +159,6 @@ impl Config {
     }
 }
 
-/// The draft `chute init` writes. `verify_run` is the repository's check command.
 pub fn draft(verify_run: &str) -> String {
     let run = toml::Value::String(verify_run.to_owned());
     format!(
@@ -163,7 +177,7 @@ name = "test"
 # 검증 worktree에서 sh -c로 실행한다
 run = {run}
 timeout = 3600          # 초
-# failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
+# failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식. 첫 괄호 묶음이 이름이다
 "#
     )
 }
@@ -230,8 +244,25 @@ failed = 'test (\S+) \.\.\. FAILED'
 
     #[test]
     fn rejects_bad_regex() {
-        let text = format!("{MINIMAL}failed = 'test ('\n");
-        assert!(Config::parse(&text).is_err());
+        for failed in ["test (", "", "no group"] {
+            let text = format!("{MINIMAL}failed = '{failed}'\n");
+            assert!(Config::parse(&text).is_err(), "{failed:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_blank_respawn_arguments() {
+        assert!(Config::parse(&format!("respawn = [\"\"]\n{MINIMAL}")).is_err());
+        assert!(Config::parse(&format!("respawn = [\"claude\", \" \"]\n{MINIMAL}")).is_err());
+        assert!(Config::parse(&format!("respawn = []\n{MINIMAL}")).is_ok());
+    }
+
+    #[test]
+    fn rejects_step_names_that_are_not_file_names() {
+        for name in ["../x", "a/b", ".hidden", "", "a b"] {
+            let text = format!("[[verify]]\nname = \"{name}\"\nrun = \"true\"\n");
+            assert!(Config::parse(&text).is_err(), "{name:?}");
+        }
     }
 
     #[test]

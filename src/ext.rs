@@ -1,12 +1,10 @@
-//! The only place that runs `git`, `gh`, and `hc`.
-
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +29,6 @@ impl Tool {
         }
     }
 
-    /// The environment variable that replaces the executable.
     pub fn env_var(self) -> &'static str {
         match self {
             Tool::Git => "CHUTE_GIT",
@@ -49,12 +46,14 @@ impl fmt::Display for Tool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtError {
-    #[error("{tool} 실행 파일 {}을 띄우지 못했다: {source}", program.display())]
+    #[error("{tool} 실행 파일을 띄우지 못했다: {}", program.display())]
     Spawn {
         tool: Tool,
         program: PathBuf,
         source: io::Error,
     },
+    #[error("`{call}`을 실행할 폴더가 없다: {}", dir.display())]
+    NoDir { call: String, dir: PathBuf },
     #[error("`{call}`이 {}초 안에 끝나지 않아 멈췄다", after.as_secs_f32())]
     Timeout { call: String, after: Duration },
     #[error("`{call}`이 실패했다(종료 코드 {code:?}): {stderr}")]
@@ -63,13 +62,12 @@ pub enum ExtError {
         code: Option<i32>,
         stderr: String,
     },
-    #[error("`{call}`의 출력을 읽지 못했다: {source}")]
+    #[error("`{call}`의 출력을 읽지 못했다")]
     Io { call: String, source: io::Error },
 }
 
 #[derive(Clone, Debug)]
 pub struct Output {
-    /// The command line, for messages.
     pub call: String,
     /// `None` when a signal ended the process.
     pub code: Option<i32>,
@@ -90,7 +88,6 @@ impl Output {
         String::from_utf8_lossy(&self.stderr).into_owned()
     }
 
-    /// The standard output of a successful call, or `ExtError::Failed`.
     pub fn ok(self) -> Result<String, ExtError> {
         if self.success() {
             Ok(self.stdout_text())
@@ -119,7 +116,6 @@ impl Ext {
         Ext::from_vars(|key| std::env::var_os(key))
     }
 
-    /// Like `from_env`, reading variables through `var` so tests need not touch the process environment.
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Ext {
         let program = |tool: Tool| {
             var(tool.env_var())
@@ -199,6 +195,12 @@ impl Ext {
             .stderr(Stdio::piped())
             .process_group(0);
         if let Some(cwd) = cwd {
+            if !cwd.is_dir() {
+                return Err(ExtError::NoDir {
+                    call,
+                    dir: cwd.to_owned(),
+                });
+            }
             command.current_dir(cwd);
         }
         let mut child = command.spawn().map_err(|source| ExtError::Spawn {
@@ -215,13 +217,10 @@ impl Ext {
             Ok(None) => return Err(time_out(&mut child, call, timeout)),
             Err(source) => return Err(ExtError::Io { call, source }),
         };
-        let left = || deadline.saturating_duration_since(Instant::now());
-        let (stdout, stderr) = match (stdout.recv_timeout(left()), stderr.recv_timeout(left())) {
-            (Ok(Ok(out)), Ok(Ok(err))) => (out, err),
-            (Ok(Err(source)), _) | (_, Ok(Err(source))) => {
-                return Err(ExtError::Io { call, source });
-            }
-            _ => return Err(time_out(&mut child, call, timeout)),
+        let until = Instant::now() + PIPE_GRACE;
+        let (stdout, stderr) = match (stdout.finish(until), stderr.finish(until)) {
+            (Ok(out), Ok(err)) => (out, err),
+            (Err(source), _) | (_, Err(source)) => return Err(ExtError::Io { call, source }),
         };
         Ok(Output {
             code: status.code(),
@@ -232,17 +231,54 @@ impl Ext {
     }
 }
 
-fn drain(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel();
-    if let Some(mut pipe) = pipe {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = tx.send(pipe.read_to_end(&mut buf).map(|_| buf));
-        });
-    } else {
-        let _ = tx.send(Ok(Vec::new()));
+/// How long to wait for end-of-file after the process exits. A background grandchild may
+/// keep the pipe open forever; what the process itself wrote is read well within this.
+const PIPE_GRACE: Duration = Duration::from_millis(500);
+
+struct Drain {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<io::Result<()>>,
+}
+
+impl Drain {
+    fn finish(self, until: Instant) -> io::Result<Vec<u8>> {
+        let wait = until.saturating_duration_since(Instant::now());
+        if let Ok(Err(e)) = self.done.recv_timeout(wait) {
+            return Err(e);
+        }
+        Ok(std::mem::take(
+            &mut *self.bytes.lock().unwrap_or_else(|e| e.into_inner()),
+        ))
     }
-    rx
+}
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let (tx, done) = mpsc::channel();
+    match pipe {
+        Some(mut pipe) => {
+            let bytes = Arc::clone(&bytes);
+            thread::spawn(move || {
+                let mut chunk = [0u8; 64 * 1024];
+                let result = loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break Ok(()),
+                        Ok(n) => bytes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => break Err(e),
+                    }
+                };
+                let _ = tx.send(result);
+            });
+        }
+        None => {
+            let _ = tx.send(Ok(()));
+        }
+    }
+    Drain { bytes, done }
 }
 
 fn wait_until(
@@ -334,6 +370,45 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ExtError::Timeout { .. }), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_background_grandchild_does_not_turn_success_into_a_timeout() {
+        let sb = Sandbox::new();
+        let hc = sb.script("bg-hc", "echo started\nsleep 5 &\nexit 0\n");
+        let ext = Ext::from_vars(|k| (k == "CHUTE_HC").then(|| hc.clone().into()));
+        let started = Instant::now();
+        let out = ext
+            .call(Tool::Hc, None, ["run", "--bg"], Duration::from_secs(3))
+            .unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout_text(), "started\n");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn large_output_on_both_pipes_is_read_whole() {
+        let sb = Sandbox::new();
+        let gh = sb.script(
+            "loud-gh",
+            "head -c 3000000 /dev/zero; head -c 3000000 /dev/zero >&2\n",
+        );
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
+        let out = ext.gh(sb.root(), ["api"]).unwrap();
+        assert_eq!((out.stdout.len(), out.stderr.len()), (3_000_000, 3_000_000));
+    }
+
+    #[test]
+    fn a_missing_work_folder_is_named_as_such() {
+        let sb = Sandbox::new();
+        let missing = sb.root().join("gone");
+        let err = Ext::from_vars(|_| None)
+            .git(&missing, ["status"])
+            .unwrap_err();
+        assert!(
+            matches!(&err, ExtError::NoDir { dir, .. } if *dir == missing),
+            "{err}"
+        );
     }
 
     #[test]

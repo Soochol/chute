@@ -20,11 +20,18 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let info = repo::discover(&ctx.ext, &ctx.target_dir()?)?;
 
     let config_path = info.path.join(config::FILE_NAME);
+    let on_remote = format!("origin/{}:{}", info.default_branch, config::FILE_NAME);
     if config_path.exists() {
         println!(
             "설정 파일이 이미 있어 그대로 둔다: {}",
             config_path.display()
         );
+    } else if ctx
+        .ext
+        .git(&info.path, ["cat-file", "-e", &on_remote])?
+        .success()
+    {
+        println!("기본 브랜치에 설정 파일이 이미 있어 초안을 쓰지 않는다: {on_remote}");
     } else {
         fs::write(&config_path, config::draft(guess_verify(&info.path)))
             .with_context(|| format!("쓰지 못했다: {}", config_path.display()))?;

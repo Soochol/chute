@@ -56,6 +56,7 @@ pub enum Command {
 }
 
 pub fn main() -> ExitCode {
+    restore_sigpipe();
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,
@@ -64,6 +65,14 @@ pub fn main() -> ExitCode {
             ExitCode::from(cmd::CANNOT_RUN)
         }
     }
+}
+
+/// Rust ignores SIGPIPE, which turns `chute status | head` into a panic. A command-line tool
+/// should end quietly instead.
+fn restore_sigpipe() {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    // SAFETY: runs first in `main`, before any other thread exists.
+    let _ = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {

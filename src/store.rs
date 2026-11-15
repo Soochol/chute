@@ -1,9 +1,9 @@
-//! The state folder: `$CHUTE_HOME`, else `$XDG_STATE_HOME/chute`, else `~/.local/state/chute`.
-
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -49,13 +49,12 @@ impl Home {
         }
     }
 
-    /// Verification worktrees live outside the state folder so the mod's `watchFolder`
-    /// stays under its sub-folder limit.
+    /// Outside `repos/` because Herdr's `watchFolder`, which the mod points at the state
+    /// folder, refuses folders with more than 4096 sub-folders on Linux.
     pub fn slots_dir(&self, slug: &Slug) -> PathBuf {
         self.root.join("slots").join(slug.dir_name())
     }
 
-    /// Every registered repository, ordered by slug.
     pub fn repos(&self) -> Result<Vec<RepoInfo>> {
         let dir = self.root.join("repos");
         let entries = match fs::read_dir(&dir) {
@@ -65,8 +64,11 @@ impl Home {
         };
         let mut repos = Vec::new();
         for entry in entries {
-            let path = entry?.path().join(REPO_FILE);
-            if let Some(info) = read_json::<RepoInfo>(&path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(info) = read_json::<RepoInfo>(&entry.path().join(REPO_FILE))? {
                 repos.push(info);
             }
         }
@@ -82,17 +84,26 @@ const DAEMON_LOCK_FILE: &str = "daemon.lock";
 const DAEMON_FILE: &str = "daemon.json";
 const HISTORY_FILE: &str = "history.jsonl";
 
-/// One repository's state folder, `repos/<owner>__<name>/`.
 #[derive(Clone, Debug)]
 pub struct RepoStore {
     dir: PathBuf,
 }
 
-/// An exclusive `flock` that lasts until dropped.
 #[derive(Debug)]
 pub struct FileLock {
     _file: File,
 }
+
+/// `history.jsonl` as read. A line cut short by a crash is skipped, and its number is kept
+/// so the caller can warn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct History {
+    pub events: Vec<Event>,
+    pub broken_lines: Vec<usize>,
+}
+
+const DAEMON_LOCK_TRIES: u32 = 20;
+const DAEMON_LOCK_PAUSE: Duration = Duration::from_millis(10);
 
 impl RepoStore {
     pub fn dir(&self) -> &Path {
@@ -107,7 +118,6 @@ impl RepoStore {
         self.dir.join("reports").join(format!("pr-{}", pr.0))
     }
 
-    /// Writes `repo.json`. Writing the same info again leaves the file byte-identical.
     pub fn register(&self, info: &RepoInfo) -> Result<()> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("만들지 못했다: {}", self.dir.display()))?;
@@ -124,8 +134,6 @@ impl RepoStore {
         Ok(read_json(&self.dir.join(STATE_FILE))?.unwrap_or_default())
     }
 
-    /// Changes `state.json` under the lock. Nothing is written when `change` fails or when
-    /// the current file cannot be read.
     pub fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let _lock = self.lock(LOCK_FILE)?;
         let mut state = self.load()?;
@@ -134,41 +142,51 @@ impl RepoStore {
         Ok(value)
     }
 
+    /// Appends one line. If an earlier write was cut short, the new line still starts on its own line.
     pub fn append_history(&self, event: &Event) -> Result<()> {
         let path = self.dir.join(HISTORY_FILE);
-        let mut line = serde_json::to_vec(event)?;
-        line.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("열지 못했다: {}", path.display()))?;
+        let mut line = Vec::new();
+        if !ends_with_newline(&mut file)? {
+            line.push(b'\n');
+        }
+        serde_json::to_writer(&mut line, event)?;
+        line.push(b'\n');
         file.write_all(&line)
             .with_context(|| format!("쓰지 못했다: {}", path.display()))
     }
 
-    pub fn history(&self) -> Result<Vec<Event>> {
+    pub fn history(&self) -> Result<History> {
         let path = self.dir.join(HISTORY_FILE);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        let text = match fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(History::default()),
             Err(e) => return Err(e).with_context(|| format!("읽지 못했다: {}", path.display())),
         };
-        text.lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim().is_empty())
-            .map(|(i, line)| {
-                serde_json::from_str(line)
-                    .with_context(|| format!("기록이 깨졌다: {}:{}", path.display(), i + 1))
-            })
-            .collect()
+        let mut history = History::default();
+        for (i, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str(line) {
+                Ok(event) => history.events.push(event),
+                Err(_) => history.broken_lines.push(i + 1),
+            }
+        }
+        Ok(history)
     }
 
     pub fn daemon(&self) -> Result<Option<DaemonInfo>> {
         read_json(&self.dir.join(DAEMON_FILE))
     }
 
-    /// Takes `daemon.lock` for as long as the daemon lives. `None` means another process holds it.
+    /// The daemon's exclusive lock, or `None` when another daemon holds it. `daemon_running`
+    /// holds a shared lock for an instant, so a refusal is retried for a short while before it counts.
     pub fn try_lock_daemon(&self) -> Result<Option<FileLock>> {
         fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(DAEMON_LOCK_FILE);
@@ -178,16 +196,32 @@ impl RepoStore {
             .write(true)
             .open(&path)
             .with_context(|| format!("열지 못했다: {}", path.display()))?;
-        try_flock(file, &path)
+        for _ in 1..DAEMON_LOCK_TRIES {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(FileLock { _file: file })),
+                Err(fs::TryLockError::WouldBlock) => thread::sleep(DAEMON_LOCK_PAUSE),
+                Err(fs::TryLockError::Error(e)) => return Err(lock_error(e, &path)),
+            }
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(FileLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(e)) => Err(lock_error(e, &path)),
+        }
     }
 
-    /// Whether some process holds `daemon.lock`. Creates nothing.
+    /// Probes with a shared lock, so probes never see each other as a daemon.
     pub fn daemon_running(&self) -> Result<bool> {
         let path = self.dir.join(DAEMON_LOCK_FILE);
-        match File::open(&path) {
-            Ok(file) => Ok(try_flock(file, &path)?.is_none()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("열지 못했다: {}", path.display())),
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("열지 못했다: {}", path.display())),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(fs::TryLockError::WouldBlock) => Ok(true),
+            Err(fs::TryLockError::Error(e)) => Err(lock_error(e, &path)),
         }
     }
 
@@ -207,14 +241,18 @@ impl RepoStore {
     }
 }
 
-fn try_flock(file: File, path: &Path) -> Result<Option<FileLock>> {
-    match file.try_lock() {
-        Ok(()) => Ok(Some(FileLock { _file: file })),
-        Err(fs::TryLockError::WouldBlock) => Ok(None),
-        Err(fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("잠그지 못했다: {}", path.display()))
-        }
+fn lock_error(e: io::Error, path: &Path) -> anyhow::Error {
+    anyhow::Error::new(e).context(format!("잠그지 못했다: {}", path.display()))
+}
+
+fn ends_with_newline(file: &mut File) -> io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
     }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -401,9 +439,82 @@ mod tests {
         };
         store.append_history(&event(1)).unwrap();
         store.append_history(&event(2)).unwrap();
-        assert_eq!(store.history().unwrap(), [event(1), event(2)]);
+        assert_eq!(store.history().unwrap().events, [event(1), event(2)]);
         let text = fs::read_to_string(store.dir().join(HISTORY_FILE)).unwrap();
         assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn a_torn_history_line_is_skipped_and_does_not_swallow_the_next() {
+        let (_dir, store) = store();
+        fs::create_dir_all(store.dir()).unwrap();
+        let event = |pr| Event {
+            at_ms: EpochMs(pr),
+            kind: EventKind::Bounced {
+                pr: PrNumber(pr),
+                batch: None,
+                reason: crate::model::BounceReason::Verify,
+                attempts: 1,
+            },
+        };
+        store.append_history(&event(1)).unwrap();
+        let path = store.dir().join(HISTORY_FILE);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"at_ms\":2,\"event\":\"bou").unwrap();
+        store.append_history(&event(3)).unwrap();
+
+        let history = store.history().unwrap();
+        assert_eq!(history.events, [event(1), event(3)]);
+        assert_eq!(history.broken_lines, [2]);
+    }
+
+    fn probe_in_threads(store: &Arc<RepoStore>) -> Vec<thread::JoinHandle<usize>> {
+        (0..4)
+            .map(|_| {
+                let store = Arc::clone(store);
+                thread::spawn(move || {
+                    (0..2000)
+                        .filter(|_| store.daemon_running().unwrap())
+                        .count()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_probes_never_see_a_daemon() {
+        let (_dir, store) = store();
+        drop(store.try_lock_daemon().unwrap().unwrap());
+        let store = Arc::new(store);
+        let seen: usize = probe_in_threads(&store)
+            .into_iter()
+            .map(|p| p.join().unwrap())
+            .sum();
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn probes_do_not_block_a_starting_daemon() {
+        let (_dir, store) = store();
+        drop(store.try_lock_daemon().unwrap().unwrap());
+        let store = Arc::new(store);
+        let probes = probe_in_threads(&store);
+        let refused = (0..200)
+            .filter(|_| store.try_lock_daemon().unwrap().is_none())
+            .count();
+        for p in probes {
+            p.join().unwrap();
+        }
+        assert_eq!(refused, 0);
+    }
+
+    #[test]
+    fn repos_skips_stray_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path());
+        fs::create_dir_all(dir.path().join("repos")).unwrap();
+        fs::write(dir.path().join("repos/.DS_Store"), "").unwrap();
+        assert!(home.repos().unwrap().is_empty());
     }
 
     #[test]

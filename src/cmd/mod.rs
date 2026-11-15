@@ -1,5 +1,3 @@
-//! One file per command: its arguments and its `run`.
-
 pub mod approve;
 pub mod batches;
 pub mod daemon;
@@ -24,7 +22,6 @@ use anyhow::{Context, Result};
 use crate::ext::Ext;
 use crate::store::Home;
 
-/// The exit code for "could not run", shared by errors and unimplemented commands.
 pub const CANNOT_RUN: u8 = 2;
 
 pub struct Ctx {
@@ -42,7 +39,6 @@ impl Ctx {
         })
     }
 
-    /// A directory inside the target repository: `--repo`, else the current directory.
     pub fn target_dir(&self) -> Result<PathBuf> {
         match &self.repo {
             Some(dir) => Ok(dir.clone()),

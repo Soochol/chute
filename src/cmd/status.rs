@@ -13,7 +13,7 @@ use crate::repo;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// 플랜 5.5의 상태 JSON을 출력한다
+    /// 상태를 JSON으로 출력한다
     #[arg(long)]
     pub json: bool,
     /// 등록된 모든 저장소를 배열로 출력한다
@@ -54,8 +54,6 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Builds the status JSON from the state folder. The approval mode and budget come from
-/// `chute.toml` on the remote default branch; when that cannot be read, defaults apply and a warning says so.
 pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusView> {
     let store = ctx.home.repo(&info.slug);
     let state = store.load()?;
@@ -75,7 +73,19 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
     };
     let running = store.daemon_running()?;
     let daemon = if running { store.daemon()? } else { None };
-    let (today, recent) = summarize(&store.history()?, now);
+    let history = store.history()?;
+    if !history.broken_lines.is_empty() {
+        warnings.push(Warning {
+            kind: WarningKind::History,
+            message: format!(
+                "history.jsonl의 깨진 줄을 건너뛰었다: {:?}",
+                history.broken_lines
+            ),
+            pr: None,
+            at_ms: EpochMs(now.timestamp_millis().max(0) as u64),
+        });
+    }
+    let (today, recent) = summarize(&history.events, now);
     Ok(StatusView {
         schema: SchemaV1,
         repo: RepoView {
@@ -103,7 +113,6 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
     })
 }
 
-/// Today's numbers by the calendar day of `now`, and the latest finished batches, newest first.
 pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, Vec<RecentBatch>) {
     let day = now.date_naive();
     let tz = now.timezone();
