@@ -497,6 +497,11 @@ fn a_failed_tree_ref_lives_while_the_pr_is_in_the_queue_and_goes_when_it_leaves(
         .git(&["for-each-ref", "--format=%(refname)", "refs/chute/failed/"]);
     assert!(refs.contains("refs/chute/failed/pr1-"), "{refs}");
 
+    let head = lab.repo.head();
+    lab.repo
+        .git(&["update-ref", "refs/chute/failed/preflight-1-abc", &head]);
+    lab.repo
+        .git(&["update-ref", "refs/chute/failed/commit-abc", &head]);
     lab.store
         .update(|s| Ok(queue::drop_item(s, PrNumber(1))?))
         .unwrap();
@@ -505,7 +510,14 @@ fn a_failed_tree_ref_lives_while_the_pr_is_in_the_queue_and_goes_when_it_leaves(
     let refs = lab
         .repo
         .git(&["for-each-ref", "--format=%(refname)", "refs/chute/failed/"]);
-    assert!(refs.trim().is_empty(), "{refs}");
+    assert_eq!(
+        refs.lines().collect::<Vec<_>>(),
+        [
+            "refs/chute/failed/commit-abc",
+            "refs/chute/failed/preflight-1-abc"
+        ],
+        "preflight와 커밋 참조는 engine이 지우지 않는다"
+    );
 }
 
 #[test]
@@ -634,4 +646,121 @@ fn an_error_in_the_middle_of_a_batch_puts_every_pr_back_in_the_queue() {
     assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
     assert!(lab.state().batch.is_none());
     assert_eq!(lab.verify_runs(), 0);
+}
+
+fn mover(script: &str) -> String {
+    format!(
+        "m='@ROOT@/moved'\nif [ ! -e \"$m\" ]; then touch \"$m\"; (git clone -q '@ORIGIN@' '@ROOT@/mover' && cd '@ROOT@/mover' && {script} && git push -q origin HEAD:main) || fail 'mover failed'; fi"
+    )
+}
+
+#[test]
+fn a_conflict_that_goes_away_while_the_push_is_retried_merges_the_pr_once() {
+    let lab = Lab::new(&mover(
+        "git rm -q shared.txt && git commit -qm 'chore: drop shared'",
+    ));
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("shared.txt", "from pr\n")]);
+    lab.main_commit(&[("shared.txt", "from main\n")], "feat: shared");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2]));
+    assert!(lab.state().queue.is_empty());
+    assert_eq!(lab.merged_prs(), [1, 2]);
+    lab.assert_every_pushed_commit_was_verified();
+}
+
+#[test]
+fn a_pr_that_conflicted_in_round_one_and_failed_in_round_two_is_bounced_for_failing_only() {
+    let lab = Lab::new(&format!(
+        "{}\n[ -e shared.txt ] && [ -e BAD ] && fail 'BAD'",
+        mover("git rm -q shared.txt && git commit -qm 'chore: drop shared'")
+    ));
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("shared.txt", "from pr\n"), ("BAD", "")]);
+    lab.main_commit(&[("shared.txt", "from main\n")], "feat: shared");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(summary.bounced, prs(&[2]));
+    assert_eq!(lab.bounced_events(), [(2, BounceReason::Verify)]);
+    let Failure::Verify(step) = lab.item(2).unwrap().last_failure.unwrap().failure else {
+        panic!("검증 실패여야 한다");
+    };
+    assert_eq!(
+        step.mode,
+        VerifyMode::Solo,
+        "시작 main에 얹을 수 없는 PR을 앞 PR의 조합 탓으로 돌리지 않는다"
+    );
+}
+
+#[test]
+fn a_pr_sent_back_for_its_head_is_not_sent_back_again_when_the_push_is_retried() {
+    let lab = Lab::new(&mover(
+        "echo x > moved.txt && git add moved.txt && git commit -qm 'chore: other push'",
+    ));
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    let other = lab.origin_git(&["rev-parse", "refs/pull/1/head"]);
+    lab.origin_git(&["update-ref", "refs/pull/2/head", &other]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        lab.item_state(2),
+        Some(ItemState::Bounced(BounceReason::HeadChanged))
+    );
+    assert_eq!(lab.bounced_events(), [(2, BounceReason::HeadChanged)]);
+    assert_eq!(lab.hc_calls("send").len(), 1);
+    lab.assert_every_pushed_commit_was_verified();
+}
+
+#[test]
+fn a_main_that_a_pr_of_the_batch_repaired_does_not_stop_the_queue() {
+    let lab = Lab::new("[ -e BASEBAD ] && fail 'base'\n[ -e BAD ] && fail 'bad'");
+    lab.main_commit(&[("BASEBAD", "")], "feat: broken");
+    lab.open_pr_removing(1, "BASEBAD");
+    lab.open_pr(2, &[("BAD", "")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        lab.item_state(2),
+        Some(ItemState::Bounced(BounceReason::Verify))
+    );
+    assert!(lab.state().blocked.is_none());
+    lab.assert_every_pushed_commit_was_verified();
+}
+
+#[test]
+fn a_main_broken_by_someone_else_mid_batch_stops_the_queue_instead_of_blaming_a_pr() {
+    let lab = Lab::new("[ -e EXTBAD ] && fail 'ext'\n[ -e BAD ] && fail 'bad'");
+    lab.open_pr(1, &[("f1", "x")]);
+    lab.open_pr(2, &[("BAD", "")]);
+    lab.open_pr(3, &[("f3", "x")]);
+    let root = lab.sb.root().to_string_lossy().into_owned();
+    let origin = lab.repo.origin().to_string_lossy().into_owned();
+    let hook = format!(
+        "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\nexport GIT_CONFIG_GLOBAL='{root}/gitconfig' GIT_CONFIG_NOSYSTEM=1\nm='{root}/extbad'\nwhile read old new ref; do\n  [ \"$ref\" = refs/heads/main ] || continue\n  [ -e \"$m\" ] && continue\n  git --git-dir='{origin}' cat-file -e \"$new:f1\" 2>/dev/null || continue\n  touch \"$m\"\n  (git clone -q '{origin}' '{root}/ext' && cd '{root}/ext' && echo x > EXTBAD && git add EXTBAD && git commit -qm 'chore: direct push' && git push -q origin HEAD:main) >'{root}/hook.log' 2>&1\ndone\n"
+    );
+    let path = lab.repo.origin().join("hooks/post-receive");
+    fs::write(&path, hook).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+
+    assert!(
+        lab.origin_git(&["ls-tree", "--name-only", "main"])
+            .contains("EXTBAD")
+    );
+    assert_eq!(lab.item_state(3), Some(ItemState::Queued(None)));
+    assert_eq!(lab.bounced_events(), [(2, BounceReason::Verify)]);
+    assert_eq!(lab.state().blocked.unwrap().reason, BlockReason::BaseBroken);
 }

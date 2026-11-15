@@ -197,6 +197,30 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         sha(&head)
     }
 
+    /// A PR cut from origin's `main` that deletes `path`.
+    pub fn open_pr_removing(&self, n: u64, path: &str) -> Sha {
+        let branch = format!("pr-{n}");
+        self.repo.git(&["fetch", "--quiet", "origin"]);
+        self.repo
+            .git(&["checkout", "--quiet", "-B", &branch, "origin/main"]);
+        self.repo.git(&["rm", "--quiet", path]);
+        self.repo
+            .git(&["commit", "--quiet", "-m", &format!("feat: change {n}")]);
+        let head = self.repo.head();
+        self.repo.git(&[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("{head}:refs/heads/{branch}"),
+            &format!("{head}:refs/pull/{n}/head"),
+        ]);
+        self.repo.git(&["checkout", "--quiet", "main"]);
+        self.gh_says_head(n, &head);
+        let head = sha(&head);
+        self.queue_pr(n, &head, Some(self.agent()), Approval::Agent);
+        head
+    }
+
     pub fn queue_pr(&self, n: u64, head: &Sha, agent: Option<Agent>, approval: Approval) {
         let submission = Submission {
             pr: PrNumber(n),

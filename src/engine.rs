@@ -315,7 +315,8 @@ impl Engine {
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
             fetched: BTreeSet::new(),
-            conflicted: Vec::new(),
+            conflicted: BTreeSet::new(),
+            sent_back: BTreeSet::new(),
             landed: Vec::new(),
             merged: Vec::new(),
             bounced: Vec::new(),
@@ -453,7 +454,9 @@ struct Run<'e> {
     start_base: Sha,
     items: BTreeMap<PrNumber, QueueItem>,
     fetched: BTreeSet<PrNumber>,
-    conflicted: Vec<PrNumber>,
+    conflicted: BTreeSet<PrNumber>,
+    /// PRs sent back before any push, because their head moved.
+    sent_back: BTreeSet<PrNumber>,
     landed: Vec<Landed>,
     merged: Vec<PrNumber>,
     bounced: Vec<PrNumber>,
@@ -522,6 +525,8 @@ impl Run<'_> {
             attempts: held.attempts,
         })?;
         self.bounced.push(item.pr);
+        self.sent_back.insert(item.pr);
+        self.conflicted.remove(&item.pr);
         self.notify(
             &held,
             &Notice::HeadChanged {
@@ -574,6 +579,7 @@ impl Run<'_> {
             Ok((to, held.ok_or_else(|| anyhow!("{pr}가 큐에서 사라졌다"))?))
         })?;
         self.bounced.push(pr);
+        self.conflicted.remove(&pr);
         match to {
             ItemState::Bounced(reason) => {
                 engine.history(EventKind::Bounced {
@@ -629,6 +635,9 @@ impl Run<'_> {
     fn fetch_heads(&mut self, group: &[PrNumber]) -> Result<Vec<PrNumber>> {
         let mut fit = Vec::new();
         for &pr in group {
+            if self.sent_back.contains(&pr) {
+                continue;
+            }
             if self.fetched.contains(&pr) {
                 fit.push(pr);
                 continue;
@@ -663,14 +672,16 @@ impl Run<'_> {
             };
             match outcome.result {
                 ItemResult::Merged { commit } => {
+                    self.conflicted.remove(&pr);
                     landing.push((pr, commit));
                     members.push(pr);
                 }
-                ItemResult::AlreadyMerged => members.push(pr),
+                ItemResult::AlreadyMerged => {
+                    self.conflicted.remove(&pr);
+                    members.push(pr);
+                }
                 ItemResult::Conflict(_) => {
-                    if !self.conflicted.contains(&pr) {
-                        self.conflicted.push(pr);
-                    }
+                    self.conflicted.insert(pr);
                 }
             }
         }
@@ -840,6 +851,7 @@ impl Run<'_> {
     /// alone or only together with PRs this batch merged before it, then whether the commit it
     /// failed on was fit to blame anyone.
     fn convict(&mut self, pr: PrNumber, b: &Build, failed: Failed) -> Result<()> {
+        let together = (failed.clone(), b.tip.clone());
         let (failed, tip, blame) = if b.base == self.start_base || self.landed.is_empty() {
             (
                 failed,
@@ -851,14 +863,39 @@ impl Run<'_> {
         } else {
             let start = self.start_base.clone();
             match self.check_alone(pr, &start)? {
-                Alone::Fail { failed, tip } => (failed, tip, Blame::Solo { base: start }),
-                Alone::Pass | Alone::Conflict => {
-                    (failed, b.tip.clone(), Blame::Combo(self.landed.clone()))
+                Alone::Pass => (together.0, together.1, Blame::Combo(self.landed.clone())),
+                // It cannot even be put on the starting main, so nothing says the PRs merged
+                // before it have a part in this failure.
+                Alone::Conflict => (
+                    together.0,
+                    together.1,
+                    Blame::Solo {
+                        base: b.base.clone(),
+                    },
+                ),
+                Alone::Fail {
+                    failed: alone,
+                    tip: alone_tip,
+                } => {
+                    if self.base_sound(&start)? {
+                        (alone, alone_tip, Blame::Solo { base: start })
+                    } else {
+                        // The starting main was broken and a PR of this batch fixed it; the
+                        // PR fails on the commit that was verified afterwards.
+                        (
+                            together.0,
+                            together.1,
+                            Blame::Solo {
+                                base: b.base.clone(),
+                            },
+                        )
+                    }
                 }
             }
         };
-        if let Blame::Solo { base } = &blame {
-            self.ensure_base_sound(base)?;
+        match &blame {
+            Blame::Solo { base } => self.require_sound_base(base)?,
+            Blame::Combo(_) => self.require_sound_base(&b.base)?,
         }
         let item = self.items[&pr].clone();
         let mode = match blame {
@@ -902,41 +939,51 @@ impl Run<'_> {
         }
     }
 
-    /// A PR failing on a commit that never passed verification may only be a victim. The
-    /// commit is verified by itself; if it fails too, nobody is blamed and the queue stops.
-    fn ensure_base_sound(&mut self, base: &Sha) -> Result<()> {
+    /// A PR failing on a commit that never passed verification may only be a victim, so the
+    /// commit is verified by itself first. `false` means it fails too.
+    fn base_sound(&mut self, base: &Sha) -> Result<bool> {
         let engine = self.engine;
         if engine.store.load()?.verified_bases.contains(base) {
-            return Ok(());
+            return Ok(true);
         }
         self.slot.checkout(base)?;
         match self.verify(base)? {
-            Verdict::Pass => engine.store.update(|s| {
-                s.verified_bases.push(base.clone());
-                Ok(())
-            }),
-            Verdict::Fail(_) => {
+            Verdict::Pass => {
                 engine.store.update(|s| {
-                    s.blocked = Some(Blocked {
-                        reason: BlockReason::BaseBroken,
-                        base: base.clone(),
-                        since_ms: EpochMs::now(),
-                    });
+                    s.verified_bases.push(base.clone());
                     Ok(())
                 })?;
-                engine.history(EventKind::Blocked {
-                    reason: BlockReason::BaseBroken,
-                    base: base.clone(),
-                })?;
-                Err(Halt::Blocked.into())
+                Ok(true)
             }
+            Verdict::Fail(_) => Ok(false),
         }
+    }
+
+    /// Nobody is blamed for a failure on a base that fails by itself: the queue stops.
+    fn require_sound_base(&mut self, base: &Sha) -> Result<()> {
+        if self.base_sound(base)? {
+            return Ok(());
+        }
+        let engine = self.engine;
+        engine.store.update(|s| {
+            s.blocked = Some(Blocked {
+                reason: BlockReason::BaseBroken,
+                base: base.clone(),
+                since_ms: EpochMs::now(),
+            });
+            Ok(())
+        })?;
+        engine.history(EventKind::Blocked {
+            reason: BlockReason::BaseBroken,
+            base: base.clone(),
+        })?;
+        Err(Halt::Blocked.into())
     }
 
     /// PRs that conflicted inside the batch meet the main the batch left behind. Conflicts
     /// with a PR that was never merged are gone by now.
     fn recheck_conflicts(&mut self) -> Result<()> {
-        let conflicted = std::mem::take(&mut self.conflicted);
+        let conflicted: Vec<PrNumber> = std::mem::take(&mut self.conflicted).into_iter().collect();
         if conflicted.is_empty() {
             return Ok(());
         }
