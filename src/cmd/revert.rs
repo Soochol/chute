@@ -55,12 +55,19 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
         let done = revert_all(ctx, &slot, &base, &targets, &all, batch)?;
         if done.made.is_empty() {
             let record = locate_reverts(ctx, &slot, &base, &targets)?;
-            record_push(&store, &id, &record)?;
             println!(
-                "batch {}의 변경은 이미 {}에 없다. 되돌리기를 다시 올리지 않고 기록만 남겼다.",
+                "batch {}의 변경은 이미 {}에 없다. 아무것도 올리지 않았다.",
                 id.0, info.default_branch
             );
-            print!("{}", report(&info, &id, &record, &done.skipped));
+            if record.prs.is_empty() {
+                println!(
+                    "되돌린 커밋을 {}의 이력에서 찾지 못해 기록하지 않았다.",
+                    info.default_branch
+                );
+            } else {
+                record_push(&store, &id, &record)?;
+                print!("{}", report(&info, &id, &record, &done.skipped, false));
+            }
             return Ok(());
         }
         let tip = slot.head()?;
@@ -82,7 +89,7 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
                         record.tip
                     )
                 })?;
-                print!("{}", report(&info, &id, &record, &done.skipped));
+                print!("{}", report(&info, &id, &record, &done.skipped, true));
                 return Ok(());
             }
         }
@@ -361,20 +368,26 @@ fn record_push(store: &RepoStore, id: &BatchId, record: &RevertRecord) -> Result
     Ok(())
 }
 
-fn report(info: &RepoInfo, id: &BatchId, record: &RevertRecord, skipped: &[PrNumber]) -> String {
+fn report(
+    info: &RepoInfo,
+    id: &BatchId,
+    record: &RevertRecord,
+    skipped: &[PrNumber],
+    pushed: bool,
+) -> String {
     let branch = &info.default_branch;
-    let mut out = format!(
-        "batch {}를 되돌려 {branch}에 올렸다 ({})\n",
-        id.0,
-        short(&record.tip)
-    );
-    if !record.verified {
-        out.push_str("--no-verify라서 검증하지 않았다.\n");
+    let mut out = String::new();
+    if pushed {
+        out.push_str(&format!(
+            "batch {}를 되돌려 {branch}에 올렸다 ({})\n",
+            id.0,
+            short(&record.tip)
+        ));
+        if !record.verified {
+            out.push_str("--no-verify라서 검증하지 않았다.\n");
+        }
     }
     out.push_str("\n되돌린 PR:\n");
-    if record.prs.is_empty() {
-        out.push_str("  (되돌린 커밋을 main의 이력에서 찾지 못했다)\n");
-    }
     for p in &record.prs {
         out.push_str(&format!("  #{}  revert 커밋 {}\n", p.pr.0, p.revert));
     }

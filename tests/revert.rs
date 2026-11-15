@@ -303,6 +303,7 @@ fn a_rerun_after_a_crash_between_push_and_record_finishes_the_record_without_pus
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(lab.origin_main(), pushed);
     assert!(stdout(&out).contains("이미"), "{}", stdout(&out));
+    assert!(!stdout(&out).contains("--no-verify"), "{}", stdout(&out));
     let list = stdout(&chute(&lab, &["batches", "--json"]));
     let list: serde_json::Value = serde_json::from_str(&list).unwrap();
     assert_eq!(list[0]["reverted"], true);
@@ -373,4 +374,26 @@ fn hand_revert(lab: &Lab, merge: &str) {
 fn hand_revert_plain(lab: &Lab, commit: &str) {
     lab.repo.git(&["revert", "--no-edit", commit]);
     lab.repo.git(&["push", "--quiet", "origin", "main"]);
+}
+
+#[test]
+fn a_batch_already_removed_by_plain_commits_pushes_and_records_nothing() {
+    let lab = Lab::new("");
+    let id = merge_batch(&lab, &[(1, "a.txt", "a\n")]);
+    lab.remove_from_main("a.txt", "chore: rm a");
+    let main_before = lab.origin_main();
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(lab.origin_main(), main_before);
+    let text = stdout(&out);
+    assert!(text.contains("아무것도 올리지 않았다"), "{text}");
+    assert!(
+        !text.contains("올렸다") && !text.contains("--no-verify"),
+        "{text}"
+    );
+    let list = stdout(&chute(&lab, &["batches", "--json"]));
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(list[0]["reverted"], false);
 }
