@@ -589,7 +589,7 @@ fn remove_old(dir: &Path, only_commit_reports: bool) -> io::Result<()> {
 
 fn blocked_notice(blocked: &Blocked) -> String {
     format!(
-        "경고: 저장소가 base_broken 상태다. 기준 {}이 검증을 통과하지 못해 큐가 멈춰 있다. 이 결과의 실패가 내 변경 때문이 아닐 수 있다",
+        "경고: 저장소가 base_broken 상태다. 기준 커밋 {}의 검증이 실패해 큐가 멈춰 있다. 이 실행의 실패는 이 HEAD의 변경 탓이 아닐 수 있다",
         short(&blocked.base)
     )
 }
@@ -647,7 +647,7 @@ fn render(report: &Report) -> String {
             format!(" (시험 {})", flaky.tests.join(", "))
         };
         out.push_str(&format!(
-            "흔들린 단계: {}{tests}. 다시 돌려 통과해서 통과로 본다\n",
+            "흔들린 단계: {}{tests}. 한 번 실패한 뒤 다시 돌리니 통과했다. 통과로 본다\n",
             flaky.step
         ));
     }
