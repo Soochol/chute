@@ -2551,3 +2551,125 @@ fn the_line_stands_on_its_own_without_pointing_at_text_above() {
     assert!(line.contains("보고서의 재현 방법"), "{line}");
     assert!(line.contains("따옴표"), "{line}");
 }
+
+#[test]
+fn a_shell_that_holds_the_agent_name_is_skipped_not_adopted() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let item = lab.item(12, "feat/a");
+    let dest = lab.worktrees.join("widget").join("feat/a");
+    lab.hc()
+        .respond(
+            "run --bg --json --no-parent --name chute-widget-pr12 --cwd *",
+            Reply::ok("")
+                .code(1)
+                .stderr("{\"error\":{\"kind\":\"name_taken\"}}"),
+        )
+        .respond(
+            "get chute-widget-pr12 --json",
+            Reply::ok(format!(
+                "{{\"address\":\"t1a\",\"state\":\"live\",\"created_ms\":5,\"status\":null,\"reported\":true,\"cwd\":\"{}\",\"foreground\":{{\"name\":\"zsh\"}}}}",
+                dest.display()
+            )),
+        );
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let Delivery::Spawned(agent) = delivery else {
+        panic!("{delivery:?}")
+    };
+    assert_eq!(agent.name.as_deref(), Some("chute-widget-pr12-2"));
+    assert!(!verbs(&lab.hc_calls()).contains(&"send"));
+}
+
+#[test]
+fn a_holder_folder_whose_name_ends_in_a_space_is_still_used() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let held = lab.sb.root().join("held ");
+    lab.repo.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        &held.to_string_lossy(),
+        "feat/a",
+    ]);
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert_eq!(lab.run_cwd(), held);
+    assert!(!lab.worktrees.exists());
+}
+
+#[test]
+fn a_locked_missing_worktree_at_the_wanted_folder_gets_a_sibling_instead() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let wanted = lab.worktrees.join("widget").join("feat/a");
+    lab.repo.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        &wanted.to_string_lossy(),
+        "main",
+    ]);
+    lab.repo.git(&[
+        "worktree",
+        "lock",
+        "--reason",
+        "unmounted",
+        &wanted.to_string_lossy(),
+    ]);
+    fs::remove_dir_all(&wanted).unwrap();
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert!(matches!(delivery, Delivery::Spawned(_)), "{delivery:?}");
+    assert_eq!(
+        lab.run_cwd(),
+        lab.worktrees.join("widget").join("feat/a-chute-2")
+    );
+}
+
+#[test]
+fn the_line_counts_conflicting_files_instead_of_spelling_their_names() {
+    let lab = Lab::new();
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let files = ["src/(app)/[id]/page.tsx", "docs/a b.md", "x'y\"z$HOME.rs"]
+        .iter()
+        .map(|path| ConflictFile {
+            path: (*path).into(),
+            main_commits: vec![],
+        })
+        .collect();
+    let failure = Failure::Conflict {
+        files: NonEmpty::new(files).unwrap(),
+    };
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let line = lab.hc_calls()[1][2].clone();
+    assert!(line.contains("충돌: 파일 3개"), "{line}");
+    assert!(
+        !line.contains("page.tsx") && !line.contains("HOME"),
+        "{line}"
+    );
+    assert!(read(&written.md).contains("`src/(app)/[id]/page.tsx`"));
+}

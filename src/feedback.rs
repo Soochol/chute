@@ -778,7 +778,7 @@ impl Notice<'_> {
                     "{} {}{}",
                     without_shell_syntax(&format!(
                         "chute 반송: {label}. {}. 보고서:",
-                        written.doc.summary
+                        line_summary(&written.doc)
                     )),
                     shell_word(&written.md.to_string_lossy()),
                     without_shell_syntax(&format!(". 할 일: {}", steps.join(" ")))
@@ -793,6 +793,13 @@ impl Notice<'_> {
                 short(current)
             )),
         }
+    }
+}
+
+fn line_summary(doc: &ReportDoc) -> String {
+    match &doc.failure {
+        Failure::Conflict { files } => format!("충돌: 파일 {}개", files.len()),
+        _ => doc.summary.clone(),
     }
 }
 
@@ -1118,19 +1125,18 @@ impl Feedback<'_> {
         let Some(info) = self.terminal(&TerminalId(name.to_owned()))? else {
             return Ok(None);
         };
+        let is_agent = info.state == TerminalState::Live && !info.has_left_for_a_shell();
         let (Some(terminal), Some(launched_in)) = (info.address, info.cwd) else {
             return Ok(None);
         };
         let same_folder = resolved(&launched_in) == resolved(cwd);
-        Ok(
-            (info.state == TerminalState::Live && same_folder).then(|| Agent {
-                terminal,
-                created_ms: info.created_ms,
-                name: Some(name.to_owned()),
-                workdir: cwd.to_owned(),
-                alive: true,
-            }),
-        )
+        Ok((is_agent && same_folder).then(|| Agent {
+            terminal,
+            created_ms: info.created_ms,
+            name: Some(name.to_owned()),
+            workdir: cwd.to_owned(),
+            alive: true,
+        }))
     }
 
     fn agent_name(&self, pr: PrNumber, attempt: u32) -> String {
@@ -1179,7 +1185,7 @@ impl Feedback<'_> {
                 locked.path.display()
             );
         }
-        let dest = free_dest(&self.worktree_dest(item)?)?;
+        let dest = free_dest(&self.worktree_dest(item)?, &checkouts)?;
         let record_without_folder = !holders.is_empty()
             || checkouts
                 .iter()
@@ -1197,7 +1203,9 @@ impl Feedback<'_> {
         self.ext
             .git(dir, ["rev-parse", "--show-toplevel"])
             .is_ok_and(|out| {
-                out.success() && resolved(Path::new(out.stdout_text().trim())) == resolved(dir)
+                out.success()
+                    && resolved(Path::new(out.stdout_text().trim_end_matches('\n')))
+                        == resolved(dir)
             })
     }
 
@@ -1221,7 +1229,7 @@ impl Feedback<'_> {
                 )
                 .ok()?;
             out.success()
-                .then(|| PathBuf::from(out.stdout_text().trim()))?
+                .then(|| PathBuf::from(out.stdout_text().trim_end_matches('\n')))?
                 .canonicalize()
                 .ok()
         };
@@ -1268,7 +1276,7 @@ impl Feedback<'_> {
                     ["rev-parse", "--git-path", &format!("{state}/head-name")],
                 )
                 .ok()?;
-            let file = dir.join(out.stdout_text().trim());
+            let file = dir.join(out.stdout_text().trim_end_matches('\n'));
             fs::read_to_string(file)
                 .ok()?
                 .trim()
@@ -1360,8 +1368,14 @@ fn resolved(path: &Path) -> PathBuf {
     }
 }
 
-fn free_dest(wanted: &Path) -> Result<PathBuf> {
-    if !wanted.exists() {
+fn free_dest(wanted: &Path, checkouts: &[Checkout]) -> Result<PathBuf> {
+    let taken = |path: &Path| {
+        path.exists()
+            || checkouts
+                .iter()
+                .any(|c| c.locked && resolved(&c.path) == resolved(path))
+    };
+    if !taken(wanted) {
         return Ok(wanted.to_owned());
     }
     (2..=SIBLING_TRIES)
@@ -1370,7 +1384,7 @@ fn free_dest(wanted: &Path) -> Result<PathBuf> {
             name.push(format!("-chute-{n}"));
             PathBuf::from(name)
         })
-        .find(|candidate| !candidate.exists())
+        .find(|candidate| !taken(candidate))
         .ok_or_else(|| anyhow!("worktree를 만들 빈 자리가 없다: {}", wanted.display()))
 }
 
