@@ -478,3 +478,90 @@ fn a_no_checks_warning_is_written_once_even_when_its_pr_is_pushed_out_of_a_batch
     assert_eq!(lab.state().warnings, first);
     assert_eq!(lab.item_state(2), Some(CI_PENDING));
 }
+
+#[test]
+fn reading_new_prs_does_not_push_back_the_next_look_at_the_ones_already_waiting() {
+    let lab = Lab::build("", REQUIRE_CI, 60);
+    lab.open_pr(1, &[("f1.txt", "x\n")]);
+    lab.gh_checks(1, &[("build", "pending")]);
+    let engine = lab.engine_rechecking_ci_every(Duration::from_millis(400));
+    engine.run_once().unwrap();
+    lab.gh_checks(1, &[("build", "pass")]);
+
+    for n in 2..=3 {
+        std::thread::sleep(Duration::from_millis(250));
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+        lab.gh_checks(n, &[("build", "pending")]);
+        engine.run_once().unwrap();
+    }
+
+    assert_eq!(lab.merged_prs(), [1]);
+}
+
+#[test]
+fn a_green_ci_waiter_is_not_starved_by_ordinary_prs_that_fill_every_batch() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 1", 60);
+    lab.open_pr(1, &[("f1.txt", "x\n")]);
+    lab.gh_checks(1, &[("build", "pass")]);
+    mark_ci_pending(&lab, &[1]);
+
+    for n in 2..=4 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+        lab.gh_checks(n, &[("build", "pass")]);
+        lab.engine().run_once().unwrap();
+    }
+
+    assert_eq!(lab.merged_prs()[0], 1);
+}
+
+#[test]
+fn a_failed_gh_read_keeps_the_wait_marks_and_the_no_checks_warnings_as_they_were() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    make_submitted_minutes_ago(&lab, 1, 11);
+    make_submitted_minutes_ago(&lab, 2, 11);
+    lab.engine().run_once().unwrap();
+    let before = lab.state().warnings;
+    assert_eq!(before.len(), 2, "{before:?}");
+
+    lab.gh_checks_error(1, 2);
+    assert!(lab.engine().run_once().is_err());
+    assert_eq!(lab.item_state(1), Some(CI_PENDING));
+    assert_eq!(lab.item_state(2), Some(CI_PENDING));
+    lab.gh_checks(1, &[]);
+    lab.engine().run_once().unwrap();
+
+    assert_eq!(lab.state().warnings, before);
+}
+
+#[test]
+fn turning_the_option_off_clears_every_no_checks_warning_and_wait_mark() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 1", 60);
+    for n in 1..=3 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+        make_submitted_minutes_ago(&lab, n, 11);
+    }
+    mark_ci_pending(&lab, &[1, 2, 3]);
+    lab.engine().run_once().unwrap();
+    assert_eq!(lab.state().warnings.len(), 3);
+    let config = std::fs::read_to_string(lab.repo.path().join("chute.toml"))
+        .unwrap()
+        .replace("require_ci = true", "require_ci = false");
+    lab.main_commit(&[("chute.toml", &config)], "chore: require_ci 끔");
+
+    lab.engine().run_once().unwrap();
+
+    assert!(
+        lab.state().warnings.is_empty(),
+        "{:?}",
+        lab.state().warnings
+    );
+    let marked = lab
+        .state()
+        .queue
+        .iter()
+        .filter(|i| i.state == CI_PENDING)
+        .count();
+    assert_eq!(marked, 0);
+}

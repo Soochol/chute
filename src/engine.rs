@@ -82,7 +82,7 @@ pub struct Engine {
     worktrees_root: PathBuf,
     cancel: Cancel,
     timing: Timing,
-    ci_looked: Mutex<Option<Instant>>,
+    ci_looked: Mutex<BTreeMap<PrNumber, Instant>>,
 }
 
 impl Engine {
@@ -98,7 +98,7 @@ impl Engine {
             worktrees_root,
             cancel: Cancel::new(),
             timing: Timing::default(),
-            ci_looked: Mutex::new(None),
+            ci_looked: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -362,40 +362,40 @@ impl Engine {
         Ok(())
     }
 
-    fn ci_look_due(&self) -> bool {
-        let looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
-        looked.is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
+    fn ci_due(&self, state: &State) -> bool {
+        let mut looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
+        looked.retain(|pr, _| state.queue.iter().any(|i| i.pr == *pr));
+        state.queue.iter().any(|i| {
+            i.state == ItemState::Queued(Some(QueuedReason::CiPending))
+                && looked
+                    .get(&i.pr)
+                    .is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
+        })
     }
 
-    fn prune_no_checks_warnings(&self) -> Result<()> {
-        let waiting = |s: &State, pr: Option<PrNumber>| {
-            s.queue.iter().any(|i| {
-                Some(i.pr) == pr && i.state == ItemState::Queued(Some(QueuedReason::CiPending))
-            })
-        };
+    fn prune_no_checks_warnings(&self, require_ci: Option<bool>) -> Result<()> {
         let stale = |s: &State| {
-            s.warnings
-                .iter()
-                .any(|w| w.kind == WarningKind::NoChecks && !waiting(s, w.pr))
+            s.warnings.iter().any(|w| {
+                w.kind == WarningKind::NoChecks
+                    && (require_ci == Some(false) || !s.queue.iter().any(|i| Some(i.pr) == w.pr))
+            })
         };
         if !stale(&self.store.load()?) {
             return Ok(());
         }
         self.store.update(|s| {
-            let keep: Vec<bool> = s
-                .warnings
-                .iter()
-                .map(|w| w.kind != WarningKind::NoChecks || waiting(s, w.pr))
-                .collect();
-            let mut keep = keep.into_iter();
-            s.warnings.retain(|_| keep.next().unwrap_or(true));
+            let in_queue: BTreeSet<PrNumber> = s.queue.iter().map(|i| i.pr).collect();
+            s.warnings.retain(|w| {
+                w.kind != WarningKind::NoChecks
+                    || (require_ci != Some(false) && w.pr.is_some_and(|pr| in_queue.contains(&pr)))
+            });
             Ok(())
         })
     }
 
     pub fn run_once(&self) -> Result<Pass> {
-        self.prune_no_checks_warnings()?;
-        let ci_due = self.ci_look_due();
+        self.prune_no_checks_warnings(None)?;
+        let ci_due = self.ci_due(&self.store.load()?);
         let waiting = |s: &crate::model::State| {
             s.queue.iter().any(|i| match i.state {
                 ItemState::Queued(None) => true,
@@ -418,6 +418,7 @@ impl Engine {
             })?;
         }
         let config = self.load_config()?;
+        self.prune_no_checks_warnings(Some(config.require_ci))?;
         let id = self.new_batch_id();
         let (taken, was_waiting_on_ci): (Vec<QueueItem>, BTreeSet<PrNumber>) =
             self.store.update(|s| {
@@ -670,9 +671,15 @@ impl Run<'_> {
             return Ok(true);
         }
         let engine = self.engine;
-        *engine.ci_looked.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         let pr = item.pr;
-        match ci::read(&engine.ext, &engine.info.path, pr)? {
+        let verdict = ci::read(&engine.ext, &engine.info.path, pr)?;
+        let mut looked = engine.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
+        match verdict {
+            CiVerdict::Pending | CiVerdict::NoChecks => looked.insert(pr, Instant::now()),
+            CiVerdict::Passed | CiVerdict::Failed(_) => looked.remove(&pr),
+        };
+        drop(looked);
+        match verdict {
             CiVerdict::Passed => {
                 self.clear_no_checks_warning(pr)?;
                 Ok(true)
@@ -702,7 +709,7 @@ impl Run<'_> {
     /// Puts a PR the batch has no room for back in the queue, still marked if it was waiting
     /// on CI, so it neither counts as a member nor loses its place.
     fn release(&mut self, pr: PrNumber) -> Result<()> {
-        let keep_mark = self.was_waiting_on_ci.contains(&pr);
+        let keep_mark = self.config.require_ci && self.was_waiting_on_ci.contains(&pr);
         self.engine.store.update(|s| {
             queue::requeue(s, pr)?;
             if keep_mark {
@@ -1296,11 +1303,19 @@ impl Run<'_> {
             })?;
         }
         let prs: Vec<PrNumber> = self.items.keys().copied().collect();
+        let keep_marks = if self.config.require_ci {
+            self.was_waiting_on_ci.clone()
+        } else {
+            BTreeSet::new()
+        };
         engine.store.update(|s| {
             for pr in &prs {
                 let held = s.queue.iter().find(|i| i.pr == *pr);
                 if held.is_some_and(|i| i.state == ItemState::InBatch) {
                     queue::requeue(s, *pr)?;
+                    if keep_marks.contains(pr) {
+                        queue::set_ci_pending(s, *pr)?;
+                    }
                 }
             }
             s.batch = None;

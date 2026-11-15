@@ -270,6 +270,15 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         .unwrap();
     }
 
+    pub fn gh_checks_error(&self, n: u64, code: i32) {
+        fs::write(self.gh_dir.join(format!("{n}.checks")), "").unwrap();
+        fs::write(
+            self.gh_dir.join(format!("{n}.checks.code")),
+            code.to_string(),
+        )
+        .unwrap();
+    }
+
     pub fn gh_check_reads(&self) -> usize {
         fs::read_to_string(self.gh_dir.join("checks-calls"))
             .map(|t| t.lines().count())

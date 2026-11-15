@@ -398,18 +398,20 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
 
 pub fn take_batch(state: &mut State, max_batch: u32, waiting_on_ci: bool) -> Vec<PrNumber> {
     let mut taken = Vec::new();
-    for ci_pass in [false, true] {
+    let mut others = 0;
+    for ci_pass in [true, false] {
         if ci_pass && !waiting_on_ci {
-            break;
+            continue;
         }
         for item in &mut state.queue {
             let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
-            if is_waiting != ci_pass || (!is_waiting && taken.len() >= max_batch as usize) {
+            if is_waiting != ci_pass || (!ci_pass && others >= max_batch) {
                 continue;
             }
             if let Some(Next::To(to)) = step(item.state, Action::Take) {
                 item.state = to;
                 taken.push(item.pr);
+                others += u32::from(!ci_pass);
             }
         }
     }
@@ -760,9 +762,9 @@ mod tests {
     }
 
     #[test]
-    fn take_batch_takes_ci_waiters_after_the_others_and_only_when_asked() {
+    fn take_batch_takes_ci_waiters_first_without_a_cap_and_only_when_asked() {
         let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED), (3, CI_PENDING), (4, QUEUED)]);
-        assert_eq!(prs(&take_batch(&mut state, 1, true)), [2, 1, 3]);
+        assert_eq!(prs(&take_batch(&mut state, 1, true)), [1, 3, 2]);
         assert_eq!(state_of(&state, 4), QUEUED);
         let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED)]);
         assert_eq!(prs(&take_batch(&mut state, 8, false)), [2]);
