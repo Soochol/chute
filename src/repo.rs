@@ -35,25 +35,21 @@ fn origin_url(ext: &Ext, dir: &Path) -> Result<String> {
     Ok(out.stdout_text().trim().to_owned())
 }
 
-/// The main work tree, or the current one when the repository itself is bare.
+/// The main work tree. A bare repository has none and no `origin/*` refs to read the
+/// config from, so it is refused.
 fn work_tree(ext: &Ext, dir: &Path) -> Result<PathBuf> {
     let text = ext.git(dir, ["worktree", "list", "--porcelain"])?.ok()?;
     let main = text.split("\n\n").next().unwrap_or_default();
-    let path = main
-        .lines()
-        .find_map(|line| line.strip_prefix("worktree "))
-        .ok_or_else(|| anyhow!("git worktree list의 출력을 읽지 못했다: {text:?}"))?;
-    if !main.lines().any(|line| line == "bare") {
-        return Ok(PathBuf::from(path));
-    }
-    let top = ext.git(dir, ["rev-parse", "--show-toplevel"])?;
-    if !top.success() {
+    if main.lines().any(|line| line == "bare") {
         bail!(
-            "bare 저장소 안이다. worktree 안에서 실행한다: {}",
+            "bare 저장소는 지원하지 않는다. 일반 clone에서 실행한다: {}",
             dir.display()
         );
     }
-    Ok(PathBuf::from(top.stdout_text().trim()))
+    main.lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("git worktree list의 출력을 읽지 못했다: {text:?}"))
 }
 
 fn default_branch(ext: &Ext, repo: &Path) -> Result<String> {
@@ -125,33 +121,18 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_repository_uses_the_worktree_it_runs_in() {
+    fn a_bare_repository_is_refused() {
         let sb = Sandbox::new();
         let repo = TestRepo::new(&sb, "acme/widget");
         let bare = sb.root().join("bare.git");
         let wt = sb.root().join("bare-wt");
-        repo.git(&[
-            "clone",
-            "--quiet",
-            "--bare",
-            &repo.origin().to_string_lossy(),
-            &bare.to_string_lossy(),
-        ]);
-        repo.git(&[
-            "-C",
-            &bare.to_string_lossy(),
-            "worktree",
-            "add",
-            "--quiet",
-            &wt.to_string_lossy(),
-            "main",
-        ]);
+        let (bare_s, wt_s) = (bare.to_string_lossy(), wt.to_string_lossy());
+        let origin = repo.origin().to_string_lossy();
+        repo.git(&["clone", "--quiet", "--bare", &origin, &bare_s]);
+        repo.git(&["-C", &bare_s, "worktree", "add", "--quiet", &wt_s, "main"]);
         let ext = Ext::from_vars(|k| sb.var(k));
 
-        assert_eq!(
-            discover(&ext, &wt).unwrap().path,
-            wt.canonicalize().unwrap()
-        );
+        assert!(discover(&ext, &wt).is_err());
         assert!(discover(&ext, &bare).is_err());
     }
 }

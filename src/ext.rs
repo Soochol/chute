@@ -236,24 +236,25 @@ impl Ext {
 const PIPE_GRACE: Duration = Duration::from_millis(500);
 
 struct Drain {
-    bytes: Arc<Mutex<Vec<u8>>>,
+    bytes: Arc<Mutex<Option<Vec<u8>>>>,
     done: mpsc::Receiver<io::Result<()>>,
 }
 
 impl Drain {
+    /// Takes what was read. A reader still blocked on a grandchild's pipe stops at its next
+    /// read and closes the pipe, so nothing keeps buffering after the call returns.
     fn finish(self, until: Instant) -> io::Result<Vec<u8>> {
         let wait = until.saturating_duration_since(Instant::now());
         if let Ok(Err(e)) = self.done.recv_timeout(wait) {
             return Err(e);
         }
-        Ok(std::mem::take(
-            &mut *self.bytes.lock().unwrap_or_else(|e| e.into_inner()),
-        ))
+        let taken = self.bytes.lock().unwrap_or_else(|e| e.into_inner()).take();
+        Ok(taken.unwrap_or_default())
     }
 }
 
 fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
-    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let bytes = Arc::new(Mutex::new(Some(Vec::new())));
     let (tx, done) = mpsc::channel();
     match pipe {
         Some(mut pipe) => {
@@ -263,10 +264,10 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
                 let result = loop {
                     match pipe.read(&mut chunk) {
                         Ok(0) => break Ok(()),
-                        Ok(n) => bytes
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .extend_from_slice(&chunk[..n]),
+                        Ok(n) => match bytes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                            Some(buf) => buf.extend_from_slice(&chunk[..n]),
+                            None => break Ok(()),
+                        },
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(e) => break Err(e),
                     }
@@ -384,6 +385,29 @@ mod tests {
         assert!(out.success());
         assert_eq!(out.stdout_text(), "started\n");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_chatty_grandchild_stops_being_buffered_after_return() {
+        let sb = Sandbox::new();
+        let hc = sb.script("yes-hc", "yes xxxxxxxxxxxxxxxx &\necho started\nexit 0\n");
+        let ext = Ext::from_vars(|k| (k == "CHUTE_HC").then(|| hc.clone().into()));
+        let out = ext
+            .call(Tool::Hc, None, ["run"], Duration::from_secs(3))
+            .unwrap();
+        assert!(out.stdout_text().contains("started\n"));
+        let rss = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
+                .unwrap()
+        };
+        drop(out);
+        let before = rss();
+        thread::sleep(Duration::from_millis(500));
+        assert!(rss() < before + 100_000, "호출이 끝난 뒤에도 출력이 쌓인다");
     }
 
     #[test]

@@ -65,7 +65,7 @@ impl Home {
         let mut repos = Vec::new();
         for entry in entries {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            if !entry.path().is_dir() {
                 continue;
             }
             if let Some(info) = read_json::<RepoInfo>(&entry.path().join(REPO_FILE))? {
@@ -515,6 +515,24 @@ mod tests {
         fs::create_dir_all(dir.path().join("repos")).unwrap();
         fs::write(dir.path().join("repos/.DS_Store"), "").unwrap();
         assert!(home.repos().unwrap().is_empty());
+
+        let slug = Slug::new("acme", "a").unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        Home::at(&elsewhere)
+            .repo(&slug)
+            .register(&RepoInfo {
+                slug: slug.clone(),
+                path: "/w/a".into(),
+                remote: "git@github.com:acme/a.git".into(),
+                default_branch: "main".into(),
+            })
+            .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("repos/acme__a"),
+            dir.path().join("repos/acme__a"),
+        )
+        .unwrap();
+        assert_eq!(home.repos().unwrap().len(), 1);
     }
 
     #[test]

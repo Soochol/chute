@@ -95,9 +95,12 @@ pub struct Slug {
 impl Slug {
     pub fn new(owner: &str, name: &str) -> Result<Slug, String> {
         let owner_ok = !owner.is_empty()
+            && !owner.starts_with('_')
+            && !owner.ends_with('_')
+            && !owner.contains("__")
             && owner
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b));
         let name_ok = !name.is_empty()
             && name != "."
             && name != ".."
@@ -886,6 +889,9 @@ mod tests {
     #[test]
     fn slug_owner_cannot_make_folder_names_collide() {
         assert!(Slug::new("a__b", "c").is_err());
+        assert!(Slug::new("a_", "b").is_err());
+        assert_eq!(Slug::new("a", "_b").unwrap().dir_name(), "a___b");
+        assert!(Slug::new("octocat_acme", "widget").is_ok());
         assert!(Slug::new("github.com", "solo").is_err());
         assert_eq!(Slug::new("a", "b__c").unwrap().dir_name(), "a__b__c");
         assert!(Slug::new("Soochol", "chute.rs_x-1").is_ok());
