@@ -211,3 +211,46 @@ fn the_mod_installed_in_a_temporary_home_passes_herdr_app_check() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn concurrent_installs_both_succeed() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    let skill = sb.home().join(".claude/skills/chute/SKILL.md");
+    for round in 0..30 {
+        let _ = fs::remove_file(&skill);
+        let spawn = || {
+            sb.command(env!("CARGO_BIN_EXE_chute"))
+                .arg("install")
+                .current_dir(sb.root())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let (a, b) = (spawn(), spawn());
+        for out in [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()] {
+            assert!(
+                out.status.success(),
+                "round {round}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&skill).unwrap(),
+            repo_file("skill/SKILL.md")
+        );
+    }
+}
+
+#[test]
+fn a_blocked_target_exits_2_and_installs_the_rest() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    fs::create_dir_all(sb.home().join(".claude/skills/chute/SKILL.md")).unwrap();
+    let out = install(&sb);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(sb.home().join(".codex/skills/chute/SKILL.md").is_file());
+    assert!(herdr_home(&sb).join("mods/chute/mod.json").is_file());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("실패했다"));
+}
