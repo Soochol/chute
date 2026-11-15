@@ -158,57 +158,81 @@ impl Engine {
         // `batch` and `in_batch` items, and repeats what is left. Each step before it can be
         // repeated without a trace.
         let batch_id = state.batch.as_ref().map(|b| b.id.clone());
-        let already_told: Vec<(PrNumber, BatchId)> = self
-            .store
-            .history()?
-            .events
-            .into_iter()
-            .filter_map(|e| match e.kind {
-                EventKind::Merged { pr, batch, .. } => Some((pr, batch)),
-                _ => None,
-            })
-            .collect();
         let id_for_events = batch_id.clone().unwrap_or(BatchId(String::new()));
+        let events = self.store.history()?.events;
+        let mut merged_prs: Vec<PrNumber> = Vec::new();
+        let mut bounced_prs: Vec<PrNumber> = Vec::new();
+        let mut finished_already = false;
+        for event in &events {
+            match &event.kind {
+                EventKind::Merged { pr, batch, .. } if *batch == id_for_events => {
+                    merged_prs.push(*pr)
+                }
+                EventKind::Bounced {
+                    pr,
+                    batch: Some(batch),
+                    ..
+                } if *batch == id_for_events => bounced_prs.push(*pr),
+                EventKind::BatchFinished { batch, .. } if *batch == id_for_events => {
+                    finished_already = true
+                }
+                _ => {}
+            }
+        }
         for (item, commit) in &settled {
-            if !already_told.contains(&(item.pr, id_for_events.clone())) {
+            if !merged_prs.contains(&item.pr) {
                 self.history(EventKind::Merged {
                     pr: item.pr,
                     batch: id_for_events.clone(),
                     commit: commit.clone().unwrap_or_else(|| item.head.clone()),
                     submitted_ms: item.submitted_ms,
                 })?;
+                merged_prs.push(item.pr);
             }
         }
-        if let Some(id) = &batch_id
-            && let Some(mut record) = self.store.read_batch(id)?
-            && record.finished_ms.is_none()
-        {
-            let now = EpochMs::now();
-            for (item, commit) in &settled {
-                let known = record.merges.iter().any(|m| m.pr == item.pr);
-                if let (Some(commit), false) = (commit, known) {
-                    record.merges.push(MergeRef {
-                        pr: item.pr,
-                        commit: commit.clone(),
-                    });
+        if let Some(id) = &batch_id {
+            let record = match self.store.read_batch(id) {
+                Ok(record) => record,
+                Err(e) => {
+                    eprintln!("chute: batch 기록을 읽지 못해 건너뛴다: {e:#}");
+                    None
                 }
-            }
-            record.finished_ms = Some(now);
-            self.store.write_batch(&record)?;
-            let mut merged_prs: Vec<PrNumber> = record.merges.iter().map(|m| m.pr).collect();
-            for (item, _) in &settled {
-                if !merged_prs.contains(&item.pr) {
-                    merged_prs.push(item.pr);
+            };
+            if let Some(mut record) = record
+                && record.finished_ms.is_none()
+            {
+                let now = EpochMs::now();
+                for (item, commit) in &settled {
+                    let known = record.merges.iter().any(|m| m.pr == item.pr);
+                    if let (Some(commit), false) = (commit, known) {
+                        record.merges.push(MergeRef {
+                            pr: item.pr,
+                            commit: commit.clone(),
+                        });
+                    }
                 }
-            }
-            if !merged_prs.is_empty() || !record.bounced.is_empty() {
-                self.history(EventKind::BatchFinished {
-                    batch: id.clone(),
-                    merged: merged_prs,
-                    bounced: record.bounced.clone(),
-                    seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
-                    verify_s: record.verify_s,
-                })?;
+                for pr in &record.bounced {
+                    if !bounced_prs.contains(pr) {
+                        bounced_prs.push(*pr);
+                    }
+                }
+                for merge in &record.merges {
+                    if !merged_prs.contains(&merge.pr) {
+                        merged_prs.push(merge.pr);
+                    }
+                }
+                record.bounced = bounced_prs.clone();
+                if !finished_already && (!merged_prs.is_empty() || !bounced_prs.is_empty()) {
+                    self.history(EventKind::BatchFinished {
+                        batch: id.clone(),
+                        merged: merged_prs,
+                        bounced: bounced_prs,
+                        seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
+                        verify_s: record.verify_s,
+                    })?;
+                }
+                record.finished_ms = Some(now);
+                self.store.write_batch(&record)?;
             }
         }
         self.store.update(|s| {
@@ -246,13 +270,18 @@ impl Engine {
                 "log",
                 "--first-parent",
                 "--fixed-strings",
-                "-n1",
-                "--format=%H",
+                "--format=%H%x09%s",
                 &format!("--grep={title}"),
                 main,
             ],
         )?;
-        Ok(Sha::try_from(out.stdout_text().trim().to_owned()).ok())
+        let found = out
+            .stdout_text()
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(_, subject)| subject.starts_with(&title))
+            .and_then(|(sha, _)| Sha::try_from(sha.to_owned()).ok());
+        Ok(found)
     }
 
     fn prune_failed_refs(&self) -> Result<()> {
@@ -508,16 +537,16 @@ impl Run<'_> {
                     self.engine.history(EventKind::Closed { pr: item.pr })?;
                 }
                 Inspection::Merged { commit } => {
-                    self.engine
-                        .store
-                        .update(|s| Ok(queue::merged(s, item.pr)?))?;
-                    self.merged.push(item.pr);
                     self.engine.history(EventKind::Merged {
                         pr: item.pr,
                         batch: self.id().clone(),
                         commit,
                         submitted_ms: item.submitted_ms,
                     })?;
+                    self.engine
+                        .store
+                        .update(|s| Ok(queue::merged(s, item.pr)?))?;
+                    self.merged.push(item.pr);
                 }
                 Inspection::HeadChanged { current } => self.head_changed(item, &current)?,
             }
@@ -538,6 +567,7 @@ impl Run<'_> {
         self.bounced.push(pr);
         self.sent_back.insert(pr);
         self.conflicted.remove(&pr);
+        self.save_record()?;
         self.engine.history(EventKind::Bounced {
             pr,
             batch: Some(self.id().clone()),
@@ -606,6 +636,7 @@ impl Run<'_> {
         };
         self.bounced.push(pr);
         self.conflicted.remove(&pr);
+        self.save_record()?;
         match to {
             ItemState::Bounced(reason) => engine.history(EventKind::Bounced {
                 pr,
@@ -825,22 +856,13 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// The PRs of `b` are in the default branch now. The record and the history come before
+    /// the queue changes, so a run cut short in here is finished by `recover`, which sees the
+    /// PRs still `in_batch` and finds the events already written.
     fn land(&mut self, b: &Build) -> Result<()> {
         let engine = self.engine;
         let pushed = !b.landing.is_empty();
         let commits: BTreeMap<PrNumber, Sha> = b.landing.iter().cloned().collect();
-        let gone = engine.store.update(|s| {
-            let mut gone = Vec::new();
-            for pr in &b.members {
-                gone.push(queue::merged(s, *pr)?);
-            }
-            if pushed {
-                s.verified_bases.push(b.tip.clone());
-                let excess = s.verified_bases.len().saturating_sub(VERIFIED_BASES_KEPT);
-                s.verified_bases.drain(..excess);
-            }
-            Ok(gone)
-        })?;
         if pushed {
             self.record.pushed.push(b.tip.clone());
         }
@@ -850,23 +872,37 @@ impl Run<'_> {
                 commit: commit.clone(),
             });
         }
-        for item in gone {
-            let commit = commits.get(&item.pr).unwrap_or(&item.head).clone();
-            if commits.contains_key(&item.pr) {
-                self.landed.push(Landed {
-                    pr: item.pr,
-                    title: item.title.clone(),
-                });
-            }
-            self.merged.push(item.pr);
+        self.save_record()?;
+        for pr in &b.members {
+            let item = &self.items[pr];
             engine.history(EventKind::Merged {
-                pr: item.pr,
+                pr: *pr,
                 batch: self.id().clone(),
-                commit,
+                commit: commits.get(pr).unwrap_or(&item.head).clone(),
                 submitted_ms: item.submitted_ms,
             })?;
         }
-        self.save_record()
+        engine.store.update(|s| {
+            for pr in &b.members {
+                queue::merged(s, *pr)?;
+            }
+            if pushed {
+                s.verified_bases.push(b.tip.clone());
+                let excess = s.verified_bases.len().saturating_sub(VERIFIED_BASES_KEPT);
+                s.verified_bases.drain(..excess);
+            }
+            Ok(())
+        })?;
+        for pr in &b.members {
+            if commits.contains_key(pr) {
+                self.landed.push(Landed {
+                    pr: *pr,
+                    title: self.items[pr].title.clone(),
+                });
+            }
+            self.merged.push(*pr);
+        }
+        Ok(())
     }
 
     fn convict(&mut self, pr: PrNumber, b: &Build, failed: Failed) -> Result<()> {
@@ -1006,14 +1042,15 @@ impl Run<'_> {
                     self.bounce(pr, Failure::Conflict { files }, None)?;
                 }
                 Some(ItemResult::AlreadyMerged) => {
-                    let held = engine.store.update(|s| Ok(queue::merged(s, pr)?))?;
-                    self.merged.push(pr);
+                    let held = self.items[&pr].clone();
                     engine.history(EventKind::Merged {
                         pr,
                         batch: self.id().clone(),
                         commit: held.head.clone(),
                         submitted_ms: held.submitted_ms,
                     })?;
+                    engine.store.update(|s| Ok(queue::merged(s, pr)?))?;
+                    self.merged.push(pr);
                 }
                 Some(ItemResult::Merged { .. }) => {
                     engine.store.update(|s| Ok(queue::requeue(s, pr)?))?;

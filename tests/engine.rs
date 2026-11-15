@@ -956,3 +956,216 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
     assert!(lab.state().queue.is_empty());
     assert!(lab.state().batch.is_none());
 }
+
+fn batch_record(
+    id: &str,
+    merges: Vec<chute::model::MergeRef>,
+    bounced: &[u64],
+) -> chute::model::BatchRecord {
+    chute::model::BatchRecord {
+        id: chute::model::BatchId(id.into()),
+        base: engine_kit::sha("abc1234"),
+        prs: prs(&[1, 2, 3]),
+        started_ms: chute::model::EpochMs::now(),
+        finished_ms: None,
+        merges,
+        bounced: prs(bounced),
+        flaky: Vec::new(),
+        verify_s: 0,
+        pushed: Vec::new(),
+        verifications: 0,
+    }
+}
+
+fn batch_finished(lab: &Lab) -> Vec<(Vec<PrNumber>, Vec<PrNumber>)> {
+    lab.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::BatchFinished {
+                merged, bounced, ..
+            } => Some((merged, bounced)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_batch_record_that_cannot_be_read_does_not_keep_the_queue_from_recovering() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.strand_in_batch();
+    let dir = lab
+        .store
+        .batch_dir(&chute::model::BatchId("b-crashed".into()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("batch.json"), "{\"id\":").unwrap();
+
+    lab.engine().recover().unwrap();
+
+    assert_eq!(lab.item_state(1), Some(ItemState::Queued(None)));
+    assert!(lab.state().batch.is_none());
+    assert_eq!(done(lab.engine().run_once().unwrap()).merged, prs(&[1]));
+}
+
+#[test]
+fn recovery_cut_before_the_batch_finished_event_writes_it_once_after_the_rerun() {
+    let lab = Lab::new("");
+    lab.strand_in_batch();
+    let landed = engine_kit::sha(&lab.origin_main());
+    lab.store
+        .write_batch(&batch_record(
+            "b-crashed",
+            vec![chute::model::MergeRef {
+                pr: PrNumber(2),
+                commit: landed,
+            }],
+            &[1],
+        ))
+        .unwrap();
+    let history = lab.store.dir().join("history.jsonl");
+    fs::write(&history, "").unwrap();
+    fs::set_permissions(
+        &history,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+
+    assert!(lab.engine().recover().is_err());
+    fs::set_permissions(
+        &history,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    lab.engine().recover().unwrap();
+    lab.engine().recover().unwrap();
+
+    assert_eq!(batch_finished(&lab), [(prs(&[2]), prs(&[1]))]);
+    let record = lab
+        .store
+        .read_batch(&chute::model::BatchId("b-crashed".into()))
+        .unwrap()
+        .unwrap();
+    assert!(record.finished_ms.is_some());
+}
+
+#[test]
+fn a_finished_event_already_written_is_not_written_again() {
+    let lab = Lab::new("");
+    lab.strand_in_batch();
+    lab.store
+        .write_batch(&batch_record("b-crashed", Vec::new(), &[1]))
+        .unwrap();
+    lab.engine().recover().unwrap();
+    lab.store
+        .update(|s| {
+            s.batch = Some(chute::model::Batch {
+                id: chute::model::BatchId("b-crashed".into()),
+                base: engine_kit::sha("abc1234"),
+                prs: Vec::new(),
+                phase: chute::model::Phase::Verifying,
+                step: None,
+                round: 1,
+                started_ms: chute::model::EpochMs::now(),
+            });
+            Ok(())
+        })
+        .unwrap();
+    let mut record = lab
+        .store
+        .read_batch(&chute::model::BatchId("b-crashed".into()))
+        .unwrap()
+        .unwrap();
+    record.finished_ms = None;
+    lab.store.write_batch(&record).unwrap();
+
+    lab.engine().recover().unwrap();
+
+    assert_eq!(batch_finished(&lab).len(), 1);
+}
+
+#[test]
+fn a_revert_merge_that_quotes_the_title_is_not_taken_for_the_pr_merge_commit() {
+    let lab = Lab::new("");
+    let head = lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.strand_in_batch();
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "main", "origin/main"]);
+    lab.repo.git(&[
+        "merge",
+        "--no-ff",
+        "--quiet",
+        "-m",
+        "Merge pull request #1 from acme/pr-1\n\nfeat: change 1",
+        head.as_str(),
+    ]);
+    let real = lab.repo.head();
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "revert-1", "main~1"]);
+    lab.repo.write("r.txt", "r\n");
+    lab.repo.git(&["add", "r.txt"]);
+    lab.repo
+        .git(&["commit", "--quiet", "-m", "Revert change 1"]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    lab.repo.git(&[
+        "merge",
+        "--no-ff",
+        "--quiet",
+        "-m",
+        "Merge pull request #2 from acme/revert-1\n\nRevert \"Merge pull request #1 from acme/pr-1\"",
+        "revert-1",
+    ]);
+    lab.repo.git(&["push", "--quiet", "origin", "main"]);
+
+    lab.engine().recover().unwrap();
+
+    let commits: Vec<String> = lab
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Merged { commit, .. } => Some(commit.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commits, [real]);
+}
+
+#[test]
+fn a_run_cut_short_inside_the_landing_still_ends_with_one_merged_event() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    let history = lab.store.dir().join("history.jsonl");
+    fs::create_dir_all(&history).unwrap();
+
+    assert!(lab.engine().run_once().is_err());
+    fs::remove_dir(&history).unwrap();
+    lab.engine().recover().unwrap();
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(lab.merged_prs(), [1]);
+    assert!(lab.state().queue.is_empty());
+    assert_eq!(lab.merge_commits_on_main().len(), 1);
+}
+
+#[test]
+fn a_bounce_is_in_the_batch_record_before_the_next_verification_runs() {
+    let lab = Lab::new(&format!(
+        "cp \"@ROOT@\"/chute-home/repos/acme__widget/batches/*/batch.json \"@ROOT@/copy-$$\" 2>/dev/null\n{BAD}"
+    ));
+    lab.open_pr(1, &[("BAD", "")]);
+    lab.open_pr(2, &[("a.txt", "a\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let during: Vec<chute::model::BatchRecord> = fs::read_dir(lab.sb.root())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("copy-"))
+        .map(|e| serde_json::from_str(&fs::read_to_string(e.path()).unwrap()).unwrap())
+        .collect();
+    assert!(
+        during.iter().any(|r| r.bounced == prs(&[1])),
+        "{:?}",
+        during.iter().map(|r| &r.bounced).collect::<Vec<_>>()
+    );
+}
