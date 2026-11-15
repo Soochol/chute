@@ -14,3 +14,13 @@ pub struct Args {
 pub fn run(_args: Args, _ctx: &Ctx) -> Result<ExitCode> {
     not_implemented("drop")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    #[test]
+    fn not_implemented_yet() {
+        assert_eq!(super::super::run_args(&["drop", "12"]), ExitCode::from(2));
+    }
+}

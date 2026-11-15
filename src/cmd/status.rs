@@ -328,6 +328,36 @@ mod tests {
     }
 
     #[test]
+    fn median_of_an_even_count_and_flaky_count() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
+        let sha = Sha::try_from("abc1234".to_owned()).unwrap();
+        let mut events: Vec<Event> = [100u64, 400]
+            .into_iter()
+            .map(|lead_s| Event {
+                at_ms: at(&now, 1),
+                kind: EventKind::Merged {
+                    pr: PrNumber(1),
+                    batch: BatchId("b".into()),
+                    commit: sha.clone(),
+                    submitted_ms: EpochMs(at(&now, 1).0 - lead_s * 1000),
+                },
+            })
+            .collect();
+        events.push(Event {
+            at_ms: at(&now, 1),
+            kind: EventKind::Flaky {
+                batch: BatchId("b".into()),
+                step: "test".into(),
+                tests: vec!["a".into()],
+                tree: sha.clone(),
+            },
+        });
+        let (today, _) = summarize(&events, &now);
+        assert_eq!(today.median_lead_s, Some(250));
+        assert_eq!(today.flaky, 1);
+    }
+
+    #[test]
     fn no_merges_means_no_median() {
         let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
         assert_eq!(summarize(&[], &now).0.median_lead_s, None);

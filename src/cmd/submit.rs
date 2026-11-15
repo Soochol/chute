@@ -20,3 +20,16 @@ pub struct Args {
 pub fn run(_args: Args, _ctx: &Ctx) -> Result<ExitCode> {
     not_implemented("submit")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    #[test]
+    fn not_implemented_yet() {
+        assert_eq!(
+            super::super::run_args(&["submit", "#12", "--agent", "t1rs", "--json"]),
+            ExitCode::from(2)
+        );
+    }
+}

@@ -76,32 +76,36 @@ fn restore_sigpipe() {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let ctx = Ctx::from_env(cli.repo)?;
+    let ctx = Ctx::from_env(cli.repo.clone())?;
+    dispatch(cli, &ctx)
+}
+
+pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
     if cli.skill {
         if cli.command.is_some() {
             bail!("--skill은 하위 명령과 함께 쓸 수 없다");
         }
-        return cmd::skill::run(&ctx);
+        return cmd::skill::run(ctx);
     }
     let Some(command) = cli.command else {
         Cli::command().print_help()?;
         return Ok(ExitCode::from(cmd::CANNOT_RUN));
     };
     match command {
-        Command::Init(args) => cmd::init::run(args, &ctx),
-        Command::Preflight(args) => cmd::preflight::run(args, &ctx),
-        Command::Submit(args) => cmd::submit::run(args, &ctx),
-        Command::Giveup(args) => cmd::giveup::run(args, &ctx),
-        Command::Status(args) => cmd::status::run(args, &ctx),
-        Command::Approve(args) => cmd::approve::run(args, &ctx),
-        Command::Retry(args) => cmd::retry::run(args, &ctx),
-        Command::Drop(args) => cmd::drop::run(args, &ctx),
-        Command::Up(args) => cmd::up::run(args, &ctx),
-        Command::Down(args) => cmd::down::run(args, &ctx),
-        Command::Daemon(args) => cmd::daemon::run(args, &ctx),
-        Command::Batches(args) => cmd::batches::run(args, &ctx),
-        Command::Revert(args) => cmd::revert::run(args, &ctx),
-        Command::Install(args) => cmd::install::run(args, &ctx),
+        Command::Init(args) => cmd::init::run(args, ctx),
+        Command::Preflight(args) => cmd::preflight::run(args, ctx),
+        Command::Submit(args) => cmd::submit::run(args, ctx),
+        Command::Giveup(args) => cmd::giveup::run(args, ctx),
+        Command::Status(args) => cmd::status::run(args, ctx),
+        Command::Approve(args) => cmd::approve::run(args, ctx),
+        Command::Retry(args) => cmd::retry::run(args, ctx),
+        Command::Drop(args) => cmd::drop::run(args, ctx),
+        Command::Up(args) => cmd::up::run(args, ctx),
+        Command::Down(args) => cmd::down::run(args, ctx),
+        Command::Daemon(args) => cmd::daemon::run(args, ctx),
+        Command::Batches(args) => cmd::batches::run(args, ctx),
+        Command::Revert(args) => cmd::revert::run(args, ctx),
+        Command::Install(args) => cmd::install::run(args, ctx),
     }
 }
 

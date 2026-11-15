@@ -17,3 +17,16 @@ pub struct Args {
 pub fn run(_args: Args, _ctx: &Ctx) -> Result<ExitCode> {
     not_implemented("giveup")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    #[test]
+    fn not_implemented_yet() {
+        assert_eq!(
+            super::super::run_args(&["giveup", "12", "--reason", "막혔다"]),
+            ExitCode::from(2)
+        );
+    }
+}

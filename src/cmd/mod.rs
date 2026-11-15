@@ -31,6 +31,10 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    pub fn new(home: Home, ext: Ext, repo: Option<PathBuf>) -> Ctx {
+        Ctx { home, ext, repo }
+    }
+
     pub fn from_env(repo: Option<PathBuf>) -> Result<Ctx> {
         Ok(Ctx {
             home: Home::from_env()?,
@@ -50,4 +54,19 @@ impl Ctx {
 pub fn not_implemented(command: &str) -> Result<ExitCode> {
     eprintln!("chute {command}: 아직 구현되지 않았다");
     Ok(ExitCode::from(CANNOT_RUN))
+}
+
+/// Parses `argv` as the real command line would and runs it against an empty home.
+/// Commands that touch nothing use this in their tests.
+#[cfg(test)]
+pub(crate) fn run_args(argv: &[&str]) -> ExitCode {
+    use clap::Parser;
+    let cli = crate::cli::Cli::try_parse_from(std::iter::once("chute").chain(argv.iter().copied()))
+        .unwrap();
+    let ctx = Ctx::new(
+        Home::at("/nonexistent/chute"),
+        Ext::from_vars(|_| None),
+        None,
+    );
+    crate::cli::dispatch(cli, &ctx).unwrap()
 }

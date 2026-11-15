@@ -203,7 +203,7 @@ impl Ext {
             }
             command.current_dir(cwd);
         }
-        let mut child = command.spawn().map_err(|source| ExtError::Spawn {
+        let mut child = spawn(&mut command).map_err(|source| ExtError::Spawn {
             tool,
             program: program.to_owned(),
             source,
@@ -282,6 +282,22 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
     Drain { bytes, done }
 }
 
+/// Retries `ETXTBSY`: a script written a moment ago can still be open for writing in a
+/// child that another thread forked and has not yet exec'd.
+fn spawn(command: &mut Command) -> io::Result<Child> {
+    for _ in 1..SPAWN_TRIES {
+        match command.spawn() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            result => return result,
+        }
+    }
+    command.spawn()
+}
+
+const SPAWN_TRIES: u32 = 50;
+
 fn wait_until(
     child: &mut Child,
     deadline: Instant,
@@ -337,6 +353,7 @@ mod tests {
 
     #[test]
     fn unset_vars_fall_back_to_path_names() {
+        assert_eq!(Ext::DEFAULT_TIMEOUT, Duration::from_secs(300));
         let ext = Ext::from_vars(|_| None);
         for tool in Tool::ALL {
             assert_eq!(ext.program(tool), Path::new(tool.name()));

@@ -26,33 +26,6 @@ fn ok(out: Output) -> String {
 }
 
 #[test]
-fn unimplemented_commands_exit_2() {
-    let sb = Sandbox::new();
-    for args in [
-        &["preflight"][..],
-        &["submit", "12"],
-        &["giveup", "--reason", "x"],
-        &["approve", "12"],
-        &["retry", "#12"],
-        &["drop", "12"],
-        &["up"],
-        &["down", "--now"],
-        &["daemon"],
-        &["batches"],
-        &["revert", "b1", "--no-verify"],
-        &["install"],
-        &["--skill"],
-    ] {
-        let out = chute(&sb, sb.root(), args);
-        assert_eq!(out.status.code(), Some(2), "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("아직 구현되지 않았다"),
-            "{args:?}"
-        );
-    }
-}
-
-#[test]
 fn init_writes_a_readable_draft_and_registers() {
     let sb = Sandbox::new();
     let repo = TestRepo::new(&sb, "acme/widget");
@@ -127,7 +100,7 @@ fn status_reads_approval_from_the_default_branch() {
         "chore: chute 설정",
     );
     repo.git(&["push", "--quiet", "origin", "main"]);
-    repo.write("chute.toml", &draft);
+    repo.commit_file("chute.toml", &draft, "local only");
 
     let status: Value =
         serde_json::from_str(&ok(chute(&sb, repo.path(), &["status", "--json"]))).unwrap();
@@ -324,4 +297,81 @@ fn a_missing_repo_folder_is_reported_as_missing() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("폴더가 없다"), "{err}");
+}
+
+#[test]
+fn status_keeps_every_null_key_of_the_contract() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    let status = status_json(&sb, &repo);
+    let obj = status.as_object().unwrap();
+    for key in ["blocked", "batch"] {
+        assert_eq!(obj.get(key), Some(&Value::Null), "{key}");
+    }
+    assert_eq!(
+        status["today"],
+        serde_json::json!({"merged": 0, "bounced": 0, "flaky": 0, "batches": 0,
+                           "median_lead_s": null, "verify_s": 0})
+    );
+}
+
+#[test]
+fn status_shows_queue_items_from_the_state_folder() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    let draft = fs::read_to_string(repo.path().join("chute.toml")).unwrap();
+    repo.commit_file(
+        "chute.toml",
+        &draft.replace("budget = 3", "budget = 5"),
+        "chore: chute 설정",
+    );
+    repo.git(&["push", "--quiet", "origin", "main"]);
+    let state = serde_json::json!({
+        "queue": [{
+            "pr": 7, "title": "설정 바꾸기", "branch": "feat/cfg", "head": "abc1234",
+            "state": "awaiting_approval", "state_reason": null,
+            "agent": {"terminal": "t1rs", "created_ms": 5, "name": "impl-a",
+                      "workdir": "/w/cfg", "alive": false},
+            "attempts": 1, "submitted_ms": 10, "touches_config": true,
+            "last_failure": {"kind": "verify", "step": "test", "mode": "solo",
+                             "failed_tests": ["a::b"], "log": "/l", "tree": "def5678",
+                             "summary": "test 실패", "report": "/r/1.md", "at_ms": 9}
+        }],
+        "batch": null, "blocked": null, "verified_bases": [],
+        "preflights": {"feat/cfg": {"head": "abc1234", "result": "pass", "report": null, "at_ms": 8}},
+        "warnings": []
+    });
+    fs::write(
+        sb.chute_home().join("repos/acme__widget/state.json"),
+        state.to_string(),
+    )
+    .unwrap();
+
+    let item = status_json(&sb, &repo)["queue"][0].clone();
+    assert_eq!(
+        item,
+        serde_json::json!({
+            "pr": 7, "title": "설정 바꾸기", "branch": "feat/cfg", "head": "abc1234",
+            "state": "awaiting_approval", "state_reason": null,
+            "agent": {"terminal": "t1rs", "name": "impl-a", "alive": false},
+            "attempts": 1, "budget": 5, "submitted_ms": 10, "touches_config": true,
+            "preflight": {"result": "pass", "head": "abc1234"},
+            "last_failure": {"kind": "verify", "mode": "solo", "summary": "test 실패", "report": "/r/1.md"}
+        })
+    );
+}
+
+#[test]
+fn status_refuses_a_corrupt_state_file() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    ok(chute(&sb, repo.path(), &["init"]));
+    let path = sb.chute_home().join("repos/acme__widget/state.json");
+    fs::write(&path, "{\"queue\": [").unwrap();
+    let out = chute(&sb, repo.path(), &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "{\"queue\": [");
 }

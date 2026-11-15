@@ -88,15 +88,10 @@ impl Config {
         let mut names = BTreeSet::new();
         let mut steps = Vec::with_capacity(raw.verify.len());
         for step in raw.verify {
-            let name_ok = !step.name.is_empty()
-                && !step.name.starts_with('.')
-                && step
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-            if !name_ok {
+            if step.name.is_empty() || step.name.starts_with('.') || step.name.contains(['/', '\0'])
+            {
                 bail!(
-                    "chute.toml의 verify 단계 이름 {:?}에는 영문, 숫자, '.', '_', '-'만 쓴다",
+                    "chute.toml의 verify 단계 이름 {:?}은 비어 있거나 '.'으로 시작하거나 '/'를 담을 수 없다",
                     step.name
                 );
             }
@@ -120,11 +115,8 @@ impl Config {
                 .with_context(|| {
                     format!("verify 단계 {:?}의 failed 정규식이 잘못됐다", step.name)
                 })?;
-            if failed.as_ref().is_some_and(|re| re.captures_len() < 2) {
-                bail!(
-                    "verify 단계 {:?}의 failed 정규식에 시험 이름을 담을 괄호 묶음이 없다",
-                    step.name
-                );
+            if failed.as_ref().is_some_and(|re| re.as_str().is_empty()) {
+                bail!("verify 단계 {:?}의 failed 정규식이 비어 있다", step.name);
             }
             steps.push(VerifyStep {
                 name: step.name,
@@ -177,7 +169,7 @@ name = "test"
 # 검증 worktree에서 sh -c로 실행한다
 run = {run}
 timeout = 3600          # 초
-# failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식. 첫 괄호 묶음이 이름이다
+# failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
 "#
     )
 }
@@ -244,10 +236,16 @@ failed = 'test (\S+) \.\.\. FAILED'
 
     #[test]
     fn rejects_bad_regex() {
-        for failed in ["test (", "", "no group"] {
+        for failed in ["test (", ""] {
             let text = format!("{MINIMAL}failed = '{failed}'\n");
             assert!(Config::parse(&text).is_err(), "{failed:?}");
         }
+    }
+
+    #[test]
+    fn accepts_korean_step_names_and_regexes_without_groups() {
+        let text = "[[verify]]\nname = \"단위 시험\"\nrun = \"true\"\nfailed = 'FAILED'\n";
+        assert_eq!(Config::parse(text).unwrap().verify[0].name, "단위 시험");
     }
 
     #[test]
@@ -259,7 +257,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 
     #[test]
     fn rejects_step_names_that_are_not_file_names() {
-        for name in ["../x", "a/b", ".hidden", "", "a b"] {
+        for name in ["../x", "a/b", ".hidden", ""] {
             let text = format!("[[verify]]\nname = \"{name}\"\nrun = \"true\"\n");
             assert!(Config::parse(&text).is_err(), "{name:?}");
         }

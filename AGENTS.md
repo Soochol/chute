@@ -29,6 +29,8 @@ cargo test
 - `gh`와 `hc`는 `Sandbox::fake`가 만드는 가짜다. 원격은 `TestRepo`가 만드는 로컬 bare 저장소다.
 - 실제 hc 코어, Herdr 창, 사용자의 홈 폴더, GitHub에 쓰지 않는다.
 - 시험에서 프로세스 환경 변수를 바꾸지 않는다(`std::env::set_var` 금지). 환경은 `Ext::from_vars`, `Home::from_vars`, `Sandbox::command`로 넘긴다.
+- 잠금의 의미를 보는 시험은 `tests/locks.rs`에 둔다. 그 시험 바이너리에서는 프로세스를 띄우지 않는다. 다른 시험 스레드가 fork한 자식은 exec하기 전까지 열린 잠금 파일을 함께 쥐기 때문이다.
+- 명령의 시험은 그 명령 파일(`src/cmd/<명령>.rs`)에 둔다. 여러 명령을 한 목록에 모은 시험을 만들지 않는다. 뒤 작업들이 같은 줄을 고치게 된다.
 
 ## 커밋
 
