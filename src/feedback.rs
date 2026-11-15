@@ -30,7 +30,6 @@ const HC_NAME_LIMIT: usize = 32;
 const FAILED_REF_PREFIX: &str = "refs/chute/failed/";
 const NAME_TRIES: u32 = 5;
 const SIBLING_TRIES: u32 = 20;
-const NAME_SUFFIX_ROOM: usize = 2;
 const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
 
@@ -236,7 +235,6 @@ impl Feedback<'_> {
         })
     }
 
-    /// `name` is the full `refs/...` name or the short name under `refs/chute/failed/`.
     fn failed_ref_at(&self, name: &str, tree: &Sha) -> Result<String> {
         let full = if name.starts_with("refs/") {
             name.to_owned()
@@ -795,7 +793,7 @@ impl Notice<'_> {
     }
 }
 
-/// `hc send` pastes the text into the pane and presses Enter, whatever program is reading it.
+/// `hc send` pastes the text into the terminal and submits it with Enter.
 fn without_shell_syntax(text: &str) -> String {
     let plain: String = text
         .chars()
@@ -1001,7 +999,7 @@ impl Feedback<'_> {
             item.pr,
             code_span(&item.branch)
         );
-        let (name, out) = self.run_named(item.pr, &cwd, task)?;
+        let (name, out) = self.run_with_free_name(item.pr, &cwd, task)?;
         let launched: Launched = serde_json::from_slice(&out.stdout)
             .map_err(|e| Unreachable::Failed(format!("hc run의 출력을 읽지 못했다: {e}")))?;
         if let Some(FirstMessage {
@@ -1045,8 +1043,7 @@ impl Feedback<'_> {
         }))
     }
 
-    /// A name another live terminal already holds gets the next number, up to `NAME_TRIES`.
-    fn run_named(
+    fn run_with_free_name(
         &self,
         pr: PrNumber,
         cwd: &Path,
@@ -1079,7 +1076,8 @@ impl Feedback<'_> {
 
     fn agent_name(&self, pr: PrNumber, attempt: u32) -> String {
         let number = pr.0.to_string();
-        let room = HC_NAME_LIMIT - "chute--pr".len() - number.len() - NAME_SUFFIX_ROOM;
+        let longest_suffix = format!("-{NAME_TRIES}");
+        let room = HC_NAME_LIMIT - "chute--pr".len() - number.len() - longest_suffix.len();
         let repo: String = self
             .repo
             .slug
@@ -1257,7 +1255,6 @@ impl Feedback<'_> {
     }
 }
 
-/// The wanted folder, or the first `<folder>-chute-<n>` that does not exist yet.
 fn free_dest(wanted: &Path) -> Result<PathBuf> {
     if !wanted.exists() {
         return Ok(wanted.to_owned());
