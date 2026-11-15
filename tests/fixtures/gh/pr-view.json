@@ -1,1 +1,1 @@
-{"number":12,"title":"큐 상태 전이 추가","headRefName":"orch/feat-12","headRefOid":"12e5678","baseRefName":"main","state":"OPEN","isDraft":false}
+{"number":12,"title":"큐 상태 전이 추가","headRefName":"orch/feat-12","headRefOid":"12e5678","baseRefName":"main","state":"OPEN","isDraft":false,"files":[{"path":"src/queue.rs","additions":410,"deletions":0}],"changedFiles":1}

@@ -113,3 +113,41 @@ fn sandbox_points_home_and_state_into_the_temp_folder() {
     }
     assert_eq!(sb.var("XDG_STATE_HOME"), None);
 }
+
+#[test]
+fn sandbox_clears_every_git_variable_of_the_parent_but_keeps_its_own() {
+    if std::env::var_os("CHUTE_SANDBOX_PROBE").is_some() {
+        let sb = Sandbox::new();
+        let envs = sb.envs();
+        let value = |key: &str| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        for key in [
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_TEMPLATE_DIR",
+            "GIT_DIR",
+        ] {
+            assert_eq!(value(key), Some(None), "{key}가 지워지지 않는다");
+        }
+        assert!(matches!(value("GIT_CONFIG_GLOBAL"), Some(Some(_))));
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "sandbox_clears_every_git_variable_of_the_parent_but_keeps_its_own",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env("CHUTE_SANDBOX_PROBE", "1")
+        .env("GIT_OBJECT_DIRECTORY", "/nonexistent/objects")
+        .env("GIT_COMMON_DIR", "/nonexistent/common")
+        .env("GIT_TEMPLATE_DIR", "/nonexistent/template")
+        .env("GIT_DIR", "/nonexistent/dir")
+        .env("GIT_CONFIG_GLOBAL", "/nonexistent/config")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
