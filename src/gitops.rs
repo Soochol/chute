@@ -584,7 +584,7 @@ impl Slot {
             }
             let now = self.read_ref(tracking)?;
             if now == expected {
-                return Ok(());
+                bail!("{tracking}을 옮기지 못했다: {}", out.stderr_text().trim());
             }
             if let Some(now) = &now
                 && !self.is_ancestor(now, tip)?
@@ -1334,16 +1334,17 @@ mod tests {
     }
 
     #[test]
-    fn a_tracking_ref_another_git_is_writing_does_not_fail_fetch_base() {
+    fn a_tracking_ref_that_cannot_be_moved_is_an_error_not_silence() {
         let w = World::new();
         let slot = w.slot(SlotName::Batch);
         slot.fetch_base().unwrap();
-        let newest = w.advance_main(&[("n.txt", "n\n")], "feat: 새 변경");
+        w.advance_main(&[("n.txt", "n\n")], "feat: 새 변경");
         let lock = w.repo.path().join(".git/refs/remotes/origin/main.lock");
         fs::write(&lock, "").unwrap();
 
-        assert_eq!(slot.fetch_base().unwrap(), newest);
+        let err = slot.fetch_base().unwrap_err();
 
+        assert!(format!("{err:#}").contains("옮기지 못했다"), "{err:#}");
         fs::remove_file(&lock).unwrap();
     }
 
