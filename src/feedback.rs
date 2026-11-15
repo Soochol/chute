@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::ext::{Ext, Output};
+use crate::gitops::FAILED_REF_PREFIX;
 use crate::model::{
     Agent, ConflictFile, EpochMs, Failure, FailureRecord, Partner, PrNumber, QueueItem, RepoInfo,
     Sha, StepFailure, TerminalId, VerifyMode,
@@ -27,7 +28,6 @@ const LISTED_FILES: usize = 30;
 const LISTED_TESTS: usize = 50;
 const LISTED_COMMITS: usize = 10;
 const HC_NAME_LIMIT: usize = 32;
-const FAILED_REF_PREFIX: &str = "refs/chute/failed/";
 const NAME_TRIES: u32 = 5;
 const SIBLING_TRIES: u32 = 20;
 const SHELLS: [&str; 9] = [

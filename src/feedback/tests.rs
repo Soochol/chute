@@ -3133,3 +3133,67 @@ fn the_report_says_whether_the_failure_is_solo_or_combo_and_fences_with_three_ti
     assert!(combo.contains("- 범위: 조합") && !combo.contains("- 범위: 단독"));
     assert!(solo.contains("\n```sh\n") && !solo.contains("````"));
 }
+
+#[test]
+fn partners_and_failed_refs_work_with_what_gitops_really_writes() {
+    use crate::gitops::{Gitops, ItemResult, MergeItem, SlotName};
+    let lab = Lab::new();
+    let head_a = lab.repo.pr_branch("feat/a", "a.txt", "a change\n");
+    let head_b = lab.repo.pr_branch("feat/b", "b.txt", "b change\n");
+    let base = sha(&lab.repo.head());
+    let home = Home::at(lab.sb.chute_home());
+    let gitops = Gitops::new(&lab.ext, &home, &lab.info);
+    let slot = gitops
+        .lock_slot(SlotName::Batch)
+        .unwrap()
+        .expect("the batch slot is free")
+        .open()
+        .unwrap();
+    let item = |pr: u64, branch: &str, head: &str| MergeItem::Pr {
+        pr: PrNumber(pr),
+        branch: branch.to_owned(),
+        title: format!("PR {pr}"),
+        head: sha(head),
+    };
+
+    let merged = slot
+        .merge(
+            &base,
+            &[item(9, "feat/a", &head_a), item(12, "feat/b", &head_b)],
+        )
+        .unwrap();
+    assert!(
+        merged
+            .items
+            .iter()
+            .all(|o| matches!(o.result, ItemResult::Merged { .. }))
+    );
+    let subject = Subject::from(&lab.item(12, "feat/b"));
+    let partner = lab
+        .fb()
+        .partner_or_placeholder(&subject, &merged.tip, PrNumber(9), "앞 PR")
+        .unwrap();
+    gitops.set_failed_ref("pr-12-1", &merged.tip).unwrap();
+    let failure = Failure::Verify(StepFailure {
+        tree: merged.tip.clone(),
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner.clone()),
+            },
+            &["t::x"],
+            lab.log("x\n"),
+        )
+    });
+    let written = lab
+        .fb()
+        .write_report(&subject, &failure, Some("pr-12-1"))
+        .unwrap();
+
+    assert_eq!(partner.files, ["a.txt"]);
+    assert!(read(&partner.diff).contains("+a change"));
+    assert!(!read(&partner.diff).contains("b change"));
+    assert_eq!(
+        written.doc.step.unwrap().git_ref.as_deref(),
+        Some("refs/chute/failed/pr-12-1")
+    );
+}
