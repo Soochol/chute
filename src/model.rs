@@ -542,6 +542,7 @@ pub enum WarningKind {
     NoChecks,
     Config,
     History,
+    Engine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +587,10 @@ pub struct BatchRecord {
     pub bounced: Vec<PrNumber>,
     pub flaky: Vec<Flaky>,
     pub verify_s: u64,
+    #[serde(default)]
+    pub pushed: Vec<Sha>,
+    #[serde(default)]
+    pub verifications: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,6 +636,18 @@ pub enum EventKind {
     GaveUp {
         pr: PrNumber,
         reason: String,
+    },
+    Closed {
+        pr: PrNumber,
+    },
+    NeedsHuman {
+        pr: PrNumber,
+        reason: HumanReason,
+        detail: Option<String>,
+    },
+    Blocked {
+        reason: BlockReason,
+        base: Sha,
     },
 }
 

@@ -159,7 +159,11 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
                 today.batches += 1;
                 today.verify_s += verify_s;
             }
-            EventKind::Reverted { .. } | EventKind::GaveUp { .. } => {}
+            EventKind::Reverted { .. }
+            | EventKind::GaveUp { .. }
+            | EventKind::Closed { .. }
+            | EventKind::NeedsHuman { .. }
+            | EventKind::Blocked { .. } => {}
         }
     }
     leads.sort_unstable();

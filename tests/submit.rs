@@ -85,6 +85,14 @@ fn submit(w: &World, args: &[&str]) -> Output {
     submit_as(w, None, args)
 }
 
+fn hc_lookups(w: &World) -> Vec<Vec<String>> {
+    w.sb.fake("hc")
+        .calls()
+        .into_iter()
+        .filter(|call| call.first().is_some_and(|verb| verb == "get"))
+        .collect()
+}
+
 fn code(out: &Output) -> Option<i32> {
     out.status.code()
 }
@@ -210,7 +218,7 @@ fn submit_reads_the_agent_from_hc_terminal_id_and_the_flag_wins() {
     let out = submit_as(&w, Some("t1env"), &["12"]);
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     assert_eq!(w.entry(12).unwrap()["agent"]["terminal"], "t1env");
-    assert_eq!(w.sb.fake("hc").calls(), [vec!["get", "--json", "t1env"]]);
+    assert_eq!(hc_lookups(&w), [vec!["get", "--json", "t1env"]]);
 
     let w = World::new();
     gh_pr(&w, Some(12), pr(12, HEAD));
@@ -218,7 +226,7 @@ fn submit_reads_the_agent_from_hc_terminal_id_and_the_flag_wins() {
     let out = submit_as(&w, Some("t1env"), &["12", "--agent", "t1flag"]);
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     assert_eq!(w.entry(12).unwrap()["agent"]["terminal"], "t1flag");
-    assert_eq!(w.sb.fake("hc").calls(), [vec!["get", "--json", "t1flag"]]);
+    assert_eq!(hc_lookups(&w), [vec!["get", "--json", "t1flag"]]);
 }
 
 #[test]
@@ -235,7 +243,7 @@ fn submit_outside_hc_registers_without_an_agent_and_never_calls_hc() {
         stderr(&out)
     );
     assert_eq!(w.entry(12).unwrap()["agent"], Value::Null);
-    assert!(w.sb.fake("hc").calls().is_empty());
+    assert!(hc_lookups(&w).is_empty());
 }
 
 #[test]
@@ -893,7 +901,7 @@ fn an_empty_agent_flag_or_terminal_id_is_not_an_address() {
     let out = submit_as(&w, Some(""), &["12"]);
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     assert_eq!(w.entry(12).unwrap()["agent"], Value::Null);
-    assert!(w.sb.fake("hc").calls().is_empty());
+    assert!(hc_lookups(&w).is_empty());
 }
 
 #[test]
@@ -955,4 +963,63 @@ fn a_git_replace_ref_cannot_swap_the_config_of_the_remote_default_branch() {
 
     assert_eq!(w.state().queue[0].state, ItemState::AwaitingApproval);
     assert_eq!(w.status(w.repo.path())["approval"], "human");
+}
+
+fn hc_run_calls(w: &World) -> Vec<Vec<String>> {
+    w.sb.fake("hc")
+        .calls()
+        .into_iter()
+        .filter(|call| call.first().is_some_and(|verb| verb == "run"))
+        .collect()
+}
+
+#[test]
+fn a_successful_submit_starts_the_daemon_with_hc_run_in_the_background_without_a_parent() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    w.sb.fake("hc")
+        .respond("run *", Reply::ok(r#"{"address":"t1dd"}"#));
+
+    let out = submit(&w, &["12"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let runs = hc_run_calls(&w);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let run = &runs[0];
+    for flag in ["--bg", "--no-parent"] {
+        assert!(run.iter().any(|a| a == flag), "{flag}: {run:?}");
+    }
+    assert_eq!(&run[run.len() - 3..], ["--", "chute", "daemon"]);
+}
+
+#[test]
+fn a_second_submit_right_after_does_not_start_another_daemon() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    gh_pr(&w, Some(13), pr(13, "13e5678"));
+    w.sb.fake("hc")
+        .respond("run *", Reply::ok(r#"{"address":"t1dd"}"#));
+
+    assert_eq!(code(&submit(&w, &["12"])), Some(0));
+    assert_eq!(code(&submit(&w, &["13"])), Some(0));
+
+    assert_eq!(hc_run_calls(&w).len(), 1);
+}
+
+#[test]
+fn a_daemon_that_cannot_be_started_only_warns_and_the_submit_succeeds() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    w.sb.fake("hc")
+        .respond("run *", Reply::ok("").code(5).stderr("hc가 없다"));
+
+    let out = submit(&w, &["12"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("데몬을 띄우지 못했다"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(w.entry(12).is_some());
 }
