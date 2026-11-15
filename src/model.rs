@@ -594,6 +594,21 @@ pub struct BatchRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevertRecord {
+    pub at_ms: EpochMs,
+    pub tip: Sha,
+    pub prs: Vec<RevertedPr>,
+    pub verified: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevertedPr {
+    pub pr: PrNumber,
+    pub merge: Sha,
+    pub revert: Sha,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub at_ms: EpochMs,
     #[serde(flatten)]

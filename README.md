@@ -119,8 +119,8 @@ failed = 'test (\S+) \.\.\. FAILED'
 
 ### batch 보기와 되돌리기
 
-- `chute batches`: 최근 batch 목록을 본다.
-- `chute revert <batch> [--no-verify]`: 그 batch의 merge commit들을 역순으로 `git revert -m 1`로 지금의 기본 브랜치 위에 쌓고, 검증한 뒤 push한다. `--no-verify`는 검증을 건너뛴다. 강제 push로 기본 브랜치를 되감지 않는다. 그 뒤에 머지된 변경과 충돌하면 아무것도 push하지 않고 멈춘다. 되돌리기는 사람이 내린 결정이라 에이전트에게 자동으로 알리지 않는다. 되돌린 PR의 커밋은 기본 브랜치의 이력에 남아 있어서 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. `chute revert`는 되돌린 PR 목록과 다시 올리는 방법(브랜치에서 revert 커밋을 되돌린 뒤 고친다)을 출력한다.
+- `chute batches [--json] [-n <수>]`: 최근 batch를 새것부터 보인다(기본 20개). batch마다 id, 끝난 시각, 머지된 PR, 반송된 PR, 되돌려졌는지를 적는다. `--json`은 같은 내용을 배열로 낸다.
+- `chute revert <batch> [--no-verify]`: 그 batch의 merge commit들을 역순으로 `git revert -m 1`로 `origin/<기본 브랜치>` 위에 쌓고, 되돌린 트리를 검증한 뒤 push한다. `--no-verify`는 검증을 건너뛴다. 강제 push로 기본 브랜치를 되감지 않는다. push가 거절되면 새 기준으로 처음부터 다시 하고, 3번까지 시도한다. 아무것도 push하지 않고 종료 코드 1로 끝나는 경우는 다음과 같다. 없는 batch, 머지한 PR이 없는 batch, 이미 되돌린 batch, 기록이 불완전한 batch(데몬이 도중에 멈춰 기록과 `history.jsonl`이 어긋난 경우는 추측하지 않는다), 뒤에 머지된 변경과의 충돌(그 뒤 batch 목록을 보인다), 되돌린 트리의 검증 실패(로그 경로를 보인다). 이미 기본 브랜치에서 사라진 PR은 건너뛰고 나머지를 되돌린다. 되돌리기는 사람이 내린 결정이라 에이전트에게 알리지 않고 큐 항목도 바꾸지 않는다. 되돌린 PR의 커밋은 기본 브랜치의 이력에 남아 있어서 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. `chute revert`는 되돌린 PR 번호와 PR마다 revert 커밋의 SHA, 다시 올리는 방법(브랜치에 기본 브랜치를 합친 뒤 `git revert <revert 커밋>`으로 되돌리고 고쳐서 다시 submit한다)을 출력한다. 되돌린 사실은 batch 폴더의 `revert.json`과 `history.jsonl`에 남는다.
 
 ### 데몬 멈추기
 

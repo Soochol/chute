@@ -9,7 +9,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::model::{BatchId, BatchRecord, DaemonInfo, Event, PrNumber, RepoInfo, Slug, State};
+use crate::model::{
+    BatchId, BatchRecord, DaemonInfo, Event, PrNumber, RepoInfo, RevertRecord, Slug, State,
+};
 
 #[derive(Clone, Debug)]
 pub struct Home {
@@ -85,6 +87,7 @@ const DAEMON_FILE: &str = "daemon.json";
 const HISTORY_FILE: &str = "history.jsonl";
 const LAUNCH_LOCK_FILE: &str = "up.lock";
 const BATCH_FILE: &str = "batch.json";
+const REVERT_FILE: &str = "revert.json";
 
 #[derive(Clone, Debug)]
 pub struct RepoStore {
@@ -224,6 +227,32 @@ impl RepoStore {
 
     pub fn read_batch(&self, id: &BatchId) -> Result<Option<BatchRecord>> {
         read_json(&self.batch_dir(id).join(BATCH_FILE))
+    }
+
+    pub fn write_revert(&self, id: &BatchId, record: &RevertRecord) -> Result<()> {
+        write_json_atomic(&self.batch_dir(id).join(REVERT_FILE), record)
+    }
+
+    pub fn read_revert(&self, id: &BatchId) -> Result<Option<RevertRecord>> {
+        read_json(&self.batch_dir(id).join(REVERT_FILE))
+    }
+
+    pub fn batch_ids(&self) -> Result<Vec<BatchId>> {
+        let dir = self.dir.join("batches");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("읽지 못했다: {}", dir.display())),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("읽지 못했다: {}", dir.display()))?;
+            if entry.path().join(BATCH_FILE).is_file() {
+                ids.push(BatchId(entry.file_name().to_string_lossy().into_owned()));
+            }
+        }
+        ids.sort();
+        Ok(ids)
     }
 
     pub fn lock_launch(&self) -> Result<FileLock> {
