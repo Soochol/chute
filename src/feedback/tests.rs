@@ -567,23 +567,56 @@ fn a_commit_without_a_pr_gets_a_report_of_its_own() {
 }
 
 #[test]
-fn remote_ci_failures_have_no_report_yet_and_leave_nothing_behind() {
+fn a_remote_ci_report_lists_the_failed_checks_and_no_local_repro() {
     let lab = Lab::new();
-    let item = lab.item(12, "feat/a");
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
     let failure = Failure::Ci {
-        checks: one(FailedCheck {
-            name: "build".into(),
-            link: "https://example.invalid/1".into(),
-        }),
+        checks: NonEmpty::new(vec![
+            FailedCheck {
+                name: "build".into(),
+                link: "https://example.invalid/runs/1".into(),
+            },
+            FailedCheck {
+                name: "lint".into(),
+                link: "https://example.invalid/runs/2".into(),
+            },
+        ])
+        .unwrap(),
     };
 
-    let err = lab
+    let written = lab
         .fb()
         .write_report(&Subject::from(&item), &failure, None)
-        .unwrap_err();
+        .unwrap();
 
-    assert!(err.to_string().contains("원격 CI"), "{err}");
-    assert!(!lab.store.report_dir(PrNumber(12)).exists());
+    let md = read(&written.md);
+    for needed in [
+        "원격 CI 실패: build, lint",
+        "등록한 HEAD",
+        "`build`",
+        "https://example.invalid/runs/1",
+        "https://example.invalid/runs/2",
+        "chute submit",
+        "chute giveup",
+    ] {
+        assert!(md.contains(needed), "{needed}\n{md}");
+    }
+    assert!(
+        !md.contains("## 재현") && !md.contains("worktree add"),
+        "{md}"
+    );
+    assert!(written.doc.step.is_none());
+    let json: ReportDoc = serde_json::from_str(&read(&written.json)).unwrap();
+    assert_eq!(json.failure, failure);
+
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+    let sent = lab.hc_calls().into_iter().find(|c| c[0] == "send").unwrap();
+    assert!(sent[2].contains("원격 CI 실패"), "{}", sent[2]);
+    assert!(sent[2].contains(&written.md.display().to_string()));
 }
 
 #[test]

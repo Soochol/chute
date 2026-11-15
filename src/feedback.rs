@@ -13,8 +13,8 @@ use crate::config::Config;
 use crate::ext::{Ext, Output};
 use crate::gitops::FAILED_REF_PREFIX;
 use crate::model::{
-    Agent, ConflictFile, EpochMs, Failure, FailureRecord, Partner, PrNumber, QueueItem, RepoInfo,
-    Sha, StepFailure, TerminalId, VerifyMode,
+    Agent, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner, PrNumber,
+    QueueItem, RepoInfo, Sha, StepFailure, TerminalId, VerifyMode,
 };
 use crate::store::RepoStore;
 
@@ -151,6 +151,7 @@ enum Cause<'a> {
         timed_out: bool,
         step: &'a StepFailure,
     },
+    Ci(&'a [FailedCheck]),
 }
 
 impl<'a> Cause<'a> {
@@ -165,7 +166,7 @@ impl<'a> Cause<'a> {
                 timed_out: true,
                 step,
             }),
-            Failure::Ci { .. } => bail!("원격 CI 실패의 보고서는 아직 만들 수 없다"),
+            Failure::Ci { checks } => Ok(Cause::Ci(checks)),
         }
     }
 }
@@ -182,7 +183,7 @@ impl Feedback<'_> {
             Cause::Step { step, timed_out } => {
                 Some(self.step_report(subject, step, failed_ref, *timed_out)?)
             }
-            Cause::Conflict(_) => None,
+            Cause::Conflict(_) | Cause::Ci(_) => None,
         };
         let dir = self.report_dir(subject);
         fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
@@ -546,9 +547,18 @@ fn file_names(files: &[ConflictFile]) -> String {
     }
 }
 
+fn check_names(checks: &[FailedCheck]) -> String {
+    let shown: Vec<String> = checks.iter().take(3).map(|c| one_line(&c.name)).collect();
+    match checks.len().saturating_sub(shown.len()) {
+        0 => shown.join(", "),
+        more => format!("{} 외 {more}개", shown.join(", ")),
+    }
+}
+
 fn summarize(cause: &Cause) -> String {
     match cause {
         Cause::Conflict(files) => format!("충돌: {}", file_names(files)),
+        Cause::Ci(checks) => format!("원격 CI 실패: {}", check_names(checks)),
         Cause::Step { timed_out, step } => {
             let what = if *timed_out {
                 "시간 초과"
@@ -585,6 +595,9 @@ fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<Str
         Cause::Conflict(_) => vec![format!(
             "{merge} 기준 브랜치를 합치고 충돌한 파일을 푼다. 충돌 상대가 아직 머지되지 않은 큐의 PR이면 그 PR이 머지된 뒤에 합쳐도 된다."
         )],
+        Cause::Ci(_) => vec![
+            "보고서의 링크에서 실패한 check의 로그를 보고 원인을 찾는다. 로컬 검증이 아니라 GitHub의 check가 실패한 것이라 재현 명령이 없다.".to_owned(),
+        ],
         Cause::Step { timed_out, step } => {
             let mut steps =
                 vec!["보고서의 재현 방법으로 같은 단계를 돌려 실패를 직접 확인한다.".to_owned()];
@@ -637,6 +650,7 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
             render_step(&mut out, &doc.subject, step, report, *timed_out)
         }
         (Cause::Step { .. }, None) => {}
+        (Cause::Ci(checks), _) => render_ci(&mut out, checks),
     }
 
     out.push("## 다음에 할 일".to_owned());
@@ -646,6 +660,31 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
     }
     out.push(String::new());
     out.join("\n")
+}
+
+fn render_ci(out: &mut Vec<String>, checks: &[FailedCheck]) {
+    out.push("## 실패한 check".to_owned());
+    out.push(String::new());
+    out.push(
+        "GitHub가 이 PR의 등록한 HEAD에서 실패하거나 취소됐다고 알린 check다. 합친 트리의 로컬 검증은 이 PR에 돌지 않았다."
+            .to_owned(),
+    );
+    out.push(String::new());
+    for check in checks.iter().take(LISTED_FILES) {
+        let link = if check.link.is_empty() {
+            "링크 없음".to_owned()
+        } else {
+            code_span(&check.link)
+        };
+        out.push(format!("- {}: {link}", code_span(&check.name)));
+    }
+    if checks.len() > LISTED_FILES {
+        out.push(format!(
+            "- …외 {}개. 전부 `.json`에 있다",
+            checks.len() - LISTED_FILES
+        ));
+    }
+    out.push(String::new());
 }
 
 fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {

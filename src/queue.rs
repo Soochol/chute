@@ -82,7 +82,7 @@ pub fn step(from: ItemState, action: Action) -> Option<Next> {
         } else {
             Queued(None)
         }),
-        (Queued(None), Take) => to(InBatch),
+        (Queued(_), Take) => to(InBatch),
         (InBatch, Requeue) => to(Queued(None)),
         (InBatch, Merge | Close) => Some(Next::Remove),
         (InBatch, Bounce(reason)) => to(Bounced(reason)),
@@ -396,15 +396,23 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
     move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
 }
 
+/// Items waiting for remote CI come after every other queued item, so they never crowd
+/// a ready PR out of a full batch.
 pub fn take_batch(state: &mut State, max_batch: u32) -> Vec<PrNumber> {
     let mut taken = Vec::new();
-    for item in &mut state.queue {
-        if taken.len() >= max_batch as usize {
-            break;
-        }
-        if let Some(Next::To(to)) = step(item.state, Action::Take) {
-            item.state = to;
-            taken.push(item.pr);
+    for waiting_on_ci in [false, true] {
+        for item in &mut state.queue {
+            if taken.len() >= max_batch as usize {
+                return taken;
+            }
+            let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
+            if is_waiting != waiting_on_ci {
+                continue;
+            }
+            if let Some(Next::To(to)) = step(item.state, Action::Take) {
+                item.state = to;
+                taken.push(item.pr);
+            }
         }
     }
     taken
@@ -587,7 +595,7 @@ mod tests {
         allow(&mut t, &waiting, resubmit(true, true), To(AWAITING));
         allow(&mut t, &waiting, resubmit(true, false), To(QUEUED));
 
-        allow(&mut t, &[QUEUED], Action::Take, To(IN_BATCH));
+        allow(&mut t, &[QUEUED, CI_PENDING], Action::Take, To(IN_BATCH));
         allow(&mut t, &[IN_BATCH], Action::Requeue, To(QUEUED));
         allow(&mut t, &[IN_BATCH], Action::Merge, Remove);
         allow(&mut t, &[IN_BATCH], Action::Close, Remove);
@@ -735,10 +743,10 @@ mod tests {
     }
 
     #[test]
-    fn take_batch_takes_only_waiting_prs_without_a_ci_wait() {
+    fn take_batch_takes_queued_prs_and_leaves_every_other_state_alone() {
         let mut state = queue_of(&[
             (1, AWAITING),
-            (2, CI_PENDING),
+            (2, ItemState::NeedsHuman(HumanReason::GaveUp)),
             (3, IN_BATCH),
             (4, ItemState::Bounced(BounceReason::Verify)),
             (5, ItemState::NeedsHuman(HumanReason::Budget)),
@@ -754,14 +762,24 @@ mod tests {
     }
 
     #[test]
+    fn take_batch_puts_prs_waiting_on_ci_after_the_others_and_never_ahead_of_them() {
+        let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED), (3, CI_PENDING), (4, QUEUED)]);
+        assert_eq!(prs(&take_batch(&mut state, 3)), [2, 4, 1]);
+        assert_eq!(state_of(&state, 3), CI_PENDING);
+        let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED)]);
+        assert_eq!(prs(&take_batch(&mut state, 1)), [2]);
+        assert_eq!(state_of(&state, 1), CI_PENDING);
+    }
+
+    #[test]
     fn a_ci_wait_can_be_set_cleared_and_set_again_without_error() {
         let mut state = queue_of(&[(1, QUEUED)]);
         set_ci_pending(&mut state, PrNumber(1)).unwrap();
         set_ci_pending(&mut state, PrNumber(1)).unwrap();
         assert_eq!(state_of(&state, 1), CI_PENDING);
-        assert!(take_batch(&mut state, 8).is_empty());
         clear_ci_pending(&mut state, PrNumber(1)).unwrap();
         clear_ci_pending(&mut state, PrNumber(1)).unwrap();
+        assert_eq!(state_of(&state, 1), QUEUED);
         assert_eq!(prs(&take_batch(&mut state, 8)), [1]);
         assert!(set_ci_pending(&mut state, PrNumber(1)).is_err());
     }

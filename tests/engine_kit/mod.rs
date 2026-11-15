@@ -82,6 +82,11 @@ impl Lab {
         fs::create_dir_all(&gh_dir).unwrap();
         let gh = format!(
             r#"d='{gh}'
+if [ "$1" = pr ] && [ "$2" = checks ]; then
+  echo "$*" >> "$d/checks-calls"
+  if [ -e "$d/$3.checks" ]; then cat "$d/$3.checks"; exit "$(cat "$d/$3.checks.code")"; fi
+  echo "no checks reported on the 'pr-$3' branch" >&2; exit 1
+fi
 [ "$1" = pr ] && [ "$2" = view ] || {{ echo "fake gh: $*" >&2; exit 97; }}
 n=$3
 echo "$*" >> "$d/calls"
@@ -121,6 +126,10 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
     }
 
     pub fn engine(&self) -> Engine {
+        self.engine_rechecking_ci_every(Duration::ZERO)
+    }
+
+    pub fn engine_rechecking_ci_every(&self, ci_recheck: Duration) -> Engine {
         let ext = Ext::from_vars(|k| self.sb.var(k));
         Engine::new(
             ext,
@@ -131,6 +140,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         .with_timing(Timing {
             merged_check: Duration::ZERO,
             merged_poll: Duration::from_millis(10),
+            ci_recheck,
         })
     }
 
@@ -231,6 +241,41 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
 
     pub fn gh_says_head(&self, n: u64, head: &str) {
         fs::write(self.gh_dir.join(format!("{n}.head")), head).unwrap();
+    }
+
+    /// Makes the fake `gh pr checks` answer with these `(name, bucket)` pairs, exiting the way
+    /// the real one does: 1 when a check failed, 8 while one runs, else 0.
+    pub fn gh_checks(&self, n: u64, checks: &[(&str, &str)]) {
+        let list: Vec<String> = checks
+            .iter()
+            .map(|(name, bucket)| {
+                format!(r#"{{"name":"{name}","bucket":"{bucket}","link":"https://ci.example/{n}/{name}"}}"#)
+            })
+            .collect();
+        let has = |buckets: &[&str]| checks.iter().any(|(_, b)| buckets.contains(b));
+        let code = if has(&["fail", "cancel"]) {
+            1
+        } else if has(&["pending"]) {
+            8
+        } else {
+            0
+        };
+        fs::write(
+            self.gh_dir.join(format!("{n}.checks")),
+            format!("[{}]\n", list.join(",")),
+        )
+        .unwrap();
+        fs::write(
+            self.gh_dir.join(format!("{n}.checks.code")),
+            code.to_string(),
+        )
+        .unwrap();
+    }
+
+    pub fn gh_check_reads(&self) -> usize {
+        fs::read_to_string(self.gh_dir.join("checks-calls"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
     }
 
     pub fn gh_never_shows_merged(&self, n: u64) {

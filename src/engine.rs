@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::Deserialize;
 
+use crate::ci::{self, Verdict as CiVerdict};
 use crate::config::Config;
 use crate::ext::Ext;
 use crate::feedback::{Delivery, Feedback, Notice, Subject};
@@ -29,11 +31,13 @@ const PUSH_ROUNDS: u32 = 3;
 const SLOT_LOCK_TRIES: u32 = 40;
 const SLOT_LOCK_PAUSE: Duration = Duration::from_millis(50);
 const VERIFIED_BASES_KEPT: usize = 100;
+const NO_CHECKS_WARNING_AFTER_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct Timing {
     pub merged_check: Duration,
     pub merged_poll: Duration,
+    pub ci_recheck: Duration,
 }
 
 impl Default for Timing {
@@ -41,6 +45,7 @@ impl Default for Timing {
         Timing {
             merged_check: Duration::from_secs(20),
             merged_poll: Duration::from_secs(1),
+            ci_recheck: Duration::from_secs(30),
         }
     }
 }
@@ -77,6 +82,7 @@ pub struct Engine {
     worktrees_root: PathBuf,
     cancel: Cancel,
     timing: Timing,
+    ci_looked: Mutex<Option<Instant>>,
 }
 
 impl Engine {
@@ -92,6 +98,7 @@ impl Engine {
             worktrees_root,
             cancel: Cancel::new(),
             timing: Timing::default(),
+            ci_looked: Mutex::new(None),
         }
     }
 
@@ -355,9 +362,21 @@ impl Engine {
         Ok(())
     }
 
+    /// PRs waiting on remote CI are looked at again only after `ci_recheck`, so a queue
+    /// holding nothing else does not poll GitHub in a loop.
+    fn ci_look_due(&self) -> bool {
+        let looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
+        looked.is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
+    }
+
     pub fn run_once(&self) -> Result<Pass> {
-        let waiting =
-            |s: &crate::model::State| s.queue.iter().any(|i| i.state == ItemState::Queued(None));
+        let waiting = |s: &crate::model::State| {
+            s.queue.iter().any(|i| match i.state {
+                ItemState::Queued(None) => true,
+                ItemState::Queued(Some(_)) => self.ci_look_due(),
+                _ => false,
+            })
+        };
         if !waiting(&self.store.load()?) {
             return Ok(Pass::Idle);
         }
@@ -421,10 +440,12 @@ impl Engine {
             landed: Vec::new(),
             merged: Vec::new(),
             bounced: Vec::new(),
+            deferred: BTreeSet::new(),
             bisecting: false,
             verify_time: Duration::ZERO,
         };
         let result = run.execute(&taken);
+        let only_deferred = run.only_deferred();
         let wound = run.wind_down();
         let summary = Summary {
             batch: id,
@@ -432,6 +453,7 @@ impl Engine {
             bounced: run.bounced.clone(),
         };
         match result {
+            Ok(()) if only_deferred => wound.map(|()| Pass::Idle),
             Ok(()) => wound.map(|()| Pass::Done(summary)),
             Err(e) => match e.downcast::<Halt>() {
                 Ok(Halt::Cancelled) => wound.map(|()| Pass::Cancelled),
@@ -558,6 +580,7 @@ struct Run<'e> {
     landed: Vec<Landed>,
     merged: Vec<PrNumber>,
     bounced: Vec<PrNumber>,
+    deferred: BTreeSet<PrNumber>,
     bisecting: bool,
     verify_time: Duration,
 }
@@ -578,7 +601,8 @@ impl Run<'_> {
         let mut ready = Vec::new();
         for item in taken {
             match self.engine.inspect(item)? {
-                Inspection::Ready => ready.push(item.pr),
+                Inspection::Ready if self.passes_ci_gate(item)? => ready.push(item.pr),
+                Inspection::Ready => {}
                 Inspection::Closed => {
                     self.engine
                         .store
@@ -601,6 +625,89 @@ impl Run<'_> {
             }
         }
         Ok(ready)
+    }
+
+    /// The remote-CI gate in front of the batch, on only when `require_ci` is set. A PR whose
+    /// checks are still running or absent goes back to the queue marked `ci_pending`; a failed
+    /// one is sent back. The merged tree is still judged by local verification alone.
+    fn passes_ci_gate(&mut self, item: &QueueItem) -> Result<bool> {
+        if !self.config.require_ci {
+            return Ok(true);
+        }
+        let engine = self.engine;
+        *engine.ci_looked.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let pr = item.pr;
+        match ci::read(&engine.ext, &engine.info.path, pr)? {
+            CiVerdict::Passed => {
+                self.clear_no_checks_warning(pr)?;
+                Ok(true)
+            }
+            CiVerdict::Pending => {
+                self.clear_no_checks_warning(pr)?;
+                self.defer(pr, false)?;
+                Ok(false)
+            }
+            CiVerdict::NoChecks => {
+                let waited = EpochMs::now().0.saturating_sub(item.submitted_ms.0);
+                self.defer(pr, waited > NO_CHECKS_WARNING_AFTER_MS)?;
+                Ok(false)
+            }
+            CiVerdict::Failed(checks) => {
+                self.clear_no_checks_warning(pr)?;
+                self.bounce(pr, Failure::Ci { checks }, None)?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn defer(&mut self, pr: PrNumber, warn_no_checks: bool) -> Result<()> {
+        self.engine.store.update(|s| {
+            queue::requeue(s, pr)?;
+            queue::set_ci_pending(s, pr)?;
+            let warned = s
+                .warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::NoChecks && w.pr == Some(pr));
+            if warn_no_checks && !warned {
+                s.warnings.push(Warning {
+                    kind: WarningKind::NoChecks,
+                    message: format!(
+                        "{pr}: 10분이 넘도록 GitHub check가 하나도 없다. 이 저장소에 CI가 없으면 `chute.toml`의 `require_ci`를 끈다"
+                    ),
+                    pr: Some(pr),
+                    at_ms: EpochMs::now(),
+                });
+            }
+            Ok(())
+        })?;
+        self.deferred.insert(pr);
+        Ok(())
+    }
+
+    fn clear_no_checks_warning(&self, pr: PrNumber) -> Result<()> {
+        let warned = self
+            .engine
+            .store
+            .load()?
+            .warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::NoChecks && w.pr == Some(pr));
+        if !warned {
+            return Ok(());
+        }
+        self.engine.store.update(|s| {
+            s.warnings
+                .retain(|w| !(w.kind == WarningKind::NoChecks && w.pr == Some(pr)));
+            Ok(())
+        })
+    }
+
+    /// True when the run did nothing but put PRs back to wait on CI.
+    fn only_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+            && self.deferred.len() == self.items.len()
+            && self.merged.is_empty()
+            && self.bounced.is_empty()
     }
 
     fn head_changed(&mut self, item: &QueueItem, current: &Sha) -> Result<()> {
@@ -1114,7 +1221,11 @@ impl Run<'_> {
         let engine = self.engine;
         let now = EpochMs::now();
         self.record.finished_ms = Some(now);
-        self.save_record()?;
+        if self.only_deferred() {
+            engine.store.remove_batch(self.id())?;
+        } else {
+            self.save_record()?;
+        }
         if !self.merged.is_empty() || !self.bounced.is_empty() {
             engine.history(EventKind::BatchFinished {
                 batch: self.id().clone(),
