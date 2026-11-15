@@ -458,6 +458,8 @@ impl Slot {
         let out = self.git(&[
             "-c",
             "rerere.enabled=false",
+            "-c",
+            "i18n.commitEncoding=UTF-8",
             "merge",
             "--no-ff",
             "--no-edit",
@@ -832,7 +834,14 @@ mod tests {
 
         fn message(&self, commit: &Sha) -> String {
             self.repo
-                .git(&["log", "-1", "--format=%B", commit.as_str()])
+                .git(&[
+                    "-c",
+                    "i18n.logOutputEncoding=UTF-8",
+                    "log",
+                    "-1",
+                    "--format=%B",
+                    commit.as_str(),
+                ])
                 .trim()
                 .to_owned()
         }
@@ -1494,6 +1503,7 @@ mod tests {
         install_hook(&w, "post-merge", &format!("touch '{}'", marker.display()));
         install_hook(&w, "pre-push", "echo 'main is protected' >&2; exit 1");
         w.repo.git(&["config", "commit.cleanup", "strip"]);
+        w.repo.git(&["config", "i18n.commitEncoding", "EUC-KR"]);
         let MergeItem::Pr {
             pr, branch, head, ..
         } = w.open_pr(1, &[("a.txt", "a\n")])
@@ -1516,6 +1526,8 @@ mod tests {
             "Merge pull request #1 from acme/pr-1\n\n#42 고친 것"
         );
         assert!(!marker.exists(), "post-merge 훅이 돌았다");
+        let raw = w.repo.git(&["cat-file", "commit", commit.as_str()]);
+        assert!(!raw.contains("\nencoding "), "{raw}");
         assert_eq!(slot.push(&merged.tip).unwrap(), PushOutcome::Pushed);
         assert_eq!(w.origin_main(), merged.tip);
     }
