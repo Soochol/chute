@@ -52,6 +52,15 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
     for _ in 0..PUSH_TRIES {
         let base = slot.fetch_base()?;
         slot.checkout(&base)?;
+        if let Some(record) = already_on_main(ctx, &slot, &base, &targets)? {
+            record_push(&store, &id, &record)?;
+            println!(
+                "batch {}는 이미 {}에서 되돌려져 있다. 기록만 마저 남겼다.",
+                id.0, info.default_branch
+            );
+            print!("{}", report(&info, &id, &record));
+            return Ok(());
+        }
         let made = revert_all(ctx, &slot, &base, &targets, &all, batch)?;
         let tip = slot.head()?;
         if !args.no_verify {
@@ -188,6 +197,68 @@ fn revert_all(
         });
     }
     Ok(made)
+}
+
+/// A run cut short after its push leaves main reverted and the batch unrecorded. The revert
+/// commits say which merge they undo, so a rerun finds them instead of reverting again.
+fn already_on_main(
+    ctx: &Ctx,
+    slot: &Slot,
+    base: &Sha,
+    targets: &[MergeRef],
+) -> Result<Option<RevertRecord>> {
+    let order = first_parent_order(ctx, slot, base)?;
+    let mut found = Vec::new();
+    for target in targets {
+        let marker = format!("This reverts commit {}", target.commit);
+        let out = ctx
+            .ext
+            .git(
+                slot.path(),
+                [
+                    "log",
+                    "--first-parent",
+                    "--fixed-strings",
+                    "--format=%H",
+                    "-n1",
+                    "--grep",
+                    marker.as_str(),
+                    base.as_str(),
+                ],
+            )?
+            .ok()?;
+        let revert = out.trim();
+        if !revert.is_empty() {
+            let revert = Sha::try_from(revert.to_owned()).map_err(|e| anyhow!(e))?;
+            found.push(RevertedPr {
+                pr: target.pr,
+                merge: target.commit.clone(),
+                revert,
+            });
+        }
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    if found.len() != targets.len() {
+        let names: Vec<String> = found.iter().map(|p| format!("#{}", p.pr.0)).collect();
+        return refuse(format!(
+            "{}만 이미 되돌려져 있고 나머지는 아니다. 사람이 {}의 이력을 확인해야 한다",
+            names.join(" "),
+            base
+        ));
+    }
+    let newest = found
+        .iter()
+        .filter_map(|p| order.iter().position(|c| *c == p.revert))
+        .min()
+        .map_or_else(|| base.clone(), |at| order[at].clone());
+    Ok(Some(RevertRecord {
+        at_ms: EpochMs::now(),
+        tip: newest,
+        prs: found,
+        verified: false,
+    }))
 }
 
 fn first_parent_order(ctx: &Ctx, slot: &Slot, base: &Sha) -> Result<Vec<Sha>> {

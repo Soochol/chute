@@ -137,7 +137,7 @@ where
     Tz::Offset: std::fmt::Display,
 {
     if entries.is_empty() {
-        return "batch가 아직 없다\n".to_owned();
+        return "보일 batch가 없다\n".to_owned();
     }
     let mut out = String::new();
     for e in entries {
@@ -205,6 +205,6 @@ mod tests {
 
     #[test]
     fn no_batches_says_so() {
-        assert_eq!(render(&[], &Utc), "batch가 아직 없다\n");
+        assert_eq!(render(&[], &Utc), "보일 batch가 없다\n");
     }
 }

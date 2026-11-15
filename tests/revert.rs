@@ -281,3 +281,51 @@ fn when_main_moves_during_the_revert_it_starts_again_on_the_new_main() {
     assert!(subjects.contains("bump"), "{subjects}");
     assert!(subjects.starts_with("Revert"), "{subjects}");
 }
+
+#[test]
+fn a_rerun_after_a_crash_between_push_and_record_finishes_the_record_without_pushing() {
+    let lab = Lab::new("");
+    let id = merge_batch(&lab, &[(1, "a.txt", "a\n"), (2, "b.txt", "b\n")]);
+    assert_eq!(chute(&lab, &["revert", &id.0]).status.code(), Some(0));
+    let pushed = lab.origin_main();
+    fs::remove_file(lab.store.batch_dir(&id).join("revert.json")).unwrap();
+    let history = lab.store.dir().join("history.jsonl");
+    let kept: Vec<String> = fs::read_to_string(&history)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("\"reverted\""))
+        .map(str::to_owned)
+        .collect();
+    fs::write(&history, kept.join("\n") + "\n").unwrap();
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(lab.origin_main(), pushed);
+    assert!(stdout(&out).contains("이미"), "{}", stdout(&out));
+    let list = stdout(&chute(&lab, &["batches", "--json"]));
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(list[0]["reverted"], true);
+    assert_eq!(list[0]["revert_commit"], pushed.as_str());
+}
+
+#[test]
+fn a_batch_reverted_by_hand_for_only_some_of_its_prs_is_refused() {
+    let lab = Lab::new("");
+    let id = merge_batch(&lab, &[(1, "a.txt", "a\n"), (2, "b.txt", "b\n")]);
+    let record = lab.store.read_batch(&id).unwrap().unwrap();
+    let first = record.merges[0].commit.as_str().to_owned();
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "main", "origin/main"]);
+    lab.repo
+        .git(&["revert", "-m", "1", "--no-edit", first.as_str()]);
+    lab.repo.git(&["push", "--quiet", "origin", "main"]);
+    let main_before = lab.origin_main();
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(lab.origin_main(), main_before);
+    assert!(stderr(&out).contains("나머지는 아니다"), "{}", stderr(&out));
+}
