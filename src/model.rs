@@ -536,6 +536,8 @@ pub enum WarningKind {
     NoChecks,
     Config,
     History,
+    /// The daemon's last batch failed with an error that is not any PR's fault.
+    Engine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

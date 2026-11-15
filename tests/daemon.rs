@@ -162,7 +162,15 @@ fn down_without_a_daemon_says_so_and_leaves_no_stop_request() {
 fn a_stop_request_left_by_an_earlier_run_does_not_stop_the_new_daemon() {
     let lab = Lab::new("");
     std::fs::create_dir_all(lab.store.dir()).unwrap();
-    std::fs::write(lab.store.dir().join("stop"), "now").unwrap();
+    let stop = lab.store.dir().join("stop");
+    std::fs::write(&stop, "now").unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stop)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
 
     let mut daemon = start_daemon(&lab);
     wait_until("데몬이 뜨지 않았다", || {
@@ -192,4 +200,128 @@ fn up_starts_the_daemon_again_right_after_down() {
     ok(chute(&lab, &["up"]).output().unwrap());
 
     assert_eq!(lab.hc_calls("run").len(), 2);
+}
+
+#[test]
+fn a_stop_request_made_just_now_is_kept_when_the_daemon_starts() {
+    let lab = Lab::new("");
+    std::fs::create_dir_all(lab.store.dir()).unwrap();
+    std::fs::write(lab.store.dir().join("stop"), "now").unwrap();
+
+    let mut daemon = start_daemon(&lab);
+
+    wait_until("방금 한 정지 요청이 무시됐다", || {
+        exits(&mut daemon)
+    });
+}
+
+#[test]
+fn a_push_the_server_refuses_leaves_a_warning_and_the_pr_in_the_queue() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    let hook = lab.repo.origin().join("hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nwhile read old new ref; do\n  [ \"$ref\" = refs/heads/main ] && { echo 'protected branch: PR required' >&2; exit 1; }\ndone\nexit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut daemon = start_daemon(&lab);
+    wait_until("경고가 남지 않았다", || {
+        lab.state()
+            .warnings
+            .iter()
+            .any(|w| w.kind == chute::model::WarningKind::Engine)
+    });
+
+    let warning = lab.state().warnings.remove(0);
+    assert!(warning.message.contains("protected branch"), "{warning:?}");
+    assert_eq!(lab.item_state(1), Some(ItemState::Queued(None)));
+    assert_eq!(lab.verify_runs(), 1);
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+}
+
+#[test]
+fn a_daemon_killed_before_it_told_the_agent_tells_it_after_the_restart() {
+    let lab = Lab::new("[ -e BAD ] && fail \"FAILED bad_test\"");
+    let root = lab.sb.root();
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hc/get.json");
+    lab.sb.script(
+        "hc",
+        &format!(
+            "echo \"$*\" >> '{root}/hc-calls'\nif [ \"$1\" = get ]; then\n  if [ -e '{root}/hc-hang' ]; then echo $$ > '{root}/hc-hang-pid'; sleep 60; fi\n  cat '{fixture}'\nfi\nexit 0\n",
+            root = root.display(),
+            fixture = fixture.display()
+        ),
+    );
+    std::fs::write(root.join("hc-hang"), "").unwrap();
+    lab.open_pr(1, &[("BAD", "")]);
+
+    let mut first = start_daemon(&lab);
+    wait_until("전달이 시작되지 않았다", || {
+        root.join("hc-hang-pid").exists()
+    });
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::InBatch),
+        "알리기 전에는 반송 상태를 쓰지 않는다"
+    );
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    let hung: i32 = std::fs::read_to_string(root.join("hc-hang-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _ = kill(Pid::from_raw(hung), nix::sys::signal::Signal::SIGKILL);
+    std::fs::remove_file(root.join("hc-hang")).unwrap();
+
+    let mut second = start_daemon(&lab);
+    wait_until("다시 띄운 데몬이 알리지 않았다", || {
+        std::fs::read_to_string(root.join("hc-calls"))
+            .is_ok_and(|calls| calls.lines().any(|l| l.starts_with("send ")))
+    });
+
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::Bounced(chute::model::BounceReason::Verify))
+    );
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut second));
+    let sends = std::fs::read_to_string(root.join("hc-calls"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("send "))
+        .count();
+    assert_eq!(sends, 1);
+}
+
+#[test]
+fn down_now_also_ends_a_step_process_that_left_the_process_group() {
+    let lab = Lab::new("timeout 300 sh -c \"echo \\$\\$ > '@ROOT@/leaked.pid'; exec sleep 300\"");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    let mut daemon = start_daemon(&lab);
+    let pid_file = lab.sb.root().join("leaked.pid");
+    wait_until("검증 단계가 시작되지 않았다", || {
+        std::fs::read_to_string(&pid_file).is_ok_and(|t| t.trim().parse::<i32>().is_ok())
+    });
+    let leaked: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!is_gone(leaked));
+
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+
+    wait_until("그룹을 떠난 프로세스가 남았다", || {
+        is_gone(leaked)
+    });
 }

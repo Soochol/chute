@@ -20,9 +20,9 @@ use crate::gitops::{
     FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, PushOutcome, Slot, SlotLock, SlotName,
 };
 use crate::model::{
-    Batch, BatchId, BatchRecord, BlockReason, Blocked, EpochMs, Event, EventKind, Failure, Flaky,
-    HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber, QueueItem, RepoInfo, Sha,
-    StepFailure, VerifyMode, Warning, WarningKind,
+    Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event, EventKind,
+    Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber, QueueItem,
+    RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
 };
 use crate::queue;
 use crate::store::{Home, RepoStore};
@@ -162,6 +162,7 @@ impl Engine {
                 settled.push((item.pr, self.merge_commit_of(item, &main)?));
             }
         }
+        let settled_commits: Vec<(PrNumber, Option<Sha>)> = settled.clone();
         let gone = self.store.update(|s| {
             let mut gone = Vec::new();
             for (pr, commit) in &settled {
@@ -180,11 +181,12 @@ impl Engine {
         })?;
         let (merged, batch) = gone;
         let batch_id = batch.as_ref().map(|b| b.id.clone());
+        let merged_prs: Vec<PrNumber> = merged.iter().map(|(item, _)| item.pr).collect();
         for (item, commit) in merged {
             self.history(EventKind::Merged {
                 pr: item.pr,
                 batch: batch_id.clone().unwrap_or(BatchId(String::new())),
-                commit,
+                commit: commit.unwrap_or_else(|| item.head.clone()),
                 submitted_ms: item.submitted_ms,
             })?;
         }
@@ -192,8 +194,25 @@ impl Engine {
             && let Some(mut record) = self.store.read_batch(&batch.id)?
             && record.finished_ms.is_none()
         {
-            record.finished_ms = Some(EpochMs::now());
+            let now = EpochMs::now();
+            for (pr, commit) in settled_commits {
+                let known = record.merges.iter().any(|m| m.pr == pr);
+                if let (Some(commit), false) = (commit, known) {
+                    record.merges.push(MergeRef { pr, commit });
+                }
+            }
+            record.finished_ms = Some(now);
+            record.bounced = Vec::new();
             self.store.write_batch(&record)?;
+            if !merged_prs.is_empty() {
+                self.history(EventKind::BatchFinished {
+                    batch: batch.id.clone(),
+                    merged: merged_prs,
+                    bounced: Vec::new(),
+                    seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
+                    verify_s: record.verify_s,
+                })?;
+            }
         }
         self.prune_failed_refs()
     }
@@ -207,8 +226,8 @@ impl Engine {
     }
 
     /// The merge commit of a PR that is already in `main`, found by the title GitHub and
-    /// `gitops` both give it. The PR's own head stands in when there is none.
-    fn merge_commit_of(&self, item: &QueueItem, main: &str) -> Result<Sha> {
+    /// `gitops` both give it. `None` when the PR got in some other way.
+    fn merge_commit_of(&self, item: &QueueItem, main: &str) -> Result<Option<Sha>> {
         let title = format!("Merge pull request #{} from ", item.pr.0);
         let out = self.ext.git(
             &self.info.path,
@@ -222,10 +241,7 @@ impl Engine {
                 main,
             ],
         )?;
-        Ok(
-            Sha::try_from(out.stdout_text().trim().to_owned())
-                .unwrap_or_else(|_| item.head.clone()),
-        )
+        Ok(Sha::try_from(out.stdout_text().trim().to_owned()).ok())
     }
 
     /// Failed-tree refs matter only while their PR is in the queue. `chute drop` and a merge
@@ -509,31 +525,25 @@ impl Run<'_> {
     }
 
     fn head_changed(&mut self, item: &QueueItem, current: &Sha) -> Result<()> {
-        let engine = self.engine;
-        let held = engine.store.update(|s| {
-            queue::head_changed(s, item.pr)?;
-            Ok(s.queue
-                .iter()
-                .find(|i| i.pr == item.pr)
-                .cloned()
-                .unwrap_or_else(|| item.clone()))
+        let pr = item.pr;
+        let notice = Notice::HeadChanged {
+            registered: &item.head,
+            current,
+        };
+        let (_, unreachable) = self.deliver_and_record(item, &notice, |s| {
+            queue::head_changed(s, pr)?;
+            Ok(ItemState::Bounced(BounceReason::HeadChanged))
         })?;
-        engine.history(EventKind::Bounced {
-            pr: item.pr,
+        self.bounced.push(pr);
+        self.sent_back.insert(pr);
+        self.conflicted.remove(&pr);
+        self.engine.history(EventKind::Bounced {
+            pr,
             batch: Some(self.id().clone()),
-            reason: crate::model::BounceReason::HeadChanged,
-            attempts: held.attempts,
+            reason: BounceReason::HeadChanged,
+            attempts: item.attempts,
         })?;
-        self.bounced.push(item.pr);
-        self.sent_back.insert(item.pr);
-        self.conflicted.remove(&item.pr);
-        self.notify(
-            &held,
-            &Notice::HeadChanged {
-                registered: &item.head,
-                current,
-            },
-        )
+        self.note_unreachable(pr, unreachable)
     }
 
     fn feedback(&self) -> Feedback<'_> {
@@ -546,23 +556,41 @@ impl Run<'_> {
         }
     }
 
-    fn notify(&self, item: &QueueItem, notice: &Notice<'_>) -> Result<()> {
-        let engine = self.engine;
-        match self.feedback().deliver(item, notice) {
-            Delivery::Sent { .. } => Ok(()),
-            Delivery::Spawned(agent) => engine
-                .store
-                .update(|s| Ok(queue::record_agent(s, item.pr, agent)?)),
-            Delivery::Unreachable(why) => {
-                engine
-                    .store
-                    .update(|s| Ok(queue::unreachable(s, item.pr)?))?;
-                engine.history(EventKind::NeedsHuman {
-                    pr: item.pr,
-                    reason: HumanReason::Unreachable,
-                    detail: Some(why.to_string()),
-                })
+    /// Tells the agent first and writes the outcome after, in one state update. A daemon that
+    /// dies in between leaves the PR `in_batch`, so the next run tells the agent again; the
+    /// other order would leave a bounced PR nobody ever told about. The second return value
+    /// says why the agent could not be reached, when the PR went to a human for that.
+    fn deliver_and_record(
+        &self,
+        item: &QueueItem,
+        notice: &Notice<'_>,
+        record: impl FnOnce(&mut State) -> Result<ItemState>,
+    ) -> Result<(ItemState, Option<String>)> {
+        let delivery = self.feedback().deliver(item, notice);
+        let pr = item.pr;
+        self.engine.store.update(|s| {
+            let to = record(s)?;
+            let mut unreachable = None;
+            match &delivery {
+                Delivery::Sent { .. } => {}
+                Delivery::Spawned(agent) => queue::record_agent(s, pr, agent.clone())?,
+                Delivery::Unreachable(why) => {
+                    queue::unreachable(s, pr)?;
+                    unreachable = Some(why.to_string());
+                }
             }
+            Ok((to, unreachable))
+        })
+    }
+
+    fn note_unreachable(&self, pr: PrNumber, why: Option<String>) -> Result<()> {
+        match why {
+            Some(detail) => self.engine.history(EventKind::NeedsHuman {
+                pr,
+                reason: HumanReason::Unreachable,
+                detail: Some(detail),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -573,30 +601,31 @@ impl Run<'_> {
             .feedback()
             .write_report(&Subject::from(&item), &failure, failed_ref)?;
         let budget = self.config.budget;
-        let (to, held) = engine.store.update(|s| {
-            let to = queue::record_failure(s, pr, written.record(), budget)?;
-            let held = s.queue.iter().find(|i| i.pr == pr).cloned();
-            Ok((to, held.ok_or_else(|| anyhow!("{pr}가 큐에서 사라졌다"))?))
-        })?;
+        let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
+        // `record_failure` sends the PR back while the budget lasts and to a human after, and a
+        // human is told nothing.
+        let (to, unreachable) = if item.attempts < budget {
+            self.deliver_and_record(&item, &Notice::Bounced(&written), record)?
+        } else {
+            (engine.store.update(record)?, None)
+        };
         self.bounced.push(pr);
         self.conflicted.remove(&pr);
         match to {
-            ItemState::Bounced(reason) => {
-                engine.history(EventKind::Bounced {
-                    pr,
-                    batch: Some(self.id().clone()),
-                    reason,
-                    attempts: held.attempts,
-                })?;
-                self.notify(&held, &Notice::Bounced(&written))
-            }
+            ItemState::Bounced(reason) => engine.history(EventKind::Bounced {
+                pr,
+                batch: Some(self.id().clone()),
+                reason,
+                attempts: item.attempts + 1,
+            })?,
             ItemState::NeedsHuman(reason) => engine.history(EventKind::NeedsHuman {
                 pr,
                 reason,
                 detail: Some(format!("재시도 예산 {budget}번을 모두 썼다")),
-            }),
+            })?,
             other => bail!("{pr}의 실패 처리가 뜻밖의 상태로 끝났다: {other:?}"),
         }
+        self.note_unreachable(pr, unreachable)
     }
 
     fn save_record(&mut self) -> Result<()> {
@@ -1043,6 +1072,7 @@ impl Run<'_> {
             })?;
         }
         engine.prune_failed_refs()?;
+        reap_orphans(&engine.batch_slot_dir())?;
         if engine.cancel.is_cancelled() {
             return Ok(());
         }

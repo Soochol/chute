@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{SigHandler, Signal, signal};
@@ -11,7 +11,7 @@ use nix::sys::signal::{SigHandler, Signal, signal};
 use super::Ctx;
 use crate::engine::{Engine, Pass};
 use crate::feedback;
-use crate::model::{DaemonInfo, EpochMs, PrNumber};
+use crate::model::{DaemonInfo, EpochMs, PrNumber, Warning, WarningKind};
 use crate::store::RepoStore;
 use crate::verify::Cancel;
 
@@ -20,6 +20,10 @@ const WATCH_POLL: Duration = Duration::from_millis(100);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const BLOCKED_POLL: Duration = Duration::from_secs(15);
 const ERROR_POLL: Duration = Duration::from_secs(10);
+const MAX_ERROR_POLL: Duration = Duration::from_secs(600);
+/// A stop request older than this predates the daemon; a newer one may be a `chute down`
+/// that saw the daemon take its lock.
+const STALE_STOP: Duration = Duration::from_secs(2);
 
 #[derive(clap::Args, Debug)]
 pub struct Args {}
@@ -75,7 +79,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         eprintln!("chute: {}의 데몬이 이미 돌고 있다", info.slug);
         return Ok(ExitCode::SUCCESS);
     };
-    let _ = fs::remove_file(store.dir().join(STOP_FILE));
+    remove_stale_stop(&store);
     super::up::clear_launch_marker(&store);
     let worktrees_root = feedback::worktrees_root(|key| std::env::var_os(key))?;
     let cancel = Cancel::new();
@@ -114,6 +118,18 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     served?;
     println!("chute 데몬을 멈췄다");
     Ok(ExitCode::SUCCESS)
+}
+
+fn remove_stale_stop(store: &RepoStore) {
+    let path = store.dir().join(STOP_FILE);
+    let stale = fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| SystemTime::now().duration_since(at).ok())
+        .is_some_and(|age| age > STALE_STOP);
+    if stale {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn watch(store: &RepoStore, flags: &Flags, cancel: &Cancel) {
@@ -160,22 +176,63 @@ fn prs(list: &[PrNumber]) -> String {
     }
 }
 
+/// Shows an error that is nobody's PR's fault, such as a push the server refuses, in the
+/// state, where `chute status` and the Herdr board read it. `None` clears it.
+fn engine_warning(store: &RepoStore, message: Option<&str>) {
+    let result = store.update(|s| {
+        s.warnings.retain(|w| w.kind != WarningKind::Engine);
+        if let Some(message) = message {
+            s.warnings.push(Warning {
+                kind: WarningKind::Engine,
+                message: format!("데몬이 batch를 처리하지 못해 다시 시도한다: {message}"),
+                pr: None,
+                at_ms: EpochMs::now(),
+            });
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!("chute: 경고를 남기지 못했다: {e:#}");
+    }
+}
+
+fn backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(6);
+    ERROR_POLL
+        .saturating_mul(1 << doublings)
+        .min(MAX_ERROR_POLL)
+}
+
 fn serve(engine: &Engine, store: &RepoStore, me: &mut DaemonInfo, flags: &Flags) -> Result<()> {
     let mut recovered = false;
+    let mut failures = 0u32;
+    let mut warned = false;
+    let fail = |what: &str, e: anyhow::Error, failures: &mut u32, warned: &mut bool| {
+        *failures += 1;
+        eprintln!("chute: {what}: {e:#}");
+        engine_warning(store, Some(&format!("{e:#}")));
+        *warned = true;
+        nap(flags, backoff(*failures));
+    };
     while !flags.stopping() {
         if !recovered {
             doing(store, me, "지난 실행이 남긴 것을 정리하는 중");
             match engine.recover() {
                 Ok(()) => recovered = true,
                 Err(e) => {
-                    eprintln!("chute: 정리하지 못했다: {e:#}");
-                    nap(flags, ERROR_POLL);
+                    fail("정리하지 못했다", e, &mut failures, &mut warned);
                     continue;
                 }
             }
         }
         doing(store, me, "큐를 보는 중");
-        match engine.run_once() {
+        let pass = engine.run_once();
+        if warned && pass.is_ok() {
+            engine_warning(store, None);
+            warned = false;
+            failures = 0;
+        }
+        match pass {
             Ok(Pass::Idle) => nap(flags, IDLE_POLL),
             Ok(Pass::Done(summary)) => println!(
                 "batch {} 끝: 머지 {} · 반송 {}",
@@ -189,9 +246,8 @@ fn serve(engine: &Engine, store: &RepoStore, me: &mut DaemonInfo, flags: &Flags)
             }
             Ok(Pass::Cancelled) => break,
             Err(e) => {
-                eprintln!("chute: batch를 처리하지 못했다: {e:#}");
                 doing(store, me, "오류 뒤 기다리는 중");
-                nap(flags, ERROR_POLL);
+                fail("batch를 처리하지 못했다", e, &mut failures, &mut warned);
             }
         }
     }
@@ -217,5 +273,13 @@ mod tests {
 
         fs::write(store.dir().join(STOP_FILE), "so").unwrap();
         assert_eq!(requested_stop(&store), None);
+    }
+
+    #[test]
+    fn the_wait_after_repeated_errors_doubles_up_to_a_limit() {
+        assert_eq!(backoff(1), Duration::from_secs(10));
+        assert_eq!(backoff(2), Duration::from_secs(20));
+        assert_eq!(backoff(4), Duration::from_secs(80));
+        assert_eq!(backoff(50), MAX_ERROR_POLL);
     }
 }

@@ -562,8 +562,37 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
     ]);
     lab.repo.git(&["push", "--quiet", "origin", "main"]);
     let merge_commit = lab.origin_main();
+    lab.store
+        .write_batch(&chute::model::BatchRecord {
+            id: chute::model::BatchId("b-crashed".into()),
+            base: engine_kit::sha(&lab.origin_git(&["rev-parse", "main~1"])),
+            prs: prs(&[1]),
+            started_ms: chute::model::EpochMs::now(),
+            finished_ms: None,
+            merges: Vec::new(),
+            bounced: Vec::new(),
+            flaky: Vec::new(),
+            verify_s: 0,
+            pushed: Vec::new(),
+            verifications: 0,
+        })
+        .unwrap();
 
     lab.engine().recover().unwrap();
+
+    let record = lab
+        .store
+        .read_batch(&chute::model::BatchId("b-crashed".into()))
+        .unwrap()
+        .unwrap();
+    assert!(record.finished_ms.is_some());
+    assert_eq!(record.merges.len(), 1);
+    assert_eq!(record.merges[0].pr, PrNumber(1));
+    assert_eq!(record.merges[0].commit.as_str(), merge_commit);
+    assert!(lab.events().iter().any(|e| matches!(
+        e,
+        EventKind::BatchFinished { merged, .. } if *merged == prs(&[1])
+    )));
 
     assert!(lab.state().queue.is_empty());
     assert!(lab.state().batch.is_none());
