@@ -118,6 +118,10 @@ impl RepoStore {
         self.dir.join("reports").join(format!("pr-{}", pr.0))
     }
 
+    pub fn commit_report_dir(&self, short_sha: &str) -> PathBuf {
+        self.dir.join("reports").join(format!("commit-{short_sha}"))
+    }
+
     pub fn register(&self, info: &RepoInfo) -> Result<()> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("만들지 못했다: {}", self.dir.display()))?;
