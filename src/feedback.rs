@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::ext::{Ext, Output};
 use crate::model::{
-    Agent, ConflictFile, EpochMs, Failure, FailureRecord, NonEmpty, Partner, PrNumber, QueueItem,
-    RepoInfo, Sha, StepFailure, TerminalId, VerifyMode,
+    Agent, ConflictFile, EpochMs, Failure, FailureRecord, Partner, PrNumber, QueueItem, RepoInfo,
+    Sha, StepFailure, TerminalId, VerifyMode,
 };
 use crate::store::RepoStore;
 
@@ -41,12 +41,9 @@ pub struct Feedback<'a> {
     pub repo: &'a RepoInfo,
     pub store: &'a RepoStore,
     pub config: &'a Config,
-    /// Where a new agent's worktree goes: `<worktrees>/<repository>/<branch>`.
-    pub worktrees: &'a Path,
+    pub worktrees_root: &'a Path,
 }
 
-/// What a report is about. A queued PR reports under `reports/pr-<n>/`; a commit with no PR
-/// yet (preflight) under `reports/commit-<sha>/`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Subject {
@@ -92,30 +89,27 @@ fn short(sha: &Sha) -> &str {
     &sha.as_str()[..sha.as_str().len().min(12)]
 }
 
-/// The report as data. The Markdown and the JSON file are both rendered from this one value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportDoc {
     pub seq: u32,
     pub at_ms: EpochMs,
     pub subject: Subject,
     pub summary: String,
-    /// A combo failure's partners carry the files and the diff path found while writing.
     pub failure: Failure,
     pub step: Option<StepReport>,
     pub next: Vec<String>,
 }
 
-/// What only a failed verification step has: how to run it again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepReport {
     pub name: String,
     pub command: String,
     pub timeout_s: u64,
-    /// The end of the log, kept only when no failed test name was found.
     pub log_tail: Option<String>,
     pub tree: Sha,
     pub git_ref: Option<String>,
     pub repro: Vec<String>,
+    pub cleanup: String,
 }
 
 #[derive(Clone, Debug)]
@@ -136,7 +130,6 @@ impl Written {
     }
 }
 
-/// The failures a report can describe. Remote CI failures are added by `ci-gate`.
 enum Cause<'a> {
     Conflict(&'a [ConflictFile]),
     Step {
@@ -165,26 +158,15 @@ impl<'a> Cause<'a> {
 impl Feedback<'_> {
     /// Writes `reports/.../<seq>.md` and `<seq>.json` and returns them. The sequence number
     /// goes up for every report of the same PR (or commit); nothing earlier is overwritten.
-    /// For a combo failure the partners' `files` and `diff` in `failure` are ignored and
-    /// found again from the failed tree; `Written::doc` holds the resolved failure.
     pub fn write_report(
         &self,
         subject: &Subject,
         failure: &Failure,
         failed_ref: Option<&str>,
     ) -> Result<Written> {
-        Cause::of(failure)?;
-        let dir = match subject {
-            Subject::Pr { pr, .. } => self.store.report_dir(*pr),
-            Subject::Commit { commit } => self.store.commit_report_dir(commit),
-        };
+        let cause = Cause::of(failure)?;
+        let dir = self.report_dir(subject);
         fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
-        let failure = match failure {
-            Failure::Verify(step) => Failure::Verify(self.with_partner_diffs(&dir, step)?),
-            Failure::Timeout(step) => Failure::Timeout(self.with_partner_diffs(&dir, step)?),
-            other => other.clone(),
-        };
-        let cause = Cause::of(&failure)?;
         let (seq, md) = claim_sequence(&dir)?;
         let step = match &cause {
             Cause::Step { step, .. } => Some(self.step_report(subject, step, failed_ref, seq)?),
@@ -197,14 +179,47 @@ impl Feedback<'_> {
             summary: summarize(&cause),
             next: next_steps(subject, &cause, &self.repo.default_branch),
             step,
-            failure,
+            failure: failure.clone(),
         };
         let json = dir.join(format!("{seq}.json"));
         let mut text = serde_json::to_string_pretty(&doc)?;
         text.push('\n');
         write_file(&json, &text)?;
-        write_file(&md, &render(&doc, &Cause::of(&doc.failure)?))?;
+        write_file(&md, &render(&doc, &cause))?;
         Ok(Written { md, json, doc })
+    }
+
+    /// One partner of a combo failure: its changed files, and its change written as a diff
+    /// file beside the reports of `subject`. A partner whose merge cannot be found in `tree`
+    /// still comes back, with no files and a diff file that says why.
+    pub fn partner(
+        &self,
+        subject: &Subject,
+        tree: &Sha,
+        pr: PrNumber,
+        title: &str,
+    ) -> Result<Partner> {
+        let dir = self.report_dir(subject);
+        fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
+        let diff = dir.join(format!("partner-pr{}-{}.diff", pr.0, short(tree)));
+        let (files, text) = match self.merge_change(tree, pr) {
+            Ok(change) => change,
+            Err(e) => (Vec::new(), format!("diff를 만들지 못했다: {e:#}\n")),
+        };
+        write_file(&diff, &text)?;
+        Ok(Partner {
+            pr,
+            title: title.to_owned(),
+            files,
+            diff,
+        })
+    }
+
+    fn report_dir(&self, subject: &Subject) -> PathBuf {
+        match subject {
+            Subject::Pr { pr, .. } => self.store.report_dir(*pr),
+            Subject::Commit { commit } => self.store.commit_report_dir(short(commit)),
+        }
     }
 
     fn step_report(
@@ -233,45 +248,12 @@ impl Feedback<'_> {
                 format!("git worktree add --detach {dir} {}", shell_word(rev)),
                 format!("cd {dir}"),
                 format!("sh -c {}", shell_word(&configured.run)),
-                format!("cd - && git worktree remove --force {dir}"),
             ],
+            cleanup: format!("cd - && git worktree remove --force {dir}"),
         })
     }
 
-    fn with_partner_diffs(&self, dir: &Path, step: &StepFailure) -> Result<StepFailure> {
-        let VerifyMode::Combo { partners } = &step.mode else {
-            return Ok(step.clone());
-        };
-        let mut found = Vec::with_capacity(partners.len());
-        for partner in partners.iter() {
-            let diff = dir.join(format!(
-                "partner-pr{}-{}.diff",
-                partner.pr.0,
-                short(&step.tree)
-            ));
-            let (files, text) = match self.partner_change(&step.tree, partner.pr) {
-                Ok(change) => change,
-                Err(e) => (Vec::new(), format!("diff를 만들지 못했다: {e:#}\n")),
-            };
-            write_file(&diff, &text)?;
-            found.push(Partner {
-                pr: partner.pr,
-                title: partner.title.clone(),
-                files,
-                diff,
-            });
-        }
-        Ok(StepFailure {
-            mode: VerifyMode::Combo {
-                partners: NonEmpty::new(found).ok_or_else(|| anyhow!("상대 PR 목록이 비었다"))?,
-            },
-            ..step.clone()
-        })
-    }
-
-    /// A partner's change is its merge commit in the failed tree's first-parent history,
-    /// found by the GitHub-format subject `gitops` writes (`Merge pull request #N from …`).
-    fn partner_change(&self, tree: &Sha, pr: PrNumber) -> Result<(Vec<String>, String)> {
+    fn merge_change(&self, tree: &Sha, pr: PrNumber) -> Result<(Vec<String>, String)> {
         let git = |args: &[&str]| -> Result<String> {
             Ok(self.ext.git(&self.repo.path, args.iter().copied())?.ok()?)
         };
@@ -550,13 +532,12 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
     out.push(format!("- 로그: `{}`", step.log.display()));
     out.push(String::new());
 
-    if step.failed_tests.is_empty() {
+    if let Some(tail) = &report.log_tail {
         out.push("실패한 시험 이름을 뽑지 못했다. 로그 끝부분이다.".to_owned());
         out.push(String::new());
-        let tail = report.log_tail.as_deref().unwrap_or_default();
         let fence = fence_for(tail);
         out.push(format!("{fence}text"));
-        out.push(tail.to_owned());
+        out.push(tail.clone());
         out.push(fence);
     } else {
         out.push(format!("### 실패한 시험 ({}개)", step.failed_tests.len()));
@@ -604,15 +585,20 @@ fn render_step(out: &mut Vec<String>, step: &StepFailure, report: &StepReport, t
         None => out.push(format!("실패한 트리: 커밋 `{}`", report.tree)),
     }
     out.push(String::new());
-    out.push("저장소의 아무 worktree에서 실행한다. 마지막 줄은 다 쓴 뒤 지운다.".to_owned());
+    out.push("저장소의 아무 worktree에서 실행한다.".to_owned());
     out.push(String::new());
     out.push("```sh".to_owned());
     out.extend(report.repro.iter().cloned());
     out.push("```".to_owned());
     out.push(String::new());
+    out.push("다 쓴 뒤 만든 worktree를 지운다.".to_owned());
+    out.push(String::new());
+    out.push("```sh".to_owned());
+    out.push(report.cleanup.clone());
+    out.push("```".to_owned());
+    out.push(String::new());
 }
 
-/// What to tell an agent. A bounce comes with its report; a changed HEAD has none.
 #[derive(Clone, Copy, Debug)]
 pub enum Notice<'a> {
     Bounced(&'a Written),
@@ -658,7 +644,7 @@ pub enum Delivery {
     Sent {
         terminal: TerminalId,
     },
-    /// A new agent got the message. The caller records it on the item.
+    /// The caller records the new agent on the item.
     Spawned(Agent),
     Unreachable(Unreachable),
 }
@@ -729,10 +715,19 @@ enum Attempt {
 }
 
 impl Feedback<'_> {
-    /// Tells the item's agent. A live agent with the recorded `created_ms` gets one `hc send`;
+    /// A live agent with the recorded `created_ms` gets one `hc send`;
     /// a missing, finished or different one is replaced by a new agent if `respawn` allows.
-    /// `notice` must be about `item`.
     pub fn deliver(&self, item: &QueueItem, notice: &Notice<'_>) -> Delivery {
+        if let Notice::Bounced(written) = notice
+            && !matches!(&written.doc.subject, Subject::Pr { pr, .. } if *pr == item.pr)
+        {
+            return Delivery::Unreachable(Unreachable::Failed(format!(
+                "{} 보고서는 PR {}에게 보낼 수 없다: {}",
+                written.doc.subject.label(),
+                item.pr,
+                written.md.display()
+            )));
+        }
         let line = notice.line(item);
         if let Some(agent) = &item.agent {
             match self.send(agent, &line) {
@@ -852,8 +847,6 @@ impl Feedback<'_> {
         }))
     }
 
-    /// Where a new agent works: the recorded folder if it is still on the PR's branch, else
-    /// the worktree that has the branch, else a new worktree under `self.worktrees`.
     fn workdir(&self, item: &QueueItem) -> Result<PathBuf> {
         if let Some(agent) = &item.agent
             && self.on_branch(&agent.workdir, &item.branch)
@@ -911,7 +904,7 @@ impl Feedback<'_> {
         if !plain {
             bail!("브랜치 이름으로 worktree 자리를 정할 수 없다: {branch:?}");
         }
-        let dest = self.worktrees.join(self.repo.slug.name()).join(branch);
+        let dest = self.worktrees_root.join(self.repo.slug.name()).join(branch);
         if dest.exists() {
             bail!(
                 "worktree를 만들 자리에 이미 무엇이 있다: {}",

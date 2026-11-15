@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{CommitRef, FailedCheck, ItemState};
+use crate::model::{CommitRef, FailedCheck, ItemState, NonEmpty};
 use crate::repo;
 use crate::store::Home;
 use crate::testkit::{FakeTool, Reply, Sandbox, TestRepo};
@@ -79,7 +79,7 @@ impl Lab {
             repo: &self.info,
             store: &self.store,
             config: &self.config,
-            worktrees: &self.worktrees,
+            worktrees_root: &self.worktrees,
         }
     }
 
@@ -137,8 +137,7 @@ impl Lab {
         Failure::Verify(self.step(VerifyMode::Solo, tests, self.log("ok\nFAILED\n")))
     }
 
-    /// The fake `hc` can start an agent `t1new` that is live.
-    fn spawnable(&self) {
+    fn stub_spawn(&self) {
         self.hc()
             .respond(
                 "run *",
@@ -206,7 +205,7 @@ fn a_solo_verify_report_has_what_an_agent_needs_to_fix_it() {
         "refs/chute/failed/pr-12-1",
         "git worktree add --detach \"${TMPDIR:-/tmp}/chute-repro-pr12-1\" refs/chute/failed/pr-12-1",
         "sh -c 'cargo test --quiet'",
-        "git worktree remove --force",
+        "cd - && git worktree remove --force \"${TMPDIR:-/tmp}/chute-repro-pr12-1\"",
         "`chute submit`",
         "`chute giveup --reason \"<이유>\"`",
     ] {
@@ -279,7 +278,6 @@ fn an_unreadable_log_does_not_stop_the_report() {
     assert!(read(&written.md).contains("로그를 읽지 못했다"));
 }
 
-/// `main` plus merges for PR 9, PR 90 and PR 12, as `gitops` writes them.
 fn batch_tree(lab: &Lab) -> Sha {
     let repo = &lab.repo;
     repo.pr_branch("feat/a", "a.txt", "a change\n");
@@ -300,93 +298,99 @@ fn a_combo_report_lists_each_partner_with_its_files_and_diff() {
     let lab = Lab::new();
     let tree = batch_tree(&lab);
     let item = lab.item(12, "feat/b");
-    let partner = Partner {
-        pr: PrNumber(9),
-        title: "앞 PR 제목".into(),
-        files: vec!["ignored".into()],
-        diff: "/ignored".into(),
-    };
-    let failure = Failure::Verify(StepFailure {
-        tree,
-        ..lab.step(
-            VerifyMode::Combo {
-                partners: one(partner),
-            },
-            &["t::x"],
-            lab.log("x\n"),
-        )
-    });
-
-    let written = lab
+    let subject = Subject::from(&item);
+    let partner = lab
         .fb()
-        .write_report(&Subject::from(&item), &failure, None)
+        .partner(&subject, &tree, PrNumber(9), "앞 PR 제목")
         .unwrap();
 
-    let Failure::Verify(StepFailure {
-        mode: VerifyMode::Combo { partners },
-        ..
-    }) = &written.doc.failure
-    else {
-        panic!("{:?}", written.doc.failure)
-    };
-    let found = partners.first();
-    assert_eq!(found.files, ["a.txt"]);
-    assert_eq!(found.diff.parent().unwrap(), written.md.parent().unwrap());
-    let diff = read(&found.diff);
+    assert_eq!(partner.files, ["a.txt"]);
+    assert_eq!(
+        partner.diff.parent().unwrap(),
+        lab.store.report_dir(PrNumber(12))
+    );
+    let diff = read(&partner.diff);
     assert!(
         diff.contains("+++ b/a.txt") && diff.contains("+a change"),
         "{diff}"
     );
     assert!(!diff.contains("c.txt") && !diff.contains("b.txt"), "{diff}");
 
+    let failure = Failure::Verify(StepFailure {
+        tree,
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner.clone()),
+            },
+            &["t::x"],
+            lab.log("x\n"),
+        )
+    });
+    let written = lab.fb().write_report(&subject, &failure, None).unwrap();
+
+    assert_eq!(written.doc.failure, failure);
     let md = read(&written.md);
     for needed in [
         "조합",
         "#9",
         "앞 PR 제목",
         "`a.txt`",
-        &found.diff.display().to_string(),
+        &partner.diff.display().to_string(),
     ] {
         assert!(md.contains(needed), "{needed}\n{md}");
     }
-    assert!(!md.contains("ignored"), "{md}");
     let json: ReportDoc = serde_json::from_str(&read(&written.json)).unwrap();
     assert_eq!(json, written.doc);
 }
 
 #[test]
-fn a_partner_that_cannot_be_found_is_said_so_in_the_report() {
+fn a_partner_that_cannot_be_found_is_said_so_in_its_diff_file() {
     let lab = Lab::new();
+    let tree = batch_tree(&lab);
     let item = lab.item(12, "feat/b");
-    let partner = Partner {
-        pr: PrNumber(77),
-        title: "없는 PR".into(),
-        files: vec![],
-        diff: "/x".into(),
-    };
-    let failure = Failure::Timeout(lab.step(
-        VerifyMode::Combo {
-            partners: one(partner),
-        },
-        &[],
-        lab.log("hang\n"),
-    ));
+    let subject = Subject::from(&item);
 
-    let written = lab
+    let partner = lab
         .fb()
-        .write_report(&Subject::from(&item), &failure, None)
+        .partner(&subject, &tree, PrNumber(77), "없는 PR")
         .unwrap();
 
-    let Failure::Timeout(StepFailure {
-        mode: VerifyMode::Combo { partners },
-        ..
-    }) = &written.doc.failure
-    else {
-        panic!()
-    };
-    assert!(partners.first().files.is_empty());
-    assert!(read(&partners.first().diff).contains("diff를 만들지 못했다"));
+    assert!(partner.files.is_empty());
+    let note = read(&partner.diff);
+    assert!(
+        note.contains("diff를 만들지 못했다") && note.contains("#77"),
+        "{note}"
+    );
+    let failure = Failure::Timeout(StepFailure {
+        tree,
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &[],
+            lab.log("hang\n"),
+        )
+    });
+    let written = lab.fb().write_report(&subject, &failure, None).unwrap();
     assert!(read(&written.md).contains("#77"));
+}
+
+#[test]
+fn partner_diffs_of_different_failed_trees_do_not_overwrite_each_other() {
+    let lab = Lab::new();
+    let tree = batch_tree(&lab);
+    let subject = Subject::from(&lab.item(12, "feat/b"));
+    let other_tree = sha(&lab.repo.head());
+
+    let first = lab.fb().partner(&subject, &tree, PrNumber(9), "t").unwrap();
+    let second = lab
+        .fb()
+        .partner(&subject, &other_tree, PrNumber(9), "t")
+        .unwrap();
+
+    assert_ne!(first.diff, second.diff);
+    assert!(read(&first.diff).contains("+a change"));
+    assert!(read(&second.diff).contains("diff를 만들지 못했다"));
 }
 
 #[test]
@@ -520,7 +524,7 @@ fn a_commit_without_a_pr_gets_a_report_of_its_own() {
 
     assert_eq!(
         written.md,
-        lab.store.commit_report_dir(&commit).join("1.md")
+        lab.store.commit_report_dir(short(&commit)).join("1.md")
     );
     let md = read(&written.md);
     assert!(
@@ -616,6 +620,34 @@ fn a_live_agent_with_the_same_created_ms_gets_one_send_with_the_report_path() {
 }
 
 #[test]
+fn a_report_of_another_subject_is_not_sent_to_this_pr_s_agent() {
+    let lab = Lab::new();
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    let other_pr = lab.bounced(&lab.item(13, "feat/b"));
+    let preflight = lab
+        .fb()
+        .write_report(
+            &Subject::Commit {
+                commit: sha(&lab.repo.head()),
+            },
+            &lab.solo(&["a::b"]),
+            None,
+        )
+        .unwrap();
+
+    for written in [&other_pr, &preflight] {
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(written));
+
+        let Delivery::Unreachable(Unreachable::Failed(why)) = delivery else {
+            panic!("{delivery:?}")
+        };
+        assert!(why.contains(&written.md.display().to_string()), "{why}");
+    }
+    assert!(lab.hc_calls().is_empty());
+}
+
+#[test]
 fn a_head_change_notice_goes_the_same_way_without_a_report() {
     let lab = Lab::new();
     let mut item = lab.item(12, "feat/a");
@@ -668,7 +700,7 @@ fn a_new_agent_replaces_one_that_is_not_the_recorded_one() {
             item.agent = Some(lab.recorded_agent(&lab.sb.root().join("gone")));
             lab.hc().respond("get t1rs*", reply);
         }
-        lab.spawnable();
+        lab.stub_spawn();
         let written = lab.bounced(&item);
 
         let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -693,7 +725,7 @@ fn a_send_that_finds_the_terminal_gone_falls_back_to_a_new_agent() {
     lab.hc()
         .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
         .respond("send t1rs *", Reply::ok("").code(11));
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -753,7 +785,7 @@ fn hc_that_cannot_answer_is_unreachable_and_does_not_start_a_second_agent() {
     item.agent = Some(lab.recorded_agent(lab.repo.path()));
     lab.hc()
         .respond("get t1rs*", Reply::ok("").code(1).stderr("core down"));
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -772,7 +804,7 @@ fn a_terminal_state_chute_does_not_know_is_not_taken_for_gone() {
     item.agent = Some(lab.recorded_agent(lab.repo.path()));
     lab.hc()
         .respond("get t1rs*", terminal("t1rs", "starting", RECORDED_MS));
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -789,7 +821,7 @@ fn the_new_agent_is_started_in_the_background_without_a_parent_or_herdr_labels()
     let lab = Lab::new();
     lab.repo.pr_branch("feat/a", "a.txt", "a\n");
     let item = lab.item(12, "feat/a");
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -834,7 +866,7 @@ fn respawn_arguments_are_passed_through_in_order() {
     ));
     lab.repo.pr_branch("feat/a", "a.txt", "a\n");
     let item = lab.item(12, "feat/a");
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -910,7 +942,7 @@ fn the_recorded_folder_is_used_when_it_is_still_on_the_pr_branch() {
     item.agent = Some(lab.recorded_agent(&recorded));
     lab.hc()
         .respond("get t1rs*", terminal("t1rs", "finished", RECORDED_MS));
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -935,7 +967,7 @@ fn a_worktree_that_has_the_branch_is_used_when_the_recorded_folder_is_not_on_it(
         item.agent = Some(lab.recorded_agent(&stale));
         lab.hc()
             .respond("get t1rs*", terminal("t1rs", "finished", RECORDED_MS));
-        lab.spawnable();
+        lab.stub_spawn();
         let written = lab.bounced(&item);
 
         lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -954,7 +986,7 @@ fn a_new_worktree_is_made_under_the_root_when_no_checkout_has_the_branch() {
     let lab = Lab::new();
     lab.repo.pr_branch("feat/a", "a.txt", "a\n");
     let item = lab.item(12, "feat/a");
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -976,7 +1008,7 @@ fn a_new_worktree_is_made_under_the_root_when_no_checkout_has_the_branch() {
 fn a_branch_that_exists_only_on_the_remote_is_made_at_the_registered_head() {
     let lab = Lab::new();
     let item = lab.item(12, "feat/ghost");
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -996,7 +1028,7 @@ fn a_branch_left_at_a_deleted_worktree_is_freed_and_checked_out_again() {
     let gone = worktree_add(&lab, "gone", "feat/a");
     fs::remove_dir_all(&gone).unwrap();
     let item = lab.item(12, "feat/a");
-    lab.spawnable();
+    lab.stub_spawn();
     let written = lab.bounced(&item);
 
     lab.fb().deliver(&item, &Notice::Bounced(&written));
@@ -1010,7 +1042,7 @@ fn a_branch_name_that_would_leave_the_root_is_refused() {
     for branch in ["../escape", "-flag", "a/../../b", "/abs"] {
         let lab = Lab::new();
         let item = lab.item(12, branch);
-        lab.spawnable();
+        lab.stub_spawn();
         let written = lab.bounced(&item);
 
         let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
