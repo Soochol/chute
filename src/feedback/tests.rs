@@ -1615,3 +1615,35 @@ fn a_worktree_stopped_in_a_rebase_of_the_branch_is_still_the_branch_s_worktree()
     assert_eq!(lab.run_cwd(), stuck);
     assert!(!lab.worktrees.exists());
 }
+
+#[test]
+fn a_branch_only_on_origin_is_checked_out_at_origin_s_tip_and_tracks_it() {
+    let lab = Lab::new();
+    let registered = lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    lab.repo.git(&["checkout", "--quiet", "feat/a"]);
+    let newer = lab.repo.commit_file("b.txt", "b\n", "feat: 더 최근 커밋");
+    lab.repo.git(&["push", "--quiet", "origin", "feat/a"]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    lab.repo.git(&["branch", "--quiet", "-D", "feat/a"]);
+    let mut item = lab.item(12, "feat/a");
+    item.head = sha(&registered);
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let dest = lab.run_cwd();
+    assert_eq!(dest, lab.worktrees.join("widget").join("feat/a"));
+    let git = |args: &[&str]| {
+        lab.ext
+            .git(&dest, args.iter().copied())
+            .unwrap()
+            .ok()
+            .unwrap()
+    };
+    assert_eq!(git(&["rev-parse", "HEAD"]).trim(), newer);
+    assert_eq!(
+        git(&["rev-parse", "--abbrev-ref", "feat/a@{upstream}"]).trim(),
+        "origin/feat/a"
+    );
+}

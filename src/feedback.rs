@@ -1094,20 +1094,27 @@ impl Feedback<'_> {
             );
         }
         let branch = item.branch.as_str();
-        let ref_name = format!("refs/heads/{branch}");
-        let exists = self
-            .ext
-            .git(
-                &self.repo.path,
-                ["rev-parse", "--verify", "--quiet", &ref_name],
-            )?
-            .success();
+        let has_ref = |name: String| -> Result<bool> {
+            Ok(self
+                .ext
+                .git(&self.repo.path, ["rev-parse", "--verify", "--quiet", &name])?
+                .success())
+        };
+        let remote = format!("origin/{branch}");
         let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
         if stale {
             args.push("--force".into());
         }
-        if exists {
+        if has_ref(format!("refs/heads/{branch}"))? {
             args.extend([dest.as_os_str().to_owned(), branch.into()]);
+        } else if has_ref(format!("refs/remotes/{remote}"))? {
+            args.extend([
+                "--track".into(),
+                "-b".into(),
+                branch.into(),
+                dest.as_os_str().to_owned(),
+                remote.into(),
+            ]);
         } else {
             args.extend([
                 "-b".into(),
