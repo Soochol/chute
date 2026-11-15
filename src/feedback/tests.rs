@@ -221,7 +221,7 @@ fn a_solo_verify_report_has_what_an_agent_needs_to_fix_it() {
         &log.display().to_string(),
         "refs/chute/failed/pr-12-1",
         "- 명령: `cargo test --quiet`",
-        "worktree add --detach \"${TMPDIR:-/tmp}/chute-repro-acme__widget-pr12-",
+        "worktree add --detach \"$(cd \"${TMPDIR:-/tmp}\" && pwd)/chute-repro-acme__widget-pr12-",
         "refs/chute/failed/pr-12-1",
         "sh -c 'cargo test --quiet'",
         "CHUTE_RUN_ID=repro_acme__widget_pr12_",
@@ -2796,7 +2796,7 @@ fn the_repro_of_a_timeout_is_bounded_by_the_step_limit() {
         .step
         .unwrap();
     assert!(
-        step.repro[0].contains("timeout 1 sh -c 'sleep 20'"),
+        step.repro[0].contains("echo timeout 1) sh -c 'sleep 20'"),
         "{step:?}"
     );
     let tmp = lab.sb.root().join("tmp");
@@ -3413,5 +3413,163 @@ fn a_report_has_its_header_numbered_steps_and_trees_line_without_a_ref() {
     assert!(
         line.contains("1. 보고서의 재현 방법") && line.contains("2. 보고서의 diff 파일에서"),
         "{line}"
+    );
+}
+
+fn repro_in(lab: &Lab, repro: &str, cwd: &Path, tmp: &str) -> std::process::Output {
+    lab.sb
+        .command("sh")
+        .arg("-c")
+        .arg(repro)
+        .current_dir(cwd)
+        .env("TMPDIR", tmp)
+        .output()
+        .unwrap()
+}
+
+fn repro_step(lab: &Lab, timed_out: bool) -> StepReport {
+    let item = lab.item(12, "feat/a");
+    let failure = if timed_out {
+        Failure::Timeout(lab.step(VerifyMode::Solo, &[], lab.log("x")))
+    } else {
+        lab.solo(&["a::b"])
+    };
+    lab.fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap()
+}
+
+#[test]
+fn a_failing_post_checkout_hook_does_not_stop_the_step() {
+    let lab = Lab::with_config(
+        "respawn = []\n[[verify]]\nname = \"test\"\nrun = \"echo THE-STEP-RAN\"\n",
+    );
+    let hook = lab.repo.path().join(".git/hooks/post-checkout");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho hook failing on purpose >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::os::unix::fs::PermissionsExt::set_mode(
+        &mut fs::metadata(&hook).unwrap().permissions(),
+        0o755,
+    );
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let step = repro_step(&lab, false);
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+
+    let out = repro_in(
+        &lab,
+        &step.repro.join("\n"),
+        lab.sb.root(),
+        &tmp.to_string_lossy(),
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("THE-STEP-RAN"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("hook failing"));
+}
+
+#[test]
+fn a_relative_tmpdir_still_runs_the_step_in_the_worktree_and_leaves_the_repo_clean() {
+    let lab = Lab::with_config(
+        "respawn = []\n[[verify]]\nname = \"test\"\nrun = \"echo THE-STEP-RAN\"\n",
+    );
+    let step = repro_step(&lab, false);
+    fs::create_dir_all(lab.sb.root().join("reltmp")).unwrap();
+
+    let out = repro_in(&lab, &step.repro.join("\n"), lab.sb.root(), "reltmp");
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("THE-STEP-RAN"));
+    assert_eq!(lab.repo.git(&["status", "--porcelain"]).trim(), "");
+}
+
+#[test]
+fn a_timeout_repro_runs_unbounded_where_there_is_no_timeout_command() {
+    let lab = Lab::with_config(
+        "respawn = []\n[[verify]]\nname = \"test\"\nrun = \"echo THE-STEP-RAN\"\ntimeout = 5\n",
+    );
+    let step = repro_step(&lab, true);
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let bin = lab.sb.root().join("pathbin");
+    fs::create_dir_all(&bin).unwrap();
+    for tool in ["git", "sh", "cat", "date", "echo", "pwd"] {
+        let found = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}"))
+            .output()
+            .unwrap();
+        let real = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+        if real.starts_with('/') {
+            std::os::unix::fs::symlink(real, bin.join(tool)).unwrap();
+        }
+    }
+
+    let out = lab
+        .sb
+        .command("/bin/sh")
+        .arg("-c")
+        .arg(step.repro.join("\n"))
+        .current_dir(lab.sb.root())
+        .env("TMPDIR", &tmp)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("THE-STEP-RAN"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_silent_diff_failure_still_gives_the_exit_code() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a change\n");
+    let tree = merge_branch_into_batch(&lab, "feat/a", 9);
+    let gitconfig = lab.sb.var("GIT_CONFIG_GLOBAL").unwrap();
+    lab.sb.script(
+        "git",
+        &format!(
+            "export HOME='{}' GIT_CONFIG_GLOBAL='{}' GIT_CONFIG_NOSYSTEM=1\ncase \"$*\" in *--no-textconv*) exit 3 ;; esac\nexec git \"$@\"\n",
+            lab.sb.home().display(),
+            PathBuf::from(gitconfig).display()
+        ),
+    );
+    let ext = Ext::from_vars(|k| lab.sb.var(k));
+    let fb = Feedback {
+        ext: &ext,
+        ..lab.fb()
+    };
+
+    let partner = fb
+        .partner_or_placeholder(
+            &Subject::from(&lab.item(12, "feat/b")),
+            &tree,
+            PrNumber(9),
+            "t",
+        )
+        .unwrap();
+
+    assert_eq!(partner.files, ["a.txt"]);
+    assert!(
+        read(&partner.diff).contains("종료 코드 Some(3)"),
+        "{}",
+        read(&partner.diff)
     );
 }

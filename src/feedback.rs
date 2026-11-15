@@ -299,7 +299,7 @@ impl Feedback<'_> {
         } else {
             format!("{slug}-{key}-{tree}")
         };
-        let dir = format!("\"${{TMPDIR:-/tmp}}/chute-repro-{id}\"");
+        let dir = format!("\"$(cd \"${{TMPDIR:-/tmp}}\" && pwd)/chute-repro-{id}\"");
         let repo = shell_word(&self.repo.path.to_string_lossy());
         let failed_ref = failed_ref
             .map(|name| self.failed_ref_at(name, &step.tree))
@@ -310,7 +310,10 @@ impl Feedback<'_> {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let limit = if timed_out {
-            format!("timeout {} ", configured.timeout.as_secs())
+            format!(
+                "$(command -v timeout >/dev/null 2>&1 && echo timeout {}) ",
+                configured.timeout.as_secs()
+            )
         } else {
             String::new()
         };
@@ -322,7 +325,7 @@ impl Feedback<'_> {
             tree: step.tree.clone(),
             git_ref: failed_ref.clone(),
             repro: vec![format!(
-                "git -C {repo} worktree add --detach {dir} {} && (cd {dir} && CHUTE_RUN_ID=repro_{run_id}_$$_$(date +%s) {limit}sh -c {})",
+                "git -c core.hooksPath=/dev/null -C {repo} worktree add --detach {dir} {} && (cd {dir} && CHUTE_RUN_ID=repro_{run_id}_$$_$(date +%s) {limit}sh -c {})",
                 step.tree,
                 shell_word(&configured.run)
             )],
@@ -380,9 +383,12 @@ impl Feedback<'_> {
         );
         let text = match diff {
             Err(e) => format!("diff를 만들지 못했다: {e}\n").into_bytes(),
-            Ok(diff) if !diff.success() => {
-                format!("diff를 만들지 못했다: {}\n", diff.stderr_text().trim()).into_bytes()
-            }
+            Ok(diff) if !diff.success() => format!(
+                "diff를 만들지 못했다: git이 종료 코드 {:?}로 끝났다. {}\n",
+                diff.code,
+                diff.stderr_text().trim()
+            )
+            .into_bytes(),
             Ok(diff) if diff.stdout.is_empty() => {
                 "이 머지 커밋은 바뀐 파일이 없다\n".as_bytes().to_vec()
             }
