@@ -200,6 +200,11 @@ impl Ext {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        if tool == Tool::Git {
+            for var in GIT_REPO_ENV {
+                command.env_remove(var);
+            }
+        }
         if let Some(cwd) = cwd {
             if !cwd.is_dir() {
                 return Err(ExtError::NoDir {
@@ -261,6 +266,27 @@ impl Ext {
         })
     }
 }
+
+/// `git rev-parse --local-env-vars`. git exports these to the hooks and `!` aliases it runs,
+/// so chute started from one inherits them. Left in place they point every git call at the
+/// repository that started chute instead of the call's own `cwd`.
+const GIT_REPO_ENV: [&str; 15] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
 
 /// How long to wait for end-of-file after the process exits. A background grandchild may
 /// keep the pipe open forever; what the process itself wrote is read well within this.
