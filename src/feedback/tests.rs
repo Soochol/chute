@@ -224,7 +224,7 @@ fn a_solo_verify_report_has_what_an_agent_needs_to_fix_it() {
         "worktree add --detach \"${TMPDIR:-/tmp}/chute-repro-acme__widget-pr12-",
         "refs/chute/failed/pr-12-1",
         "sh -c 'cargo test --quiet'",
-        "CHUTE_RUN_ID=repro-acme__widget-pr12-",
+        "CHUTE_RUN_ID=repro_acme__widget_pr12_",
         "worktree remove --force",
         "`chute submit`",
         "`chute giveup --reason \"<이유>\"`",
@@ -1648,7 +1648,7 @@ run = "cat README.md; echo \"it's $CHUTE_RUN_ID\""
     let stdout = sh(&step.repro.join("\n"), lab.sb.root());
 
     assert!(stdout.lines().any(|l| l == "test"), "{stdout}");
-    assert!(stdout.contains("it's repro-acme__widget-pr12-"), "{stdout}");
+    assert!(stdout.contains("it's repro_acme__widget_pr12_"), "{stdout}");
     let dir = tmp.join(format!(
         "chute-repro-acme__widget-pr12-{}",
         short(&step.tree)
@@ -1940,7 +1940,7 @@ fn a_partner_without_a_diff_says_so_in_the_report() {
 
     let md = read(&written.md);
     assert!(
-        md.contains("- 바뀐 파일: 찾지 못했다. 이유는 diff 파일에 있다"),
+        md.contains("- 바뀐 파일: 알 수 없다. 사정은 diff 파일에 있다"),
         "{md}"
     );
 }
@@ -2672,4 +2672,464 @@ fn the_line_counts_conflicting_files_instead_of_spelling_their_names() {
         "{line}"
     );
     assert!(read(&written.md).contains("`src/(app)/[id]/page.tsx`"));
+}
+
+fn merge_branch_into_batch(lab: &Lab, branch: &str, pr: u64) -> Sha {
+    let repo = &lab.repo;
+    repo.git(&["checkout", "--quiet", "-b", "batch", "main"]);
+    repo.git(&[
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "-m",
+        &format!("Merge pull request #{pr} from acme/{branch}"),
+        branch,
+    ]);
+    let tree = sha(&repo.head());
+    repo.git(&["checkout", "--quiet", "main"]);
+    tree
+}
+
+fn partner_of(lab: &Lab, tree: &Sha, pr: u64) -> Partner {
+    lab.fb()
+        .partner_or_placeholder(
+            &Subject::from(&lab.item(12, "feat/b")),
+            tree,
+            PrNumber(pr),
+            "t",
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_renamed_file_is_listed_under_both_names() {
+    let lab = Lab::new();
+    lab.repo.write("old/name.rs", "fn main() {}\n");
+    lab.repo.git(&["add", "-A"]);
+    lab.repo.git(&["commit", "--quiet", "-m", "chore: 파일"]);
+    lab.repo
+        .git(&["checkout", "--quiet", "-b", "feat/r", "main"]);
+    fs::create_dir_all(lab.repo.path().join("new")).unwrap();
+    lab.repo.git(&["mv", "old/name.rs", "new/name.rs"]);
+    lab.repo.git(&["add", "-A"]);
+    lab.repo.git(&["commit", "--quiet", "-m", "refactor: 이름"]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    let tree = merge_branch_into_batch(&lab, "feat/r", 9);
+
+    let partner = partner_of(&lab, &tree, 9);
+
+    assert_eq!(partner.files, ["new/name.rs", "old/name.rs"]);
+}
+
+#[test]
+fn a_merge_that_changes_nothing_says_so_in_its_diff_file() {
+    let lab = Lab::new();
+    lab.repo
+        .git(&["checkout", "--quiet", "-b", "feat/e", "main"]);
+    lab.repo
+        .git(&["commit", "--quiet", "--allow-empty", "-m", "chore: 빈 커밋"]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    let tree = merge_branch_into_batch(&lab, "feat/e", 9);
+
+    let partner = partner_of(&lab, &tree, 9);
+
+    assert!(partner.files.is_empty());
+    assert!(
+        read(&partner.diff).contains("바뀐 파일이 없다"),
+        "{}",
+        read(&partner.diff)
+    );
+}
+
+#[test]
+fn a_broken_textconv_does_not_cost_the_file_list_or_the_diff() {
+    let lab = Lab::new();
+    lab.repo
+        .git(&["checkout", "--quiet", "-b", "feat/t", "main"]);
+    lab.repo.write("x.dat", "binary-ish\n");
+    lab.repo.write("y.txt", "text\n");
+    lab.repo.git(&["add", "-A"]);
+    lab.repo.git(&["commit", "--quiet", "-m", "feat: 변환기"]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    lab.repo
+        .git(&["config", "diff.conv.textconv", "/nonexistent/converter"]);
+    lab.repo.write(".gitattributes", "*.dat diff=conv\n");
+    let tree = merge_branch_into_batch(&lab, "feat/t", 9);
+
+    let partner = partner_of(&lab, &tree, 9);
+
+    assert_eq!(partner.files, ["x.dat", "y.txt"]);
+    let diff = read(&partner.diff);
+    assert!(
+        diff.contains("+++ b/y.txt") && diff.contains("+text"),
+        "{diff}"
+    );
+}
+
+#[test]
+fn report_paths_are_absolute_even_when_the_state_folder_is_relative() {
+    let mut lab = Lab::new();
+    lab.store = Home::at("chute-state-relative").repo(&lab.info.slug);
+    let item = lab.item(12, "feat/a");
+
+    let dir = lab.fb().report_dir(&Subject::from(&item));
+
+    assert!(dir.is_absolute(), "{}", dir.display());
+    assert!(dir.ends_with("chute-state-relative/repos/acme__widget/reports/pr-12"));
+}
+
+#[test]
+fn the_repro_of_a_timeout_is_bounded_by_the_step_limit() {
+    let lab = Lab::with_config(
+        "respawn = []\n[[verify]]\nname = \"test\"\nrun = \"sleep 20\"\ntimeout = 1\n",
+    );
+    let item = lab.item(12, "feat/a");
+    let failure = Failure::Timeout(lab.step(VerifyMode::Solo, &[], lab.log("x")));
+    let step = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    assert!(
+        step.repro[1].contains("timeout 1 sh -c 'sleep 20'"),
+        "{step:?}"
+    );
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let started = std::time::Instant::now();
+
+    let out = lab
+        .sb
+        .command("sh")
+        .arg("-c")
+        .arg(step.repro.join("\n"))
+        .current_dir(lab.sb.root())
+        .env("TMPDIR", &tmp)
+        .output()
+        .unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(124));
+    let plain = lab.solo(&["a::b"]);
+    let verify = lab
+        .fb()
+        .write_report(&Subject::from(&item), &plain, None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    assert!(
+        !verify.repro[1].contains("timeout "),
+        "only a timeout is bounded"
+    );
+}
+
+#[test]
+fn every_repro_run_gets_its_own_lowercase_run_id() {
+    let lab = Lab::with_config(
+        r#"respawn = []
+[[verify]]
+name = "test"
+run = "echo $CHUTE_RUN_ID"
+"#,
+    );
+    let item = lab.item(12, "feat/a");
+    let step = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap()
+        .doc
+        .step
+        .unwrap();
+    let tmp = lab.sb.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let run = || {
+        let out = lab
+            .sb
+            .command("sh")
+            .arg("-c")
+            .arg(format!("{}\n{}", step.repro.join("\n"), step.cleanup))
+            .current_dir(lab.sb.root())
+            .env("TMPDIR", &tmp)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.starts_with("repro_"))
+            .unwrap()
+            .to_owned()
+    };
+
+    let (first, second) = (run(), run());
+
+    assert_ne!(first, second);
+    assert!(
+        first
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+        "{first}"
+    );
+}
+
+#[test]
+fn the_repro_checks_out_the_commit_not_the_ref_that_may_move_or_vanish() {
+    let lab = Lab::new();
+    lab.repo
+        .git(&["update-ref", "refs/chute/failed/pr-12-1", "HEAD"]);
+    let item = lab.item(12, "feat/a");
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), Some("pr-12-1"))
+        .unwrap();
+
+    let step = written.doc.step.unwrap();
+    assert!(
+        step.repro[0].ends_with(step.tree.as_str()),
+        "{}",
+        step.repro[0]
+    );
+    assert!(!step.repro[0].contains("refs/"), "{}", step.repro[0]);
+    assert!(read(&written.md).contains("refs/chute/failed/pr-12-1"));
+}
+
+#[test]
+fn a_failed_ref_name_cannot_smuggle_revision_syntax() {
+    let lab = Lab::new();
+    lab.repo.git(&["update-ref", "refs/chute/failed/p", "HEAD"]);
+    let item = lab.item(12, "feat/a");
+    for name in ["p~1", "p^", "p@{1}", "p^{/x}", "../p", "-p", "p q", ""] {
+        let err = lab
+            .fb()
+            .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), Some(name))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("참조 이름이 아니다"),
+            "{name:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn runs_of_spaces_in_paths_and_names_are_kept_exactly() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let dir = lab.sb.root().join("verify  logs");
+    fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("test.log");
+    fs::write(&log, "x\n").unwrap();
+    let partner = Partner {
+        pr: PrNumber(9),
+        title: "t".into(),
+        files: vec!["docs/my  file.md".into()],
+        diff: "/d".into(),
+    };
+    let failure = Failure::Verify(StepFailure {
+        failed_tests: vec!["a  b::c".into()],
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &[],
+            log.clone(),
+        )
+    });
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    let md = read(&written.md);
+    for exact in [
+        format!("`{}`", log.display()),
+        "`docs/my  file.md`".to_owned(),
+        "`a  b::c`".to_owned(),
+    ] {
+        assert!(md.contains(&exact), "{exact}\n{md}");
+    }
+}
+
+#[test]
+fn a_recreated_folder_inside_the_main_checkout_is_not_taken_for_the_holder() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let held = lab.repo.path().join("sub").join("held");
+    lab.repo.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        &held.to_string_lossy(),
+        "feat/a",
+    ]);
+    fs::remove_dir_all(&held).unwrap();
+    fs::create_dir_all(&held).unwrap();
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert_eq!(lab.run_cwd(), lab.worktrees.join("widget").join("feat/a"));
+}
+
+#[test]
+fn a_worktree_locked_without_a_reason_is_not_taken_over_either() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let held = worktree_add(&lab, "held", "feat/a");
+    lab.repo.git(&["worktree", "lock", &held.to_string_lossy()]);
+    fs::remove_dir_all(&held).unwrap();
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert!(
+        matches!(delivery, Delivery::Unreachable(Unreachable::Failed(_))),
+        "{delivery:?}"
+    );
+    assert!(lab.hc_calls().is_empty());
+}
+
+#[test]
+fn every_known_shell_in_the_foreground_means_the_agent_has_left() {
+    for shell in SHELLS {
+        let lab = Lab::new();
+        lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+        let mut item = lab.item(12, "feat/a");
+        item.agent = Some(lab.recorded_agent(&lab.sb.root().join("gone")));
+        lab.hc().respond(
+            "get t1rs*",
+            Reply::ok(format!(
+                "{{\"address\":\"t1rs\",\"state\":\"live\",\"created_ms\":{RECORDED_MS},\"status\":null,\"reported\":false,\"foreground\":{{\"name\":\"{shell}\"}}}}"
+            )),
+        );
+        lab.stub_spawn();
+        let written = lab.bounced(&item);
+
+        let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+        assert!(
+            matches!(delivery, Delivery::Spawned(_)),
+            "{shell}: {delivery:?}"
+        );
+    }
+}
+
+#[test]
+fn a_send_that_finds_no_such_terminal_also_falls_back_to_a_new_agent() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(&lab.sb.root().join("gone")));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("").code(3));
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert!(matches!(delivery, Delivery::Spawned(_)), "{delivery:?}");
+}
+
+#[test]
+fn the_head_change_line_names_each_commit_under_its_own_label() {
+    let lab = Lab::new();
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let (registered, current) = (sha("abc1234def5678"), sha("0123456789abcdef"));
+
+    lab.fb().deliver(
+        &item,
+        &Notice::HeadChanged {
+            registered: &registered,
+            current: &current,
+        },
+    );
+
+    let line = lab.hc_calls()[1][2].clone();
+    assert!(
+        line.contains("등록한 HEAD: abc1234def56, 지금 HEAD: 0123456789ab"),
+        "{line}"
+    );
+}
+
+#[test]
+fn the_default_branch_is_the_one_the_repository_has_and_option_names_survive_the_line() {
+    let lab = Lab::new();
+    let mut info = lab.info.clone();
+    info.default_branch = "master".into();
+    let fb = Feedback {
+        repo: &info,
+        ..lab.fb()
+    };
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    lab.hc()
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let failure = Failure::Conflict {
+        files: one(ConflictFile {
+            path: "a.rs".into(),
+            main_commits: vec![],
+        }),
+    };
+    let written = fb
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    fb.deliver(&item, &Notice::Bounced(&written));
+
+    assert!(read(&written.md).contains("`git merge origin/master`"));
+    let line = lab.hc_calls()[1][2].clone();
+    assert!(line.contains("git merge origin/master"), "{line}");
+    assert!(line.contains("chute giveup --reason"), "{line}");
+}
+
+#[test]
+fn the_report_says_whether_the_failure_is_solo_or_combo_and_fences_with_three_ticks() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let solo = lab
+        .fb()
+        .write_report(&Subject::from(&item), &lab.solo(&["a::b"]), None)
+        .unwrap();
+    let partner = Partner {
+        pr: PrNumber(9),
+        title: "t".into(),
+        files: vec![],
+        diff: "/d".into(),
+    };
+    let combo = Failure::Verify(StepFailure {
+        ..lab.step(
+            VerifyMode::Combo {
+                partners: one(partner),
+            },
+            &["a::b"],
+            lab.log("x\n"),
+        )
+    });
+    let combo = lab
+        .fb()
+        .write_report(&Subject::from(&item), &combo, None)
+        .unwrap();
+
+    let (solo, combo) = (read(&solo.md), read(&combo.md));
+
+    assert!(solo.contains("- 범위: 단독") && !solo.contains("- 범위: 조합"));
+    assert!(combo.contains("- 범위: 조합") && !combo.contains("- 범위: 단독"));
+    assert!(solo.contains("\n```sh\n") && !solo.contains("````"));
 }

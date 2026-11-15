@@ -179,7 +179,9 @@ impl Feedback<'_> {
     ) -> Result<Written> {
         let cause = Cause::of(failure)?;
         let step = match &cause {
-            Cause::Step { step, .. } => Some(self.step_report(subject, step, failed_ref)?),
+            Cause::Step { step, timed_out } => {
+                Some(self.step_report(subject, step, failed_ref, *timed_out)?)
+            }
             Cause::Conflict(_) => None,
         };
         let dir = self.report_dir(subject);
@@ -239,6 +241,15 @@ impl Feedback<'_> {
     }
 
     fn failed_ref_at(&self, name: &str, tree: &Sha) -> Result<String> {
+        let plain = !name.is_empty()
+            && !name.starts_with('-')
+            && !name.contains("..")
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b));
+        if !plain {
+            bail!("실패한 트리 참조 이름이 아니다: {name:?}");
+        }
         let full = if name.starts_with("refs/") {
             name.to_owned()
         } else {
@@ -261,10 +272,11 @@ impl Feedback<'_> {
     }
 
     fn report_dir(&self, subject: &Subject) -> PathBuf {
-        match subject {
+        let dir = match subject {
             Subject::Pr { pr, .. } => self.store.report_dir(*pr),
             Subject::Commit { commit } => self.store.commit_report_dir(short(commit)),
-        }
+        };
+        std::path::absolute(&dir).unwrap_or(dir)
     }
 
     fn step_report(
@@ -272,6 +284,7 @@ impl Feedback<'_> {
         subject: &Subject,
         step: &StepFailure,
         failed_ref: Option<&str>,
+        timed_out: bool,
     ) -> Result<StepReport> {
         let configured = self
             .config
@@ -291,7 +304,16 @@ impl Feedback<'_> {
         let failed_ref = failed_ref
             .map(|name| self.failed_ref_at(name, &step.tree))
             .transpose()?;
-        let rev = failed_ref.as_deref().unwrap_or(step.tree.as_str());
+        let run_id: String = id
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let limit = if timed_out {
+            format!("timeout {} ", configured.timeout.as_secs())
+        } else {
+            String::new()
+        };
         Ok(StepReport {
             name: step.step.clone(),
             command: configured.run.clone(),
@@ -300,12 +322,9 @@ impl Feedback<'_> {
             tree: step.tree.clone(),
             git_ref: failed_ref.clone(),
             repro: vec![
+                format!("git -C {repo} worktree add --detach {dir} {}", step.tree),
                 format!(
-                    "git -C {repo} worktree add --detach {dir} {}",
-                    shell_word(rev)
-                ),
-                format!(
-                    "(cd {dir} && CHUTE_RUN_ID=repro-{id} sh -c {})",
+                    "(cd {dir} && CHUTE_RUN_ID=repro_{run_id}_$$ {limit}sh -c {})",
                     shell_word(&configured.run)
                 ),
             ],
@@ -334,7 +353,20 @@ impl Feedback<'_> {
             })
             .ok_or_else(|| anyhow!("{tree}의 이력에서 {pr}의 머지 커밋을 찾지 못했다"))?;
         let parent = format!("{merge}^1");
-        let files = git(&["diff", "--name-only", "-z", "--no-ext-diff", &parent, merge])?;
+        let files = git(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-renames",
+            &parent,
+            merge,
+        ])?;
+        let files: Vec<String> = files
+            .split('\0')
+            .filter(|f| !f.is_empty())
+            .map(str::to_owned)
+            .collect();
         let diff = self.ext.git(
             &self.repo.path,
             [
@@ -343,19 +375,19 @@ impl Feedback<'_> {
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 &parent,
                 merge,
             ],
         )?;
-        if !diff.success() {
-            bail!("git diff가 실패했다: {}", diff.stderr_text().trim());
-        }
-        let files = files
-            .split('\0')
-            .filter(|f| !f.is_empty())
-            .map(str::to_owned)
-            .collect();
-        Ok((files, diff.stdout))
+        let text = match (diff.success(), diff.stdout.is_empty()) {
+            (false, _) => {
+                format!("diff를 만들지 못했다: {}\n", diff.stderr_text().trim()).into_bytes()
+            }
+            (true, true) => "이 머지 커밋은 바뀐 파일이 없다\n".as_bytes().to_vec(),
+            (true, false) => diff.stdout,
+        };
+        Ok((files, text))
     }
 }
 
@@ -478,10 +510,13 @@ fn fence_for(text: &str) -> String {
 }
 
 fn code_span(text: &str) -> String {
-    let text = one_line(text);
+    let text: String = strip_terminal_noise(text)
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
     let longest = longest_backtick_run(&text);
     let ticks = "`".repeat(longest + 1);
-    if longest == 0 {
+    if longest == 0 && !text.starts_with(' ') && !text.ends_with(' ') {
         format!("{ticks}{text}{ticks}")
     } else {
         format!("{ticks} {text} {ticks}")
@@ -720,7 +755,7 @@ fn render_step(
                 files.push(format!("…외 {}개", partner.files.len() - LISTED_FILES));
             }
             if files.is_empty() {
-                out.push("- 바뀐 파일: 찾지 못했다. 이유는 diff 파일에 있다".to_owned());
+                out.push("- 바뀐 파일: 알 수 없다. 사정은 diff 파일에 있다".to_owned());
             } else {
                 out.push(format!("- 바뀐 파일: {}", files.join(", ")));
             }
