@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::model::{BatchId, DaemonInfo, Event, PrNumber, RepoInfo, Slug, State};
+use crate::model::{BatchId, BatchRecord, DaemonInfo, Event, PrNumber, RepoInfo, Slug, State};
 
 #[derive(Clone, Debug)]
 pub struct Home {
@@ -83,6 +83,8 @@ const LOCK_FILE: &str = "lock";
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
 const DAEMON_FILE: &str = "daemon.json";
 const HISTORY_FILE: &str = "history.jsonl";
+const LAUNCH_LOCK_FILE: &str = "up.lock";
+const BATCH_FILE: &str = "batch.json";
 
 #[derive(Clone, Debug)]
 pub struct RepoStore {
@@ -187,6 +189,37 @@ impl RepoStore {
 
     pub fn daemon(&self) -> Result<Option<DaemonInfo>> {
         read_json(&self.dir.join(DAEMON_FILE))
+    }
+
+    pub fn write_daemon(&self, info: &DaemonInfo) -> Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        write_json_atomic(&self.dir.join(DAEMON_FILE), info)
+    }
+
+    pub fn clear_daemon(&self) -> Result<()> {
+        let path = self.dir.join(DAEMON_FILE);
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("지우지 못했다: {}", path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn write_batch(&self, record: &BatchRecord) -> Result<()> {
+        let dir = self.batch_dir(&record.id);
+        fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
+        write_json_atomic(&dir.join(BATCH_FILE), record)
+    }
+
+    pub fn read_batch(&self, id: &BatchId) -> Result<Option<BatchRecord>> {
+        read_json(&self.batch_dir(id).join(BATCH_FILE))
+    }
+
+    /// Held while a process checks for a daemon and starts one, so that agents submitting
+    /// at the same moment start a single daemon between them.
+    pub fn lock_launch(&self) -> Result<FileLock> {
+        self.lock(LAUNCH_LOCK_FILE)
     }
 
     /// The daemon's exclusive lock, or `None` when another daemon holds it. `daemon_running`

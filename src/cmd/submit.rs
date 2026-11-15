@@ -53,6 +53,9 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<()> {
         now: EpochMs::now(),
     };
     let done = store.update(|state| Ok(queue::submit(state, submission)?))?;
+    if let Err(e) = super::up::ensure_daemon(ctx, &info, &store) {
+        eprintln!("경고: 데몬을 띄우지 못했다. 큐에는 올라갔다. `chute up`으로 띄운다: {e:#}");
+    }
 
     let report = Report {
         pr: pr.number,

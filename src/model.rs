@@ -580,6 +580,12 @@ pub struct BatchRecord {
     pub bounced: Vec<PrNumber>,
     pub flaky: Vec<Flaky>,
     pub verify_s: u64,
+    /// Every commit this batch pushed to the default branch, in order.
+    #[serde(default)]
+    pub pushed: Vec<Sha>,
+    /// How many times the verification steps ran, bisection and base checks included.
+    #[serde(default)]
+    pub verifications: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -625,6 +631,18 @@ pub enum EventKind {
     GaveUp {
         pr: PrNumber,
         reason: String,
+    },
+    Closed {
+        pr: PrNumber,
+    },
+    NeedsHuman {
+        pr: PrNumber,
+        reason: HumanReason,
+        detail: Option<String>,
+    },
+    Blocked {
+        reason: BlockReason,
+        base: Sha,
     },
 }
 

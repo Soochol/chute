@@ -17,6 +17,7 @@ pub enum Action {
     Take,
     Requeue,
     Merge,
+    Close,
     Bounce(BounceReason),
     Escalate(HumanReason),
     Retry,
@@ -33,6 +34,7 @@ impl Action {
             Action::Take => "batch로 가져가기",
             Action::Requeue => "큐로 되돌리기",
             Action::Merge => "머지 처리",
+            Action::Close => "닫힌 PR 빼기",
             Action::Bounce(_) => "반송",
             Action::Escalate(_) => "사람 차례로 올리기",
             Action::Retry => "다시 넣기",
@@ -82,7 +84,7 @@ pub fn step(from: ItemState, action: Action) -> Option<Next> {
         }),
         (Queued(None), Take) => to(InBatch),
         (InBatch, Requeue) => to(Queued(None)),
-        (InBatch, Merge) => Some(Next::Remove),
+        (InBatch, Merge | Close) => Some(Next::Remove),
         (InBatch, Bounce(reason)) => to(Bounced(reason)),
         (InBatch, Escalate(H::Budget)) => to(NeedsHuman(H::Budget)),
         (Bounced(_), Escalate(H::Unreachable)) => to(NeedsHuman(H::Unreachable)),
@@ -412,6 +414,16 @@ pub fn merged(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionEr
     take_out(state, pr, Action::Merge)
 }
 
+/// The PR was closed on GitHub while the batch held it.
+pub fn closed(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
+    take_out(state, pr, Action::Close)
+}
+
+pub fn record_agent(state: &mut State, pr: PrNumber, agent: Agent) -> Result<(), TransitionError> {
+    item_mut(state, pr)?.agent = Some(agent);
+    Ok(())
+}
+
 pub fn record_failure(
     state: &mut State,
     pr: PrNumber,
@@ -505,6 +517,7 @@ mod tests {
             Action::Take,
             Action::Requeue,
             Action::Merge,
+            Action::Close,
             Action::Retry,
             Action::Drop,
             Action::MarkCiPending,
@@ -578,6 +591,7 @@ mod tests {
         allow(&mut t, &[QUEUED], Action::Take, To(IN_BATCH));
         allow(&mut t, &[IN_BATCH], Action::Requeue, To(QUEUED));
         allow(&mut t, &[IN_BATCH], Action::Merge, Remove);
+        allow(&mut t, &[IN_BATCH], Action::Close, Remove);
         for reason in BOUNCE_REASONS {
             allow(
                 &mut t,
@@ -646,7 +660,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 12 * 20);
+        assert_eq!(checked, 12 * 21);
     }
 
     #[test]
@@ -657,6 +671,7 @@ mod tests {
                 action,
                 Action::Requeue
                     | Action::Merge
+                    | Action::Close
                     | Action::Bounce(_)
                     | Action::Escalate(HumanReason::Budget)
             );
