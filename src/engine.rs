@@ -28,7 +28,7 @@ use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Out
 const PUSH_ROUNDS: u32 = 3;
 const SLOT_LOCK_TRIES: u32 = 40;
 const SLOT_LOCK_PAUSE: Duration = Duration::from_millis(50);
-const VERIFIED_BASES_KEPT: usize = 100;
+pub const VERIFIED_BASES_KEPT: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct Timing {
