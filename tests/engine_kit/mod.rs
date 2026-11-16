@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chute::engine::{Engine, Timing};
+use chute::engine::{Clock, Engine, Timing};
 use chute::ext::Ext;
 use chute::model::{
     Agent, Approval, Batch, BatchId, BounceReason, EpochMs, EventKind, ItemState, Phase, PrNumber,
@@ -131,6 +131,10 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
     }
 
     pub fn engine_rechecking_ci_every(&self, ci_recheck: Duration) -> Engine {
+        self.engine_with_clock(ci_recheck, Clock::System)
+    }
+
+    pub fn engine_with_clock(&self, ci_recheck: Duration, clock: Clock) -> Engine {
         let ext = Ext::from_vars(|k| self.sb.var(k));
         Engine::new(
             ext,
@@ -142,6 +146,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             merged_check: Duration::ZERO,
             merged_poll: Duration::from_millis(10),
             ci_recheck,
+            clock,
         })
     }
 

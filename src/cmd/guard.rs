@@ -603,6 +603,11 @@ mod tests {
     use super::*;
     use crate::testkit::{Sandbox, TestRepo};
 
+    fn thread_cpu_time() -> std::time::Duration {
+        let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).unwrap();
+        std::time::Duration::new(t.tv_sec() as u64, t.tv_nsec() as u32)
+    }
+
     fn words(command: &str) -> Vec<Vec<String>> {
         segments(command)
     }
@@ -946,9 +951,13 @@ mod tests {
     fn a_command_with_thousands_of_heredoc_openers_finishes() {
         let fx = Fixture::new(true);
         let command = "cat <<E\n".repeat(5_000);
-        let started = std::time::Instant::now();
+        let cpu_started = thread_cpu_time();
+        let wall_started = std::time::Instant::now();
         assert_eq!(fx.verdict(&command), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let cpu = thread_cpu_time() - cpu_started;
+        assert!(cpu < std::time::Duration::from_secs(10), "{cpu:?}");
+        let wall = wall_started.elapsed();
+        assert!(wall < std::time::Duration::from_secs(120), "{wall:?}");
     }
 
     #[test]
