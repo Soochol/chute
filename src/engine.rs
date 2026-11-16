@@ -738,8 +738,6 @@ impl Run<'_> {
         }
     }
 
-    /// Puts a PR the batch has no room for back in the queue, still marked if it was waiting
-    /// on CI, so it neither counts as a member nor loses its place.
     fn release(&mut self, pr: PrNumber) -> Result<()> {
         let keep_mark = self.config.require_ci && self.was_waiting_on_ci.contains(&pr);
         self.engine.store.update(|s| {
