@@ -129,6 +129,10 @@ pub enum TransitionError {
         pr: PrNumber,
         after: PrNumber,
     },
+    AfterGone {
+        pr: PrNumber,
+        after: PrNumber,
+    },
 }
 
 impl fmt::Display for TransitionError {
@@ -153,6 +157,10 @@ impl fmt::Display for TransitionError {
             TransitionError::AfterSelf(pr) => {
                 write!(f, "{pr}: 자기 자신 뒤에 둘 수 없다. `--after`에서 뺀다")
             }
+            TransitionError::AfterGone { pr, after } => write!(
+                f,
+                "{pr}: --after {after}가 그사이 큐에서 빠졌다. 다시 submit한다"
+            ),
             TransitionError::AfterCycle { pr, after } => write!(
                 f,
                 "{pr}: {after}가 이미 {pr} 뒤에 있어 서로 기다리게 된다. `--after`를 고치거나 {after}를 `--after` 없이 다시 submit한다"
@@ -296,6 +304,7 @@ pub struct Submitted {
 
 pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, TransitionError> {
     let needs_approval = s.needs_approval();
+    let pr = s.pr;
     s.after = checked_after(state, s.pr, &s.after)?;
     let Some(at) = state.queue.iter().position(|i| i.pr == s.pr) else {
         let entry = entry_state(needs_approval);
@@ -318,7 +327,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
         });
         return Ok(Submitted {
             state: entry,
-            position: place(state.queue.len() - 1),
+            position: place_in_batch_order(&state.queue, pr),
             change: Change::Added,
         });
     };
@@ -336,7 +345,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     if s.submitter.is_some() {
         item.submitter = s.submitter;
     }
-    let options_changed = item.priority != s.priority || item.after != s.after;
+    let options_changed = item.priority != s.priority || !same_set(&item.after, &s.after);
     item.priority = s.priority;
     item.after = s.after;
     let change = match (was_bounced, head_changed) {
@@ -345,7 +354,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
         (false, false) => {
             return Ok(Submitted {
                 state: item.state,
-                position: place(at),
+                position: place_in_batch_order(&state.queue, pr),
                 change: if options_changed {
                     Change::OptionsUpdated
                 } else {
@@ -364,7 +373,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     }
     Ok(Submitted {
         state: to,
-        position: place(at),
+        position: place_in_batch_order(&state.queue, pr),
         change,
     })
 }
@@ -380,7 +389,7 @@ fn checked_after(
             return Err(TransitionError::AfterSelf(pr));
         }
         if !state.queue.iter().any(|i| i.pr == n) {
-            continue;
+            return Err(TransitionError::AfterGone { pr, after: n });
         }
         if waits_for(&state.queue, n, pr) {
             return Err(TransitionError::AfterCycle { pr, after: n });
@@ -418,6 +427,19 @@ fn forget_other_heads(
     head: &Sha,
 ) {
     preflights.retain(|b, p| b != branch || &p.head == head);
+}
+
+fn same_set(a: &[PrNumber], b: &[PrNumber]) -> bool {
+    a.len() == b.len() && a.iter().all(|n| b.contains(n))
+}
+
+/// Where `pr` stands in the order a batch takes items.
+fn place_in_batch_order(queue: &[QueueItem], pr: PrNumber) -> NonZeroUsize {
+    let at = batch_order(queue)
+        .iter()
+        .position(|p| *p == pr)
+        .unwrap_or(0);
+    place(at)
 }
 
 fn place(zero_based_index: usize) -> NonZeroUsize {
@@ -920,9 +942,9 @@ mod tests {
     }
 
     #[test]
-    fn a_new_submission_keeps_its_priority_and_after_and_forgets_prs_not_in_the_queue() {
+    fn a_new_submission_keeps_its_priority_and_after_and_drops_duplicates() {
         let mut state = queue_of(&[(1, QUEUED)]);
-        let done = submit(&mut state, options(2, true, &[1, 1, 9])).unwrap();
+        let done = submit(&mut state, options(2, true, &[1, 1])).unwrap();
         assert_eq!(done.change, Change::Added);
         let item = &state.queue[1];
         assert!(item.priority);
@@ -950,6 +972,30 @@ mod tests {
         assert_eq!(cleared.change, Change::OptionsUpdated);
         assert!(!state.queue[2].priority);
         assert!(state.queue[2].after.is_empty());
+    }
+
+    #[test]
+    fn an_after_pr_that_left_the_queue_meanwhile_refuses_the_submit() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        assert_eq!(
+            submit(&mut state, options(2, false, &[9])).unwrap_err(),
+            TransitionError::AfterGone {
+                pr: PrNumber(2),
+                after: PrNumber(9)
+            }
+        );
+        assert_eq!(state.queue.len(), 1);
+    }
+
+    #[test]
+    fn the_same_after_set_in_another_order_is_unchanged_and_position_follows_batch_order() {
+        let mut state = queue_of(&[(1, QUEUED), (3, QUEUED)]);
+        submit(&mut state, options(2, false, &[1, 3])).unwrap();
+        let same = submit(&mut state, options(2, false, &[3, 1])).unwrap();
+        assert_eq!(same.change, Change::Unchanged);
+
+        let urgent = submit(&mut state, options(4, true, &[])).unwrap();
+        assert_eq!(urgent.position, place(0));
     }
 
     #[test]

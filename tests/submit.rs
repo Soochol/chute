@@ -1792,3 +1792,20 @@ fn submit_after_changes_on_the_same_head_and_empties_without_the_flag() {
     submit(&w, &["12"]);
     assert!(w.state().queue[2].after.is_empty());
 }
+
+#[test]
+fn submit_after_with_gh_down_is_an_error_and_not_a_refusal() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    w.sb.fake("gh").respond(
+        "pr view 8 --json *",
+        Reply::ok("")
+            .code(1)
+            .stderr("error connecting to api.github.com"),
+    );
+
+    let out = submit(&w, &["12", "--after", "8"]);
+
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    assert!(w.state().queue.is_empty());
+}

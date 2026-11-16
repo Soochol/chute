@@ -291,15 +291,17 @@ fn merged_on_github(ctx: &Ctx, dir: &Path, n: PrNumber) -> Result<bool> {
     struct Found {
         state: PrState,
     }
-    let text = ctx
+    let out = ctx
         .ext
-        .gh(dir, ["pr", "view", &n.0.to_string(), "--json", "state"])?
-        .ok()
-        .map_err(|_| {
-            Refusal(format!(
-                "{n}: 큐에 없고 GitHub에서도 찾지 못했다. `--after`의 PR 번호를 확인한다"
-            ))
-        })?;
+        .gh(dir, ["pr", "view", &n.0.to_string(), "--json", "state"])?;
+    let err = out.stderr_text().to_lowercase();
+    if !out.success() && (err.contains("could not resolve") || err.contains("not found")) {
+        return Err(Refusal(format!(
+            "{n}: 큐에 없고 GitHub에서도 찾지 못했다. `--after`의 PR 번호를 확인한다"
+        ))
+        .into());
+    }
+    let text = out.ok()?;
     let found: Found = serde_json::from_str(&text).context("gh pr view의 출력을 읽지 못했다")?;
     Ok(found.state == PrState::Merged)
 }
