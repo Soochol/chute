@@ -583,3 +583,79 @@ fn an_unreadable_batch_record_does_not_keep_a_failure_from_being_recorded() {
     let red = lab.state().post.red.unwrap();
     assert_eq!(red.culprit.as_ref().unwrap().pr, None);
 }
+
+#[test]
+fn a_commit_that_fixes_an_unrelated_failure_is_not_blamed_for_the_real_one() {
+    let lab = post_lab("", "", POST_STEP);
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script).unwrap().replace(
+        "\nexit 0\n",
+        "\nif [ -e svc/OTHER ]; then echo 'FAILED other_test'; exit 1; fi\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\nexit 0\n",
+    );
+    fs::write(&script, text).unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    let heads = [
+        lab.push_pr_branch(1, &[("svc/BREAK", "x\n")]),
+        lab.push_pr_branch(2, &[("svc/OTHER", "y\n")]),
+    ];
+    for (n, head) in [1, 2].into_iter().zip(&heads) {
+        lab.queue_pr(n, head, Some(lab.agent()), chute::model::Approval::Agent);
+    }
+    merged(&lab);
+    let third = lab.push_pr_branch_removing(3, "svc/OTHER");
+    lab.queue_pr(3, &third, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+    let fourth = lab.push_pr_branch(4, &[("d.txt", "d\n")]);
+    lab.queue_pr(4, &fourth, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["broken_test"]);
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(1)));
+}
+
+#[test]
+fn a_post_verify_step_added_on_the_remote_starts_the_check_without_a_fetch_by_hand() {
+    let lab = Lab::new("");
+    let post = lab.post();
+    assert_eq!(post.run_once().unwrap(), PostPass::Idle);
+
+    let other = lab.sb.root().join("other-clone");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = lab
+            .sb
+            .command("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(
+        lab.sb.root(),
+        &[
+            "clone",
+            "--quiet",
+            &lab.repo.origin().to_string_lossy(),
+            "other-clone",
+        ],
+    );
+    let mut config = fs::read_to_string(other.join("chute.toml")).unwrap();
+    config.push_str("\n[[post_verify]]\nname = \"slow\"\nrun = \"true\"\n");
+    fs::write(other.join("chute.toml"), config).unwrap();
+    git(
+        &other,
+        &["commit", "--quiet", "-am", "chore: 머지 뒤 검사를 켠다"],
+    );
+    git(&other, &["push", "--quiet", "origin", "HEAD:main"]);
+
+    // The fetch happens at most every five minutes while the check is off.
+    assert_eq!(post.run_once().unwrap(), PostPass::Idle);
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+}

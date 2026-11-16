@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ use crate::verify::{self, Cancel, Detail, Failed, FlakyStep, Options, Outcome};
 const SLOT_LOCK_TRIES: u32 = 40;
 const SLOT_LOCK_PAUSE: Duration = Duration::from_millis(50);
 const MINUTE_MS: u64 = 60 * 1000;
+const IDLE_FETCH_EVERY: Duration = Duration::from_secs(5 * 60);
 const REPORT_TAIL_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +58,7 @@ pub struct PostVerifier {
     store: RepoStore,
     gitops: Gitops,
     cancel: Cancel,
+    idle_fetch: Mutex<Option<Instant>>,
 }
 
 impl PostVerifier {
@@ -69,6 +72,7 @@ impl PostVerifier {
             store,
             gitops,
             cancel: Cancel::new(),
+            idle_fetch: Mutex::new(None),
         }
     }
 
@@ -115,10 +119,19 @@ impl PostVerifier {
             &self.info.remote_name,
             &self.info.default_branch,
         );
-        if !matches!(known, Ok(Some(Config { post: Some(_), .. }))) {
-            return Ok(PostPass::Idle);
+        let configured = matches!(known, Ok(Some(Config { post: Some(_), .. })));
+        if !configured {
+            let mut last = self.idle_fetch.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|at| at.elapsed() < IDLE_FETCH_EVERY) {
+                return Ok(PostPass::Idle);
+            }
+            *last = Some(Instant::now());
         }
-        let tip = self.gitops.fetch_base_tip()?;
+        let tip = match self.gitops.fetch_base_tip() {
+            Ok(tip) => tip,
+            Err(_) if !configured => return Ok(PostPass::Idle),
+            Err(e) => return Err(e),
+        };
         let Ok(config) = Config::load_at(&self.ext, &self.info.path, tip.as_str()) else {
             return Ok(PostPass::Idle);
         };
@@ -390,15 +403,29 @@ impl PostVerifier {
         let mut passing: isize = -1;
         let mut bad = commits.len() - 1;
         while bad as isize - passing > 1 {
-            let mid = ((passing + bad as isize) / 2) as usize;
-            match self.check(scope, &commits[mid], PostPhase::Searching)? {
-                Checked::Cancelled => return Ok(Search::Cancelled),
-                Checked::Passed { flaky } => {
-                    self.record_flaky(scope.slot, &commits[mid], flaky)?;
-                    passing = mid as isize;
+            let mid = (passing + bad as isize) / 2;
+            let mut decided = false;
+            for probe in probes(passing, bad as isize, mid) {
+                let commit = &commits[probe as usize];
+                match self.check(scope, commit, PostPhase::Searching)? {
+                    Checked::Cancelled => return Ok(Search::Cancelled),
+                    Checked::Passed { flaky } => {
+                        self.record_flaky(scope.slot, commit, flaky)?;
+                        passing = probe;
+                        decided = true;
+                    }
+                    Checked::Failed(other) if same(&other) => {
+                        bad = probe as usize;
+                        decided = true;
+                    }
+                    Checked::Failed(_) => {}
                 }
-                Checked::Failed(other) if same(&other) => bad = mid,
-                Checked::Failed(_) => passing = mid as isize,
+                if decided {
+                    break;
+                }
+            }
+            if !decided {
+                break;
             }
         }
         Ok(Search::Found(Some(Culprit {
@@ -479,6 +506,21 @@ impl PostVerifier {
     }
 }
 
+/// The commits strictly between `passing` and `bad`, nearest to `mid` first. A commit that
+/// fails differently from the tip says nothing about the failure being located, so the search
+/// moves to its neighbours.
+fn probes(passing: isize, bad: isize, mid: isize) -> Vec<isize> {
+    let mut order = Vec::new();
+    for distance in 0..(bad - passing) {
+        for probe in [mid + distance, mid - distance] {
+            if probe > passing && probe < bad && !order.contains(&probe) {
+                order.push(probe);
+            }
+        }
+    }
+    order
+}
+
 fn failed_tests(failed: &Failed) -> Vec<String> {
     match &failed.detail {
         Detail::Tests(tests) => tests.to_vec(),
@@ -525,6 +567,13 @@ mod tests {
             commit: sha(commit),
             at_ms: EpochMs(1),
         })
+    }
+
+    #[test]
+    fn probes_start_at_the_middle_and_stay_inside_the_open_range() {
+        assert_eq!(probes(-1, 5, 2), [2, 3, 1, 4, 0]);
+        assert_eq!(probes(1, 4, 2), [2, 3]);
+        assert!(probes(2, 3, 2).is_empty());
     }
 
     #[test]
