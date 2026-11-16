@@ -11,7 +11,6 @@ use crate::support::{Net, Node};
 pub const BIN: &str = env!("CARGO_BIN_EXE_chute");
 const SLUG: &str = "acme/widget";
 
-/// Machine `a` has `b` as its hub. Both have the repository registered and know each other.
 pub fn net() -> Net {
     let net = Net::new(SLUG, &["a", "b"], BIN);
     net.connect_all();
@@ -40,7 +39,6 @@ pub fn state(node: &Node) -> State {
     store(node).load().unwrap()
 }
 
-/// What `state.json` holds right now, or `None` when it was never written.
 pub fn state_file(node: &Node) -> Option<String> {
     fs::read_to_string(store(node).dir().join("state.json")).ok()
 }
@@ -53,8 +51,6 @@ pub fn err(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// Runs `args` on `a` while the hub `b` cannot be reached: the command ends with exit code 2 and
-/// says it was not recorded.
 pub fn assert_unreachable_hub(net: &Net, args: &[&str]) {
     net.set_state("a", "b", "unreachable");
     let out = net.node("a").chute(BIN, args);
@@ -65,7 +61,6 @@ pub fn assert_unreachable_hub(net: &Net, args: &[&str]) {
     assert!(said.contains("허브 `b`"), "{args:?}: {said}");
 }
 
-/// A forwarded call that reaches a PC that is not the hub answers exit code 3 and names the hub.
 pub fn assert_not_hub_answer(net: &Net, args: &[&str]) {
     let a = net.node("a");
     let before = state_file(a);

@@ -37,8 +37,6 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     finish(revert(&args, ctx))
 }
 
-/// The hub's checkout path differs per machine, so ask the hub for it; fall back to a
-/// placeholder when it cannot answer.
 fn hub_command(ctx: &Ctx, hub: &str, args: &Args) -> String {
     let path = hub_repo_path(ctx)
         .map(|path| shell_word(&path))

@@ -22,7 +22,6 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     if args.now {
         forwarded.push("--now");
     }
-    // `down --now` waits up to WAIT for the daemon, so the forward must outlast it.
     if let Some(answer) = forward_to_hub(ctx, &forwarded, FORWARD_TIMEOUT + WAIT)? {
         return Ok(relay(&answer));
     }
