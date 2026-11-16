@@ -27,15 +27,14 @@ fn text_for(ctx: &Ctx) -> String {
     }
 }
 
-/// The manual must print even where chute is not set up, so every failure here means "no notice".
 fn requires_head(ctx: &Ctx) -> bool {
-    let Ok((info, _)) = ctx.registered_repo() else {
-        return false;
-    };
-    matches!(
-        Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch),
-        Ok(Some(config)) if config.require_head
-    )
+    try_requires_head(ctx).unwrap_or(false)
+}
+
+fn try_requires_head(ctx: &Ctx) -> Result<bool> {
+    let (info, _) = ctx.registered_repo()?;
+    let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)?;
+    Ok(config.is_some_and(|config| config.require_head))
 }
 
 #[cfg(test)]

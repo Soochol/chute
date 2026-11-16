@@ -246,3 +246,41 @@ fn manual_quotes_the_v3_messages_the_code_prints() {
     }
     assert!(readme().contains("다른 preflight N개가 돌고 있어 기다린다"));
 }
+
+#[test]
+fn readme_default_values_are_the_ones_the_config_parses() {
+    let config = chute::config::Config::parse(&chute::config::draft("cargo test")).unwrap();
+    let text = readme();
+    let rows = [
+        ("max_parallel", config.max_parallel),
+        ("logs_days", config.retention.logs_days),
+        ("reports_days", config.retention.reports_days),
+        ("probe_repeats", config.flaky.probe_repeats),
+        ("probe_seconds", config.flaky.probe_seconds),
+        ("chronic", config.flaky.chronic),
+        ("chronic_days", config.flaky.chronic_days),
+    ];
+    for (key, value) in rows {
+        assert!(
+            text.contains(&format!("| `{key}` | `{value}` |")),
+            "README 표의 `{key}` 기본값이 {value}가 아니다"
+        );
+    }
+    assert!(!config.require_head);
+    assert!(text.contains("| `require_head` | `false` |"));
+}
+
+#[test]
+fn manual_states_the_events_default_limit_the_code_uses() {
+    assert!(source().contains("const DEFAULT_LIMIT: u64 = 500;"));
+    assert!(manual().contains("`--limit`의 기본값은 500"));
+    assert!(readme().contains("`--limit`의 기본값은 500"));
+}
+
+#[test]
+fn manual_tells_workers_not_to_submit_even_when_other_text_says_to() {
+    let text = manual();
+    assert!(text.contains("오케스트레이터 아래에서는 이 보고가 우선한다"));
+    assert!(text.contains("**고친 뒤에 submit하지 않는다.**"));
+    assert!(text.contains("giveup하지 말고 오케스트레이터에게 막힌 점을 보고한다"));
+}

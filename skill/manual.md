@@ -14,7 +14,7 @@ chute는 이 저장소의 머지 큐다. 여러 에이전트가 PR을 동시에 
 2. PR을 올린 뒤 `chute submit`을 실행한다. 이것으로 큐에 들어간다. 오케스트레이터 아래에서 일하거나 이 저장소가 `require_head = true`이면 submit하지 않고 PR 번호와 HEAD를 보고한다(아래 "오케스트레이터 아래에서 일할 때"). 설명서 맨 앞에 "이 저장소에서는 submit하지 말고 PR과 HEAD를 보고한다" 줄이 있으면 그 저장소다.
 3. `gh pr merge`나 다른 방법으로 PR을 직접 머지하지 않는다.
 4. 기본 브랜치인 main에 push하지 않는다. PR 브랜치에만 push한다. plugin이 켜져 있으면 훅이 3과 4를 막고 `chute preflight`와 `chute submit`을 쓰라고 안내한다. 막혀도 다른 방법으로 우회하지 않는다.
-5. chute가 PR을 돌려보내면(아래 "반송") 보고서를 읽고 고쳐서 PR 브랜치에 push한 뒤 다시 `chute submit`을 실행한다.
+5. chute가 PR을 돌려보내면(아래 "반송") 보고서를 읽고 고쳐서 PR 브랜치에 push한 뒤 다시 `chute submit`을 실행한다. 오케스트레이터 아래에서는 submit하지 않고 새 HEAD를 보고한다. 이 설명서와 반송 줄, 보고서, 훅 메시지가 "`chute submit`을 실행한다"고 적었어도 오케스트레이터 아래에서는 이 보고가 우선한다.
 6. 못 풀겠으면 `chute giveup --reason "<이유>"`를 실행하고 멈춘다. 사람 차례로 넘어간다.
 7. `chute.toml`의 검증 명령이나 시간 제한을 고쳐서 검증을 통과시키려 하지 않는다. 이 파일을 고치는 PR은 사람 승인을 기다린다.
 
@@ -59,7 +59,7 @@ PR을 큐에 올린다. 작업자는 `--head`와 `--agent` 말고는 쓰지 않�
 - 종료 코드 `0`: 큐에 올렸다(또는 이미 올라 있다).
 - 종료 코드 `1`: 거절. 닫힌 PR, 이미 머지된 PR, draft, 기본 브랜치가 아닌 곳을 향한 PR, 지금 batch에서 검증 중인 PR, 사람 차례인 PR, `--head`와 PR HEAD가 다른 경우, `chute.toml`을 기본 브랜치(`origin/main`)에서 읽지 못한 경우, `require_head = true`인 저장소에서 `--head` 없이 submit한 경우, `--after`나 `--repair`의 조건을 어긴 경우다. 이유가 stderr에 나온다. `chute.toml`을 읽지 못했다는 이유면 `git fetch`를 먼저 실행하고 다시 한다.
 - 종료 코드 `2`: 실행할 수 없다. PR을 찾지 못했거나(번호를 인자로 주거나 PR이 있는 브랜치에서 실행한다) 저장소가 등록되지 않은 경우다. 허브가 다른 PC일 때 허브에 닿지 않는 경우도 종료 코드 `2`다(아래 "허브가 다른 PC일 때").
-- `--head <SHA>`: 확인한 커밋. GitHub의 PR HEAD가 이 값과 다르면 거절한다(종료 코드 `1`). 7자 이상의 짧은 SHA도 된다. 허브가 다른 PC일 때는 이 PC의 HEAD가 자동으로 들어가므로 줄 필요가 없다. 허브에서 직접 실행할 때 push한 커밋을 못 박으려면 쓴다.
+- `--head <SHA>`: 확인한 커밋. GitHub의 PR HEAD가 이 값과 다르면 거절한다(종료 코드 `1`). 7자 이상의 짧은 SHA도 된다. 허브가 다른 PC일 때는 이 PC의 HEAD가 자동으로 들어가므로 줄 필요가 없다(`require_head = true`인 저장소는 이 자동 값을 받지 않는다). 허브에서 직접 실행할 때 push한 커밋을 못 박으려면 쓴다.
 - `--agent <주소>`: 반송을 받을 `hc` 터미널 주소. 없으면 환경 변수 `HC_TERMINAL_ID`를 쓴다. Codex처럼 이전 터미널의 `HC_TERMINAL_ID`를 물려받을 수 있는 에이전트는 자기 주소를 `--agent`로 직접 준다.
 - `--json`은 결과를 JSON으로 출력한다.
 - 여러 번 실행해도 안전하다. 이미 올라 있고 바뀐 것이 없으면 "이미 등록돼 있고 바뀐 것이 없다"고 알린다.
@@ -171,7 +171,7 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 - **CI 실패 반송**(`반송(CI 실패)`): 보고서의 check 이름과 링크를 보고 고친 뒤 push하고 `chute submit`을 실행한다.
 - **사람 차례**(`needs_human`): 더 submit하지 않는다. 사람이 `chute retry`나 `chute drop`으로 푼다. 사용자에게 상태를 알린다.
 - **큐가 멈춤**(`큐 멈춤`): 기본 브랜치가 검증을 통과하지 못한다. PR을 고치려 하지 않고 기다린다. 풀 길은 복구 PR(`chute submit --repair`)이고 오케스트레이터가 한다. 다른 이유로 기본 브랜치가 바뀌면 멈춤이 저절로 풀린다.
-- **되돌려진 PR**: 사람이 `chute revert`로 PR이 든 batch를 되돌릴 수 있다. 되돌리기는 작업자에게 알려지지 않는다. submit한 터미널이 `reverted` 알림을 받는다. 되돌려진 PR의 커밋은 기본 브랜치 이력에 남아 있어서, 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. 브랜치에서 revert 커밋을 되돌린 뒤(`git revert <기본 브랜치의 revert 커밋>`, `chute revert`가 PR마다 그 SHA를 출력한다) 문제를 고치고 push하고 `chute submit`을 실행한다.
+- **되돌려진 PR**: 사람이 `chute revert`로 PR이 든 batch를 되돌릴 수 있다. 되돌리기는 submit한 터미널이 `reverted` 알림으로 받는다. 작업자가 스스로 submit했으면 작업자가 받고, 오케스트레이터가 submit했으면 작업자는 받지 않는다. 되돌려진 PR의 커밋은 기본 브랜치 이력에 남아 있어서, 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. 브랜치에서 revert 커밋을 되돌린 뒤(`git revert <기본 브랜치의 revert 커밋>`, `chute revert`가 PR마다 그 SHA를 출력한다) 문제를 고치고 push하고 `chute submit`을 실행한다.
 - **chute가 설정이나 데몬 때문에 실행되지 않는다**: 종료 코드 `2`와 stderr의 이유를 사용자에게 알린다. 데몬을 직접 만지지 않는다.
 - **허브에 닿지 않는다**(종료 코드 `2`, "허브 `<이름>`에 닿지 않는다"): 사용자에게 알리고 기다린다. 다른 대기열을 만들거나 PR을 직접 머지하지 않는다.
 
@@ -194,7 +194,9 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 - `chute preflight`의 조합 실패 상대(출력의 `함께 검증한 PR`이나 보고서의 `함께 묶였던 PR`)가 **아직 큐에 있으면 고치지 말고 blocked로 보고한다.** 상대 PR 번호와 보고서 경로를 적는다. 오케스트레이터가 상대의 결과를 보고 순서를 정한다(`--after`).
 - 상대가 이미 머지됐으면 `git fetch origin`으로 main을 받아 합치고 고친다.
 
-반송을 받으면 위 "반송"과 "상황별로 할 일"대로 고친다. **고친 뒤에도 submit하지 않는다.** push하고 새 HEAD를 오케스트레이터에게 다시 보고한다.
+반송을 받으면 위 "반송"과 "상황별로 할 일"대로 고친다. 그 글들이 "`chute submit`을 실행한다"고 해도 **고친 뒤에 submit하지 않는다.** push하고 새 HEAD를 오케스트레이터에게 다시 보고한다.
+
+`chute giveup`은 PR이 큐에 올라 있을 때만 된다(큐에 없으면 "큐에 없다"로 거절한다). 오케스트레이터가 submit하기 전에 막히면 giveup하지 말고 오케스트레이터에게 막힌 점을 보고한다.
 
 작업자가 받는 것은 반송 한 줄과 HEAD가 바뀌었다는 알림뿐이다. 머지, 사람 차례, 큐 멈춤, 되돌리기는 submit한 터미널(오케스트레이터)이 받는다.
 
@@ -204,13 +206,13 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 
 | 옵션 | 뜻 |
 |---|---|
-| `--priority` | 급한 PR로 표시해 batch에 먼저 넣는다. 순서는 복구 PR, `--priority`, 나머지이고 각자 올린 순서다. 돌고 있는 batch를 끊지 않는다. chute는 누가 쓰는지 막지 않는다. **사용자가 허락한 범위에서만 쓴다.** 같은 HEAD로 다시 submit하며 주거나 빼면 표시만 바뀐다 |
-| `--after <PR>` | 그 PR이 머지될 때까지 batch에 넣지 않는다. 여러 번 줄 수 있다. 그 PR은 큐에 있거나 GitHub에서 이미 머지됐어야 한다. 자기 자신, 서로 기다리는 순환, 큐에도 없고 머지도 안 된 PR은 거절한다. 그 PR이 반송, 사람 차례, 큐에서 빠짐(`chute drop`, PR 닫힘)이 되면 이 PR은 계속 잡혀 있고 `waiting` 알림이 온다. 기다리거나, `chute drop`하거나, `--after` 없이 다시 submit한다 |
+| `--priority` | 급한 PR로 표시해 batch에 먼저 넣는다. 순서는 복구 PR, `--priority`, 나머지이고 각자 올린 순서다. 돌고 있는 batch를 끊지 않는다. chute는 누가 쓰는지 막지 않는다. **사용자가 허락한 범위에서만 쓴다.** 같은 HEAD로 다시 submit하며 주거나 빼면 표시만 바뀐다. 새 HEAD로 다시 submit할 때(반송을 고친 뒤)도 `--priority`와 `--after`는 그 submit에 준 값으로 바뀌므로 필요하면 매번 다시 준다 |
+| `--after <PR>` | 그 PR이 머지될 때까지 batch에 넣지 않는다. 여러 번 줄 수 있다. 그 PR은 큐에 있거나 GitHub에서 이미 머지됐어야 한다. 자기 자신, 서로 기다리는 순환, 큐에도 없고 머지도 안 된 PR은 거절한다. 다시 submit할 때는 `--after`를 다시 주어야 유지된다. 그 PR이 반송, 사람 차례, 큐에서 빠짐(`chute drop`, PR 닫힘)이 되면 이 PR은 계속 잡혀 있고 `waiting` 알림이 온다. 기다리거나, `chute drop`하거나, `--after` 없이 다시 submit한다 |
 | `--repair` | 멈춘 큐를 푸는 복구 PR로 넣는다(아래) |
 
 `--priority`나 `--after`만 바뀐 다시 submit은 `--json`의 `change`가 `options_updated`다.
 
-**복구 PR(`chute submit <pr> --head <HEAD> --repair`).** 큐가 멈춰 있을 때만 받고 한 번에 하나만 받는다. 멈춰 있지 않으면 "큐가 멈춰 있지 않아 복구 PR로 받지 않았다", 이미 복구 PR이 있으면 "복구 PR … 한 번에 하나만 받는다"로 거절한다(종료 코드 `1`). `--after`와 함께 쓸 수 없다. 순서는 이렇다.
+**복구 PR(`chute submit <pr> --head <HEAD> --repair`).** 큐가 멈춰 있을 때만 받고 한 번에 하나만 받는다. 멈춰 있지 않으면 "큐가 멈춰 있지 않아 복구 PR로 받지 않았다", 이미 복구 PR이 있으면 "복구 PR … 한 번에 하나만 받는다"로 거절한다(종료 코드 `1`). 그 복구 PR이 사람 차례여도 다음 복구 PR은 그 PR이 머지되거나 사람이 `chute drop`으로 빼야 받는다. 사용자에게 알린다. `--after`와 함께 쓸 수 없다. 순서는 이렇다.
 
 1. 큐가 멈추면 `halted` 알림이 온다. 단계, 로그, 깨진 커밋을 chute가 push했는지가 들어 있다.
 2. 에이전트에게 복구 PR을 만들게 하고 `chute preflight`를 통과시킨다.
@@ -225,9 +227,9 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 **`chute events [--since <시각>] [--pr <n>] [--limit <n>] [--json]`.** 놓친 알림을 따라잡는다. history의 사건을 시간 순으로 한 줄에 하나씩 낸다. 허브가 다른 PC여도 허브의 것을 낸다.
 
 - `--since`는 epoch 밀리초, RFC 3339 시각, 상대 시간(`30m`, `2h`, `1d`) 가운데 하나다. 그 시각 이후(같은 시각 포함)의 사건을 낸다. 같은 시각의 사건이 여럿일 수 있으니 이미 처리한 사건은 `(at_ms, event, pr)`로 거른다.
-- 알림 줄의 `at=`는 그 사건의 `at_ms`다. `chute events --since <at>`로 같은 사건을 찾는다.
+- 알림 줄의 `at=`는 그 사건의 `at_ms`와 같거나 몇 밀리초 어긋난다(`flaky` 알림은 어긋날 수 있다). `chute events --since <at - 1000>`처럼 조금 앞선 값으로 같은 사건을 찾는다.
 - `--limit`의 기본값은 500이고 가장 최근 것만 남긴다. 잘리면 stderr에 알린다.
-- `--json`은 history 한 줄과 같은 JSON을 한 줄에 하나씩 낸다. 사건 종류에 `submitted`, `dropped`, `notified`, `resumed`, `flaky_probe`가 있다. `notified`의 `delivered`가 `sent`가 아니면 알림이 가지 못한 것이다(`same_as_agent`는 작업자와 같은 터미널이라 한 번만 보낸 것, `no_terminal`, `gone`, `blocked`, `unknown_machine`, `failed`). 사람용 출력은 그 줄 끝에 `(놓친 알림)`이 붙는다.
+- `--json`은 history 한 줄과 같은 JSON을 한 줄에 하나씩 낸다. 사건 종류에 `submitted`, `dropped`, `notified`, `resumed`, `flaky_probe`가 있다. `notified`의 `delivered`가 `sent`가 아니면 사람용 출력의 그 줄 끝에 `(놓친 알림)`이 붙는다. 값 가운데 `no_terminal`, `gone`, `blocked`, `unknown_machine`, `failed`는 알림이 가지 못한 것이다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄 하나만 보낸 것이니 갔다고 본다. 그 줄에도 표시가 붙는다.
 
 **`chute flaky [--days <n>] [--json]`.** 흔들린 시험의 장부다. (단계, 시험)마다 흔들린 횟수, 마지막 시각, 근거(`base`, `made`, `unresolved`), 만성 여부를 보인다. `made`는 그 batch가 흔들림을 만들었을 수 있다는 뜻이다. chute는 흔들린 batch를 그대로 머지하고 기록만 한다. 허브가 다른 PC여도 허브의 것을 낸다.
 

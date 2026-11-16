@@ -16,7 +16,7 @@ chute는 검증을 로컬에서 묶음(batch) 단위로 한 번에 돌린다. �
 
 1. 에이전트가 PR을 올리기 전에 `chute preflight`로 기본 브랜치 + 큐 + 자기 HEAD를 합쳐 검증한다.
 2. PR을 올린 뒤 `chute submit`으로 큐에 넣는다. 그 순간의 PR HEAD가 기록된다.
-3. 데몬이 큐에서 PR을 올린 순서대로 최대 `max_batch`개 가져와 기본 브랜치 위에 합치고 `chute.toml`의 검증 단계를 돌린다.
+3. 데몬이 큐에서 PR을 (복구 PR, `--priority` PR, 나머지 순으로 각자 올린 순서대로) 최대 `max_batch`개 가져와 기본 브랜치 위에 합치고 `chute.toml`의 검증 단계를 돌린다.
 4. 통과하면 검증한 바로 그 트리를 기본 브랜치에 push한다. 실패하면 batch를 반으로 나눠 범인을 찾는다. 범인은 보고서와 함께 에이전트에게 돌아간다. 에이전트가 없으면 기본 설정에서는 띄우지 않고 사람 차례로 넘긴다. `respawn`에 명령을 넣었으면 그 명령으로 새로 띄운다.
 5. 머지에 성공하면 submit한 터미널에 결과 한 줄을 `hc send`로 보낸다. 작업자가 스스로 submit했으면 작업자가, 오케스트레이터가 submit했으면 오케스트레이터가 받는다. 받을 터미널이 없으면 기록만 남고 `chute events`로 따라잡는다. `chute status`나 현황판으로도 본다.
 
@@ -103,7 +103,7 @@ orch 같은 오케스트레이터가 작업자 에이전트들을 부리면 머�
 
 ### 알림
 
-머지 결과는 알림 한 줄로 submit한 터미널에 간다. 형식은 `chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어 한 문장>`이다. 글자, 숫자, 공백, `.,:/_-+=@%`만 쓰고 SHA는 12자다. `at`은 그 사건의 history 시각이라 `chute events --since <at>`으로 같은 사건을 찾는다.
+머지 결과는 알림 한 줄로 submit한 터미널에 간다. 형식은 `chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어 한 문장>`이다. 글자, 숫자, 공백, `.,:/_-+=@%`만 쓰고 SHA는 12자다. `at`은 그 사건의 history 시각이라 `chute events --since <at - 1000>`처럼 조금 앞선 값으로 같은 사건을 찾는다(`flaky` 알림의 `at`은 사건과 몇 밀리초 어긋날 수 있다).
 
 | kind | 받는 쪽 | 뜻 |
 |---|---|---|
@@ -111,12 +111,12 @@ orch 같은 오케스트레이터가 작업자 에이전트들을 부리면 머�
 | `bounced` | submit한 터미널(작업자와 같으면 보내지 않는다) | 반송 요약. 작업자는 반송 줄과 보고서를 따로 받는다 |
 | `human` | submit한 터미널 | 사람 차례가 됐다(`budget`, `unreachable`, `gave_up`) |
 | `halted` | 그때 큐에 있던 모든 항목의 submit한 터미널 | 큐가 멈췄다. 단계, 로그, 깨진 커밋을 chute가 push했는지가 든다 |
-| `resumed` | 멈춤 알림을 받았던 터미널과 복구 PR을 submit한 터미널 | 멈춤이 풀렸다 |
+| `resumed` | 멈춤이 풀릴 때 큐에 있던 항목과 복구 PR의 submit한 터미널 | 멈춤이 풀렸다 |
 | `reverted` | 되돌린 PR을 submit한 터미널 | 사람이 batch를 되돌렸다 |
 | `waiting` | `--after`로 잡힌 PR을 submit한 터미널 | 기다리는 PR이 머지되지 못했다 |
 | `flaky` | batch의 PR을 submit한 터미널 | 흔들림이 만들어졌거나 만성이다 |
 
-알림은 사건이 기록된 뒤에 한 번만 보낸다. 데몬이 알림 도중 죽으면 한 번 빠질 수 있고, 같은 알림이 두 번 가는 것보다 낫다고 보았다. 빠진 알림은 `chute events`에서 `notified`의 `delivered`가 `sent`가 아닌 줄(사람용 출력에서는 `(놓친 알림)`)로 찾는다. 알림을 못 보내도 큐 상태는 바뀌지 않는다.
+알림은 사건이 기록된 뒤에 한 번만 보낸다. 데몬이 알림 도중 죽으면 한 번 빠질 수 있고, 같은 알림이 두 번 가는 것보다 낫다고 보았다. 빠진 알림은 `chute events`에서 `notified`의 `delivered`가 `sent`가 아닌 줄(사람용 출력에서는 `(놓친 알림)`)로 찾는다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄만 보낸 것이므로 갔다고 보는데, 그 줄에도 표시가 붙는다. 알림을 못 보내도 큐 상태는 바뀌지 않는다.
 
 ### 복구 PR
 
@@ -137,7 +137,8 @@ orch 같은 오케스트레이터가 작업자 에이전트들을 부리면 머�
 
 - batch 검증 로그와 preflight 로그: `logs_days`(기본 7일)보다 오래된 것
 - 반송 보고서(그 PR이 큐에 없을 때)와 preflight 보고서: `reports_days`(기본 30일)보다 오래된 것
-- batch 실패 참조(`refs/chute/failed/pr<n>-<batch>`)와 preflight 실패 참조: PR이 큐에서 빠졌거나 `reports_days`보다 오래된 것
+- batch 실패 참조(`refs/chute/failed/pr<n>-<batch>`): 허브에서는 그 PR이 큐에서 빠지면(나이는 보지 않는다), 다른 PC에서는 batch id의 시각이 `reports_days`보다 오래되면
+- preflight 실패 참조: `reports_days`보다 오래된 것
 - `max_parallel`을 넘는 번호의 preflight 슬롯 가운데 아무도 쓰지 않는 것
 
 남기는 것:
@@ -350,7 +351,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 ### batch 보기와 되돌리기
 
 - `chute batches [--json] [-n <수>]`: 최근 batch를 새것부터 보인다(기본 20개). batch마다 id, 끝난 시각, 머지된 PR, 반송된 PR, 되돌려졌는지를 적는다. `--json`은 같은 내용을 배열로 낸다.
-- `chute revert <batch> [--no-verify]`: 그 batch의 merge commit들을 역순으로 `git revert -m 1`로 `origin/<기본 브랜치>` 위에 쌓고, 되돌린 트리를 검증한 뒤 push한다. `--no-verify`는 검증을 건너뛴다. 강제 push로 기본 브랜치를 되감지 않는다. push가 거절되면 새 기준으로 처음부터 다시 하고, 3번까지 시도한다. 아무것도 push하지 않고 종료 코드 1로 끝나는 경우는 다음과 같다. 없는 batch, 머지한 PR이 없는 batch, 이미 되돌린 batch, 기록이 불완전한 batch(데몬이 도중에 멈춰 기록과 `history.jsonl`이 어긋난 경우는 추측하지 않는다), 뒤에 머지된 변경과의 충돌(그 뒤 batch 목록을 보인다), 되돌린 트리의 검증 실패(로그 경로를 보인다). 이미 기본 브랜치에서 사라진 PR은 건너뛰고 나머지를 되돌린다. 되돌리기는 사람이 내린 결정이라 에이전트에게 알리지 않고 큐 항목도 바꾸지 않는다. 되돌린 PR의 커밋은 기본 브랜치의 이력에 남아 있어서 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. `chute revert`는 되돌린 PR 번호와 PR마다 revert 커밋의 SHA, 다시 올리는 방법(브랜치에 기본 브랜치를 합친 뒤 `git revert <revert 커밋>`으로 되돌리고 고쳐서 다시 submit한다)을 출력한다. 되돌린 사실은 batch 폴더의 `revert.json`과 `history.jsonl`에 남는다.
+- `chute revert <batch> [--no-verify]`: 그 batch의 merge commit들을 역순으로 `git revert -m 1`로 `origin/<기본 브랜치>` 위에 쌓고, 되돌린 트리를 검증한 뒤 push한다. `--no-verify`는 검증을 건너뛴다. 강제 push로 기본 브랜치를 되감지 않는다. push가 거절되면 새 기준으로 처음부터 다시 하고, 3번까지 시도한다. 아무것도 push하지 않고 종료 코드 1로 끝나는 경우는 다음과 같다. 없는 batch, 머지한 PR이 없는 batch, 이미 되돌린 batch, 기록이 불완전한 batch(데몬이 도중에 멈춰 기록과 `history.jsonl`이 어긋난 경우는 추측하지 않는다), 뒤에 머지된 변경과의 충돌(그 뒤 batch 목록을 보인다), 되돌린 트리의 검증 실패(로그 경로를 보인다). 이미 기본 브랜치에서 사라진 PR은 건너뛰고 나머지를 되돌린다. 되돌리기는 사람이 내린 결정이라 작업자에게 따로 알리지 않고 큐 항목도 바꾸지 않는다. submit한 터미널은 `reverted` 알림을 받는다. 되돌린 PR의 커밋은 기본 브랜치의 이력에 남아 있어서 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. `chute revert`는 되돌린 PR 번호와 PR마다 revert 커밋의 SHA, 다시 올리는 방법(브랜치에 기본 브랜치를 합친 뒤 `git revert <revert 커밋>`으로 되돌리고 고쳐서 다시 submit한다)을 출력한다. 되돌린 사실은 batch 폴더의 `revert.json`과 `history.jsonl`에 남는다.
 
 ### 데몬 멈추기
 
