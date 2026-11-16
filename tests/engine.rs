@@ -2579,6 +2579,8 @@ esac
     for item in items {
         assert_eq!(item["state"], "queued", "{item}");
     }
+    let members = status["batch"]["prs"].as_array().map_or(0, Vec::len);
+    assert_eq!(members, 0, "{}", status["batch"]);
 }
 
 fn lines_with(lab: &Lab, terminal: &str, kind: &str) -> Vec<String> {

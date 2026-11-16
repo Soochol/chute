@@ -1938,6 +1938,9 @@ impl Run<'_> {
                 if self.config.require_ci && self.was_waiting_on_ci.contains(pr) {
                     queue::set_ci_pending(s, *pr)?;
                 }
+                if let Some(batch) = &mut s.batch {
+                    batch.prs.retain(|p| p != pr);
+                }
             }
         }
         Ok(())
