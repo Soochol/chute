@@ -332,12 +332,10 @@ pub struct QueueItem {
     pub submitted_ms: EpochMs,
     pub touches_config: bool,
     pub last_failure: Option<FailureRecord>,
-    /// The terminal that ran `chute submit`. It receives the outcome. `agent` is the worker.
     #[serde(default)]
     pub submitter: Option<Agent>,
     #[serde(default)]
     pub priority: bool,
-    /// PRs that must merge before this one joins a batch.
     #[serde(default)]
     pub after: Vec<PrNumber>,
     #[serde(default)]
@@ -561,27 +559,22 @@ pub struct Blocked {
     pub reason: BlockReason,
     pub base: Sha,
     pub since_ms: EpochMs,
-    /// The verification step that failed on the base. Blocks written before it was kept have none.
     #[serde(default)]
     pub step: Option<String>,
     #[serde(default)]
     pub log: Option<PathBuf>,
-    /// The broken commit is one chute pushed itself.
     #[serde(default)]
     pub pushed_by_chute: bool,
-    /// The base had already been verified and failed when verified again.
     #[serde(default)]
     pub rechecked: bool,
 }
 
-/// What `run_once` knows about how often single PRs failed on one base.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseDoubt {
     pub base: Sha,
     pub prs: Vec<PrNumber>,
 }
 
-/// Where a verification ran: the machine, and what each `env_check` command printed there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvRecord {
     pub machine_id: MachineId,
@@ -657,7 +650,6 @@ pub struct State {
 pub struct MergeRef {
     pub pr: PrNumber,
     pub commit: Sha,
-    /// Who to tell if this merge is reverted. The queue item is gone by then.
     #[serde(default)]
     pub submitter: Option<Agent>,
     #[serde(default)]
@@ -805,7 +797,6 @@ pub enum NotifyKind {
     Flaky,
 }
 
-/// What became of one notification. Only `Sent` reached a terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivered {
