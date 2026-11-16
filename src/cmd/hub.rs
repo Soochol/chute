@@ -96,9 +96,12 @@ fn set_hub(args: &SetArgs, ctx: &Ctx) -> Result<()> {
     }
     let state = store.load()?;
     if !state.queue.is_empty() || state.batch.is_some() {
+        let what = match state.queue.len() {
+            0 => "진행 중인 batch가".to_owned(),
+            n => format!("큐에 항목이 {n}개"),
+        };
         return Err(Refusal(format!(
-            "이 PC의 큐에 항목이 {}개 남아 있다. 허브를 옮기면 이 항목들을 잃는다. 머지되거나 `chute drop`으로 빠질 때까지 기다린다",
-            state.queue.len()
+            "이 PC에 {what} 남아 있다. 허브를 옮기면 잃는다. 머지되거나 `chute drop`으로 빠지고 batch가 끝날 때까지 기다린다"
         ))
         .into());
     }

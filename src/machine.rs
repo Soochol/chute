@@ -102,7 +102,7 @@ impl Machines {
             }
         };
         AgentView {
-            terminal: agent.terminal.clone(),
+            terminal: self.address(id, &agent.terminal),
             name: agent.name.clone(),
             alive: agent.alive,
             machine_id: Some(id.clone()),
@@ -182,6 +182,11 @@ mod tests {
         };
         let m = machines();
         let home = id("aaa");
+        let terminals: Vec<String> = [None, Some("bbb"), Some("zzz")]
+            .into_iter()
+            .map(|machine| m.agent_view(&home, &agent(machine)).terminal.0)
+            .collect();
+        assert_eq!(terminals, ["t7", "desk/t7", "t7"]);
         let here = m.agent_view(&home, &agent(None));
         assert_eq!(
             (here.machine_id, here.host, here.machine),

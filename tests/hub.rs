@@ -143,6 +143,13 @@ fn hub_set_writes_hub_json_after_the_checks_and_local_undoes_it() {
     assert_eq!(json(&ok(&a.chute(BIN, &["hub", "--json"])))["local"], true);
 }
 
+const BATCH_ONLY: &str = r#"{
+  "queue": [],
+  "batch": {"id": "b1", "base": "abc1234", "prs": [7], "phase": "verifying", "step": null,
+            "round": 1, "started_ms": 1},
+  "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
+}"#;
+
 const QUEUED: &str = r#"{
   "queue": [{
     "pr": 7, "title": "t", "branch": "feat/x", "head": "abc1234",
@@ -236,6 +243,25 @@ fn hub_set_refuses_while_this_pcs_queue_holds_items() {
             .unwrap();
         },
         "큐에 항목이 1개 남아 있다",
+    );
+}
+
+#[test]
+fn hub_set_refuses_while_a_batch_runs_and_says_so() {
+    refused(
+        "batch만 남음",
+        "b",
+        |net| {
+            fs::write(
+                net.node("a")
+                    .sb
+                    .chute_home()
+                    .join("repos/acme__widget/state.json"),
+                BATCH_ONLY,
+            )
+            .unwrap();
+        },
+        "진행 중인 batch가 남아 있다",
     );
 }
 
