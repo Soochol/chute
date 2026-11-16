@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{Ctx, FORWARD_TIMEOUT, REFUSED, forward_to_hub};
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_MAX_PARALLEL};
 use crate::ext::Ext;
 use crate::feedback::{self, Feedback, Subject, Written};
 use crate::gitops::{FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, Slot};
@@ -136,8 +136,18 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .filter(|item| Some(item.branch.as_str()) != target.branch.as_deref())
         .collect();
 
-    let gitops = Gitops::new(&ctx.ext, &ctx.home, &info);
-    let slot = gitops.lock_preflight_slot()?.open()?;
+    let last_fetched_config =
+        Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)
+            .ok()
+            .flatten();
+    let max_parallel = last_fetched_config
+        .as_ref()
+        .map_or(DEFAULT_MAX_PARALLEL, |c| c.max_parallel);
+    let seed = last_fetched_config
+        .map(|c| c.cache.seed)
+        .unwrap_or_default();
+    let gitops = Gitops::new(&ctx.ext, &ctx.home, &info).with_cache_seed(seed);
+    let slot = gitops.lock_preflight_slot(max_parallel)?.open()?;
     let base = slot.fetch_base()?;
     let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)?
         .ok_or_else(|| {
@@ -492,6 +502,7 @@ impl Run<'_> {
     fn run_steps(&self, log_dir: &Path) -> Result<Outcome> {
         let on_step = |name: &str| eprintln!("검증 단계: {name}");
         let options = Options {
+            cache_dir: Some(self.gitops.cache_dir()),
             on_step: Some(&on_step),
             ..Options::default()
         };

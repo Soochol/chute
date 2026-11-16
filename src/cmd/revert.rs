@@ -9,8 +9,10 @@ use crate::engine::VERIFIED_BASES_KEPT;
 use crate::gitops::{Gitops, PushOutcome, Slot, SlotName};
 use crate::hub::{Route, route};
 use crate::model::{
-    BatchId, EpochMs, Event, EventKind, MergeRef, PrNumber, RepoInfo, RevertRecord, RevertedPr, Sha,
+    Agent, BatchId, EpochMs, Event, EventKind, MergeRef, PrNumber, RepoInfo, RevertRecord,
+    RevertedPr, Sha,
 };
+use crate::notify::{Line, Notifier};
 use crate::store::RepoStore;
 use crate::verify::{self, Options, Outcome};
 
@@ -136,6 +138,7 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
                     )
                 })?;
                 print!("{}", report(&info, &id, &record, &done.skipped, true));
+                tell_submitters(ctx, &info, &store, &id, &record, &targets);
                 return Ok(());
             }
         }
@@ -143,6 +146,36 @@ fn revert(args: &Args, ctx: &Ctx) -> Result<()> {
     refuse(format!(
         "main이 계속 움직여 {PUSH_TRIES}번 시도하고도 올리지 못했다. 아무것도 올리지 않았다. 잠시 뒤 다시 실행한다"
     ))
+}
+
+fn tell_submitters(
+    ctx: &Ctx,
+    info: &RepoInfo,
+    store: &RepoStore,
+    id: &BatchId,
+    record: &RevertRecord,
+    targets: &[MergeRef],
+) {
+    let submitter_of = |pr: PrNumber| -> Option<&Agent> {
+        targets
+            .iter()
+            .find(|t| t.pr == pr)
+            .and_then(|t| t.submitter.as_ref())
+    };
+    let reverted: Vec<(Option<&Agent>, PrNumber)> = record
+        .prs
+        .iter()
+        .map(|p| (submitter_of(p.pr), p.pr))
+        .collect();
+    Notifier::new(&ctx.ext, info, store).notify_each(&reverted, record.at_ms, |prs| {
+        let mut prs = prs.to_vec();
+        prs.sort();
+        Line::Reverted {
+            batch: id.clone(),
+            prs,
+            commit: record.tip.clone(),
+        }
+    });
 }
 
 fn revertable(batch: &Loaded) -> Result<Vec<MergeRef>> {

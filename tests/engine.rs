@@ -1245,3 +1245,241 @@ fn recovery_tells_history_about_a_bounce_the_record_has_and_the_history_lacks() 
     assert_eq!(lab.bounced_events(), [(1, BounceReason::Verify)]);
     assert_eq!(chute_status(&lab)["today"]["bounced"], 1);
 }
+
+fn words(line: &str) -> Vec<String> {
+    line.split_whitespace().map(str::to_owned).collect()
+}
+
+fn has_key(line: &str, pair: &str) -> bool {
+    words(line).iter().any(|w| w == pair)
+}
+
+#[test]
+fn notify_the_orchestrator_hears_a_merge_and_the_worker_does_not() {
+    let lab = Lab::new("");
+    let head = lab.push_pr_branch(1, &[("a.txt", "a\n")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let heard = lab.lines_sent_to("t1orch");
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].starts_with("chute 결과 merged slug=acme/widget at="),
+        "{}",
+        heard[0]
+    );
+    assert!(has_key(&heard[0], "pr=1"), "{}", heard[0]);
+    assert!(has_key(
+        &heard[0],
+        &format!("head={}", &head.as_str()[..12])
+    ));
+    assert!(lab.lines_sent_to("t1rs").is_empty());
+    assert_eq!(
+        lab.notified(),
+        [(
+            chute::model::NotifyKind::Merged,
+            chute::model::Delivered::Sent
+        )]
+    );
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.merges[0].submitter, Some(lab.orchestrator()));
+    assert_eq!(record.merges[0].agent, Some(lab.agent()));
+}
+
+#[test]
+fn notify_a_merge_without_a_submitter_is_only_recorded() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    assert!(lab.hc_calls("send").is_empty());
+    assert_eq!(
+        lab.notified(),
+        [(
+            chute::model::NotifyKind::Merged,
+            chute::model::Delivered::NoTerminal
+        )]
+    );
+}
+
+#[test]
+fn notify_a_bounce_goes_to_the_worker_and_a_summary_to_the_orchestrator() {
+    let lab = Lab::new(BAD);
+    let head = lab.push_pr_branch(1, &[("BAD", "")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+
+    done(lab.engine().run_once().unwrap());
+
+    let worker = lab.lines_sent_to("t1rs");
+    assert_eq!(worker.len(), 1, "{worker:?}");
+    assert!(worker[0].starts_with("chute 반송:"), "{}", worker[0]);
+    let orch = lab.lines_sent_to("t1orch");
+    assert_eq!(orch.len(), 1, "{orch:?}");
+    assert!(orch[0].starts_with("chute 결과 bounced slug=acme/widget at="));
+    for pair in [
+        "pr=1",
+        "reason=verify",
+        "mode=solo",
+        "attempts=1",
+        "budget=3",
+        "to=t1rs",
+        "delivered=sent",
+    ] {
+        assert!(has_key(&orch[0], pair), "{pair}: {}", orch[0]);
+    }
+    let report = lab.item(1).unwrap().last_failure.unwrap().report;
+    assert!(
+        has_key(&orch[0], &format!("report={}", report.display())),
+        "{}",
+        orch[0]
+    );
+}
+
+#[test]
+fn notify_a_worker_that_submitted_for_itself_gets_the_bounce_line_only() {
+    let lab = Lab::new(BAD);
+    let head = lab.push_pr_branch(1, &[("BAD", "")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(lab.hc_calls("send").len(), 1);
+    assert!(lab.lines_sent_to("t1rs")[0].starts_with("chute 반송:"));
+    assert_eq!(
+        lab.notified(),
+        [(
+            chute::model::NotifyKind::Bounced,
+            chute::model::Delivered::SameAsAgent
+        )]
+    );
+}
+
+#[test]
+fn notify_a_spent_budget_is_a_human_line_and_not_a_bounce_line() {
+    let lab = Lab::new(BAD);
+    let head = lab.push_pr_branch(1, &[("BAD", "")]);
+    let submit = |lab: &Lab| {
+        lab.queue_pr_by(
+            1,
+            &head,
+            Some(lab.agent()),
+            Some(lab.orchestrator()),
+            Approval::Agent,
+        )
+    };
+    for _ in 0..3 {
+        submit(&lab);
+        done(lab.engine().run_once().unwrap());
+    }
+    assert_eq!(lab.lines_sent_to("t1orch").len(), 3);
+
+    submit(&lab);
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::NeedsHuman(HumanReason::Budget))
+    );
+    let orch = lab.lines_sent_to("t1orch");
+    assert_eq!(orch.len(), 4, "{orch:?}");
+    assert!(orch[3].starts_with("chute 결과 human slug=acme/widget at="));
+    assert!(has_key(&orch[3], "pr=1") && has_key(&orch[3], "reason=budget"));
+    assert_eq!(lab.lines_sent_to("t1rs").len(), 3);
+}
+
+#[test]
+fn notify_a_bounce_that_cannot_be_delivered_is_a_human_line_for_the_orchestrator() {
+    let lab = Lab::new(BAD);
+    let hc = lab.sb.fake("hc");
+    hc.respond(
+        "get t1gone --json",
+        Reply::ok(r#"{"address":"t1gone","state":"finished","created_ms":1763188200000}"#),
+    );
+    let mut gone = lab.agent();
+    gone.terminal = chute::model::TerminalId("t1gone".into());
+    let head = lab.push_pr_branch(1, &[("BAD", "")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(gone),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::NeedsHuman(HumanReason::Unreachable))
+    );
+    let orch = lab.lines_sent_to("t1orch");
+    assert_eq!(orch.len(), 1, "{orch:?}");
+    assert!(orch[0].starts_with("chute 결과 human "), "{}", orch[0]);
+    assert!(has_key(&orch[0], "reason=unreachable"), "{}", orch[0]);
+}
+
+#[test]
+fn notify_a_halt_reaches_every_submitting_terminal_once() {
+    let lab = Lab::new("[ -e BASEBAD ] && fail \"기준이 깨졌다\"");
+    lab.main_commit(&[("BASEBAD", "")], "feat: broken");
+    for n in 1..=3 {
+        let head = lab.push_pr_branch(n, &[(&format!("f{n}.txt"), "x\n")]);
+        let submitter = if n == 3 {
+            lab.agent()
+        } else {
+            lab.orchestrator()
+        };
+        lab.queue_pr_by(
+            n,
+            &head,
+            Some(lab.agent()),
+            Some(submitter),
+            Approval::Agent,
+        );
+    }
+    let head = lab.push_pr_branch(4, &[("f4.txt", "x\n")]);
+    lab.queue_pr(4, &head, None, Approval::Agent);
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+
+    let orch = lab.lines_sent_to("t1orch");
+    assert_eq!(orch.len(), 1, "{orch:?}");
+    assert!(orch[0].starts_with("chute 결과 halted slug=acme/widget at="));
+    assert!(has_key(
+        &orch[0],
+        &format!("base={}", &lab.origin_main()[..12])
+    ));
+    for key in [
+        "step=",
+        "pushed_by_chute=",
+        "rechecked=",
+        "log=",
+        "suspect=",
+    ] {
+        assert!(!orch[0].contains(key), "{key}: {}", orch[0]);
+    }
+    assert_eq!(lab.lines_sent_to("t1rs").len(), 1);
+    assert!(lab.bounced_events().is_empty());
+}

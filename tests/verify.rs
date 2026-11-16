@@ -1371,3 +1371,34 @@ fn flaky_names_come_from_the_whole_first_log() {
     let flaky = passed(rig.run(&cfg, &Options::default()));
     assert_eq!(flaky[0].tests, ["early"]);
 }
+
+#[test]
+fn cache_dir_is_created_and_handed_to_every_step() {
+    let rig = Rig::new();
+    let cache = rig.sb.root().join("shared/cache");
+    let mark = rig.mark("cache-seen");
+    let script = format!(
+        "test -d \"$CHUTE_CACHE_DIR\" && printf %s \"$CHUTE_CACHE_DIR\" >> {}",
+        mark.display()
+    );
+    let config = config(
+        vec![step("one", script.clone()), step("two", script)],
+        false,
+    );
+    let opts = Options {
+        cache_dir: Some(cache.clone()),
+        ..Options::default()
+    };
+
+    assert!(passed(rig.run(&config, &opts)).is_empty());
+
+    let seen = fs::read_to_string(mark).unwrap();
+    assert_eq!(seen, format!("{0}{0}", cache.display()));
+}
+
+#[test]
+fn cache_dir_is_not_set_for_a_run_without_one() {
+    let rig = Rig::new();
+    let config = config(vec![step("one", "test -z \"${CHUTE_CACHE_DIR+x}\"")], false);
+    assert!(passed(rig.run(&config, &Options::default())).is_empty());
+}

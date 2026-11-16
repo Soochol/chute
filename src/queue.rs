@@ -251,6 +251,7 @@ pub struct Submission {
     pub branch: String,
     pub head: Sha,
     pub agent: Option<Agent>,
+    pub submitter: Option<Agent>,
     pub touches_config: bool,
     pub approval: Approval,
     pub now: EpochMs,
@@ -295,7 +296,7 @@ pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionE
             submitted_ms: s.now,
             touches_config: s.touches_config,
             last_failure: None,
-            submitter: None,
+            submitter: s.submitter,
             priority: false,
             after: Vec::new(),
             repair: false,
@@ -317,6 +318,9 @@ pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionE
             needs_approval,
         },
     )?;
+    if s.submitter.is_some() {
+        item.submitter = s.submitter;
+    }
     let change = match (was_bounced, head_changed) {
         (true, _) => Change::Requeued,
         (false, true) => Change::HeadUpdated,
@@ -1044,10 +1048,38 @@ mod tests {
             branch: format!("feat/{pr}"),
             head: sha(head),
             agent: None,
+            submitter: None,
             touches_config,
             approval,
             now: EpochMs(1000 + pr),
         }
+    }
+
+    #[test]
+    fn a_resubmit_takes_the_new_submitter_for_any_state_and_keeps_the_old_one_when_none_is_given() {
+        let mut state = State::default();
+        let mut first = submission(1, "abc1234", Approval::Agent, false);
+        first.submitter = Some(agent("t1orch"));
+        submit(&mut state, first).unwrap();
+        assert_eq!(
+            state.queue[0].submitter.as_ref().unwrap().terminal.0,
+            "t1orch"
+        );
+
+        let mut same_head = submission(1, "abc1234", Approval::Agent, false);
+        same_head.submitter = Some(agent("t1other"));
+        let done = submit(&mut state, same_head).unwrap();
+        assert_eq!(done.change, Change::Unchanged);
+        assert_eq!(
+            state.queue[0].submitter.as_ref().unwrap().terminal.0,
+            "t1other"
+        );
+
+        submit(&mut state, submission(1, "def5678", Approval::Agent, false)).unwrap();
+        assert_eq!(
+            state.queue[0].submitter.as_ref().unwrap().terminal.0,
+            "t1other"
+        );
     }
 
     #[test]

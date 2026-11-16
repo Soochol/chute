@@ -30,8 +30,10 @@ fn probe_in_threads(store: &Arc<RepoStore>) -> Vec<thread::JoinHandle<usize>> {
 mod slots {
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     use chute::ext::Ext;
     use chute::gitops::{Gitops, SlotName};
@@ -85,22 +87,57 @@ mod slots {
     }
 
     #[test]
-    fn preflight_takes_the_first_free_slot_and_numbers_a_new_one_when_all_are_held() {
+    fn preflight_takes_the_first_free_slot_and_waits_for_one_when_max_parallel_are_held() {
         let dir = tempfile::tempdir().unwrap();
         let git = gitops(dir.path());
 
-        let first = git.lock_preflight_slot().unwrap();
-        let second = git.lock_preflight_slot().unwrap();
-        let third = git.lock_preflight_slot().unwrap();
+        let first = git.lock_preflight_slot(2).unwrap();
+        let second = git.lock_preflight_slot(2).unwrap();
         assert_eq!(first.name(), SlotName::Preflight(1));
         assert_eq!(second.name(), SlotName::Preflight(2));
-        assert_eq!(third.name(), SlotName::Preflight(3));
+
+        let (tx, rx) = mpsc::channel();
+        let waiter = {
+            let git = git.clone();
+            thread::spawn(move || tx.send(git.lock_preflight_slot(2).unwrap().name()))
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(600)).is_err());
+        assert!(
+            !dir.path()
+                .join("slots/acme__widget/preflight-3.lock")
+                .exists()
+        );
 
         drop(second);
         assert_eq!(
-            git.lock_preflight_slot().unwrap().name(),
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
             SlotName::Preflight(2)
         );
+        waiter.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_slot_is_free_when_nobody_holds_it_and_its_name_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = gitops(dir.path());
+        let held = git.lock_slot(SlotName::Preflight(3)).unwrap().unwrap();
+        assert!(!git.slot_is_free(SlotName::Preflight(3)).unwrap());
+        assert!(git.slot_is_free(SlotName::Preflight(4)).unwrap());
+        drop(held);
+        assert!(git.slot_is_free(SlotName::Preflight(3)).unwrap());
+
+        for name in [SlotName::Batch, SlotName::Revert, SlotName::Preflight(12)] {
+            assert_eq!(SlotName::parse(&name.to_string()), Some(name));
+        }
+        for text in [
+            "preflight-0",
+            "preflight-01",
+            "preflight-",
+            "preflight-x",
+            "cache",
+        ] {
+            assert_eq!(SlotName::parse(text), None, "{text}");
+        }
     }
 
     #[test]
@@ -112,7 +149,7 @@ mod slots {
             .map(|_| {
                 let (git, barrier) = (git.clone(), Arc::clone(&barrier));
                 thread::spawn(move || {
-                    let lock = git.lock_preflight_slot().unwrap();
+                    let lock = git.lock_preflight_slot(6).unwrap();
                     barrier.wait();
                     lock.name()
                 })

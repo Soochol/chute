@@ -52,6 +52,8 @@ pub struct Options<'a> {
     pub rerun_on_exit_failure: bool,
     pub cancel: Cancel,
     pub kill_grace: Duration,
+    /// Passed to the steps as `CHUTE_CACHE_DIR`; created before the first step.
+    pub cache_dir: Option<PathBuf>,
     /// Called with the step's name as each step starts.
     pub on_step: Option<&'a dyn Fn(&str)>,
 }
@@ -62,6 +64,7 @@ impl Default for Options<'_> {
             rerun_on_exit_failure: true,
             cancel: Cancel::new(),
             kill_grace: Duration::from_secs(5),
+            cache_dir: None,
             on_step: None,
         }
     }
@@ -122,6 +125,9 @@ pub fn run(
         bail!("검증을 돌릴 폴더가 없다: {}", dir.display());
     }
     fs::create_dir_all(log_dir).with_context(|| format!("만들지 못했다: {}", log_dir.display()))?;
+    if let Some(cache) = &opts.cache_dir {
+        fs::create_dir_all(cache).with_context(|| format!("만들지 못했다: {}", cache.display()))?;
+    }
     if opts.cancel.is_cancelled() {
         return Ok(Outcome::Cancelled);
     }
@@ -213,11 +219,16 @@ impl Ctx<'_> {
         let err = out
             .try_clone()
             .with_context(|| format!("로그 파일을 복제하지 못했다: {}", log.display()))?;
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(&step.run)
             .current_dir(self.dir)
-            .env("CHUTE_RUN_ID", &self.run_id)
+            .env("CHUTE_RUN_ID", &self.run_id);
+        if let Some(cache) = &self.opts.cache_dir {
+            command.env("CHUTE_CACHE_DIR", cache);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
