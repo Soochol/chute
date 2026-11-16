@@ -64,3 +64,8 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 ## 시나리오 더하기
 
 `scenarios/NN-이름.sh`를 만들고 `lib.sh`를 읽어 들인다. `sc_setup`이 샌드박스와 터미널을 준비하고 종료 때 정리를 걸어 둔다. `mk_pr`, `submit`, `wait_for`, `check`, `ev_has`, `term_text`를 쓰고 `sc_done`으로 끝낸다. 단언이 하나라도 실패하면 종료 코드 1이다. chute의 결함이 나오면 시나리오에서 우회하지 않는다. 실패한 채로 두고 재현 방법을 보고서에 적는다.
+
+## 알려진 결함
+
+- `12-pr-closed`는 실패한다. chute는 batch를 시작할 때만 PR 상태를 읽는다. 검증 도중 PR을 닫아도 닫힌 PR의 내용이 main에 올라가고 `merged` 사건과 알림이 나간다. chute를 고치면 이 시나리오가 통과해야 한다.
+- `CHUTE_HOME`을 기본 위치가 아닌 곳으로 둔 사용자가 `chute up`이나 `chute submit`으로 데몬을 띄우면, hc 터미널이 `CHUTE_HOME`을 물려받지 못해 데몬이 다른 상태 폴더를 읽을 수 있다. 이 묶음은 `hc` 껍데기로 우회하므로 시나리오는 이것을 잡지 못한다.
