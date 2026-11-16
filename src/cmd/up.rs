@@ -112,9 +112,6 @@ fn launch(ctx: &Ctx, info: &RepoInfo) -> Result<Output> {
 /// `hc run` terminals do not inherit the caller's environment.
 fn daemon_command(home: &Home, ext: &Ext) -> Vec<String> {
     let absolute = |path: &Path| {
-        if path.components().count() == 1 {
-            return path.display().to_string();
-        }
         std::path::absolute(path)
             .unwrap_or_else(|_| path.to_owned())
             .display()
@@ -127,7 +124,13 @@ fn daemon_command(home: &Home, ext: &Ext) -> Vec<String> {
     for tool in Tool::ALL {
         let program = ext.program(tool);
         if program != Path::new(tool.name()) {
-            command.push(format!("{}={}", tool.env_var(), absolute(program)));
+            let named_on_path = program.components().count() == 1;
+            let value = if named_on_path {
+                program.display().to_string()
+            } else {
+                absolute(program)
+            };
+            command.push(format!("{}={value}", tool.env_var()));
         }
     }
     command.extend(["chute", "daemon"].map(str::to_owned));
@@ -186,6 +189,7 @@ mod tests {
             _ => None,
         });
         let command = daemon_command(&Home::at("rel/home"), &ext);
+        let bare_home = daemon_command(&Home::at("chutehome"), &ext);
         let cwd = std::env::current_dir().unwrap();
 
         assert_eq!(command[0], "env");
@@ -196,6 +200,10 @@ mod tests {
         assert_eq!(
             command[2],
             format!("CHUTE_GH={}", cwd.join("bin/gh").display())
+        );
+        assert_eq!(
+            bare_home[1],
+            format!("CHUTE_HOME={}", cwd.join("chutehome").display())
         );
         assert_eq!(command[3], "CHUTE_HC=hc-work");
         assert_eq!(command[4..], ["chute", "daemon"]);
