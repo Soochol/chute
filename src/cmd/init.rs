@@ -17,7 +17,21 @@ const FALLBACK_VERIFY: &str =
     "echo 'chute.toml의 [[verify]] run을 이 저장소의 검사 명령으로 바꾼다' >&2; exit 1";
 
 pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
-    let info = repo::discover(&ctx.ext, &ctx.target_dir()?, &|| ctx.home.repos())?;
+    let dir = ctx.target_dir()?;
+    let info = repo::discover(&ctx.ext, &dir, &|| ctx.home.repos())?;
+    let all = repo::remotes(&ctx.ext, &dir)?;
+    if let Some(chosen) = all.iter().find(|r| r.name == info.remote_name) {
+        let peers = repo::same_url_peers(&all, chosen);
+        if peers.len() > 1 {
+            let names: Vec<&str> = peers.iter().map(|r| r.name.as_str()).collect();
+            println!(
+                "주소가 같은 원격이 {}개({}) 있다. 쓰는 원격: {}",
+                peers.len(),
+                names.join(", "),
+                chosen.name
+            );
+        }
+    }
 
     let config_path = info.path.join(config::FILE_NAME);
     let on_remote = format!(
