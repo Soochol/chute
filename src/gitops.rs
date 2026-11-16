@@ -299,12 +299,16 @@ impl Gitops {
         if self.cache_seed.is_empty() {
             return;
         }
-        let Some(from) = self.last_used_slot(name) else {
-            return;
-        };
+        let donors = self.used_slots_newest_first(name);
         let to = self.slot_path(name);
         for rel in &self.cache_seed {
-            if let Err(e) = self.copy_seed(&from, &to, rel) {
+            let Some(from) = donors
+                .iter()
+                .find(|from| fs::symlink_metadata(from.join(rel)).is_ok())
+            else {
+                continue;
+            };
+            if let Err(e) = self.copy_seed(from, &to, rel) {
                 eprintln!(
                     "경고: 캐시 {rel}를 {}에서 복사하지 못했다: {e:#}",
                     from.display()
@@ -313,9 +317,11 @@ impl Gitops {
         }
     }
 
-    fn last_used_slot(&self, except: SlotName) -> Option<PathBuf> {
-        let mut found: Vec<(SystemTime, PathBuf)> = fs::read_dir(&self.slots_dir)
-            .ok()?
+    fn used_slots_newest_first(&self, except: SlotName) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(&self.slots_dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(SystemTime, PathBuf)> = entries
             .filter_map(|entry| {
                 let file_name = entry.ok()?.file_name();
                 let slot = SlotName::parse(file_name.to_str()?)?;
@@ -330,8 +336,8 @@ impl Gitops {
                 Some((used, path))
             })
             .collect();
-        found.sort();
-        found.pop().map(|(_, path)| path)
+        found.sort_by(|a, b| b.cmp(a));
+        found.into_iter().map(|(_, path)| path).collect()
     }
 
     fn copy_seed(&self, from: &Path, to: &Path, rel: &str) -> Result<()> {
@@ -383,6 +389,10 @@ impl Gitops {
             let _ = remove_tree(&target);
             bail!("{}", String::from_utf8_lossy(&copied.stderr).trim());
         }
+        if let Err(e) = drop_links_leaving(&target, &fs::canonicalize(to)?) {
+            let _ = remove_tree(&target);
+            return Err(anyhow::Error::new(e).context("복사한 링크를 검사하지 못했다"));
+        }
         Ok(())
     }
 
@@ -430,6 +440,38 @@ fn failed_ref(name: &str) -> Result<String> {
         bail!("실패 트리 참조 이름으로 쓸 수 없다: {name:?}");
     }
     Ok(format!("{FAILED_REF_PREFIX}{name}"))
+}
+
+/// Deletes every symlink at or under `entry` whose target is not inside `slot`: a copied
+/// link that still points into the donor slot or elsewhere would let the new slot write there.
+fn drop_links_leaving(entry: &Path, slot: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(entry)?;
+    if meta.file_type().is_symlink() {
+        let link = fs::read_link(entry)?;
+        let parent = fs::canonicalize(entry.parent().unwrap_or(Path::new("/")))?;
+        let mut resolved = PathBuf::new();
+        for part in parent.join(link).components() {
+            match part {
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::CurDir => {}
+                other => resolved.push(other),
+            }
+        }
+        if !resolved.starts_with(slot) {
+            eprintln!(
+                "경고: 슬롯 밖을 가리키는 링크를 지웠다: {}",
+                entry.display()
+            );
+            fs::remove_file(entry)?;
+        }
+    } else if meta.is_dir() {
+        for child in fs::read_dir(entry)? {
+            drop_links_leaving(&child?.path(), slot)?;
+        }
+    }
+    Ok(())
 }
 
 /// `remove_dir_all` cannot empty a directory it may not write to, and a build can leave one.
@@ -1444,6 +1486,94 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(fresh.path().join(".git").is_file());
         assert!(!fresh.path().join("target/locked.bin").exists());
+    }
+
+    #[test]
+    fn seed_drops_links_that_point_out_of_the_new_slot() {
+        let w = World::new();
+        let donor = used_slot(&w, SlotName::Preflight(1), &[("target/a.bin", "a")]);
+        let outside = w.sb.root().join("outside");
+        fs::create_dir_all(outside.join("real")).unwrap();
+        std::os::unix::fs::symlink(&outside, donor.path().join("target/escape")).unwrap();
+        std::os::unix::fs::symlink("a.bin", donor.path().join("target/inside")).unwrap();
+        let into_donor = donor.path().join("target");
+        std::os::unix::fs::symlink(&into_donor, donor.path().join("target/to-donor")).unwrap();
+
+        let fresh = open_seeded(&w, &["target"], SlotName::Preflight(2));
+
+        let target = fresh.path().join("target");
+        assert!(target.join("a.bin").exists());
+        assert!(fs::symlink_metadata(target.join("inside")).is_ok());
+        for gone in ["escape", "to-donor"] {
+            assert!(fs::symlink_metadata(target.join(gone)).is_err(), "{gone}");
+        }
+    }
+
+    #[test]
+    fn seed_path_that_is_a_link_into_the_donor_is_not_copied_as_a_link() {
+        let w = World::new();
+        let donor = used_slot(&w, SlotName::Preflight(1), &[("real/x", "x")]);
+        let exclude = fs::read_to_string(donor.path().join(".gitignore")).unwrap_or_default();
+        fs::write(
+            donor.path().join(".gitignore"),
+            format!("{exclude}cache\nreal\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(donor.path().join("real"), donor.path().join("cache")).unwrap();
+
+        let fresh = open_seeded(&w, &["cache"], SlotName::Preflight(2));
+
+        assert!(fs::symlink_metadata(fresh.path().join("cache")).is_err());
+    }
+
+    #[test]
+    fn seed_falls_back_to_an_older_slot_when_the_newest_has_no_such_path() {
+        let w = World::new();
+        let _warm = used_slot(&w, SlotName::Preflight(1), &[("target/a.bin", "a")]);
+        thread::sleep(Duration::from_millis(20));
+        let _empty = used_slot(&w, SlotName::Preflight(2), &[]);
+
+        let fresh = open_seeded(&w, &["target"], SlotName::Preflight(3));
+
+        assert!(fresh.path().join("target/a.bin").exists());
+    }
+
+    #[test]
+    fn seed_prefers_the_slot_opened_last_not_the_one_created_last() {
+        let w = World::new();
+        let one = used_slot(&w, SlotName::Preflight(1), &[("target/one", "1")]);
+        thread::sleep(Duration::from_millis(20));
+        let _two = used_slot(&w, SlotName::Preflight(2), &[("target/two", "2")]);
+        thread::sleep(Duration::from_millis(20));
+        drop(one);
+        let _one_again = open_seeded(&w, &[], SlotName::Preflight(1));
+
+        let fresh = open_seeded(&w, &["target"], SlotName::Preflight(3));
+
+        assert!(fresh.path().join("target/one").exists());
+        assert!(!fresh.path().join("target/two").exists());
+    }
+
+    #[test]
+    fn seed_failure_of_one_path_does_not_stop_the_next() {
+        let w = World::new();
+        let donor = used_slot(
+            &w,
+            SlotName::Preflight(1),
+            &[("target/locked.bin", "x"), ("cache/ok.bin", "ok")],
+        );
+        fs::write(donor.path().join(".gitignore"), "target/\ncache/\n").unwrap();
+        let locked = donor.path().join("target/locked.bin");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            return; // root reads anything, so cp cannot fail here
+        }
+
+        let fresh = open_seeded(&w, &["target", "cache"], SlotName::Preflight(2));
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(fresh.path().join("cache/ok.bin").exists());
+        assert!(!fresh.path().join("target").exists());
     }
 
     #[test]
