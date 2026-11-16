@@ -1,0 +1,13 @@
+approval = "agent"
+require_head = true
+respawn = []
+
+[flaky]
+probe_repeats = 2
+probe_seconds = 10
+
+[[verify]]
+name = "check"
+run = "sh check.sh"
+timeout = 12
+failed = 'FAIL (\S+)'
