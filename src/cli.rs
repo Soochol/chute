@@ -31,7 +31,7 @@ pub struct Cli {
 pub enum Command {
     /// 저장소에 chute.toml 초안을 쓰고 상태 폴더에 등록한다
     Init(cmd::init::Args),
-    /// 기본 브랜치 + 큐 + 지금 HEAD를 합쳐 검증한다
+    /// 기본 브랜치 + 큐 + 지금 HEAD를 합쳐 이 PC에서 검증한다. 큐는 허브에서 읽는다
     Preflight(cmd::preflight::Args),
     /// PR을 큐에 올린다
     Submit(cmd::submit::Args),
@@ -45,15 +45,15 @@ pub enum Command {
     Retry(cmd::retry::Args),
     /// PR을 큐에서 뺀다
     Drop(cmd::drop::Args),
-    /// 데몬을 hc 터미널로 띄운다
+    /// 데몬을 hc 터미널로 띄운다. 허브가 다른 PC면 허브에 띄운다
     Up(cmd::up::Args),
-    /// 데몬을 지금 batch 뒤(또는 즉시) 멈춘다
+    /// 데몬을 지금 batch 뒤(또는 즉시) 멈춘다. 허브가 다른 PC면 허브의 데몬을 멈춘다
     Down(cmd::down::Args),
-    /// 데몬을 전경에서 돈다
+    /// 데몬을 전경에서 돈다. 허브에서만 돌고 다른 PC에서는 거절한다
     Daemon(cmd::daemon::Args),
     /// 최근 batch 목록을 보인다
     Batches(cmd::batches::Args),
-    /// batch를 되돌린다
+    /// batch를 되돌린다. 허브에서만 실행하고 다른 PC에서는 허브에서 실행할 명령을 알려 준다
     Revert(cmd::revert::Args),
     /// mod와 Codex 스킬 파일을 설치한다
     Install(cmd::install::Args),
