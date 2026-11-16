@@ -1769,7 +1769,7 @@ impl Run<'_> {
                 pushed_by_chute,
                 rechecked,
             });
-            Ok(())
+            self.release_items(s)
         })?;
         let at = engine.history_at(EventKind::Blocked {
             reason: BlockReason::BaseBroken,
@@ -1930,6 +1930,22 @@ impl Run<'_> {
         Ok(())
     }
 
+    fn release_items(&self, s: &mut State) -> Result<()> {
+        for pr in self.items.keys() {
+            let held = s.queue.iter().find(|i| i.pr == *pr);
+            if held.is_some_and(|i| i.state == ItemState::InBatch) {
+                queue::requeue(s, *pr)?;
+                if self.config.require_ci && self.was_waiting_on_ci.contains(pr) {
+                    queue::set_ci_pending(s, *pr)?;
+                }
+                if let Some(batch) = &mut s.batch {
+                    batch.prs.retain(|p| p != pr);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn wind_down(&mut self) -> Result<()> {
         let engine = self.engine;
         let now = EpochMs::now();
@@ -1948,22 +1964,8 @@ impl Run<'_> {
                 verify_s: self.record.verify_s,
             })?;
         }
-        let prs: Vec<PrNumber> = self.items.keys().copied().collect();
-        let keep_marks = if self.config.require_ci {
-            self.was_waiting_on_ci.clone()
-        } else {
-            BTreeSet::new()
-        };
         engine.store.update(|s| {
-            for pr in &prs {
-                let held = s.queue.iter().find(|i| i.pr == *pr);
-                if held.is_some_and(|i| i.state == ItemState::InBatch) {
-                    queue::requeue(s, *pr)?;
-                    if keep_marks.contains(pr) {
-                        queue::set_ci_pending(s, *pr)?;
-                    }
-                }
-            }
+            self.release_items(s)?;
             s.batch = None;
             Ok(())
         })?;

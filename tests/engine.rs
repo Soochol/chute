@@ -2533,6 +2533,56 @@ fn halted_lab() -> Lab {
     lab
 }
 
+#[test]
+fn halt_the_state_read_when_the_halted_line_goes_out_is_blocked_with_the_items_queued() {
+    let lab = Lab::new(BROKEN_BASE);
+    lab.main_commit(&[("BASEBAD", "")], "feat: broken");
+    queue_for_worker(&lab, 1);
+    let head = lab.push_pr_branch(2, &[("f2.txt", "x\n")]);
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+    let at_send = lab.sb.root().join("status-at-send.json");
+    let hc = lab.sb.script(
+        "hc",
+        &format!(
+            r#"case "$1 $2" in
+  "get t1rs") cat '{rs}' ;;
+  "get t1orch") echo '{{"address":"t1orch","name":"orch","state":"live","created_ms":{orch}}}' ;;
+  "send "*) [ -e '{at_send}' ] || env CHUTE_HOME='{home}' HOME='{user}' CHUTE_GIT='{git}' '{chute}' status --json --repo '{repo}' > '{at_send}' ;;
+  *) exit 97 ;;
+esac
+"#,
+            rs = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hc/get.json"),
+            orch = engine_kit::ORCH_CREATED_MS,
+            at_send = at_send.display(),
+            home = lab.sb.chute_home().display(),
+            user = lab.sb.home().display(),
+            git = lab.sb.root().join("bin/git").display(),
+            chute = env!("CARGO_BIN_EXE_chute"),
+            repo = lab.repo.path().display(),
+        ),
+    );
+    assert!(hc.exists());
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+
+    let status: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&at_send).expect("알림이 나갔다")).unwrap();
+    assert_eq!(status["blocked"]["reason"], "base_broken");
+    let items = status["queue"].as_array().expect("queue 목록");
+    assert_eq!(items.len(), 2, "{status}");
+    for item in items {
+        assert_eq!(item["state"], "queued", "{item}");
+    }
+    let members = status["batch"]["prs"].as_array().map_or(0, Vec::len);
+    assert_eq!(members, 0, "{}", status["batch"]);
+}
+
 fn lines_with(lab: &Lab, terminal: &str, kind: &str) -> Vec<String> {
     lab.lines_sent_to(terminal)
         .into_iter()
