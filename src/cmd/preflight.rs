@@ -18,6 +18,7 @@ use crate::model::{
     NonEmpty, Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView,
     StepFailure, VerifyMode,
 };
+use crate::pc_limit::Wait;
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
@@ -597,6 +598,11 @@ impl Run<'_> {
         };
         let skipped = RefCell::new(Vec::new());
         let on_step = |name: &str| eprintln!("검증 단계: {name}");
+        let on_machine_wait = |wait: Wait| {
+            if let Wait::Begin { running } = wait {
+                eprintln!("이 PC에서 검증 {running}개가 돌고 있어 기다린다");
+            }
+        };
         let on_skip = |name: &str| {
             eprintln!("건너뛴 검증 단계: {name} (바뀐 파일이 paths에 없다)");
             skipped.borrow_mut().push(name.to_owned());
@@ -604,6 +610,7 @@ impl Run<'_> {
         let options = Options {
             cache_dir: Some(self.gitops.cache_dir()),
             on_step: Some(&on_step),
+            on_machine_wait: Some(&on_machine_wait),
             changed: changed.as_deref(),
             on_skip: Some(&on_skip),
             ..Options::default()

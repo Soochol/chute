@@ -48,6 +48,7 @@ impl Home {
 
     pub fn repo(&self, slug: &Slug) -> RepoStore {
         RepoStore {
+            home: self.root.clone(),
             dir: self.root.join("repos").join(slug.dir_name()),
         }
     }
@@ -94,6 +95,7 @@ const TAKEN_FILE: &str = "taken.json";
 
 #[derive(Clone, Debug)]
 pub struct RepoStore {
+    home: PathBuf,
     dir: PathBuf,
 }
 
@@ -116,6 +118,10 @@ const DAEMON_LOCK_PAUSE: Duration = Duration::from_millis(10);
 impl RepoStore {
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn home_dir(&self) -> &Path {
+        &self.home
     }
 
     pub fn batch_dir(&self, id: &BatchId) -> PathBuf {

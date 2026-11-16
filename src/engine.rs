@@ -28,6 +28,7 @@ use crate::model::{
     StepFailure, VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
+use crate::pc_limit::Wait;
 use crate::queue;
 use crate::store::{Home, RepoStore};
 use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome};
@@ -653,6 +654,7 @@ impl Engine {
                     step: None,
                     round: 0,
                     started_ms: EpochMs::now(),
+                    waiting_machine: false,
                 });
             }
             let items = prs
@@ -1402,6 +1404,14 @@ impl Run<'_> {
                 Ok(())
             });
         };
+        let on_machine_wait = |wait: Wait| {
+            let _ = engine.store.update(|s| {
+                if let Some(batch) = &mut s.batch {
+                    batch.waiting_machine = matches!(wait, Wait::Begin { .. });
+                }
+                Ok(())
+            });
+        };
         let log_dir = engine
             .store
             .batch_dir(self.id())
@@ -1422,6 +1432,7 @@ impl Run<'_> {
                 cancel: engine.cancel.clone(),
                 cache_dir: Some(engine.gitops.cache_dir()),
                 on_step: Some(&on_step),
+                on_machine_wait: Some(&on_machine_wait),
                 changed: changed.as_deref(),
                 on_skip: Some(&on_skip),
                 ..Options::default()

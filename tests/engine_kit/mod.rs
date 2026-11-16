@@ -462,6 +462,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
                     step: Some("check".into()),
                     round: 1,
                     started_ms: EpochMs::now(),
+                    waiting_machine: false,
                 });
                 Ok(())
             })

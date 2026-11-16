@@ -557,6 +557,9 @@ pub struct Batch {
     pub step: Option<String>,
     pub round: u32,
     pub started_ms: EpochMs,
+    /// True while verification waits for a free PC slot (`machine.toml`'s `max_verify`).
+    #[serde(default)]
+    pub waiting_machine: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -261,6 +261,41 @@ fn two_prs_that_only_fail_together_bounce_the_later_one_as_a_combination() {
 }
 
 #[test]
+fn a_batch_waits_for_a_pc_slot_shows_it_in_the_state_and_then_merges() {
+    let lab = Lab::new("");
+    std::fs::write(lab.sb.chute_home().join("machine.toml"), "max_verify = 1\n").unwrap();
+    let held = chute::pc_limit::acquire(&lab.sb.chute_home(), &chute::verify::Cancel::new(), None)
+        .unwrap();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    let watcher = {
+        let store = lab.store.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut seen = false;
+            while !seen && Instant::now() < deadline {
+                seen = store
+                    .load()
+                    .unwrap()
+                    .batch
+                    .is_some_and(|batch| batch.waiting_machine);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(held);
+            seen
+        })
+    };
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert!(
+        watcher.join().unwrap(),
+        "batch가 PC 자리를 기다리는 중으로 보이지 않았다"
+    );
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(lab.state().batch.is_none());
+}
+
+#[test]
 fn a_step_that_fails_once_and_then_passes_is_flaky_and_merges() {
     let lab = Lab::new(
         "m='@ROOT@/flaky-marker'\nif [ ! -e \"$m\" ]; then touch \"$m\"; fail \"FAILED flaky_test\"; fi",
@@ -1126,6 +1161,7 @@ fn a_finished_event_already_written_is_not_written_again() {
                 step: None,
                 round: 1,
                 started_ms: chute::model::EpochMs::now(),
+                waiting_machine: false,
             });
             Ok(())
         })

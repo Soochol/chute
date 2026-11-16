@@ -299,3 +299,27 @@ fn skill_description_names_every_message_an_agent_can_receive() {
         assert!(description.contains(&format!("`{prefix}`")), "{prefix}");
     }
 }
+
+#[test]
+fn docs_describe_the_pc_wide_verify_limit_the_code_enforces() {
+    let readme = readme();
+    for needed in [
+        "`machine.toml`",
+        "`max_verify`",
+        "$CHUTE_HOME/machine/verify-<k>.lock",
+        "PC 자리를 기다리는 중",
+        "batch.waiting_machine",
+    ] {
+        assert!(readme.contains(needed), "README에 `{needed}`가 없다");
+    }
+    assert_eq!(chute::pc_limit::DEFAULT_MAX_VERIFY, 3);
+    assert!(readme.contains("파일이 없으면 3"));
+    let code = source();
+    for text in [
+        "이 PC에서 검증 {running}개가 돌고 있어 기다린다",
+        "PC 자리를 기다리는 중",
+    ] {
+        assert!(code.contains(text), "코드에 `{text}`가 없다");
+    }
+    assert!(manual().contains("이 PC에서 검증 N개가 돌고 있어 기다린다"));
+}

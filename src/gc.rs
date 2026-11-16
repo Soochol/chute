@@ -687,6 +687,7 @@ mod tests {
                     step: None,
                     round: 1,
                     started_ms: EpochMs(1),
+                    waiting_machine: false,
                 });
                 s.blocked = Some(Blocked {
                     reason: BlockReason::BaseBroken,

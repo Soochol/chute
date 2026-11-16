@@ -40,7 +40,8 @@
     "phase": "verifying",
     "step": "test",
     "round": 1,
-    "started_ms": 1794724200000
+    "started_ms": 1794724200000,
+    "waiting_machine": false
   },
   "queue": [
     {

@@ -277,6 +277,7 @@ function batchOf(batch, members, now) {
       prs,
       phase: b.phase == null ? null : named(PHASE, b.phase),
       step: str(b.step) || null,
+      waitingMachine: b.waiting_machine === true,
       round: Number.isFinite(b.round) && b.round > 0 ? `${b.round}번째 검증` : null,
       elapsed: Number.isFinite(b.started_ms) ? formatDuration(Math.max(0, (now - b.started_ms) / 1000)) : null,
     },
