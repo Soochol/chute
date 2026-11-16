@@ -150,7 +150,7 @@ fn parse_since(text: &str, now: EpochMs) -> Result<EpochMs> {
             Ok(ms) => Ok(EpochMs(ms)),
             Err(_) => bail!("--since `{text}`가 1970년보다 앞선다"),
         },
-        Err(e) => bail!("--since `{text}`를 읽지 못했다 ({e}). {HINT}"),
+        Err(_) => bail!("--since `{text}`를 읽지 못했다. {HINT}"),
     }
 }
 
@@ -425,6 +425,7 @@ mod tests {
         ] {
             let message = since(bad).unwrap_err().to_string();
             assert!(message.contains("--since"), "{bad:?}: {message}");
+            assert!(!message.contains("input"), "{bad:?}: {message}");
         }
         assert!(since("5w").unwrap_err().to_string().contains("m, h, d"));
         assert!(
