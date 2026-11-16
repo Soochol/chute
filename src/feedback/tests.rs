@@ -167,6 +167,27 @@ impl Lab {
             .respond("get t1new*", terminal("t1new", "live", OTHER_MS));
     }
 
+    fn stub_head_repository(&self, owner: &str, name: &str) {
+        self.sb.fake("gh").respond(
+            "pr view *",
+            Reply::ok(format!(
+                "{{\"headRepository\":{{\"name\":\"{name}\"}},\"headRepositoryOwner\":{{\"login\":\"{owner}\"}}}}"
+            )),
+        );
+    }
+
+    fn make_origin_a_fork(&mut self) {
+        let fork = self.sb.root().join("clones/me/widget.git");
+        let fork_s = fork.to_string_lossy().into_owned();
+        let from = self.repo.origin().to_string_lossy().into_owned();
+        self.repo
+            .git(&["clone", "--quiet", "--bare", &from, &fork_s]);
+        self.repo.git(&["remote", "add", "fork", &fork_s]);
+        self.repo.git(&["remote", "rename", "origin", "upstream"]);
+        self.repo.git(&["remote", "rename", "fork", "origin"]);
+        self.info.remote_name = "upstream".into();
+    }
+
     fn bounced(&self, item: &QueueItem) -> Written {
         self.fb()
             .write_report(&Subject::from(item), &self.solo(&["a::b"]), None)
@@ -888,6 +909,7 @@ fn a_terminal_state_chute_does_not_know_is_not_taken_for_gone() {
 #[test]
 fn the_new_agent_is_started_in_the_background_without_a_parent_or_herdr_labels() {
     let lab = Lab::new();
+    lab.stub_head_repository("acme", "widget");
     lab.repo.pr_branch("feat/a", "a.txt", "a\n");
     let item = lab.item(12, "feat/a");
     lab.stub_spawn();
@@ -929,6 +951,44 @@ fn the_new_agent_is_started_in_the_background_without_a_parent_or_herdr_labels()
     assert_eq!(agent.name.as_deref(), Some("chute-widget-pr12"));
     assert_eq!(agent.workdir, lab.run_cwd());
     assert!(agent.alive);
+}
+
+#[test]
+fn the_first_task_names_the_remote_that_holds_the_pr_branch_in_a_fork_checkout() {
+    let mut lab = Lab::new();
+    lab.make_origin_a_fork();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    lab.repo.git(&["push", "origin", "feat/a"]);
+    lab.stub_head_repository("me", "widget");
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let run = lab.run_call();
+    let task = run.last().unwrap();
+    assert!(task.contains("`git fetch origin`"), "{task}");
+    assert!(task.contains("`git push -u origin <브랜치>`"), "{task}");
+    assert!(!task.contains("upstream"), "{task}");
+}
+
+#[test]
+fn the_first_task_names_no_remote_when_none_holds_the_pr_head_repository() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/a", "a.txt", "a\n");
+    lab.stub_head_repository("someone", "elsewhere");
+    let item = lab.item(12, "feat/a");
+    lab.stub_spawn();
+    let written = lab.bounced(&item);
+
+    lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    let run = lab.run_call();
+    let task = run.last().unwrap();
+    assert!(task.contains("PR 브랜치가 있는 원격으로"), "{task}");
+    assert!(!task.contains("origin"), "{task}");
+    assert!(!task.contains("git push -u"), "{task}");
 }
 
 #[test]
