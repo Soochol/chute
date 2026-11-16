@@ -284,6 +284,8 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             submitter,
             touches_config: false,
             approval,
+            priority: false,
+            after: Vec::new(),
             now: EpochMs::now(),
         };
         self.store

@@ -10,8 +10,11 @@ use crate::config::{self, Config};
 use crate::ext::Ext;
 use crate::hub::{self, Forwarded, Route};
 use crate::machine;
-use crate::model::{Agent, EpochMs, ItemState, MachineId, PrNumber, RepoInfo, Sha, TerminalId};
+use crate::model::{
+    Agent, EpochMs, Event, EventKind, ItemState, MachineId, PrNumber, RepoInfo, Sha, TerminalId,
+};
 use crate::queue::{self, Change, Submission};
+use crate::store::RepoStore;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -23,9 +26,18 @@ pub struct Args {
     /// 확인한 커밋. GitHub의 PR HEAD가 이 값과 다르면 거절한다. 7자 이상의 짧은 SHA도 된다
     #[arg(long, value_name = "SHA", value_parser = parse_head)]
     pub head: Option<Sha>,
+    /// 급한 PR로 표시해 batch에 먼저 넣는다. 사용자의 승인 범위 안에서만 쓴다
+    #[arg(long)]
+    pub priority: bool,
+    /// 이 PR이 머지된 뒤에 batch에 넣는다. 여러 번 줄 수 있다
+    #[arg(long, value_name = "PR")]
+    pub after: Vec<PrNumber>,
     /// 결과를 JSON으로 출력한다
     #[arg(long)]
     pub json: bool,
+    /// Set by a PC that filled in `--head` itself, so the hub still sees a submit without one.
+    #[arg(long, hide = true)]
+    pub relayed_no_head: bool,
     #[arg(long, hide = true, value_name = "JSON", value_parser = parse_relayed)]
     pub relayed_agent: Option<Relayed>,
     #[arg(long, hide = true, value_name = "JSON", value_parser = parse_relayed)]
@@ -77,11 +89,15 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
         }
     }
     let config = load_default_branch_config(ctx, &info)?;
+    if config.require_head && (args.head.is_none() || args.relayed_no_head) {
+        return Err(Refusal(REQUIRE_HEAD_MESSAGE.to_owned()).into());
+    }
     let pr = read_pr(ctx, &dir, args.pr)?;
     check_open_and_ready(&pr, &info)?;
     if let Some(head) = &args.head {
         check_head(&pr, head)?;
     }
+    let after = resolve_after(ctx, &dir, &store, pr.number, &args.after)?;
     let this_pc = || this_machine(ctx);
     let agent = match &args.relayed_agent {
         Some(relayed) => {
@@ -117,9 +133,29 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
         submitter,
         touches_config: config_edit != ConfigEdit::No,
         approval: config.approval,
+        priority: args.priority,
+        after,
         now: EpochMs::now(),
     };
-    let done = store.update(|state| Ok(queue::submit(state, submission)?))?;
+    let (done, kept_after) = store.update(|state| {
+        let done = queue::submit(state, submission)?;
+        let kept = state
+            .queue
+            .iter()
+            .find(|i| i.pr == pr.number)
+            .map(|i| i.after.clone())
+            .unwrap_or_default();
+        Ok((done, kept))
+    })?;
+    if done.change != Change::Unchanged {
+        record_submitted(
+            &store,
+            &pr.head_ref_oid,
+            pr.number,
+            args.priority,
+            kept_after,
+        );
+    }
     if let Err(e) = super::up::ensure_daemon(ctx, &info, &store) {
         eprintln!("경고: 데몬을 띄우지 못했다. 큐에는 올라갔다. `chute up`으로 띄운다: {e:#}");
     }
@@ -169,6 +205,15 @@ fn submit_through_hub(
         "--relayed-submitter".to_owned(),
         serde_json::to_string(&submitter)?,
     ];
+    if args.head.is_none() {
+        forwarded.push("--relayed-no-head".to_owned());
+    }
+    if args.priority {
+        forwarded.push("--priority".to_owned());
+    }
+    for n in &args.after {
+        forwarded.extend(["--after".to_owned(), n.0.to_string()]);
+    }
     if args.json {
         forwarded.push("--json".to_owned());
     }
@@ -181,6 +226,85 @@ fn submit_through_hub(
         &argv,
         FORWARD_TIMEOUT,
     )
+}
+
+const REQUIRE_HEAD_MESSAGE: &str = "이 저장소는 확인한 HEAD(`--head`) 없이 submit을 받지 않는다. \
+     오케스트레이터 아래에서 일한다면 submit하지 말고 PR과 HEAD를 보고한다";
+
+fn record_submitted(
+    store: &RepoStore,
+    head: &Sha,
+    pr: PrNumber,
+    priority: bool,
+    after: Vec<PrNumber>,
+) {
+    let recorded = store.append_history(&Event {
+        at_ms: EpochMs::now(),
+        kind: EventKind::Submitted {
+            pr,
+            head: head.clone(),
+            priority,
+            after,
+            repair: false,
+        },
+    });
+    if let Err(e) = recorded {
+        eprintln!("경고: submit을 history.jsonl에 남기지 못했다: {e:#}");
+    }
+}
+
+/// Keeps the PRs this one must wait for: those in the queue. A PR that is not queued but
+/// already merged on GitHub needs no waiting and is left out; any other is refused.
+fn resolve_after(
+    ctx: &Ctx,
+    dir: &Path,
+    store: &RepoStore,
+    pr: PrNumber,
+    wanted: &[PrNumber],
+) -> Result<Vec<PrNumber>> {
+    let mut kept: Vec<PrNumber> = Vec::new();
+    for &n in wanted {
+        if n == pr {
+            return Err(Refusal(format!(
+                "{pr}: 자기 자신 뒤에 둘 수 없다. `--after`에서 뺀다"
+            ))
+            .into());
+        }
+        let queued = store.load()?.queue.iter().any(|i| i.pr == n);
+        if queued {
+            kept.push(n);
+            continue;
+        }
+        match merged_on_github(ctx, dir, n)? {
+            true => {}
+            false => {
+                return Err(Refusal(format!(
+                    "{pr}: --after {n}를 받지 않았다. {n}는 큐에 없고 머지되지도 않았다. \
+                     {n}를 먼저 submit하거나 `--after`에서 뺀다"
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(kept)
+}
+
+fn merged_on_github(ctx: &Ctx, dir: &Path, n: PrNumber) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Found {
+        state: PrState,
+    }
+    let text = ctx
+        .ext
+        .gh(dir, ["pr", "view", &n.0.to_string(), "--json", "state"])?
+        .ok()
+        .map_err(|_| {
+            Refusal(format!(
+                "{n}: 큐에 없고 GitHub에서도 찾지 못했다. `--after`의 PR 번호를 확인한다"
+            ))
+        })?;
+    let found: Found = serde_json::from_str(&text).context("gh pr view의 출력을 읽지 못했다")?;
+    Ok(found.state == PrState::Merged)
 }
 
 fn this_machine(ctx: &Ctx) -> Option<MachineId> {

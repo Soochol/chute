@@ -1483,3 +1483,202 @@ fn notify_a_halt_reaches_every_submitting_terminal_once() {
     assert_eq!(lab.lines_sent_to("t1rs").len(), 1);
     assert!(lab.bounced_events().is_empty());
 }
+
+fn hold_behind(lab: &Lab, pr: u64, after: u64) {
+    lab.store
+        .update(|s| {
+            let item = s.queue.iter_mut().find(|i| i.pr == PrNumber(pr)).unwrap();
+            item.after = vec![PrNumber(after)];
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn queue_bad_pr_and_a_waiter(lab: &Lab) {
+    let head = lab.push_pr_branch(1, &[("BAD", "")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+    let head = lab.push_pr_branch(2, &[("b.txt", "b\n")]);
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+    hold_behind(lab, 2, 1);
+}
+
+fn waiting_lines(lab: &Lab) -> Vec<String> {
+    lab.lines_sent_to("t1orch")
+        .into_iter()
+        .filter(|l| l.starts_with("chute 결과 waiting "))
+        .collect()
+}
+
+#[test]
+fn waiting_a_bounced_pr_tells_the_submitter_of_the_pr_behind_it_and_holds_that_pr() {
+    let lab = Lab::new(BAD);
+    queue_bad_pr_and_a_waiter(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert!(summary.merged.is_empty());
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+    assert_eq!(lab.item(2).unwrap().after, prs(&[1]));
+    let lines = waiting_lines(&lab);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for pair in ["slug=acme/widget", "pr=2", "after=1", "why=bounced"] {
+        assert!(has_key(&lines[0], pair), "{pair}: {}", lines[0]);
+    }
+    assert!(lab.notified().iter().any(|(kind, delivered)| {
+        *kind == chute::model::NotifyKind::Waiting && *delivered == chute::model::Delivered::Sent
+    }));
+}
+
+#[test]
+fn waiting_a_pr_handed_to_a_human_by_a_spent_budget_says_human() {
+    let lab = Lab::new(BAD);
+    queue_bad_pr_and_a_waiter(&lab);
+    for _ in 0..4 {
+        done(lab.engine().run_once().unwrap());
+        let head = lab.item(1).unwrap().head;
+        if matches!(lab.item_state(1), Some(ItemState::NeedsHuman(_))) {
+            break;
+        }
+        lab.queue_pr_by(
+            1,
+            &head,
+            Some(lab.agent()),
+            Some(lab.agent()),
+            Approval::Agent,
+        );
+    }
+
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::NeedsHuman(HumanReason::Budget))
+    );
+    let lines = waiting_lines(&lab);
+    assert!(has_key(lines.last().unwrap(), "why=human"), "{lines:?}");
+    assert!(
+        lines[..lines.len() - 1]
+            .iter()
+            .all(|l| has_key(l, "why=bounced"))
+    );
+    assert!(lab.merged_prs().is_empty());
+}
+
+#[test]
+fn waiting_a_dropped_pr_tells_the_submitter_of_the_pr_behind_it() {
+    let lab = Lab::new("");
+    let head = lab.push_pr_branch(1, &[("a.txt", "a\n")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+    let head = lab.push_pr_branch(2, &[("b.txt", "b\n")]);
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+    hold_behind(&lab, 2, 1);
+
+    let out = lab
+        .sb
+        .command(env!("CARGO_BIN_EXE_chute"))
+        .current_dir(lab.repo.path())
+        .args(["drop", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = waiting_lines(&lab);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for pair in ["pr=2", "after=1", "why=dropped"] {
+        assert!(has_key(&lines[0], pair), "{pair}: {}", lines[0]);
+    }
+    assert!(
+        lab.events()
+            .contains(&EventKind::Dropped { pr: PrNumber(1) })
+    );
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Idle);
+    assert!(lab.merged_prs().is_empty());
+}
+
+#[test]
+fn waiting_a_pr_closed_on_github_tells_the_submitter_of_the_pr_behind_it() {
+    let lab = Lab::new("");
+    let head = lab.push_pr_branch(1, &[("a.txt", "a\n")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+    let head = lab.push_pr_branch(2, &[("b.txt", "b\n")]);
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+    hold_behind(&lab, 2, 1);
+    lab.gh_says_closed(1);
+
+    lab.engine().run_once().unwrap();
+
+    let lines = waiting_lines(&lab);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(has_key(&lines[0], "why=closed"), "{}", lines[0]);
+    assert!(lab.item(1).is_none());
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+}
+
+#[test]
+fn waiting_a_pr_behind_one_that_merges_joins_the_next_batch_and_hears_nothing() {
+    let lab = Lab::new("");
+    let head = lab.push_pr_branch(1, &[("a.txt", "a\n")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+    let head = lab.push_pr_branch(2, &[("b.txt", "b\n")]);
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+    hold_behind(&lab, 2, 1);
+
+    let first = done(lab.engine().run_once().unwrap());
+    assert_eq!(first.merged, prs(&[1]));
+    assert!(lab.item(2).unwrap().after.is_empty());
+    let second = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(second.merged, prs(&[2]));
+    assert!(waiting_lines(&lab).is_empty());
+}
