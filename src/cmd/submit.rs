@@ -295,7 +295,7 @@ fn merged_on_github(ctx: &Ctx, dir: &Path, n: PrNumber) -> Result<bool> {
         .ext
         .gh(dir, ["pr", "view", &n.0.to_string(), "--json", "state"])?;
     let err = out.stderr_text().to_lowercase();
-    if !out.success() && (err.contains("could not resolve") || err.contains("not found")) {
+    if !out.success() && (err.contains("could not resolve to a pullrequest")) {
         return Err(Refusal(format!(
             "{n}: 큐에 없고 GitHub에서도 찾지 못했다. `--after`의 PR 번호를 확인한다"
         ))

@@ -1741,7 +1741,9 @@ fn submit_after_a_pr_that_is_neither_queued_nor_merged_is_refused() {
     gh_pr(&w, Some(9), json!({"state": "OPEN"}));
     w.sb.fake("gh").respond(
         "pr view 8 --json *",
-        Reply::ok("").code(1).stderr("not found"),
+        Reply::ok("").code(1).stderr(
+            "GraphQL: Could not resolve to a PullRequest with the number of 8. (repository.pullRequest)",
+        ),
     );
 
     for n in ["9", "8"] {
@@ -1801,7 +1803,7 @@ fn submit_after_with_gh_down_is_an_error_and_not_a_refusal() {
         "pr view 8 --json *",
         Reply::ok("")
             .code(1)
-            .stderr("error connecting to api.github.com"),
+            .stderr("error connecting to api.github.com\nCould not resolve host: api.github.com"),
     );
 
     let out = submit(&w, &["12", "--after", "8"]);
