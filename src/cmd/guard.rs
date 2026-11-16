@@ -144,9 +144,23 @@ impl<'a> Repo<'a> {
     fn current_branch(&self) -> Option<String> {
         let out = self
             .ext
-            .git(&self.dir, ["symbolic-ref", "--short", "-q", "HEAD"])
+            .git(&self.dir, ["symbolic-ref", "-q", "HEAD"])
             .ok()?;
-        out.success().then(|| out.stdout_text().trim().to_owned())
+        let head = out.stdout_text();
+        out.success()
+            .then(|| head.trim().strip_prefix("refs/heads/").map(str::to_owned))?
+    }
+
+    /// The branch a bare `git push` lands on, which `push.default` and the upstream decide.
+    fn push_target_branch(&self) -> Option<String> {
+        let out = self
+            .ext
+            .git(&self.dir, ["rev-parse", "--symbolic-full-name", "@{push}"])
+            .ok()?;
+        let target = out.stdout_text();
+        let tracked = target.trim().strip_prefix("refs/remotes/")?;
+        out.success()
+            .then(|| tracked.split_once('/').map(|(_, branch)| branch.to_owned()))?
     }
 
     fn is_default(&self, branch: &str) -> bool {
@@ -154,25 +168,29 @@ impl<'a> Repo<'a> {
     }
 }
 
-/// `origin/HEAD` names the default branch of a clone. Without it, the two usual names stand in.
+/// Every remote's `HEAD` names that remote's default branch. Without one, the two usual names
+/// stand in.
 fn default_branches(ext: &Ext, dir: &Path) -> Vec<String> {
-    let named = ext
-        .git(
-            dir,
-            ["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
-        )
+    let listed = ext
+        .git(dir, ["for-each-ref", "--format=%(symref)", "refs/remotes"])
         .ok()
         .filter(|out| out.success())
-        .and_then(|out| {
-            out.stdout_text()
-                .trim()
-                .strip_prefix("origin/")
-                .map(str::to_owned)
-        });
-    match named {
-        Some(name) => vec![name],
-        None => vec!["main".to_owned(), "master".to_owned()],
+        .map(|out| out.stdout_text())
+        .unwrap_or_default();
+    let mut named: Vec<String> = Vec::new();
+    for symref in listed.lines() {
+        let branch = symref
+            .strip_prefix("refs/remotes/")
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, branch)| branch.to_owned());
+        if let Some(branch) = branch.filter(|b| !named.contains(b)) {
+            named.push(branch);
+        }
     }
+    if named.is_empty() {
+        named = vec!["main".to_owned(), "master".to_owned()];
+    }
+    named
 }
 
 impl Kind {
@@ -204,7 +222,10 @@ impl Push {
             if self.tags_only {
                 return None;
             }
-            return repo.current_branch().filter(|b| repo.is_default(b));
+            return [repo.current_branch(), repo.push_target_branch()]
+                .into_iter()
+                .flatten()
+                .find(|b| repo.is_default(b));
         }
         self.destinations.iter().find_map(|destination| {
             let branch = match destination {
@@ -702,6 +723,37 @@ mod tests {
         fx.repo.git(&["remote", "set-head", "origin", "trunk"]);
         assert!(fx.verdict("git push origin trunk").is_some());
         assert_eq!(fx.verdict("git push origin main"), None);
+    }
+
+    #[test]
+    fn a_bare_push_follows_the_upstream_and_survives_a_tag_named_like_the_branch() {
+        let fx = Fixture::new(true);
+        fx.repo.git(&["tag", "main"]);
+        assert!(fx.verdict("git push").is_some(), "main이라는 태그가 있어도");
+        assert!(fx.verdict("git push origin HEAD").is_some());
+
+        fx.repo.git(&["checkout", "--quiet", "-b", "feature"]);
+        fx.repo.git(&["branch", "--quiet", "-u", "origin/main"]);
+        fx.repo.git(&["config", "push.default", "upstream"]);
+        assert!(
+            fx.verdict("git push").is_some(),
+            "upstream이 main인 feature"
+        );
+        fx.repo.git(&["config", "push.default", "simple"]);
+        fx.repo.git(&["branch", "--quiet", "--unset-upstream"]);
+        assert_eq!(fx.verdict("git push"), None);
+    }
+
+    #[test]
+    fn finds_the_default_branch_through_any_remote_name() {
+        let fx = Fixture::new(true);
+        fx.repo.git(&["push", "--quiet", "origin", "main:trunk"]);
+        fx.repo.git(&["fetch", "--quiet", "origin"]);
+        fx.repo.git(&["remote", "set-head", "origin", "trunk"]);
+        fx.repo.git(&["remote", "rename", "origin", "up"]);
+        assert!(fx.verdict("git push up trunk").is_some());
+        fx.repo.git(&["branch", "--quiet", "origin/trunk"]);
+        assert!(fx.verdict("git push up trunk").is_some());
     }
 
     #[test]
