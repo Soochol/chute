@@ -742,6 +742,10 @@ test("random malformed status never breaks the board", () => {
     maybe(o, "touches_config", () => or(() => rnd() < 0.5));
     maybe(o, "preflight", () => or(() => ({ head: or(() => "abc1234"), result: or(() => pick(["pass", "fail", "conflict"])) })));
     maybe(o, "last_failure", () => or(() => ({ kind: or(() => "verify"), mode: or(() => "solo"), summary: or(() => "s"), report: or(() => "/r") })));
+    maybe(o, "submitter", () => or(() => ({ terminal: or(() => pick(["t1", "t2"])), name: or(() => "orch"), alive: or(() => true) })));
+    maybe(o, "priority", () => or(() => rnd() < 0.5));
+    maybe(o, "repair", () => or(() => rnd() < 0.5));
+    maybe(o, "after", () => or(() => Array.from({ length: Math.floor(rnd() * 3) }, () => or(() => pick([1, 2, 12])))));
     return o;
   };
   const statusView = () => {
@@ -749,11 +753,11 @@ test("random malformed status never breaks the board", () => {
     maybe(o, "repo", () => or(() => ({ slug: or(() => "a/b"), path: or(() => "/p"), state_dir: or(() => "/s") }), 0.15));
     maybe(o, "approval", () => or(() => pick(["agent", "human"])));
     maybe(o, "daemon", () => or(() => ({ running: or(() => rnd() < 0.5) })));
-    maybe(o, "blocked", () => or(() => pick([null, { reason: or(() => "base_broken"), base: or(() => "0a1"), since_ms: or(() => 1794724080000) }])));
+    maybe(o, "blocked", () => or(() => pick([null, { reason: or(() => "base_broken"), base: or(() => "0a1"), since_ms: or(() => 1794724080000), step: or(() => "test"), log: or(() => "/l"), pushed_by_chute: or(() => rnd() < 0.5), rechecked: or(() => rnd() < 0.5) }])));
     maybe(o, "batch", () => or(() => pick([null, { prs: or(() => Array.from({ length: Math.floor(rnd() * 4) }, () => or(() => pick([1, 2, 3, 5, 12])))), phase: or(() => "verifying"), step: or(() => "test"), round: or(() => 1), started_ms: or(() => 1794724200000) }])));
     maybe(o, "queue", () => or(() => Array.from({ length: Math.floor(rnd() * 6) }, () => or(queueItem, 0.1)), 0.1));
     maybe(o, "today", () => or(() => ({ merged: or(() => 1), bounced: or(() => 0), flaky: or(() => 0), batches: or(() => 1), median_lead_s: or(() => 60), verify_s: or(() => 5) })));
-    maybe(o, "warnings", () => or(() => Array.from({ length: Math.floor(rnd() * 3) }, () => or(() => ({ kind: or(() => "config"), message: or(() => "m") })))));
+    maybe(o, "warnings", () => or(() => Array.from({ length: Math.floor(rnd() * 3) }, () => or(() => ({ kind: or(() => pick(["config", "flaky_chronic", "gc"])), message: or(() => "m") })))));
     return o;
   };
 
@@ -766,7 +770,7 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub"]);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts"]);
     const leaves = [];
     const walk = (value, path, key) => {
       if (value !== null && typeof value === "object") {
@@ -948,4 +952,163 @@ test("polling is fast when any hub is remote and the v1 pace when all are local"
   assert.equal(pollInterval(null), LOCAL_POLL_MS);
   assert.equal(pollInterval({ kind: "failed" }), LOCAL_POLL_MS);
   assert.ok(REMOTE_POLL_MS < LOCAL_POLL_MS);
+});
+
+const marksOfItem = (item) => item.marks.map((m) => m.text);
+const waitingItem = (data, pr) => section(only(data), "waiting").items.find((item) => item.pr === pr);
+
+test("v3: a priority item is marked urgent, with or without an agent", () => {
+  const data = withQueue(itemOf(20), itemOf(23));
+  assert.deepEqual(marksOfItem(waitingItem(data, 20)), ["급함"]);
+  assert.deepEqual(marksOfItem(waitingItem(data, 23)), ["급함"]);
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(itemOf(19)), 19)), []);
+});
+
+test("v3: an item held behind other PRs lists every one of them", () => {
+  const data = withQueue(itemOf(24), itemOf(12));
+  assert.deepEqual(marksOfItem(waitingItem(data, 24)), ["#12, #22 뒤"]);
+  const one = itemOf(24);
+  one.after = [7];
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(one), 24)), ["#7 뒤"]);
+});
+
+test("v3: a repair item is marked, and marks combine", () => {
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(itemOf(22)), 22)), ["복구"]);
+  const both = itemOf(22);
+  both.priority = true;
+  both.after = [3];
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(both), 22)), ["급함", "복구", "#3 뒤"]);
+});
+
+test("v3: cards in the human and bounced sections carry the marks too", () => {
+  const human = itemOf(9);
+  human.priority = true;
+  human.after = [5, 6];
+  const bounced = itemOf(14);
+  bounced.repair = true;
+  const repo = only(withQueue(human, bounced));
+  assert.deepEqual(marksOfItem(section(repo, "human").items[0]), ["급함", "#5, #6 뒤"]);
+  assert.deepEqual(marksOfItem(section(repo, "bounced").items[0]), ["복구"]);
+});
+
+test("v3: the submitter is shown only when it differs from the agent", () => {
+  assert.equal(waitingItem(withQueue(itemOf(22)), 22).submitter.text, "submit orch (t1s0)");
+  assert.equal(waitingItem(withQueue(itemOf(24)), 24).submitter.label, "orch (t1s0)");
+  assert.equal(waitingItem(withQueue(itemOf(23)), 23).submitter, null, "same terminal as the agent");
+  assert.equal(waitingItem(withQueue(itemOf(20)), 20).submitter, null, "no submitter");
+  const bounced = itemOf(14);
+  bounced.submitter = itemOf(22).submitter;
+  assert.equal(section(only(withQueue(bounced)), "bounced").items[0].submitter.text, "submit orch (t1s0)");
+  const nameless = itemOf(22);
+  nameless.submitter = { terminal: "desk/t9", alive: true };
+  assert.equal(waitingItem(withQueue(nameless), 22).submitter.text, "submit desk/t9");
+  const noAgent = itemOf(20);
+  noAgent.submitter = itemOf(22).submitter;
+  assert.equal(waitingItem(withQueue(noAgent), 20).submitter.label, "orch (t1s0)");
+});
+
+test("v3: a halt shows step, who pushed, the recheck, the log, and the repair PR waiting", () => {
+  const [alert] = section(only([fixture]), "alerts").items;
+  assert.deepEqual(alert.facts, [
+    "실패한 단계 test",
+    "chute가 push한 커밋",
+    "다시 검증했다",
+    "복구 PR #22 검증 대기",
+  ]);
+  assert.equal(alert.log, fixture.blocked.log);
+  assert.equal(alert.detail, "기준 0a1b2c3 · 7분 12초 전부터");
+});
+
+test("v3: a halt not pushed by chute and not rechecked says so, and a repair in a batch is being verified", () => {
+  const data = clone(fixture);
+  data.blocked.pushed_by_chute = false;
+  data.blocked.rechecked = false;
+  data.blocked.log = null;
+  data.queue.find((item) => item.pr === 22).state = "in_batch";
+  const [alert] = section(only(data), "alerts").items;
+  assert.deepEqual(alert.facts, ["실패한 단계 test", "chute가 push하지 않은 커밋", "복구 PR #22 검증 중"]);
+  assert.equal(alert.log, null);
+});
+
+test("v3: a repair item that is no longer queued is not called waiting for verification", () => {
+  const data = clone(fixture);
+  data.queue.find((item) => item.pr === 22).state = "bounced";
+  const [alert] = section(only(data), "alerts").items;
+  assert.ok(alert.facts.includes("복구 PR #22 처리 필요"));
+});
+
+test("v3: no repair item means no repair line", () => {
+  const data = clone(fixture);
+  data.queue = data.queue.filter((item) => !item.repair);
+  const [alert] = section(only(data), "alerts").items;
+  assert.ok(!alert.facts.some((fact) => fact.includes("복구")));
+});
+
+test("v3: a repair item is not announced when the queue is not halted", () => {
+  const data = { ...clone(fixture), blocked: null };
+  assert.ok(section(only(data), "alerts").items.every((a) => a.facts.length === 0));
+});
+
+test("v3: flaky_chronic and gc warnings come out like other warnings; chronic also marks the flaky number", () => {
+  const data = clone(fixture);
+  data.warnings.push(
+    { kind: "flaky_chronic", message: "build::slow가 30일 안에 3번 흔들렸다", pr: null, at_ms: 1 },
+    { kind: "gc", message: "정리하지 못한 폴더가 있다", pr: null, at_ms: 2 },
+  );
+  const repo = only(data);
+  const warnings = section(repo, "alerts").items.filter((a) => a.kind === "warning");
+  assert.deepEqual(warnings.slice(-2).map((a) => [a.tone, a.text]), [
+    ["warn", "build::slow가 30일 안에 3번 흔들렸다"],
+    ["warn", "정리하지 못한 폴더가 있다"],
+  ]);
+  const stats = section(repo, "today").items;
+  assert.equal(stats.find((s) => s.key === "flaky").note, "만성");
+  assert.ok(stats.filter((s) => s.key !== "flaky").every((s) => !s.note));
+  assert.equal(section(only([fixture]), "today").items.find((s) => s.key === "flaky").note, null);
+});
+
+test("v3: a gc warning alone does not mark the flaky number", () => {
+  const data = { ...clone(fixture), warnings: [{ kind: "gc", message: "정리 경고" }] };
+  assert.equal(section(only(data), "today").items.find((s) => s.key === "flaky").note, null);
+});
+
+test("v3: JSON without any v3 field draws as before", () => {
+  const data = clone(fixture);
+  for (const item of data.queue) {
+    delete item.submitter;
+    delete item.priority;
+    delete item.after;
+    delete item.repair;
+  }
+  data.blocked = { reason: "base_broken", base: "0a1b2c3", since_ms: fixture.blocked.since_ms };
+  const repo = only(data);
+  assert.deepEqual(prs(section(repo, "waiting")), [19, 20, 22, 23, 24]);
+  for (const id of ["human", "waiting", "bounced"]) {
+    for (const item of section(repo, id).items) {
+      assert.deepEqual(item.marks, [], `${id} #${item.pr}`);
+      assert.equal(item.submitter, null);
+    }
+  }
+  const [alert] = section(repo, "alerts").items;
+  assert.deepEqual(alert.facts, []);
+  assert.equal(alert.log, null);
+  assert.equal(alert.detail, "기준 0a1b2c3 · 7분 12초 전부터");
+});
+
+test("v3: malformed v3 fields do not break the board", () => {
+  const item = itemOf(24);
+  item.after = [0, -1, "x", null, 1.5, 9];
+  item.priority = "yes";
+  item.repair = 1;
+  item.submitter = "orch";
+  const queued = waitingItem(withQueue(item), 24);
+  assert.deepEqual(marksOfItem(queued), ["#9 뒤"]);
+  assert.equal(queued.submitter, null);
+  item.after = "12";
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(item), 24)), []);
+  const data = clone(fixture);
+  data.blocked = { reason: "base_broken", step: 5, pushed_by_chute: "yes", rechecked: "yes", log: 7 };
+  const [alert] = section(only(data), "alerts").items;
+  assert.equal(alert.log, null);
+  assert.deepEqual(alert.facts, ["복구 PR #22 검증 대기"]);
 });

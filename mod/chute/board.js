@@ -117,6 +117,22 @@ function agentOf(agent) {
   };
 }
 
+// Queue-item facts added in v3: priority, repair, `after` and a submitter that differs from the worker.
+function marksOf(item) {
+  const marks = [];
+  if (item.priority === true) marks.push({ kind: "priority", text: "급함", tone: "warn" });
+  if (item.repair === true) marks.push({ kind: "repair", text: "복구", tone: "error" });
+  const after = list(item.after).filter((pr) => Number.isSafeInteger(pr) && pr > 0);
+  if (after.length > 0) marks.push({ kind: "after", text: `${after.map((pr) => `#${pr}`).join(", ")} 뒤`, tone: "muted" });
+  return marks;
+}
+
+function submitterOf(item) {
+  const submitter = agentOf(item.submitter);
+  if (!submitter || submitter.terminal === agentOf(item.agent)?.terminal) return null;
+  return { ...submitter, text: `submit ${submitter.label}` };
+}
+
 function hubOf(hub) {
   const h = isObject(hub) ? hub : {};
   const local = h.local !== false;
@@ -180,6 +196,8 @@ function cardOf(item, repoPath) {
     retries: `${num(item.attempts)}/${num(item.budget)}`,
     failure: failureOf(item),
     actions: actionsOf(item, repoPath),
+    marks: marksOf(item),
+    submitter: submitterOf(item),
   };
   if (item.state === "awaiting_approval") {
     card.reason = "승인 대기";
@@ -195,7 +213,24 @@ function cardOf(item, repoPath) {
   return card;
 }
 
-function alertsOf(view, now) {
+const REPAIR_STATE = table({ queued: "검증 대기", in_batch: "검증 중" });
+
+function repairFacts(queue) {
+  return queue
+    .filter((item) => item.repair === true)
+    .map((item) => `복구 PR #${item.pr} ${REPAIR_STATE[item.state] ?? "처리 필요"}`);
+}
+
+function haltFacts(blocked, queue) {
+  const facts = [];
+  if (str(blocked.step)) facts.push(`실패한 단계 ${blocked.step}`);
+  if (blocked.pushed_by_chute === true) facts.push("chute가 push한 커밋");
+  else if (blocked.pushed_by_chute === false) facts.push("chute가 push하지 않은 커밋");
+  if (blocked.rechecked === true) facts.push("다시 검증했다");
+  return [...facts, ...repairFacts(queue)];
+}
+
+function alertsOf(view, queue, now) {
   const alerts = [];
   if (view.blocked) {
     const blocked = isObject(view.blocked) ? view.blocked : { reason: view.blocked };
@@ -208,14 +243,16 @@ function alertsOf(view, now) {
       tone: "error",
       text: BLOCK_REASON[reason] ?? `큐가 멈췄다: ${reason || "사유 모름"}`,
       detail: parts.join(" · "),
+      facts: haltFacts(blocked, queue),
+      log: str(blocked.log) || null,
     });
   }
   if (isObject(view.daemon) && view.daemon.running === false) {
-    alerts.push({ kind: "daemon", tone: "error", text: "데몬이 꺼져 있다", detail: "`chute up`으로 켠다" });
+    alerts.push({ kind: "daemon", tone: "error", text: "데몬이 꺼져 있다", detail: "`chute up`으로 켠다", facts: [], log: null });
   }
   for (const warning of list(view.warnings)) {
     const words = typeof warning === "string" ? [warning] : [warning?.message, warning?.kind];
-    alerts.push({ kind: "warning", tone: "warn", text: words.map((w) => str(w).trim()).find(Boolean) ?? "경고", detail: "" });
+    alerts.push({ kind: "warning", tone: "warn", text: words.map((w) => str(w).trim()).find(Boolean) ?? "경고", detail: "", facts: [], log: null });
   }
   return alerts;
 }
@@ -240,12 +277,15 @@ function batchOf(batch, members, now) {
   ];
 }
 
-function todayOf(today) {
+const chronicFlaky = (view) =>
+  list(view.warnings).some((warning) => isObject(warning) && warning.kind === "flaky_chronic");
+
+function todayOf(today, chronic) {
   if (!isObject(today)) return [];
   return [
     { key: "merged", label: "머지", value: num(today.merged) },
     { key: "bounced", label: "반송", value: num(today.bounced) },
-    { key: "flaky", label: "flaky", value: num(today.flaky) },
+    { key: "flaky", label: "flaky", value: num(today.flaky), note: chronic ? "만성" : null },
     { key: "batches", label: "batch", value: num(today.batches) },
     { key: "lead", label: "머지까지 중앙값", value: formatDuration(today.median_lead_s) },
     { key: "verify", label: "검증 시간", value: formatDuration(today.verify_s) },
@@ -292,6 +332,8 @@ function repoBoard(view, now) {
         ciPending,
         label: ciPending ? "CI 대기" : "대기",
         note: item.state_reason && !ciPending ? item.state_reason : null,
+        marks: marksOf(item),
+        submitter: submitterOf(item),
       });
     } else if (section === "unknown") {
       placed.unknown.push({
@@ -302,9 +344,9 @@ function repoBoard(view, now) {
       });
     } else placed[section].push(cardOf(item, path));
   }
-  placed.alerts = alertsOf(view, now);
+  placed.alerts = alertsOf(view, queue, now);
   placed.batch = batchOf(view.batch, inBatch, now);
-  placed.today = todayOf(view.today);
+  placed.today = todayOf(view.today, chronicFlaky(view));
 
   return {
     slug: str(repo.slug) || "(이름 없는 저장소)",
