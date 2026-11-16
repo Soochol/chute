@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,6 @@ use crate::verify::{self, Cancel, Detail, Failed, FlakyStep, Options, Outcome};
 const SLOT_LOCK_TRIES: u32 = 40;
 const SLOT_LOCK_PAUSE: Duration = Duration::from_millis(50);
 const MINUTE_MS: u64 = 60 * 1000;
-const IDLE_FETCH_EVERY: Duration = Duration::from_secs(5 * 60);
 const REPORT_TAIL_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +56,6 @@ pub struct PostVerifier {
     store: RepoStore,
     gitops: Gitops,
     cancel: Cancel,
-    idle_fetch: Mutex<Option<Instant>>,
 }
 
 impl PostVerifier {
@@ -72,7 +69,6 @@ impl PostVerifier {
             store,
             gitops,
             cancel: Cancel::new(),
-            idle_fetch: Mutex::new(None),
         }
     }
 
@@ -119,19 +115,10 @@ impl PostVerifier {
             &self.info.remote_name,
             &self.info.default_branch,
         );
-        let configured = matches!(known, Ok(Some(Config { post: Some(_), .. })));
-        if !configured {
-            let mut last = self.idle_fetch.lock().unwrap_or_else(|e| e.into_inner());
-            if last.is_some_and(|at| at.elapsed() < IDLE_FETCH_EVERY) {
-                return Ok(PostPass::Idle);
-            }
-            *last = Some(Instant::now());
+        if !matches!(known, Ok(Some(Config { post: Some(_), .. }))) {
+            return Ok(PostPass::Idle);
         }
-        let tip = match self.gitops.fetch_base_tip() {
-            Ok(tip) => tip,
-            Err(_) if !configured => return Ok(PostPass::Idle),
-            Err(e) => return Err(e),
-        };
+        let tip = self.gitops.fetch_base_tip()?;
         let Ok(config) = Config::load_at(&self.ext, &self.info.path, tip.as_str()) else {
             return Ok(PostPass::Idle);
         };
@@ -387,8 +374,12 @@ impl PostVerifier {
     }
 
     fn locate(&self, scope: &Scope, tip: &Sha, failure: &Failed) -> Result<Search> {
+        let wanted = failed_tests(failure);
         let same = |other: &Failed| {
-            other.step == failure.step && failed_tests(other) == failed_tests(failure)
+            other.step == failure.step && {
+                let seen = failed_tests(other);
+                wanted.iter().all(|test| seen.contains(test))
+            }
         };
         let Some(good) = scope.baseline else {
             return Ok(Search::Found(None));
@@ -402,10 +393,11 @@ impl PostVerifier {
         }
         let mut passing: isize = -1;
         let mut bad = commits.len() - 1;
+        let mut different: Vec<isize> = Vec::new();
         while bad as isize - passing > 1 {
             let mid = (passing + bad as isize) / 2;
             let mut decided = false;
-            for probe in probes(passing, bad as isize, mid) {
+            for probe in probes(passing, bad as isize, mid, &different) {
                 let commit = &commits[probe as usize];
                 match self.check(scope, commit, PostPhase::Searching)? {
                     Checked::Cancelled => return Ok(Search::Cancelled),
@@ -418,14 +410,14 @@ impl PostVerifier {
                         bad = probe as usize;
                         decided = true;
                     }
-                    Checked::Failed(_) => {}
+                    Checked::Failed(_) => different.push(probe),
                 }
                 if decided {
                     break;
                 }
             }
             if !decided {
-                break;
+                return Ok(Search::Found(None));
             }
         }
         Ok(Search::Found(Some(Culprit {
@@ -506,14 +498,14 @@ impl PostVerifier {
     }
 }
 
-/// The commits strictly between `passing` and `bad`, nearest to `mid` first. A commit that
-/// fails differently from the tip says nothing about the failure being located, so the search
-/// moves to its neighbours.
-fn probes(passing: isize, bad: isize, mid: isize) -> Vec<isize> {
+/// The commits strictly between `passing` and `bad`, nearest to `mid` first, leaving out those
+/// already known to fail differently. Such a commit says nothing about the failure being
+/// located, so the search moves to its neighbours.
+fn probes(passing: isize, bad: isize, mid: isize, skip: &[isize]) -> Vec<isize> {
     let mut order = Vec::new();
     for distance in 0..(bad - passing) {
         for probe in [mid + distance, mid - distance] {
-            if probe > passing && probe < bad && !order.contains(&probe) {
+            if probe > passing && probe < bad && !skip.contains(&probe) && !order.contains(&probe) {
                 order.push(probe);
             }
         }
@@ -571,9 +563,10 @@ mod tests {
 
     #[test]
     fn probes_start_at_the_middle_and_stay_inside_the_open_range() {
-        assert_eq!(probes(-1, 5, 2), [2, 3, 1, 4, 0]);
-        assert_eq!(probes(1, 4, 2), [2, 3]);
-        assert!(probes(2, 3, 2).is_empty());
+        assert_eq!(probes(-1, 5, 2, &[]), [2, 3, 1, 4, 0]);
+        assert_eq!(probes(1, 4, 2, &[]), [2, 3]);
+        assert!(probes(2, 3, 2, &[]).is_empty());
+        assert_eq!(probes(-1, 5, 2, &[2, 3]), [1, 4, 0]);
     }
 
     #[test]

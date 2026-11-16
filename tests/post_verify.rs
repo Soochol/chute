@@ -617,7 +617,7 @@ fn a_commit_that_fixes_an_unrelated_failure_is_not_blamed_for_the_real_one() {
 }
 
 #[test]
-fn a_post_verify_step_added_on_the_remote_starts_the_check_without_a_fetch_by_hand() {
+fn a_post_verify_step_pushed_straight_to_the_remote_starts_the_check_once_the_branch_is_fetched() {
     let lab = Lab::new("");
     let post = lab.post();
     assert_eq!(post.run_once().unwrap(), PostPass::Idle);
@@ -655,7 +655,69 @@ fn a_post_verify_step_added_on_the_remote_starts_the_check_without_a_fetch_by_ha
     );
     git(&other, &["push", "--quiet", "origin", "HEAD:main"]);
 
-    // The fetch happens at most every five minutes while the check is off.
-    assert_eq!(post.run_once().unwrap(), PostPass::Idle);
+    assert_eq!(
+        post.run_once().unwrap(),
+        PostPass::Idle,
+        "가져오기 전에는 켜진 줄 모른다"
+    );
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
     assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+}
+
+#[test]
+fn a_failure_that_includes_the_tips_failure_counts_and_an_undecidable_range_names_nobody() {
+    let lab = post_lab("", "", POST_STEP);
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script).unwrap().replace(
+        "\nexit 0\n",
+        "\nif [ -e svc/OTHER ]; then echo 'FAILED other_test'; fi\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; fi\nif [ -e svc/OTHER ] || [ -e svc/BREAK ]; then exit 1; fi\nexit 0\n",
+    );
+    fs::write(&script, text).unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    let first = lab.push_pr_branch(1, &[("svc/BREAK", "x\n"), ("svc/OTHER", "y\n")]);
+    lab.queue_pr(1, &first, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+    let second = lab.push_pr_branch_removing(2, "svc/OTHER");
+    lab.queue_pr(2, &second, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+    let third = lab.push_pr_branch(3, &[("d.txt", "d\n")]);
+    lab.queue_pr(3, &third, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["broken_test"]);
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(1)));
+}
+
+#[test]
+fn a_range_where_nothing_fails_like_the_tip_names_no_culprit_and_checks_each_commit_once() {
+    let lab = post_lab("", "", POST_STEP);
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script).unwrap().replace(
+        "\nexit 0\n",
+        "\nif [ -e svc/OTHER ]; then echo 'FAILED other_test'; exit 1; fi\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\nexit 0\n",
+    );
+    fs::write(&script, text).unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    let first = lab.push_pr_branch(1, &[("svc/BREAK", "x\n"), ("svc/OTHER", "y\n")]);
+    lab.queue_pr(1, &first, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+    let second = lab.push_pr_branch_removing(2, "svc/OTHER");
+    lab.queue_pr(2, &second, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    assert!(lab.state().post.red.unwrap().culprit.is_none());
+    let checked = runs(&lab);
+    let mut distinct = checked.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        checked.len(),
+        distinct.len(),
+        "같은 커밋을 두 번 검사하지 않는다"
+    );
 }
