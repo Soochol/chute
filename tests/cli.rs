@@ -34,10 +34,14 @@ fn init_writes_a_readable_draft_and_registers() {
 
     let draft = fs::read_to_string(repo.path().join("chute.toml")).unwrap();
     let config = Config::parse(&draft).unwrap();
-    assert_eq!(config.respawn, ["claude", "--dangerously-skip-permissions"]);
+    assert!(config.respawn.is_empty());
     let lines: Vec<&str> = draft.lines().collect();
     let at = lines.iter().position(|l| l.starts_with("respawn")).unwrap();
     assert!(lines[at - 1].contains("권한 확인 없이"), "{draft}");
+    assert!(
+        lines[at - 1].contains("--dangerously-skip-permissions"),
+        "{draft}"
+    );
 
     let repo_json = sb.chute_home().join("repos/acme__widget/repo.json");
     let info: Value = serde_json::from_str(&fs::read_to_string(repo_json).unwrap()).unwrap();
@@ -370,7 +374,8 @@ fn status_shows_queue_items_from_the_state_folder() {
                       "machine": null},
             "attempts": 1, "budget": 5, "submitted_ms": 10, "touches_config": true,
             "preflight": {"result": "pass", "head": "abc1234"},
-            "last_failure": {"kind": "verify", "mode": "solo", "summary": "test 실패", "report": "/r/1.md"}
+            "last_failure": {"kind": "verify", "mode": "solo", "summary": "test 실패", "report": "/r/1.md"},
+            "submitter": null, "priority": false, "after": [], "repair": false
         })
     );
 }

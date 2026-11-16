@@ -190,6 +190,41 @@ fn agents_are_addressed_from_the_viewing_pc() {
 }
 
 #[test]
+fn the_submitter_and_queue_options_are_shown_and_addressed_like_the_agent() {
+    let net = net();
+    let (hub, pc, lap) = (net.node("hub"), net.node("pc"), net.node("lap"));
+    let mut orchestrated = item(2, Some(&pc.id));
+    orchestrated["submitter"] = serde_json::json!({
+        "terminal": "t9", "created_ms": 6, "name": "orch", "workdir": "/o",
+        "alive": true, "machine": lap.id
+    });
+    orchestrated["priority"] = true.into();
+    orchestrated["after"] = serde_json::json!([1]);
+    orchestrated["repair"] = true.into();
+    write_queue(hub, "acme__widget", vec![item(1, None), orchestrated]);
+
+    let at_hub = status(hub, &[]);
+    let at_pc = status(pc, &[]);
+    for view in [&at_hub, &at_pc] {
+        let plain = &view["queue"][0];
+        assert_eq!(plain["submitter"], Value::Null);
+        assert_eq!(plain["priority"], false);
+        assert_eq!(plain["after"], serde_json::json!([]));
+        assert_eq!(plain["repair"], false);
+        let held = &view["queue"][1];
+        assert_eq!(held["priority"], true);
+        assert_eq!(held["after"], serde_json::json!([1]));
+        assert_eq!(held["repair"], true);
+        assert_eq!(held["submitter"]["name"], "orch");
+        assert_eq!(held["submitter"]["machine_id"], lap.id.as_str());
+    }
+    assert_eq!(at_hub["queue"][1]["submitter"]["terminal"], "lap/t9");
+    assert_eq!(at_pc["queue"][1]["submitter"]["terminal"], "lappy/t9");
+    assert_eq!(at_pc["queue"][1]["submitter"]["machine"], "lappy");
+    assert_eq!(at_pc["queue"][1]["agent"]["terminal"], "t7");
+}
+
+#[test]
 fn what_the_pc_prints_reads_as_the_status_type() {
     let net = net();
     let text = ok(&net.node("pc").chute(BIN, &["status", "--json"]));

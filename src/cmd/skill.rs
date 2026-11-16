@@ -76,4 +76,10 @@ mod tests {
         assert!(MANUAL.contains("권한 확인 없이"));
         assert!(MANUAL.contains("범위 밖을 건드리지 않는다"));
     }
+
+    #[test]
+    fn manual_says_nothing_is_respawned_by_default() {
+        assert!(MANUAL.contains("기본 설정에서는 chute가 새 에이전트를 띄우지 않고"));
+        assert!(!MANUAL.contains("기본 설정에서는 이 에이전트가"));
+    }
 }

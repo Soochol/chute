@@ -141,6 +141,10 @@ pub fn item(pr: u64, state: ItemState) -> QueueItem {
         submitted_ms: EpochMs(pr),
         touches_config: false,
         last_failure: None,
+        submitter: None,
+        priority: false,
+        after: Vec::new(),
+        repair: false,
     }
 }
 

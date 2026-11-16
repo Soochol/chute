@@ -296,7 +296,7 @@ fn after_the_budget_is_spent_the_next_failure_goes_to_a_human_and_nothing_is_sen
 
 #[test]
 fn a_finished_agent_is_replaced_and_the_new_address_is_recorded() {
-    let lab = Lab::new(BAD);
+    let lab = Lab::build(BAD, "respawn = [\"claude\"]", 60);
     let hc = lab.sb.fake("hc");
     hc.respond(
         "get t1gone --json",
@@ -330,7 +330,7 @@ fn a_finished_agent_is_replaced_and_the_new_address_is_recorded() {
 
 #[test]
 fn without_an_agent_or_a_respawn_command_the_pr_waits_for_a_human() {
-    let lab = Lab::build(BAD, "respawn = []", 60);
+    let lab = Lab::new(BAD);
     let hc = lab.sb.fake("hc");
     hc.respond(
         "get t1gone --json",
@@ -575,6 +575,7 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
             verify_s: 0,
             pushed: Vec::new(),
             verifications: 0,
+            env: None,
         })
         .unwrap();
 
@@ -869,12 +870,15 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
             merges: vec![chute::model::MergeRef {
                 pr: PrNumber(2),
                 commit: landed.clone(),
+                submitter: None,
+                agent: None,
             }],
             bounced: prs(&[1]),
             flaky: Vec::new(),
             verify_s: 7,
             pushed: vec![landed],
             verifications: 3,
+            env: None,
         })
         .unwrap();
 
@@ -935,6 +939,7 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
             verify_s: 0,
             pushed: Vec::new(),
             verifications: 0,
+            env: None,
         })
         .unwrap();
     let history = lab.store.dir().join("history.jsonl");
@@ -974,6 +979,7 @@ fn batch_record(
         verify_s: 0,
         pushed: Vec::new(),
         verifications: 0,
+        env: None,
     }
 }
 
@@ -1018,6 +1024,8 @@ fn recovery_cut_before_the_batch_finished_event_writes_it_once_after_the_rerun()
             vec![chute::model::MergeRef {
                 pr: PrNumber(2),
                 commit: landed,
+                submitter: None,
+                agent: None,
             }],
             &[1],
         ))
@@ -1201,6 +1209,8 @@ fn recovery_writes_the_finished_event_a_batch_with_a_finished_record_never_got()
         vec![chute::model::MergeRef {
             pr: PrNumber(2),
             commit: landed,
+            submitter: None,
+            agent: None,
         }],
         &[1],
     );

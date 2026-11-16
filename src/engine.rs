@@ -246,6 +246,8 @@ impl Engine {
                         record.merges.push(MergeRef {
                             pr: item.pr,
                             commit: commit.clone(),
+                            submitter: None,
+                            agent: None,
                         });
                     }
                 }
@@ -490,6 +492,7 @@ impl Engine {
                 verify_s: 0,
                 pushed: Vec::new(),
                 verifications: 0,
+                env: None,
             },
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
@@ -1130,6 +1133,8 @@ impl Run<'_> {
             self.record.merges.push(MergeRef {
                 pr: *pr,
                 commit: commit.clone(),
+                submitter: None,
+                agent: None,
             });
         }
         self.save_record()?;
@@ -1277,6 +1282,10 @@ impl Run<'_> {
                 reason: BlockReason::BaseBroken,
                 base: base.clone(),
                 since_ms: EpochMs::now(),
+                step: None,
+                log: None,
+                pushed_by_chute: false,
+                rechecked: false,
             });
             Ok(())
         })?;

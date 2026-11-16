@@ -337,6 +337,7 @@ fn old_results_of_unqueued_branches_are_dropped() {
                     at_ms: chute::model::EpochMs(1),
                     base: None,
                     with: Vec::new(),
+                    env: None,
                 },
             );
             Ok(())
@@ -449,6 +450,10 @@ fn a_broken_base_is_announced_first() {
                 reason: chute::model::BlockReason::BaseBroken,
                 base: Sha::try_from(base.clone()).unwrap(),
                 since_ms: chute::model::EpochMs(1),
+                step: None,
+                log: None,
+                pushed_by_chute: false,
+                rechecked: false,
             });
             Ok(())
         })
@@ -880,6 +885,10 @@ mod remote {
                     reason: chute::model::BlockReason::BaseBroken,
                     base: Sha::try_from(base.trim().to_owned()).unwrap(),
                     since_ms: chute::model::EpochMs(1),
+                    step: None,
+                    log: None,
+                    pushed_by_chute: false,
+                    rechecked: false,
                 });
                 Ok(())
             })

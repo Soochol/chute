@@ -11,6 +11,7 @@ use crate::model::{Approval, NonEmpty};
 
 pub const FILE_NAME: &str = "chute.toml";
 pub const DEFAULT_BUDGET: u32 = 3;
+pub const PROBE_PLACEHOLDER: &str = "{tests}";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -20,7 +21,32 @@ pub struct Config {
     pub serialize: bool,
     pub require_ci: bool,
     pub respawn: Vec<String>,
+    pub require_head: bool,
+    pub max_parallel: u32,
+    pub env_check: Vec<String>,
+    pub retention: Retention,
+    pub cache: Cache,
+    pub flaky: FlakyPolicy,
     pub verify: NonEmpty<VerifyStep>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    pub logs_days: u32,
+    pub reports_days: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cache {
+    pub seed: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlakyPolicy {
+    pub probe_repeats: u32,
+    pub probe_seconds: u32,
+    pub chronic: u32,
+    pub chronic_days: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +55,7 @@ pub struct VerifyStep {
     pub run: String,
     pub timeout: Duration,
     pub failed: Option<Regex>,
+    pub probe: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,10 +71,71 @@ struct RawConfig {
     serialize: bool,
     #[serde(default)]
     require_ci: bool,
-    #[serde(default = "default_respawn")]
+    #[serde(default)]
     respawn: Vec<String>,
     #[serde(default)]
+    require_head: bool,
+    #[serde(default = "default_max_parallel")]
+    max_parallel: u32,
+    #[serde(default)]
+    env_check: Vec<String>,
+    #[serde(default)]
+    retention: RawRetention,
+    #[serde(default)]
+    cache: RawCache,
+    #[serde(default)]
+    flaky: RawFlaky,
+    #[serde(default)]
     verify: Vec<RawStep>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetention {
+    #[serde(default = "default_logs_days")]
+    logs_days: u32,
+    #[serde(default = "default_reports_days")]
+    reports_days: u32,
+}
+
+impl Default for RawRetention {
+    fn default() -> Self {
+        RawRetention {
+            logs_days: default_logs_days(),
+            reports_days: default_reports_days(),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCache {
+    #[serde(default)]
+    seed: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFlaky {
+    #[serde(default = "default_probe_repeats")]
+    probe_repeats: u32,
+    #[serde(default = "default_probe_seconds")]
+    probe_seconds: u32,
+    #[serde(default = "default_chronic")]
+    chronic: u32,
+    #[serde(default = "default_chronic_days")]
+    chronic_days: u32,
+}
+
+impl Default for RawFlaky {
+    fn default() -> Self {
+        RawFlaky {
+            probe_repeats: default_probe_repeats(),
+            probe_seconds: default_probe_seconds(),
+            chronic: default_chronic(),
+            chronic_days: default_chronic_days(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -58,6 +146,7 @@ struct RawStep {
     #[serde(default = "default_timeout")]
     timeout: u64,
     failed: Option<String>,
+    probe: Option<String>,
 }
 
 fn default_budget() -> u32 {
@@ -68,8 +157,32 @@ fn default_max_batch() -> u32 {
     8
 }
 
-fn default_respawn() -> Vec<String> {
-    vec!["claude".into(), "--dangerously-skip-permissions".into()]
+fn default_max_parallel() -> u32 {
+    2
+}
+
+fn default_logs_days() -> u32 {
+    7
+}
+
+fn default_reports_days() -> u32 {
+    30
+}
+
+fn default_probe_repeats() -> u32 {
+    20
+}
+
+fn default_probe_seconds() -> u32 {
+    180
+}
+
+fn default_chronic() -> u32 {
+    3
+}
+
+fn default_chronic_days() -> u32 {
+    30
 }
 
 fn default_timeout() -> u64 {
@@ -84,6 +197,24 @@ impl Config {
         }
         if raw.respawn.iter().any(|arg| arg.trim().is_empty()) {
             bail!("chute.toml의 respawn에 빈 항목이 있다. 띄우지 않으려면 respawn = []로 둔다");
+        }
+        let at_least_one = [
+            ("max_parallel", raw.max_parallel),
+            ("retention.logs_days", raw.retention.logs_days),
+            ("retention.reports_days", raw.retention.reports_days),
+            ("flaky.probe_repeats", raw.flaky.probe_repeats),
+            ("flaky.probe_seconds", raw.flaky.probe_seconds),
+            ("flaky.chronic", raw.flaky.chronic),
+            ("flaky.chronic_days", raw.flaky.chronic_days),
+        ];
+        if let Some((key, _)) = at_least_one.iter().find(|(_, value)| *value == 0) {
+            bail!("chute.toml의 {key}는 1 이상이어야 한다");
+        }
+        if raw.env_check.iter().any(|run| run.trim().is_empty()) {
+            bail!("chute.toml의 env_check에 빈 항목이 있다");
+        }
+        if raw.cache.seed.iter().any(|path| path.trim().is_empty()) {
+            bail!("chute.toml의 cache.seed에 빈 항목이 있다");
         }
         let mut names = BTreeSet::new();
         let mut steps = Vec::with_capacity(raw.verify.len());
@@ -118,11 +249,20 @@ impl Config {
             if failed.as_ref().is_some_and(|re| re.as_str().is_empty()) {
                 bail!("verify 단계 {:?}의 failed 정규식이 비어 있다", step.name);
             }
+            if let Some(probe) = &step.probe
+                && !probe.contains(PROBE_PLACEHOLDER)
+            {
+                bail!(
+                    "verify 단계 {:?}의 probe에 {PROBE_PLACEHOLDER} 자리가 없다",
+                    step.name
+                );
+            }
             steps.push(VerifyStep {
                 name: step.name,
                 run: step.run,
                 timeout: Duration::from_secs(step.timeout),
                 failed,
+                probe: step.probe,
             });
         }
         let verify = NonEmpty::new(steps)
@@ -134,6 +274,22 @@ impl Config {
             serialize: raw.serialize,
             require_ci: raw.require_ci,
             respawn: raw.respawn,
+            require_head: raw.require_head,
+            max_parallel: raw.max_parallel,
+            env_check: raw.env_check,
+            retention: Retention {
+                logs_days: raw.retention.logs_days,
+                reports_days: raw.retention.reports_days,
+            },
+            cache: Cache {
+                seed: raw.cache.seed,
+            },
+            flaky: FlakyPolicy {
+                probe_repeats: raw.flaky.probe_repeats,
+                probe_seconds: raw.flaky.probe_seconds,
+                chronic: raw.flaky.chronic,
+                chronic_days: raw.flaky.chronic_days,
+            },
             verify,
         })
     }
@@ -184,9 +340,26 @@ budget = 3              # 연속 반송 한도. 넘으면 사람 차례로 간�
 max_batch = 8           # 한 batch의 PR 수 상한
 serialize = false       # true면 검증을 한 번에 하나만 돈다
 require_ci = false      # true면 GitHub check가 통과한 PR만 batch에 넣는다
-# 에이전트가 없을 때 띄울 명령. 빈 배열이면 띄우지 않는다.
-# 주의: 이 기본값은 새 에이전트가 권한 확인 없이 명령을 실행하게 한다.
-respawn = ["claude", "--dangerously-skip-permissions"]
+require_head = false    # true면 --head 없는 submit을 거절한다
+max_parallel = 2        # 동시에 도는 preflight 수 상한(슬롯 수 상한)
+env_check = []          # 검증 전에 돌려 결과를 남길 명령. 예: ["cargo --version"]
+# 에이전트가 없을 때 띄울 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다.
+# 값을 넣으면 그 명령으로 새 에이전트를 띄운다.
+# 주의: --dangerously-skip-permissions를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행한다.
+respawn = []
+
+[retention]
+logs_days = 7           # 검증 로그와 preflight 로그를 남기는 날수
+reports_days = 30       # 반송 보고서, preflight 보고서, 실패 트리 참조를 남기는 날수
+
+[cache]
+seed = []               # 새 슬롯에 복사해 올 git이 무시하는 경로. 예: ["target"]
+
+[flaky]
+probe_repeats = 20      # 흔들린 시험을 되풀이하는 횟수 상한
+probe_seconds = 180     # 되풀이하는 시간 상한(초)
+chronic = 3             # 이만큼 흔들리면 만성으로 본다
+chronic_days = 30       # 만성을 세는 기간(일)
 
 [[verify]]
 name = "test"
@@ -194,6 +367,7 @@ name = "test"
 run = {run}
 timeout = 3600          # 초
 # failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
+# probe = "cargo test {{tests}} -- --exact"   # 흔들린 시험만 되풀이하는 명령. {{tests}} 자리가 필요하다
 "#
     )
 }
@@ -213,10 +387,31 @@ mod tests {
         assert_eq!(c.max_batch, 8);
         assert!(!c.serialize);
         assert!(!c.require_ci);
-        assert_eq!(c.respawn, ["claude", "--dangerously-skip-permissions"]);
+        assert!(c.respawn.is_empty());
+        assert!(!c.require_head);
+        assert_eq!(c.max_parallel, 2);
+        assert!(c.env_check.is_empty());
+        assert_eq!(
+            c.retention,
+            Retention {
+                logs_days: 7,
+                reports_days: 30
+            }
+        );
+        assert!(c.cache.seed.is_empty());
+        assert_eq!(
+            c.flaky,
+            FlakyPolicy {
+                probe_repeats: 20,
+                probe_seconds: 180,
+                chronic: 3,
+                chronic_days: 30
+            }
+        );
         assert_eq!(c.verify.len(), 1);
         assert_eq!(c.verify[0].timeout, Duration::from_secs(3600));
         assert!(c.verify[0].failed.is_none());
+        assert!(c.verify[0].probe.is_none());
     }
 
     #[test]
@@ -228,19 +423,57 @@ budget = 5
 max_batch = 2
 serialize = true
 require_ci = true
-respawn = []
+respawn = ["codex", "--no-daemon"]
+require_head = true
+max_parallel = 4
+env_check = ["cargo --version", "git --version"]
+[retention]
+logs_days = 3
+reports_days = 10
+[cache]
+seed = ["target", "node_modules"]
+[flaky]
+probe_repeats = 5
+probe_seconds = 60
+chronic = 2
+chronic_days = 14
 [[verify]]
 name = "test"
 run = "cargo test"
 timeout = 1800
 failed = 'test (\S+) \.\.\. FAILED'
+probe = "cargo test {tests} -- --exact"
 "#,
         )
         .unwrap();
         assert_eq!(c.approval, Approval::Human);
         assert_eq!((c.budget, c.max_batch), (5, 2));
         assert!(c.serialize && c.require_ci);
-        assert!(c.respawn.is_empty());
+        assert_eq!(c.respawn, ["codex", "--no-daemon"]);
+        assert!(c.require_head);
+        assert_eq!(c.max_parallel, 4);
+        assert_eq!(c.env_check, ["cargo --version", "git --version"]);
+        assert_eq!(
+            c.retention,
+            Retention {
+                logs_days: 3,
+                reports_days: 10
+            }
+        );
+        assert_eq!(c.cache.seed, ["target", "node_modules"]);
+        assert_eq!(
+            c.flaky,
+            FlakyPolicy {
+                probe_repeats: 5,
+                probe_seconds: 60,
+                chronic: 2,
+                chronic_days: 14
+            }
+        );
+        assert_eq!(
+            c.verify[0].probe.as_deref(),
+            Some("cargo test {tests} -- --exact")
+        );
         assert_eq!(c.verify[0].timeout, Duration::from_secs(1800));
         let re = c.verify[0].failed.as_ref().unwrap();
         assert_eq!(&re.captures("test a::b ... FAILED").unwrap()[1], "a::b");
@@ -280,6 +513,53 @@ failed = 'test (\S+) \.\.\. FAILED'
     }
 
     #[test]
+    fn rejects_zero_limits() {
+        for key in [
+            "max_parallel = 0\n",
+            "[retention]\nlogs_days = 0\n",
+            "[retention]\nreports_days = 0\n",
+            "[flaky]\nprobe_repeats = 0\n",
+            "[flaky]\nprobe_seconds = 0\n",
+            "[flaky]\nchronic = 0\n",
+            "[flaky]\nchronic_days = 0\n",
+        ] {
+            let text = if key.starts_with('[') {
+                format!("{MINIMAL}{key}")
+            } else {
+                format!("{key}{MINIMAL}")
+            };
+            let err = Config::parse(&text).unwrap_err();
+            assert!(format!("{err:#}").contains("1 이상"), "{key:?}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn rejects_blank_env_check_and_seed_entries() {
+        assert!(Config::parse(&format!("env_check = [\"\"]\n{MINIMAL}")).is_err());
+        assert!(Config::parse(&format!("env_check = [\" \"]\n{MINIMAL}")).is_err());
+        assert!(Config::parse(&format!("{MINIMAL}[cache]\nseed = [\"\"]\n")).is_err());
+        assert!(Config::parse(&format!("env_check = []\n{MINIMAL}[cache]\nseed = []\n")).is_ok());
+    }
+
+    #[test]
+    fn a_probe_needs_the_tests_placeholder() {
+        let step = |probe: &str| {
+            format!("[[verify]]\nname = \"test\"\nrun = \"true\"\nprobe = '{probe}'\n")
+        };
+        assert!(Config::parse(&step("cargo test")).is_err());
+        assert!(Config::parse(&step("")).is_err());
+        assert!(Config::parse(&step("cargo test {tests}")).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_the_new_tables() {
+        for table in ["retention", "cache", "flaky"] {
+            let text = format!("{MINIMAL}[{table}]\nbogus = 1\n");
+            assert!(Config::parse(&text).is_err(), "{table}");
+        }
+    }
+
+    #[test]
     fn rejects_step_names_that_are_not_file_names() {
         for name in ["../x", "a/b", ".hidden", ""] {
             let text = format!("[[verify]]\nname = \"{name}\"\nrun = \"true\"\n");
@@ -291,11 +571,44 @@ failed = 'test (\S+) \.\.\. FAILED'
     fn draft_parses_and_warns_above_respawn() {
         let text = draft("cargo test");
         let c = Config::parse(&text).unwrap();
-        assert_eq!(c.respawn, ["claude", "--dangerously-skip-permissions"]);
+        assert!(c.respawn.is_empty());
         assert_eq!(c.verify[0].run, "cargo test");
         let lines: Vec<&str> = text.lines().collect();
         let at = lines.iter().position(|l| l.starts_with("respawn")).unwrap();
-        assert!(lines[at - 1].starts_with('#') && lines[at - 1].contains("권한 확인 없이"));
+        let comment = &lines[at - 3..at];
+        assert!(comment.iter().all(|l| l.starts_with('#')), "{comment:?}");
+        assert!(comment[0].contains("비어 있으면 띄우지 않고 사람 차례로 넘긴다"));
+        assert!(comment[1].contains("값을 넣으면 그 명령으로 새 에이전트를 띄운다"));
+        assert!(
+            comment[2].contains("--dangerously-skip-permissions")
+                && comment[2].contains("권한 확인 없이")
+        );
+    }
+
+    #[test]
+    fn draft_carries_every_key_and_reads_back_as_the_defaults() {
+        let text = draft("cargo test");
+        let table: toml::Table = text.parse().unwrap();
+        for key in [
+            "require_head",
+            "max_parallel",
+            "env_check",
+            "respawn",
+            "retention",
+            "cache",
+            "flaky",
+        ] {
+            assert!(table.contains_key(key), "초안에 {key}가 없다");
+        }
+        let minimal = Config::parse(MINIMAL).unwrap();
+        let drafted = Config::parse(&text).unwrap();
+        assert_eq!(drafted.max_parallel, minimal.max_parallel);
+        assert_eq!(drafted.retention, minimal.retention);
+        assert_eq!(drafted.flaky, minimal.flaky);
+        assert_eq!(drafted.cache, minimal.cache);
+        assert_eq!(drafted.env_check, minimal.env_check);
+        assert_eq!(drafted.require_head, minimal.require_head);
+        assert!(text.contains("# probe = "));
     }
 
     #[test]
