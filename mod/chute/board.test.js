@@ -18,7 +18,7 @@ const only = (data) => board(data).repos[0];
 const section = (repo, id) => repo.sections.find((s) => s.id === id);
 const prs = (s) => s.items.map((item) => item.pr);
 const withQueue = (...items) => ({ ...clone(fixture), queue: items.map(clone) });
-const queueOnly = (...items) => ({ ...withQueue(...items), blocked: null, warnings: [], batch: null });
+const queueOnly = (...items) => ({ ...withQueue(...items), blocked: null, warnings: [], post_verify: {}, batch: null });
 const itemOf = (pr) => clone(fixture.queue.find((item) => item.pr === pr));
 
 test("every fixture item lands in one of the six sections", () => {
@@ -160,6 +160,7 @@ test("a stopped daemon is announced in the first section", () => {
   const data = clone(fixture);
   data.blocked = null;
   data.warnings = [];
+  data.post_verify = {};
   data.daemon = { running: false, terminal: null, pid: null };
   const repo = only(data);
   assert.equal(repo.sections[0].id, "alerts");
@@ -172,6 +173,7 @@ test("a healthy repo has no alerts section", () => {
   const data = clone(fixture);
   data.blocked = null;
   data.warnings = [];
+  data.post_verify = {};
   assert.equal(section(only(data), "alerts"), undefined);
 });
 
@@ -290,6 +292,7 @@ test("today's numbers", () => {
     batches: "3",
     lead: "6분 52초",
     verify: "21분",
+    post_green: "1e2d3c4",
   });
   const data = clone(fixture);
   data.today.median_lead_s = null;
@@ -297,7 +300,7 @@ test("today's numbers", () => {
 });
 
 test("empty sections are not drawn", () => {
-  const data = { ...clone(fixture), queue: [], batch: null, blocked: null, warnings: [] };
+  const data = { ...clone(fixture), queue: [], batch: null, blocked: null, warnings: [], post_verify: {} };
   assert.deepEqual(only(data).sections.map((s) => s.id), ["today"]);
 });
 
@@ -463,13 +466,14 @@ test("an exit code that is not a number is reported without printing null", () =
 
 test("warnings alone still make the alerts section", () => {
   const data = { ...clone(fixture), blocked: null };
-  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["warning", "warning", "warning"]);
+  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["post_verify", "warning", "warning", "warning"]);
 });
 
 test("a blocked queue and a stopped daemon are both announced, blocked first", () => {
   const data = { ...clone(fixture), daemon: { running: false, terminal: null, pid: null } };
-  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["blocked", "daemon", "warning", "warning", "warning"]);
+  assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["blocked", "daemon", "post_verify", "warning", "warning", "warning"]);
   data.warnings = [];
+  data.post_verify = {};
   assert.deepEqual(section(only(data), "alerts").items.map((a) => a.kind), ["blocked", "daemon"]);
 });
 
@@ -537,6 +541,7 @@ test("alerts keep their text, kind and tone", () => {
   const alerts = section(only([fixture]), "alerts").items;
   assert.deepEqual(alerts.map((a) => [a.kind, a.tone]), [
     ["blocked", "error"],
+    ["post_verify", "error"],
     ["warning", "warn"],
     ["warning", "warn"],
     ["warning", "warn"],
@@ -546,6 +551,7 @@ test("alerts keep their text, kind and tone", () => {
   const data = {
     ...clone(fixture),
     blocked: null,
+    post_verify: {},
     daemon: { running: false, terminal: null, pid: null },
     warnings: ["문자열 경고", { kind: "config" }, { message: "" }, {}],
   };
@@ -574,7 +580,7 @@ test("a blocked reason that is not a known word is shown as it is, and a future 
 
 test("a daemon record that does not say running:false raises no alert", () => {
   for (const daemon of [{}, null, { running: true }, { running: null }]) {
-    const data = { ...clone(fixture), blocked: null, warnings: [], daemon };
+    const data = { ...clone(fixture), blocked: null, warnings: [], post_verify: {}, daemon };
     assert.equal(section(only(data), "alerts"), undefined, JSON.stringify(daemon));
   }
 });
@@ -1062,7 +1068,7 @@ test("v3: no repair item means no repair line", () => {
 });
 
 test("v3: a repair item is not announced when the queue is not halted", () => {
-  const data = { ...clone(fixture), blocked: null };
+  const data = { ...clone(fixture), blocked: null, post_verify: {} };
   assert.ok(section(only(data), "alerts").items.every((a) => a.facts.length === 0));
 });
 
@@ -1150,4 +1156,37 @@ test("v3: a PR listed twice in after is shown once", () => {
   const item = itemOf(24);
   item.after = [12, 12, 22];
   assert.deepEqual(marksOfItem(waitingItem(withQueue(item), 24)), ["#12, #22 뒤"]);
+});
+
+test("a failed check after the merge is an alert with the culprit, the last green commit and the revert hint", () => {
+  const alert = section(only([fixture]), "alerts").items.find((a) => a.kind === "post_verify");
+  assert.equal(alert.tone, "error");
+  assert.equal(alert.text, "머지 뒤 검사가 실패했다: 단계 e2e");
+  assert.match(alert.detail, /^커밋 9f8e7d6 · /);
+  assert.deepEqual(alert.facts, [
+    "처음 실패한 머지 #12",
+    "마지막 통과 1e2d3c4",
+    "실패한 시험 login flow",
+    "되돌리려면 chute revert b20261117-091500",
+  ]);
+  assert.match(alert.log, /e2e\.1\.log$/);
+
+  const data = clone(fixture);
+  data.post_verify.red.culprit = null;
+  data.post_verify.red.last_green = null;
+  const lost = section(only(data), "alerts").items.find((a) => a.kind === "post_verify");
+  assert.deepEqual(lost.facts, ["처음 실패한 머지를 찾지 못했다", "실패한 시험 login flow"]);
+});
+
+test("the last passing commit of the check after the merge sits among today's numbers, with the phase while it runs", () => {
+  const stat = (data) => section(only(data), "today").items.find((s) => s.key === "post_green");
+  assert.equal(stat(fixture).value, "1e2d3c4");
+  assert.equal(stat(fixture).label, "머지 뒤 검사 마지막 통과 · 범인 찾는 중");
+  const data = clone(fixture);
+  data.post_verify.run = null;
+  assert.equal(stat(data).label, "머지 뒤 검사 마지막 통과");
+  data.post_verify.last_green = null;
+  assert.equal(stat(data), undefined);
+  delete data.post_verify;
+  assert.equal(stat(data), undefined);
 });

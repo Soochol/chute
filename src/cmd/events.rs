@@ -121,7 +121,12 @@ fn involves(kind: &EventKind, target: PrNumber) -> bool {
         EventKind::Flaky { .. }
         | EventKind::Blocked { .. }
         | EventKind::FlakyProbe { .. }
-        | EventKind::Reused { .. } => false,
+        | EventKind::Reused { .. }
+        | EventKind::PostGreen { .. } => false,
+        EventKind::PostFailed { culprit, .. } => {
+            culprit.as_ref().and_then(|c| c.pr) == Some(target)
+        }
+        EventKind::PostFixed { pr, .. } => *pr == Some(target),
     }
 }
 
@@ -302,6 +307,52 @@ fn describe(kind: &EventKind) -> String {
             names(tests),
             probe_evidence(*evidence)
         ),
+        EventKind::PostGreen {
+            commit,
+            previous,
+            seconds,
+        } => {
+            let previous = previous
+                .as_ref()
+                .map_or(String::new(), |p| format!(" · 이전 통과 {}", short(p)));
+            format!(
+                "머지 뒤 검사 통과 · 커밋 {}{previous} · {seconds}초",
+                short(commit)
+            )
+        }
+        EventKind::PostFailed {
+            commit,
+            step,
+            tests,
+            last_green,
+            culprit,
+        } => {
+            let green = last_green
+                .as_ref()
+                .map_or(" · 마지막 통과 없음".to_owned(), |g| {
+                    format!(" · 마지막 통과 {}", short(g))
+                });
+            let culprit = match culprit {
+                Some(c) => match c.pr {
+                    Some(pr) => format!(" · 범인 {pr}"),
+                    None => format!(" · 범인 커밋 {}(chute가 머지하지 않았다)", short(&c.commit)),
+                },
+                None => " · 범인을 찾지 못했다".to_owned(),
+            };
+            format!(
+                "머지 뒤 검사 실패 · 커밋 {} · 단계 {step} · 시험 {}{green}{culprit}",
+                short(commit),
+                names(tests)
+            )
+        }
+        EventKind::PostFixed { commit, was, pr } => {
+            let pr = pr.map_or(String::new(), |p| format!(" · 범인이던 {p}"));
+            format!(
+                "머지 뒤 검사 풀림 · 커밋 {} · 실패했던 {}{pr}",
+                short(commit),
+                short(was)
+            )
+        }
     }
 }
 
@@ -358,6 +409,8 @@ fn notify_kind(kind: NotifyKind) -> &'static str {
         NotifyKind::Reverted => "되돌림",
         NotifyKind::Waiting => "대기",
         NotifyKind::Flaky => "흔들림",
+        NotifyKind::PostFailed => "머지 뒤 검사 실패",
+        NotifyKind::PostFixed => "머지 뒤 검사 풀림",
     }
 }
 
@@ -577,6 +630,42 @@ mod tests {
     }
 
     #[test]
+    fn pr_keeps_the_check_after_the_merge_events_that_name_the_culprit() {
+        let culprit = |pr| crate::model::Culprit {
+            commit: sha("abcd"),
+            pr,
+            batch: None,
+        };
+        let failed = EventKind::PostFailed {
+            commit: sha("9f8e7d6a5b4c"),
+            step: "e2e".into(),
+            tests: vec![],
+            last_green: None,
+            culprit: Some(culprit(Some(PrNumber(7)))),
+        };
+        let unknown = EventKind::PostFailed {
+            commit: sha("9f8e7d6a5b4c"),
+            step: "e2e".into(),
+            tests: vec![],
+            last_green: None,
+            culprit: Some(culprit(None)),
+        };
+        let fixed = EventKind::PostFixed {
+            commit: sha("9f8e7d6a5b4c"),
+            was: sha("abcd"),
+            pr: Some(PrNumber(7)),
+        };
+        let green = EventKind::PostGreen {
+            commit: sha("9f8e7d6a5b4c"),
+            previous: None,
+            seconds: 1,
+        };
+        assert!(involves(&failed, PrNumber(7)) && involves(&fixed, PrNumber(7)));
+        assert!(!involves(&failed, PrNumber(8)) && !involves(&unknown, PrNumber(7)));
+        assert!(!involves(&green, PrNumber(7)));
+    }
+
+    #[test]
     fn every_kind_of_event_has_a_one_line_korean_description() {
         let batch = BatchId("b1".into());
         let kinds = [
@@ -650,6 +739,27 @@ mod tests {
                 evidence: ProbeEvidence::Made,
                 runs: 5,
                 failures: 2,
+            },
+            EventKind::PostGreen {
+                commit: sha("9f8e7d6a5b4c"),
+                previous: Some(sha("abcd")),
+                seconds: 480,
+            },
+            EventKind::PostFailed {
+                commit: sha("9f8e7d6a5b4c"),
+                step: "e2e".into(),
+                tests: vec!["login".into()],
+                last_green: None,
+                culprit: Some(crate::model::Culprit {
+                    commit: sha("abcd"),
+                    pr: None,
+                    batch: None,
+                }),
+            },
+            EventKind::PostFixed {
+                commit: sha("9f8e7d6a5b4c"),
+                was: sha("abcd"),
+                pr: Some(PrNumber(1)),
             },
         ];
         for kind in kinds {

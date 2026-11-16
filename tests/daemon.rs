@@ -429,3 +429,57 @@ fn the_daemon_runs_gc_when_it_starts_and_leaves_the_records() {
     ok(chute(&lab, &["down", "--now"]).output().unwrap());
     wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
 }
+
+#[test]
+fn the_daemon_checks_the_tip_after_the_merge_beside_the_queue_and_down_ends_the_check() {
+    let step = "[[post_verify]]\nname = \"slow\"\nrun = \"sh @ROOT@/post.sh\"\ntimeout = 60\n";
+    let lab = Lab::build_with_step("", "", 60, step);
+    let root = lab.sb.root();
+    std::fs::write(
+        root.join("post.sh"),
+        format!(
+            "echo $$ > '{r}/post.pid'\nwhile [ -e '{r}/gate' ]; do sleep 0.05; done\n",
+            r = root.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("gate"), "").unwrap();
+    let first_tip = lab.origin_main();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    let mut daemon = start_daemon(&lab);
+
+    wait_until("검사가 시작되지 않았다", || {
+        lab.state().post.run.is_some_and(|run| run.step.is_some())
+    });
+    wait_until("큐가 비지 않았다", || lab.state().queue.is_empty());
+    assert_eq!(
+        lab.merge_commits_on_main().len(),
+        1,
+        "검사가 도는 중에도 머지한다"
+    );
+    assert_eq!(lab.state().post.run.unwrap().tip.as_str(), first_tip);
+
+    std::fs::remove_file(root.join("gate")).unwrap();
+    let merged_tip = lab.origin_main();
+    wait_until("last green이 새 tip으로 오지 않았다", || {
+        lab.state()
+            .post
+            .last_green
+            .is_some_and(|green| green.commit.as_str() == merged_tip)
+    });
+
+    std::fs::write(root.join("gate"), "").unwrap();
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    wait_until("두 번째 검사가 시작되지 않았다", || {
+        lab.state().post.run.is_some_and(|run| run.step.is_some())
+    });
+    let pid: i32 = std::fs::read_to_string(root.join("post.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    ok(chute(&lab, &["down"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+    wait_until("검사 단계가 남았다", || is_gone(pid));
+    assert!(lab.state().post.run.is_none());
+}

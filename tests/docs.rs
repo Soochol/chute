@@ -217,7 +217,16 @@ fn readme_and_manual_notice_kinds_match() {
     let readme = readme();
     let manual = manual();
     for kind in [
-        "merged", "bounced", "human", "halted", "resumed", "reverted", "waiting", "flaky",
+        "merged",
+        "bounced",
+        "human",
+        "halted",
+        "resumed",
+        "reverted",
+        "waiting",
+        "flaky",
+        "post_failed",
+        "post_fixed",
     ] {
         assert!(readme.contains(&format!("| `{kind}` |")), "README에 {kind}");
         assert!(manual.contains(&format!("| `{kind}` |")), "설명서에 {kind}");
@@ -340,4 +349,35 @@ fn docs_describe_the_pc_wide_verify_limit_the_code_enforces() {
         assert!(code.contains(text), "코드에 `{text}`가 없다");
     }
     assert!(manual().contains("이 PC에서 검증 N개가 돌고 있어 기다린다"));
+}
+
+#[test]
+fn docs_describe_the_check_after_the_merge_the_code_runs() {
+    let readme = readme();
+    let manual = manual();
+    for needed in [
+        "## 머지 뒤 검사",
+        "`[[post_verify]]`",
+        "`post_verify_interval`",
+        "`post_verify_hold`",
+        "last green",
+        "post_verify.last_green",
+        "chute revert <batch>",
+        "자동으로 되돌리지 않는다",
+        "chute 결과 post_failed slug=",
+        "chute 결과 post_fixed slug=",
+        "post-<커밋 12자>",
+        "`놓친 알림`",
+    ] {
+        assert!(readme.contains(needed), "README에 `{needed}`가 없다");
+    }
+    assert!(manual.contains("머지 뒤 검사가 실패했다는 알림"));
+    let config = chute::config::Config::parse(&chute::config::draft("cargo test")).unwrap();
+    assert!(config.post.is_none());
+    assert!(readme.contains("| `post_verify_interval` | `0` |"));
+    assert!(readme.contains("| `post_verify_hold` | `false` |"));
+    let code = source();
+    for text in ["post-{}", "머지 뒤 검사 슬롯을 다른 프로세스가 쥐고 있다"] {
+        assert!(code.contains(text), "코드에 `{text}`가 없다");
+    }
 }

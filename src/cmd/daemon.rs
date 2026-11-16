@@ -14,6 +14,7 @@ use crate::feedback;
 use crate::gc;
 use crate::hub::{Route, route};
 use crate::model::{DaemonInfo, EpochMs, PrNumber, Warning, WarningKind};
+use crate::post::{PostPass, PostVerifier};
 use crate::store::RepoStore;
 use crate::verify::Cancel;
 
@@ -21,6 +22,8 @@ const STOP_FILE: &str = "stop";
 const WATCH_POLL: Duration = Duration::from_millis(100);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const BLOCKED_POLL: Duration = Duration::from_secs(15);
+/// Looking at the default branch's tip costs a fetch, so the check after the merge looks less often.
+const POST_POLL: Duration = Duration::from_secs(10);
 const ERROR_POLL: Duration = Duration::from_secs(10);
 const MAX_ERROR_POLL: Duration = Duration::from_secs(600);
 const STALE_STOP: Duration = Duration::from_secs(2);
@@ -109,9 +112,17 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         signal(Signal::SIGINT, SigHandler::Handler(on_terminate))?;
     }
     let flags = Arc::new(Flags::default());
+    let post_cancel = Cancel::new();
     let watcher = {
         let (store, flags, cancel) = (store.clone(), flags.clone(), cancel.clone());
-        thread::spawn(move || watch(&store, &flags, &cancel))
+        let post_cancel = post_cancel.clone();
+        thread::spawn(move || watch(&store, &flags, &cancel, &post_cancel))
+    };
+    let post = {
+        let verifier = PostVerifier::new(ctx.ext.clone(), ctx.home.clone(), info.clone())
+            .with_cancel(post_cancel);
+        let (store, flags) = (store.clone(), flags.clone());
+        thread::spawn(move || serve_post(&verifier, &store, &flags))
     };
     engine_warning(&store, None);
     println!("chute 데몬을 시작한다: {} (pid {})", info.slug, me.pid);
@@ -124,6 +135,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let served = serve(&engine, &site, &mut me, &flags);
     flags.done.store(true, Ordering::SeqCst);
     let _ = watcher.join();
+    let _ = post.join();
     let _ = store.clear_daemon();
     let _ = fs::remove_file(store.dir().join(STOP_FILE));
     super::up::clear_launch_marker(&store);
@@ -144,7 +156,7 @@ fn remove_stale_stop(store: &RepoStore) {
     }
 }
 
-fn watch(store: &RepoStore, flags: &Flags, cancel: &Cancel) {
+fn watch(store: &RepoStore, flags: &Flags, cancel: &Cancel, post_cancel: &Cancel) {
     while !flags.done.load(Ordering::SeqCst) {
         let stop = if TERMINATED.load(Ordering::SeqCst) {
             Some(Stop::Now)
@@ -158,6 +170,10 @@ fn watch(store: &RepoStore, flags: &Flags, cancel: &Cancel) {
             }
             Some(Stop::AfterBatch) => flags.after_batch.store(true, Ordering::SeqCst),
             None => {}
+        }
+        // The check after the merge is no batch to wait for. It starts over on the next start.
+        if flags.stopping() {
+            post_cancel.cancel();
         }
         thread::sleep(WATCH_POLL);
     }
@@ -203,6 +219,64 @@ fn engine_warning(store: &RepoStore, message: Option<&str>) {
     });
     if let Err(e) = result {
         eprintln!("chute: 경고를 남기지 못했다: {e:#}");
+    }
+}
+
+fn post_warning(store: &RepoStore, message: Option<&str>) {
+    let result = store.update(|s| {
+        s.warnings.retain(|w| w.kind != WarningKind::Post);
+        if let Some(message) = message {
+            s.warnings.push(Warning {
+                kind: WarningKind::Post,
+                message: format!("머지 뒤 검사를 하지 못해 다시 시도한다: {message}"),
+                pr: None,
+                at_ms: EpochMs::now(),
+            });
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!("chute: 경고를 남기지 못했다: {e:#}");
+    }
+}
+
+/// Runs beside `serve`: the check after the merge never holds the queue.
+fn serve_post(post: &PostVerifier, store: &RepoStore, flags: &Flags) {
+    let mut recovered = false;
+    let mut failures = 0u32;
+    let mut warned = false;
+    while !flags.stopping() && !flags.done.load(Ordering::SeqCst) {
+        let step = if recovered {
+            post.run_once().map(Some)
+        } else {
+            post.recover().map(|()| {
+                recovered = true;
+                None
+            })
+        };
+        match step {
+            Ok(pass) => {
+                if warned {
+                    post_warning(store, None);
+                    warned = false;
+                    failures = 0;
+                }
+                match pass {
+                    None => {}
+                    Some(PostPass::Idle) => nap(flags, POST_POLL),
+                    Some(PostPass::Passed) => println!("머지 뒤 검사 통과"),
+                    Some(PostPass::Failed) => println!("머지 뒤 검사 실패"),
+                    Some(PostPass::Cancelled) => break,
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("chute: 머지 뒤 검사를 하지 못했다: {e:#}");
+                post_warning(store, Some(&format!("{e:#}")));
+                warned = true;
+                nap(flags, backoff(failures));
+            }
+        }
     }
 }
 
@@ -265,6 +339,10 @@ fn serve(engine: &Engine, site: &gc::Site, me: &mut DaemonInfo, flags: &Flags) -
             ),
             Ok(Pass::Blocked) => {
                 doing(store, me, "기준 커밋이 깨져 멈춤");
+                nap(flags, BLOCKED_POLL);
+            }
+            Ok(Pass::Held) => {
+                doing(store, me, "머지 뒤 검사 실패로 PR을 잡아 두는 중");
                 nap(flags, BLOCKED_POLL);
             }
             Ok(Pass::Cancelled) => break,

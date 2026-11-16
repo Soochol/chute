@@ -575,5 +575,37 @@
       "pr": null,
       "at_ms": 1794724200000
     }
-  ]
+  ],
+  "post_verify": {
+    "last_green": {
+      "commit": "1e2d3c4b5a6978877665544332211009988aabbc",
+      "at_ms": 1794722400000
+    },
+    "run": {
+      "tip": "9f8e7d6c5b4a39281706f5e4d3c2b1a099887766",
+      "phase": "searching",
+      "commit": "5a4b3c2d1e0f9a8b7c6d5e4f30291807a6b5c4d3",
+      "step": "e2e",
+      "started_ms": 1794723600000,
+      "waiting_machine": false
+    },
+    "red": {
+      "commit": "9f8e7d6c5b4a39281706f5e4d3c2b1a099887766",
+      "step": "e2e",
+      "tests": [
+        "login flow"
+      ],
+      "log": "/home/u/.local/state/chute/repos/acme__widget/reports/commit-9f8e7d6c5b4a/post/verify/e2e.1.log",
+      "report": "/home/u/.local/state/chute/repos/acme__widget/reports/commit-9f8e7d6c5b4a/post/report.md",
+      "since_ms": 1794723000000,
+      "last_green": "1e2d3c4b5a6978877665544332211009988aabbc",
+      "culprit": {
+        "commit": "3c2b1a0998877665544332211009f8e7d6c5b4a3",
+        "pr": 12,
+        "batch": "b20261117-091500"
+      },
+      "holding": false
+    },
+    "last_started_ms": 1794723600000
+  }
 }

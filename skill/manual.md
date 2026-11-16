@@ -177,6 +177,7 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 - **CI 실패 반송**(`반송(CI 실패)`): 보고서의 check 이름과 링크를 보고 고친 뒤 push하고 `chute submit`을 실행한다.
 - **사람 차례**(`needs_human`): 더 submit하지 않는다. 사람이 `chute retry`나 `chute drop`으로 푼다. 사용자에게 상태를 알린다.
 - **큐가 멈춤**(`큐 멈춤`): 기본 브랜치가 검증을 통과하지 못한다. PR을 고치려 하지 않고 기다린다. 풀 길은 복구 PR(`chute submit --repair`)이고 오케스트레이터가 한다. 다른 이유로 기본 브랜치가 바뀌면 멈춤이 저절로 풀린다.
+- **머지 뒤 검사가 실패했다는 알림**(`chute 결과 post_failed`): 머지는 batch 검증을 통과했지만 머지 뒤에 기본 브랜치에서 도는 `[[post_verify]]` 단계가 실패했고, 처음 실패한 머지가 내 PR이라는 알림이다. `report`의 보고서와 `log`를 읽고 내 변경이 원인인지 확인한다. 내 변경이 원인이면 고치는 PR을 만들어 `chute preflight`를 통과시킨다. 오케스트레이터 아래에서는 submit하지 않고 PR과 HEAD를 보고한다. 되돌리는 일은 오케스트레이터가 정한다(`chute revert <batch>`). 작업자는 되돌리지 않는다. 원인이 내 변경이 아닌 것 같으면 근거와 함께 보고한다. 같은 실패의 알림은 한 번만 온다. 이 저장소가 `post_verify_hold`를 켜서 실패한 단계의 `paths`에 해당하는 PR을 batch가 가져가지 않으면, 고치는 PR도 오케스트레이터가 `--repair`로 submit해야 머지된다. 고친 머지로 검사가 통과하면 `post_fixed`가 온다.
 - **되돌려진 PR**: 사람이 `chute revert`로 PR이 든 batch를 되돌릴 수 있다. 되돌리기는 submit한 터미널이 `reverted` 알림으로 받는다. 작업자가 스스로 submit했으면 작업자가 받고, 오케스트레이터가 submit했으면 작업자는 받지 않는다. 되돌려진 PR의 커밋은 기본 브랜치 이력에 남아 있어서, 같은 브랜치를 다시 머지해도 변경이 돌아오지 않는다. 브랜치에서 revert 커밋을 되돌린 뒤(`git revert <기본 브랜치의 revert 커밋>`, `chute revert`가 PR마다 그 SHA를 출력한다) 문제를 고치고 push하고 `chute submit`을 실행한다.
 - **chute가 설정이나 데몬 때문에 실행되지 않는다**: 종료 코드 `2`와 stderr의 이유를 사용자에게 알린다. 데몬을 직접 만지지 않는다.
 - **허브에 닿지 않는다**(종료 코드 `2`, "허브 `<이름>`에 닿지 않는다"): 사용자에게 알리고 기다린다. 다른 대기열을 만들거나 PR을 직접 머지하지 않는다.
@@ -218,7 +219,7 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 
 `--priority`나 `--after`만 바뀐 다시 submit은 `--json`의 `change`가 `options_updated`다.
 
-**복구 PR(`chute submit <pr> --head <HEAD> --repair`).** 큐가 멈춰 있을 때만 받고 한 번에 하나만 받는다. 멈춰 있지 않으면 "큐가 멈춰 있지 않아 복구 PR로 받지 않았다", 이미 복구 PR이 있으면 "복구 PR … 한 번에 하나만 받는다"로 거절한다(종료 코드 `1`). 그 복구 PR이 사람 차례여도 다음 복구 PR은 그 PR이 머지되거나 사람이 `chute drop`으로 빼야 받는다. 사용자에게 알린다. `--after`와 함께 쓸 수 없다. 순서는 이렇다.
+**복구 PR(`chute submit <pr> --head <HEAD> --repair`).** 큐가 멈춰 있을 때만 받고 한 번에 하나만 받는다. 머지 뒤 검사 실패로 PR을 잡아 두는 동안(`post_verify_hold`)에도 받는다. 그때는 잡힌 PR을 건너뛰고 먼저 머지된다. 멈춰 있지 않으면 "큐가 멈춰 있지 않아 복구 PR로 받지 않았다", 이미 복구 PR이 있으면 "복구 PR … 한 번에 하나만 받는다"로 거절한다(종료 코드 `1`). 그 복구 PR이 사람 차례여도 다음 복구 PR은 그 PR이 머지되거나 사람이 `chute drop`으로 빼야 받는다. 사용자에게 알린다. `--after`와 함께 쓸 수 없다. 순서는 이렇다.
 
 1. 큐가 멈추면 `halted` 알림이 온다. 단계, 로그, 깨진 커밋을 chute가 push했는지가 들어 있다.
 2. 에이전트에게 복구 PR을 만들게 하고 `chute preflight`를 통과시킨다.
@@ -249,7 +250,7 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어 한 문장>
 ```
 
-글자와 숫자, 공백, `.,:/_-+=@%`만 쓴다. 값에는 공백이 없고 목록은 쉼표로 잇는다(`prs=12,13`). `key=value`가 아닌 첫 낱말부터 끝까지가 사람용 문장이다. SHA는 12자다. 경로에 쓸 수 없는 글자가 있으면 그 키를 빼고 문장에 "chute events로 본다"가 붙는다. 종류는 여덟 가지다.
+글자와 숫자, 공백, `.,:/_-+=@%`만 쓴다. 값에는 공백이 없고 목록은 쉼표로 잇는다(`prs=12,13`). `key=value`가 아닌 첫 낱말부터 끝까지가 사람용 문장이다. SHA는 12자다. 경로에 쓸 수 없는 글자가 있으면 그 키를 빼고 문장에 "chute events로 본다"가 붙는다. 종류는 열 가지다.
 
 | kind | 언제 | 키 | 할 일 |
 |---|---|---|---|
@@ -261,6 +262,8 @@ chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어
 | `reverted` | 사람이 batch를 되돌렸다 | `batch`, `prs`, `commit` | 되돌려진 PR의 작업자에게 알린다 |
 | `waiting` | `--after` 대상이 머지되지 못해 잡혀 있다 | `pr`, `after`, `why`(`bounced`, `human`, `dropped`, `closed`) | 기다리거나 `chute drop`하거나 `--after` 없이 다시 submit한다 |
 | `flaky` | 흔들린 시험이 만들어졌거나 만성이다 | `batch`, `prs`, `step`, `tests`, `evidence`(`made`), `chronic`(`yes`) | 그 시험을 확인한다 |
+| `post_failed` | 머지 뒤 검사가 기본 브랜치에서 실패했다. 처음 실패한 머지의 PR을 submit한 터미널과 그 작업자가 받는다 | `commit`(실패한 기본 브랜치 커밋), `step`, `tests`, `last_green`, `pr`, `batch`(`pr`와 `batch`는 처음 실패한 머지를 찾았을 때만), `log`, `report` | 아래 "머지 뒤 검사가 실패했다는 알림" |
+| `post_fixed` | 실패했던 머지 뒤 검사가 다시 통과했다 | `commit`, `was`(실패했던 커밋), `pr` | 맡은 고침이 끝난 것으로 본다 |
 
 예:
 

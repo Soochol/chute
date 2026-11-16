@@ -251,11 +251,49 @@ function alertsOf(view, queue, now) {
   if (isObject(view.daemon) && view.daemon.running === false) {
     alerts.push({ kind: "daemon", tone: "error", text: "데몬이 꺼져 있다", detail: "`chute up`으로 켠다", facts: [], log: null });
   }
+  alerts.push(...postVerifyAlerts(view.post_verify, now));
   for (const warning of list(view.warnings)) {
     const words = typeof warning === "string" ? [warning] : [warning?.message, warning?.kind];
     alerts.push({ kind: "warning", tone: "warn", text: words.map((w) => str(w).trim()).find(Boolean) ?? "경고", detail: "", facts: [], log: null });
   }
   return alerts;
+}
+
+const shortSha = (v) => str(v).slice(0, 7);
+
+function postVerifyAlerts(post, now) {
+  const red = isObject(post) && isObject(post.red) ? post.red : null;
+  if (!red) return [];
+  const culprit = isObject(red.culprit) ? red.culprit : null;
+  const facts = [];
+  if (culprit && Number.isSafeInteger(culprit.pr)) facts.push(`처음 실패한 머지 #${culprit.pr}`);
+  else if (culprit) facts.push(`처음 실패한 커밋 ${shortSha(culprit.commit)}`);
+  else facts.push("처음 실패한 머지를 찾지 못했다");
+  if (str(red.last_green)) facts.push(`마지막 통과 ${shortSha(red.last_green)}`);
+  const tests = list(red.tests).filter((t) => typeof t === "string" && t);
+  if (tests.length > 0) facts.push(`실패한 시험 ${tests.join(", ")}`);
+  if (culprit && str(culprit.batch)) facts.push(`되돌리려면 chute revert ${culprit.batch}`);
+  const parts = [`커밋 ${shortSha(red.commit)}`];
+  if (Number.isFinite(red.since_ms) && now >= red.since_ms) parts.push(`${formatDuration((now - red.since_ms) / 1000)} 전부터`);
+  return [
+    {
+      kind: "post_verify",
+      tone: "error",
+      text: `머지 뒤 검사가 실패했다: 단계 ${str(red.step) || "?"}`,
+      detail: parts.join(" · "),
+      facts,
+      log: str(red.log) || null,
+    },
+  ];
+}
+
+function postVerifyStats(post) {
+  if (!isObject(post)) return [];
+  const green = isObject(post.last_green) ? post.last_green : null;
+  const run = isObject(post.run) ? post.run : null;
+  if (!green && !run) return [];
+  const doing = run ? ` · ${run.phase === "searching" ? "범인 찾는 중" : "검사 중"}` : "";
+  return [{ key: "post_green", label: `머지 뒤 검사 마지막 통과${doing}`, value: green ? shortSha(green.commit) : "—" }];
 }
 
 function batchOf(batch, members, now) {
@@ -289,7 +327,7 @@ function batchOf(batch, members, now) {
 const chronicFlaky = (view) =>
   list(view.warnings).some((warning) => isObject(warning) && warning.kind === "flaky_chronic");
 
-function todayOf(today, chronic) {
+function todayOf(today, chronic, post) {
   if (!isObject(today)) return [];
   return [
     { key: "merged", label: "머지", value: num(today.merged) },
@@ -298,6 +336,7 @@ function todayOf(today, chronic) {
     { key: "batches", label: "batch", value: num(today.batches) },
     { key: "lead", label: "머지까지 중앙값", value: formatDuration(today.median_lead_s) },
     { key: "verify", label: "검증 시간", value: formatDuration(today.verify_s) },
+    ...postVerifyStats(post),
   ];
 }
 
@@ -355,7 +394,7 @@ function repoBoard(view, now) {
   }
   placed.alerts = alertsOf(view, queue, now);
   placed.batch = batchOf(view.batch, inBatch, now);
-  placed.today = todayOf(view.today, chronicFlaky(view));
+  placed.today = todayOf(view.today, chronicFlaky(view), view.post_verify);
 
   return {
     slug: str(repo.slug) || "(이름 없는 저장소)",

@@ -31,6 +31,18 @@ struct Checked {
     file: PathBuf,
     error: Option<String>,
     verify: Vec<Step>,
+    post_verify: Vec<Step>,
+}
+
+fn steps_of(steps: &[config::VerifyStep]) -> Vec<Step> {
+    steps
+        .iter()
+        .map(|step| Step {
+            name: step.name.clone(),
+            paths: step.paths.as_ref().map(|paths| paths.to_vec()),
+            timeout_s: step.timeout.as_secs(),
+        })
+        .collect()
 }
 
 pub fn run(args: &Args, repo: Option<&Path>) -> Result<ExitCode> {
@@ -60,21 +72,18 @@ fn check(file: PathBuf) -> Checked {
             ok: true,
             file,
             error: None,
-            verify: config
-                .verify
-                .iter()
-                .map(|step| Step {
-                    name: step.name.clone(),
-                    paths: step.paths.as_ref().map(|paths| paths.to_vec()),
-                    timeout_s: step.timeout.as_secs(),
-                })
-                .collect(),
+            verify: steps_of(&config.verify),
+            post_verify: config
+                .post
+                .as_ref()
+                .map_or_else(Vec::new, |post| steps_of(&post.steps)),
         },
         Err(e) => Checked {
             ok: false,
             file,
             error: Some(format!("{e:#}")),
             verify: Vec::new(),
+            post_verify: Vec::new(),
         },
     }
 }
@@ -91,7 +100,20 @@ fn render(checked: &Checked) -> String {
         checked.file.display(),
         checked.verify.len()
     );
-    for step in &checked.verify {
+    out.push_str(&render_steps(&checked.verify));
+    if !checked.post_verify.is_empty() {
+        out.push_str(&format!(
+            "머지 뒤 검사 단계 {}개\n",
+            checked.post_verify.len()
+        ));
+        out.push_str(&render_steps(&checked.post_verify));
+    }
+    out
+}
+
+fn render_steps(steps: &[Step]) -> String {
+    let mut out = String::new();
+    for step in steps {
         let paths = match &step.paths {
             Some(paths) => paths.join(", "),
             None => "없음(늘 돈다)".to_owned(),
@@ -145,6 +167,24 @@ paths = ["web/", "Cargo.toml"]
         let text = render(&checked);
         assert!(text.contains("e2e · paths: web/, Cargo.toml · 시간 제한 1800초"));
         assert!(text.contains("check · paths: 없음(늘 돈다) · 시간 제한 3600초"));
+    }
+
+    #[test]
+    fn the_steps_after_the_merge_are_listed_apart_from_the_batch_steps() {
+        let sb = Sandbox::new();
+        let text =
+            format!("{GOOD}\n[[post_verify]]\nname = \"slow\"\nrun = \"true\"\ntimeout = 900\n");
+        let checked = check(write(&sb, &text));
+        assert!(checked.ok);
+        assert_eq!(checked.verify.len(), 2);
+        assert_eq!(checked.post_verify.len(), 1);
+        assert_eq!(checked.post_verify[0].name, "slow");
+        let rendered = render(&checked);
+        assert!(
+            rendered
+                .contains("머지 뒤 검사 단계 1개\n  slow · paths: 없음(늘 돈다) · 시간 제한 900초")
+        );
+        assert!(check(write(&sb, GOOD)).post_verify.is_empty());
     }
 
     #[test]

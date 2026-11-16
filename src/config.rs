@@ -31,6 +31,20 @@ pub struct Config {
     pub cache: Cache,
     pub flaky: FlakyPolicy,
     pub verify: NonEmpty<VerifyStep>,
+    /// The steps that run on the default branch after a merge. `None` leaves the check off.
+    pub post: Option<PostVerify>,
+}
+
+/// The check after the merge: steps too slow for the batch, run on the default branch's tip
+/// beside the queue.
+#[derive(Clone, Debug)]
+pub struct PostVerify {
+    pub steps: NonEmpty<VerifyStep>,
+    /// Minutes between the starts of two runs. 0 starts a run whenever the tip moved and the
+    /// last run is over.
+    pub interval_minutes: u32,
+    /// Queued PRs that touch a failed step's paths wait until a later run passes.
+    pub hold: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +170,12 @@ struct RawConfig {
     flaky: RawFlaky,
     #[serde(default)]
     verify: Vec<RawStep>,
+    #[serde(default)]
+    post_verify: Vec<RawPostStep>,
+    #[serde(default)]
+    post_verify_interval: u32,
+    #[serde(default)]
+    post_verify_hold: bool,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +236,17 @@ struct RawStep {
     timeout: u64,
     failed: Option<String>,
     probe: Option<String>,
+    paths: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPostStep {
+    name: String,
+    run: String,
+    #[serde(default = "default_timeout")]
+    timeout: u64,
+    failed: Option<String>,
     paths: Option<Vec<String>>,
 }
 
@@ -309,69 +340,27 @@ impl Config {
         let mut names = BTreeSet::new();
         let mut steps = Vec::with_capacity(raw.verify.len());
         for step in raw.verify {
-            if step.name.is_empty() || step.name.starts_with('.') || step.name.contains(['/', '\0'])
-            {
-                bail!(
-                    "chute.toml의 verify 단계 이름 {:?}은 비어 있거나 '.'으로 시작하거나 '/'를 담을 수 없다",
-                    step.name
-                );
-            }
-            if !names.insert(step.name.clone()) {
-                bail!("chute.toml의 verify 단계 이름 {:?}이 겹친다", step.name);
-            }
-            if step.run.trim().is_empty() {
-                bail!("verify 단계 {:?}의 run이 비어 있다", step.name);
-            }
-            if step.timeout == 0 {
-                bail!(
-                    "verify 단계 {:?}의 timeout은 1초 이상이어야 한다",
-                    step.name
-                );
-            }
-            let failed = step
-                .failed
-                .as_deref()
-                .map(Regex::new)
-                .transpose()
-                .with_context(|| {
-                    format!("verify 단계 {:?}의 failed 정규식이 잘못됐다", step.name)
-                })?;
-            if failed.as_ref().is_some_and(|re| re.as_str().is_empty()) {
-                bail!("verify 단계 {:?}의 failed 정규식이 비어 있다", step.name);
-            }
-            if let Some(probe) = &step.probe
-                && !probe.contains(PROBE_PLACEHOLDER)
-            {
-                bail!(
-                    "verify 단계 {:?}의 probe에 {PROBE_PLACEHOLDER} 자리가 없다",
-                    step.name
-                );
-            }
-            let paths = step
-                .paths
-                .map(|paths| {
-                    if paths.iter().any(|path| path.trim().is_empty()) {
-                        bail!("verify 단계 {:?}의 paths에 빈 항목이 있다", step.name);
-                    }
-                    NonEmpty::new(paths).ok_or_else(|| {
-                        anyhow!(
-                            "verify 단계 {:?}의 paths가 비어 있다. 늘 돌리려면 paths 키를 지운다",
-                            step.name
-                        )
-                    })
-                })
-                .transpose()?;
-            steps.push(VerifyStep {
-                name: step.name,
-                run: step.run,
-                timeout: Duration::from_secs(step.timeout),
-                failed,
-                probe: step.probe,
-                paths,
-            });
+            steps.push(build_step("verify", &mut names, step.into())?);
         }
         let verify = NonEmpty::new(steps)
             .ok_or_else(|| anyhow!("chute.toml에 [[verify]] 단계가 하나도 없다"))?;
+        let mut post_steps = Vec::with_capacity(raw.post_verify.len());
+        for step in raw.post_verify {
+            post_steps.push(build_step("post_verify", &mut names, step.into())?);
+        }
+        let post = match NonEmpty::new(post_steps) {
+            Some(steps) => Some(PostVerify {
+                steps,
+                interval_minutes: raw.post_verify_interval,
+                hold: raw.post_verify_hold,
+            }),
+            None if raw.post_verify_interval != 0 || raw.post_verify_hold => {
+                bail!(
+                    "chute.toml의 post_verify_interval과 post_verify_hold는 [[post_verify]] 단계가 있을 때만 쓴다"
+                )
+            }
+            None => None,
+        };
         Ok(Config {
             remote: raw.remote,
             approval: raw.approval,
@@ -403,6 +392,7 @@ impl Config {
                 chronic_days: raw.flaky.chronic_days,
             },
             verify,
+            post,
         })
     }
 
@@ -448,6 +438,111 @@ impl Config {
     }
 }
 
+/// What `[[verify]]` and `[[post_verify]]` steps share. `probe` belongs to `[[verify]]` only.
+struct RawStepParts {
+    name: String,
+    run: String,
+    timeout: u64,
+    failed: Option<String>,
+    probe: Option<String>,
+    paths: Option<Vec<String>>,
+}
+
+impl From<RawStep> for RawStepParts {
+    fn from(step: RawStep) -> Self {
+        RawStepParts {
+            name: step.name,
+            run: step.run,
+            timeout: step.timeout,
+            failed: step.failed,
+            probe: step.probe,
+            paths: step.paths,
+        }
+    }
+}
+
+impl From<RawPostStep> for RawStepParts {
+    fn from(step: RawPostStep) -> Self {
+        RawStepParts {
+            name: step.name,
+            run: step.run,
+            timeout: step.timeout,
+            failed: step.failed,
+            probe: None,
+            paths: step.paths,
+        }
+    }
+}
+
+/// `section` names the table in messages. `names` holds every step name seen so far in both
+/// tables, because the flaky ledger keys a step by its name alone.
+fn build_step(
+    section: &str,
+    names: &mut BTreeSet<String>,
+    step: RawStepParts,
+) -> Result<VerifyStep> {
+    if step.name.is_empty() || step.name.starts_with('.') || step.name.contains(['/', '\0']) {
+        bail!(
+            "chute.toml의 {section} 단계 이름 {:?}은 비어 있거나 '.'으로 시작하거나 '/'를 담을 수 없다",
+            step.name
+        );
+    }
+    if !names.insert(step.name.clone()) {
+        bail!(
+            "chute.toml의 {section} 단계 이름 {:?}이 겹친다. verify와 post_verify의 단계 이름은 모두 달라야 한다",
+            step.name
+        );
+    }
+    if step.run.trim().is_empty() {
+        bail!("{section} 단계 {:?}의 run이 비어 있다", step.name);
+    }
+    if step.timeout == 0 {
+        bail!(
+            "{section} 단계 {:?}의 timeout은 1초 이상이어야 한다",
+            step.name
+        );
+    }
+    let failed = step
+        .failed
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .with_context(|| format!("{section} 단계 {:?}의 failed 정규식이 잘못됐다", step.name))?;
+    if failed.as_ref().is_some_and(|re| re.as_str().is_empty()) {
+        bail!("{section} 단계 {:?}의 failed 정규식이 비어 있다", step.name);
+    }
+    if let Some(probe) = &step.probe
+        && !probe.contains(PROBE_PLACEHOLDER)
+    {
+        bail!(
+            "{section} 단계 {:?}의 probe에 {PROBE_PLACEHOLDER} 자리가 없다",
+            step.name
+        );
+    }
+    let paths = step
+        .paths
+        .map(|paths| {
+            if paths.iter().any(|path| path.trim().is_empty()) {
+                bail!("{section} 단계 {:?}의 paths에 빈 항목이 있다", step.name);
+            }
+            NonEmpty::new(paths).ok_or_else(|| {
+                anyhow!(
+                    "{section} 단계 {:?}의 paths가 비어 있다. 늘 돌리려면 paths 키를 지운다",
+                    step.name
+                )
+            })
+        })
+        .transpose()?;
+    Ok(VerifyStep {
+        name: step.name,
+        run: step.run,
+        timeout: Duration::from_secs(step.timeout),
+        failed,
+        probe: step.probe,
+        paths,
+    })
+}
+
 fn is_remote_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
@@ -476,6 +571,8 @@ env_check = []          # 검증 전에 돌려 결과를 남길 명령. 예: ["c
 reuse_verified = true   # true면 같은 트리에서 이미 통과한 검증 결과를 batch가 다시 쓴다
 reuse_hours = 24        # 통과 기록을 다시 쓸 수 있는 시간(시간 단위, 1 이상 168 이하)
 reuse_other_machines = false  # true면 다른 PC의 통과 기록도 env_check 결과가 같을 때 다시 쓴다
+post_verify_interval = 0  # [[post_verify]] 검사를 시작하는 최소 간격(분). 0이면 머지로 기본 브랜치가 움직인 뒤 지금 검사가 끝나는 대로 돈다
+post_verify_hold = false  # true면 검사가 실패한 동안 실패한 단계의 paths에 해당하는 PR을 batch에 넣지 않는다
 # 에이전트가 없을 때 띄울 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다.
 # 값을 넣으면 그 명령으로 새 에이전트를 띄운다.
 # 주의: --dangerously-skip-permissions를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행한다.
@@ -504,6 +601,13 @@ timeout = 3600          # 초
 # failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
 # probe = "cargo test {{tests}} -- --exact"   # 흔들린 시험만 되풀이하는 명령. {{tests}} 자리가 필요하다
 # paths = ["src/", "Cargo.toml"]   # 바뀐 파일이 이 접두어로 시작할 때만 이 단계를 돈다. 비우면 안 된다
+
+# 머지 뒤에 기본 브랜치에서 돌릴 단계. [[verify]]보다 느려 batch가 기다리기 싫은 단계를 둔다.
+# 모양은 [[verify]]와 같고(probe는 없다), 단계 이름은 [[verify]]와 겹치면 안 된다.
+# [[post_verify]]
+# name = "e2e"
+# run = "npm run e2e"
+# timeout = 1800
 "#
     )
 }
@@ -656,6 +760,75 @@ probe = "cargo test {tests} -- --exact"
         assert!(step.runs_for(&files(&["Cargo.toml.bak"])), "접두어 비교다");
         assert!(!step.runs_for(&files(&["docs/web/app.js", "src/web/x", "cargo.toml"])));
         assert!(!step.runs_for(&[]));
+    }
+
+    const POST: &str = "[[post_verify]]\nname = \"e2e\"\nrun = \"npm run e2e\"\n";
+
+    #[test]
+    fn without_post_verify_steps_the_check_after_the_merge_is_off() {
+        assert!(Config::parse(MINIMAL).unwrap().post.is_none());
+        let inert = format!("post_verify_interval = 0\npost_verify_hold = false\n{MINIMAL}");
+        assert!(Config::parse(&inert).unwrap().post.is_none());
+    }
+
+    #[test]
+    fn post_verify_steps_have_the_shape_of_verify_steps_and_their_own_defaults() {
+        let text =
+            format!("{MINIMAL}{POST}timeout = 900\nfailed = 'FAIL (\\S+)'\npaths = [\"web/\"]\n");
+        let post = Config::parse(&text).unwrap().post.unwrap();
+        assert_eq!(post.interval_minutes, 0);
+        assert!(!post.hold);
+        let step = post.steps.first();
+        assert_eq!(step.name, "e2e");
+        assert_eq!(step.run, "npm run e2e");
+        assert_eq!(step.timeout, Duration::from_secs(900));
+        assert!(step.failed.is_some());
+        assert!(step.probe.is_none());
+        assert_eq!(step.paths.as_ref().unwrap().first(), "web/");
+        let plain = Config::parse(&format!("{MINIMAL}{POST}"))
+            .unwrap()
+            .post
+            .unwrap();
+        assert_eq!(plain.steps.first().timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn the_interval_and_the_hold_are_read_and_need_a_post_verify_step() {
+        let text = format!("post_verify_interval = 15\npost_verify_hold = true\n{MINIMAL}{POST}");
+        let post = Config::parse(&text).unwrap().post.unwrap();
+        assert_eq!((post.interval_minutes, post.hold), (15, true));
+        for key in ["post_verify_interval = 5", "post_verify_hold = true"] {
+            let e = Config::parse(&format!("{key}\n{MINIMAL}"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("[[post_verify]]"), "{key}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_post_verify_step_name_may_not_repeat_a_verify_step_or_another_post_step() {
+        let same_as_verify = POST.replace("e2e", "test");
+        let e = Config::parse(&format!("{MINIMAL}{same_as_verify}")).unwrap_err();
+        assert!(e.to_string().contains("post_verify 단계 이름"), "{e}");
+        let e = Config::parse(&format!("{MINIMAL}{POST}{POST}")).unwrap_err();
+        assert!(e.to_string().contains("겹친다"), "{e}");
+    }
+
+    #[test]
+    fn a_post_verify_step_is_checked_like_a_verify_step_and_takes_no_probe() {
+        for bad in [
+            "timeout = 0\n",
+            "paths = []\n",
+            "failed = 'x('\n",
+            "probe = \"t {tests}\"\n",
+        ] {
+            assert!(
+                Config::parse(&format!("{MINIMAL}{POST}{bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        let blank = "[[post_verify]]\nname = \"x\"\nrun = \" \"\n";
+        assert!(Config::parse(&format!("{MINIMAL}{blank}")).is_err());
     }
 
     #[test]
