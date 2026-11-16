@@ -5,7 +5,8 @@ use serde::Deserialize;
 
 use super::{Ctx, Refusal, finish, run_on_hub};
 use crate::hub::{Route, route};
-use crate::model::{EpochMs, Event, EventKind, PrNumber};
+use crate::model::{EpochMs, Event, EventKind, HumanReason, PrNumber};
+use crate::notify::{Line, Notifier};
 use crate::queue;
 
 #[derive(clap::Args, Debug)]
@@ -47,14 +48,22 @@ fn reason_of(args: &Args) -> Result<&str> {
 
 fn giveup(args: &Args, ctx: &Ctx) -> Result<()> {
     let reason = reason_of(args)?;
-    let (_, store) = ctx.registered_repo()?;
+    let (info, store) = ctx.registered_repo()?;
     let pr = match args.pr {
         Some(pr) => pr,
         None => current_pr(ctx)?,
     };
-    store.update(|state| Ok(queue::give_up(state, pr)?))?;
+    let submitter = store.update(|state| {
+        queue::give_up(state, pr)?;
+        Ok(state
+            .queue
+            .iter()
+            .find(|i| i.pr == pr)
+            .and_then(|i| i.submitter.clone()))
+    })?;
+    let at_ms = EpochMs::now();
     let recorded = store.append_history(&Event {
-        at_ms: EpochMs::now(),
+        at_ms,
         kind: EventKind::GaveUp {
             pr,
             reason: reason.to_owned(),
@@ -63,6 +72,12 @@ fn giveup(args: &Args, ctx: &Ctx) -> Result<()> {
     if let Err(e) = recorded {
         eprintln!("경고: 이유를 history.jsonl에 남기지 못했다: {e:#}");
     }
+    let line = Line::Human {
+        pr,
+        reason: HumanReason::GaveUp,
+        detail: Some(reason.to_owned()),
+    };
+    Notifier::new(&ctx.ext, &info, &store).notify(submitter.as_ref(), at_ms, &line);
     println!("사람 차례로 넘겼다: {pr} (포기: {reason})");
     Ok(())
 }

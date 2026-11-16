@@ -14,7 +14,17 @@ fn history(w: &World) -> Vec<Value> {
     fs::read_to_string(w.store().dir().join("history.jsonl"))
         .unwrap_or_default()
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event"] != "notified")
+        .collect()
+}
+
+fn notified(w: &World) -> Vec<Value> {
+    fs::read_to_string(w.store().dir().join("history.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event"] == "notified")
         .collect()
 }
 
@@ -332,4 +342,61 @@ fn giveup_on_another_pc_forwards_a_reason_that_starts_with_a_hyphen_as_a_value()
 
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(forward_kit::out(&out).contains("(포기: -1 재시도 남음)"));
+}
+
+#[test]
+fn giveup_notify_tells_the_submitter_a_human_line_with_the_reason() {
+    let w = World::new();
+    let mut queued = item(12, ItemState::Bounced(BounceReason::Conflict));
+    queued.submitter = Some(chute::model::Agent {
+        terminal: chute::model::TerminalId("t1orch".into()),
+        created_ms: chute::model::EpochMs(1),
+        name: None,
+        workdir: "/w".into(),
+        alive: true,
+        machine: None,
+    });
+    w.seed(vec![queued, item(13, ItemState::Queued(None))]);
+    w.sb.fake("hc").respond(
+        "get t1orch --json",
+        Reply::ok(
+            r#"{"address":"t1orch","state":"live","created_ms":1,"foreground":{"name":"claude"}}"#,
+        ),
+    );
+    w.sb.fake("hc").respond("send t1orch *", Reply::ok(""));
+
+    w.ok(
+        w.repo.path(),
+        &["giveup", "12", "--reason", "충돌을 풀 수 없다"],
+    );
+    w.ok(w.repo.path(), &["giveup", "13", "--reason", "필요 없다"]);
+
+    let sends: Vec<Vec<String>> =
+        w.sb.fake("hc")
+            .calls()
+            .into_iter()
+            .filter(|c| c.first().is_some_and(|v| v == "send"))
+            .collect();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert_eq!(sends[0][1], "t1orch");
+    assert!(
+        sends[0][2].starts_with("chute 결과 human slug=acme/widget at="),
+        "{}",
+        sends[0][2]
+    );
+    for part in [" pr=12 ", " reason=gave_up ", "충돌을 풀 수 없다"] {
+        assert!(sends[0][2].contains(part), "{part}: {}", sends[0][2]);
+    }
+    let recorded: Vec<(String, String)> = notified(&w)
+        .iter()
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_owned(),
+                e["delivered"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let expected = [("human", "sent"), ("human", "no_terminal")]
+        .map(|(kind, delivered)| (kind.to_owned(), delivered.to_owned()));
+    assert_eq!(recorded, expected);
 }
