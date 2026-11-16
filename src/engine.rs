@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::ci::{self, Verdict as CiVerdict};
 use crate::config::Config;
+use crate::env::{self, EnvSection};
 use crate::ext::Ext;
 use crate::feedback::{Delivery, Feedback, Notice, Subject};
 use crate::gitops::{
@@ -659,6 +660,12 @@ impl Run<'_> {
     }
 
     fn execute(&mut self, taken: &[QueueItem]) -> Result<()> {
+        self.record.env = Some(env::record(
+            &self.engine.ext,
+            self.slot.path(),
+            &self.engine.store.batch_dir(self.id()).join("env"),
+            &self.config.env_check,
+        ));
         self.save_record()?;
         let mut by_queue = taken.to_vec();
         by_queue.sort_by_key(|i| self.queue_position[&i.pr]);
@@ -884,12 +891,29 @@ impl Run<'_> {
         }
     }
 
+    fn env_section(&self, item: &QueueItem) -> Result<Option<EnvSection>> {
+        let Some(env) = self.record.env.clone() else {
+            return Ok(None);
+        };
+        let state = self.engine.store.load()?;
+        let preflight = state
+            .preflights
+            .get(&item.branch)
+            .filter(|p| p.head == item.head)
+            .and_then(|p| p.env.clone());
+        Ok(Some(EnvSection { env, preflight }))
+    }
+
     fn bounce(&mut self, pr: PrNumber, failure: Failure, failed_ref: Option<&str>) -> Result<()> {
         let engine = self.engine;
         let item = self.items[&pr].clone();
-        let written = self
-            .feedback()
-            .write_report(&Subject::from(&item), &failure, failed_ref)?;
+        let section = self.env_section(&item)?;
+        let written = self.feedback().write_report_with_env(
+            &Subject::from(&item),
+            &failure,
+            failed_ref,
+            section,
+        )?;
         let budget = self.config.budget;
         let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
         let (to, unreachable) = if item.attempts < budget {

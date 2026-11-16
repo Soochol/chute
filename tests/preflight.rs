@@ -19,6 +19,10 @@ fn world(run: &str) -> World {
     World::with_config(Some(config(run)))
 }
 
+fn env_config(run: &str, env_check: &str) -> String {
+    format!("env_check = {env_check}\n{}", config(run))
+}
+
 /// Publishes `branch` as PR `pr` on origin and queues it the way `submit` would have.
 fn queue_pr(w: &World, pr: u64, file: &str, content: &str, state: ItemState) -> String {
     let branch = format!("feat/{pr}");
@@ -647,6 +651,62 @@ fn untracked_files_count_even_when_git_is_set_to_hide_them() {
     assert!(!mark.exists(), "검증이 돌았다");
 }
 
+#[test]
+fn preflight_env_is_in_the_json_the_report_and_the_record() {
+    let w = World::with_config(Some(env_config(
+        "test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }",
+        "[\"echo tool 1.2\", \"echo broken >&2; exit 4\"]",
+    )));
+    let head = work_on(&w, "feat/bad", "bad.txt", "x\n");
+
+    let out = preflight(&w, &["--json"]);
+
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let doc = json(&out);
+    let env = &doc["env"];
+    assert_eq!(env["machine_id"], support::SANDBOX_MACHINE_ID);
+    assert!(!env["host"].as_str().unwrap().is_empty());
+    assert_eq!(env["checks"][0]["run"], "echo tool 1.2");
+    assert_eq!(env["checks"][0]["output"], "tool 1.2");
+    assert_eq!(env["checks"][0]["ok"], true);
+    assert_eq!(env["checks"][1]["output"], "broken");
+    assert_eq!(env["checks"][1]["ok"], false);
+    let report = read(&doc["report"]);
+    assert!(report.contains("## 검사 환경"), "{report}");
+    assert!(report.contains("`echo tool 1.2`: `tool 1.2`"), "{report}");
+    assert!(!report.contains("preflight를 돌린 PC"), "{report}");
+    let report_json: Value = serde_json::from_str(&read(&doc["report_json"])).unwrap();
+    assert_eq!(report_json["env"]["env"]["checks"][0]["output"], "tool 1.2");
+    let recorded = w.state().preflights["feat/bad"].env.clone().unwrap();
+    assert_eq!(recorded.checks.len(), 2);
+    assert_eq!(recorded.checks[0].output, "tool 1.2");
+    assert_eq!(recorded.host, env["host"]);
+    assert!(w.state().preflights["feat/bad"].head.as_str() == head);
+}
+
+#[test]
+fn preflight_env_is_printed_for_a_pass_and_kept_without_env_check() {
+    let w = World::with_config(Some(env_config("true", "[\"echo tool 1.2\"]")));
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let out = preflight(&w, &[]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let shown = text(&out);
+    assert!(shown.contains("검사 환경: "), "{shown}");
+    assert!(shown.contains("echo tool 1.2: tool 1.2"), "{shown}");
+
+    let plain = world("true");
+    work_on(&plain, "feat/mine", "mine.txt", "x\n");
+    let doc = json(&preflight(&plain, &["--json"]));
+    assert_eq!(doc["env"]["checks"], serde_json::json!([]));
+    assert_eq!(doc["env"]["machine_id"], support::SANDBOX_MACHINE_ID);
+    assert!(
+        plain.state().preflights["feat/mine"]
+            .env
+            .as_ref()
+            .is_some_and(|env| env.checks.is_empty())
+    );
+}
+
 mod remote {
     use super::*;
     use chute::model::{QueueItem, Slug};
@@ -664,6 +724,10 @@ mod remote {
     }
 
     fn mesh(run: &str) -> Net {
+        mesh_with(config(run))
+    }
+
+    fn mesh_with(config: String) -> Net {
         let net = Net::new("acme/widget", &["a", "b"], BIN);
         for node in &net.nodes {
             let out = node.chute(BIN, &["init"]);
@@ -677,7 +741,7 @@ mod remote {
         net.connect_all();
         let a = net.node("a");
         a.repo
-            .commit_file("chute.toml", &config(run), "chore: chute 설정");
+            .commit_file("chute.toml", &config, "chore: chute 설정");
         a.repo.git(&["push", "--quiet", "origin", "main"]);
         let out = net.node("b").chute(BIN, &["hub", "set", "a"]);
         assert!(
@@ -807,6 +871,34 @@ mod remote {
             .unwrap();
         assert_eq!(item["preflight"]["result"], "pass");
         assert_eq!(item["preflight"]["head"], head);
+    }
+
+    #[test]
+    fn preflight_env_of_a_pc_that_is_not_the_hub_is_kept_on_the_hub() {
+        let net = mesh_with(env_config("true", "[\"echo tool 1.2\"]"));
+        hub_queue(&net, 2, "two.txt", "two\n", ItemState::AwaitingApproval);
+        let b = net.node("b");
+        b.repo.git(&["fetch", "--quiet", "origin"]);
+        b.repo
+            .git(&["checkout", "--quiet", "-b", "feat/2", "origin/feat/2"]);
+        b.repo.commit_file("more.txt", "x\n", "feat: 더");
+
+        let out = run_b(&net, &["--json"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+        let hub = hub_state(net.node("a"));
+        let env = hub.preflights["feat/2"]
+            .env
+            .clone()
+            .expect("허브에 env가 남았다");
+        assert_eq!(env.checks.len(), 1);
+        assert_eq!(env.checks[0].output, "tool 1.2");
+        assert_eq!(json(&out)["env"]["checks"][0]["output"], "tool 1.2");
+        assert_eq!(
+            env.machine_id.as_ref().map(|id| id.as_str()),
+            json(&out)["env"]["machine_id"].as_str()
+        );
+        assert!(hub_state(net.node("b")).preflights.is_empty());
     }
 
     #[test]

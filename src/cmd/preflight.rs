@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{Ctx, FORWARD_TIMEOUT, REFUSED, forward_to_hub};
 use crate::config::Config;
+use crate::env::{self, EnvSection};
 use crate::ext::Ext;
 use crate::feedback::{self, Feedback, Subject, Written};
 use crate::gitops::{FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
-    Blocked, ConflictFile, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty, Partner,
-    PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView, StepFailure, VerifyMode,
+    Blocked, ConflictFile, EnvRecord, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty,
+    Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView, StepFailure,
+    VerifyMode,
 };
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
@@ -70,6 +72,7 @@ struct Report {
     report_json: Option<PathBuf>,
     blocked: Option<Blocked>,
     at_ms: EpochMs,
+    env: EnvRecord,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +183,13 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         worktrees_root: &worktrees_root,
     };
     let at = EpochMs::now();
+    let log_dir = log_dir(&store, &target.head, at)?;
+    let env = env::record(
+        &ctx.ext,
+        slot.path(),
+        &log_dir.join("env"),
+        &config.env_check,
+    );
     let run = Run {
         ctx,
         info: &info,
@@ -192,14 +202,15 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         base: &base,
         together: &together,
         at,
-        log_dir: log_dir(&store, &target.head, at)?,
+        log_dir,
+        env: &env,
     };
     let judged = match &own.result {
         ItemResult::Conflict(files) => run.conflict(files, run.with())?,
         ItemResult::Merged { .. } | ItemResult::AlreadyMerged => run.verify(&merged.tip)?,
     };
 
-    let report = Report::new(&judged, &target, &base, skipped, blocked, at);
+    let report = Report::new(&judged, &target, &base, skipped, blocked, at, env);
     if let Err(e) = record(ctx, &store, &target, &report) {
         eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
     }
@@ -346,6 +357,7 @@ struct Run<'a> {
     together: &'a [(PrNumber, String, Sha)],
     at: EpochMs,
     log_dir: PathBuf,
+    env: &'a EnvRecord,
 }
 
 impl Run<'_> {
@@ -379,9 +391,7 @@ impl Run<'_> {
             })
             .collect();
         let files = NonEmpty::new(named).ok_or_else(|| anyhow!("충돌한 파일 목록이 비었다"))?;
-        let written =
-            self.feedback
-                .write_report(&self.subject(), &Failure::Conflict { files }, None)?;
+        let written = self.write_report(&Failure::Conflict { files }, None)?;
         Ok(Judged {
             result: PreflightResult::Conflict,
             with,
@@ -485,8 +495,16 @@ impl Run<'_> {
     fn report_failure(&self, failure: &Failure, tree: &Sha) -> Result<Written> {
         let name = failed_ref_name(self.at, tree);
         self.gitops.set_failed_ref(&name, tree)?;
+        self.write_report(failure, Some(&name))
+    }
+
+    fn write_report(&self, failure: &Failure, failed_ref: Option<&str>) -> Result<Written> {
+        let section = EnvSection {
+            env: self.env.clone(),
+            preflight: None,
+        };
         self.feedback
-            .write_report(&self.subject(), failure, Some(&name))
+            .write_report_with_env(&self.subject(), failure, failed_ref, Some(section))
     }
 
     fn run_steps(&self, log_dir: &Path) -> Result<Outcome> {
@@ -542,6 +560,7 @@ impl Report {
         skipped: Vec<Skipped>,
         blocked: Option<Blocked>,
         at_ms: EpochMs,
+        env: EnvRecord,
     ) -> Report {
         let shape = judged
             .written
@@ -576,6 +595,7 @@ impl Report {
             report_json: judged.written.as_ref().map(|written| written.json.clone()),
             blocked,
             at_ms,
+            env,
         }
     }
 }
@@ -600,7 +620,7 @@ fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Res
             at_ms: report.at_ms,
             base: Some(report.base.clone()),
             with: report.with.clone(),
-            env: None,
+            env: Some(report.env.clone()),
         },
     };
     deliver(ctx, store, &entry)
@@ -740,6 +760,10 @@ fn render(report: &Report) -> String {
             skipped.why.label()
         ));
     }
+    out.push_str(&format!("검사 환경: {}\n", env::machine_line(&report.env)));
+    for check in &report.env.checks {
+        out.push_str(&format!("  {}: {}\n", check.run, env::result_text(check)));
+    }
     for flaky in &report.flaky {
         let tests = if flaky.tests.is_empty() {
             String::new()
@@ -777,6 +801,11 @@ mod tests {
             report_json: None,
             blocked: None,
             at_ms: EpochMs(1),
+            env: EnvRecord {
+                machine_id: None,
+                host: "pc".into(),
+                checks: Vec::new(),
+            },
         }
     }
 

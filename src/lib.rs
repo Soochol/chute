@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod cmd;
 pub mod config;
+pub mod env;
 pub mod ext;
 pub mod hub;
 pub mod machine;

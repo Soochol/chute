@@ -1245,3 +1245,154 @@ fn recovery_tells_history_about_a_bounce_the_record_has_and_the_history_lacks() 
     assert_eq!(lab.bounced_events(), [(1, BounceReason::Verify)]);
     assert_eq!(chute_status(&lab)["today"]["bounced"], 1);
 }
+
+mod env {
+    use super::*;
+    use chute::model::{EnvCheck, EnvRecord, EpochMs, PreflightRecord, PreflightResult};
+
+    fn preflight_env(version: &str) -> EnvRecord {
+        EnvRecord {
+            machine_id: None,
+            host: "laptop".into(),
+            checks: vec![EnvCheck {
+                run: "echo hub-tool".into(),
+                output: version.into(),
+                ok: true,
+            }],
+        }
+    }
+
+    fn preflight_of(head: &chute::model::Sha, env: EnvRecord) -> PreflightRecord {
+        PreflightRecord {
+            head: head.clone(),
+            result: PreflightResult::Pass,
+            report: None,
+            at_ms: EpochMs(1),
+            base: None,
+            with: Vec::new(),
+            env: Some(env),
+        }
+    }
+
+    #[test]
+    fn a_batch_records_its_env_once_before_the_first_verification() {
+        let marks = tempfile::tempdir().unwrap();
+        let marker = marks.path().join("env-count");
+        let first = format!("echo run >> {}; echo hub-tool 1", marker.display());
+        let lab = Lab::build("", &format!("env_check = [{first:?}, \"exit 3\"]"), 60);
+        lab.open_pr(1, &[("f1", "x")]);
+        lab.open_pr(2, &[("f2", "x")]);
+
+        let summary = done(lab.engine().run_once().unwrap());
+
+        assert_eq!(summary.merged, prs(&[1, 2]));
+        let env = lab
+            .store
+            .read_batch(&summary.batch)
+            .unwrap()
+            .unwrap()
+            .env
+            .expect("batch 기록에 환경이 있다");
+        assert_eq!(
+            env.machine_id.as_ref().map(|id| id.as_str()),
+            Some(support::SANDBOX_MACHINE_ID)
+        );
+        let outputs: Vec<(&str, &str, bool)> = env
+            .checks
+            .iter()
+            .map(|c| (c.run.as_str(), c.output.as_str(), c.ok))
+            .collect();
+        assert_eq!(
+            outputs,
+            [(first.as_str(), "hub-tool 1", true), ("exit 3", "", false)]
+        );
+        assert_eq!(lab.verify_runs(), 1, "실패한 환경 명령이 검증을 막았다");
+        assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn a_bounce_report_shows_the_hub_env_beside_the_preflight_of_the_same_head() {
+        let lab = Lab::build(BAD, "env_check = [\"echo hub-tool 2\"]", 60);
+        lab.open_pr(1, &[("f1", "x")]);
+        let head = lab.open_pr(2, &[("f2", "x"), ("BAD", "")]);
+        lab.store
+            .update(|s| {
+                s.preflights.insert(
+                    "pr-2".into(),
+                    preflight_of(&head, preflight_env("hub-tool 1")),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(2).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(report.contains("## 검사 환경"), "{report}");
+        assert!(
+            report.contains("`echo hub-tool 2`: `hub-tool 2`"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| 항목 | preflight를 돌린 PC | 허브 |"),
+            "{report}"
+        );
+        assert!(report.contains("`laptop`"), "{report}");
+        let json = fs::read_to_string(failure.report.with_extension("json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["env"]["preflight"]["host"], "laptop");
+        assert_eq!(doc["env"]["env"]["checks"][0]["output"], "hub-tool 2");
+    }
+
+    #[test]
+    fn a_bounce_report_says_the_environment_is_the_same_when_the_preflight_matches() {
+        let lab = Lab::build(BAD, "env_check = [\"echo hub-tool 1\"]", 60);
+        let head = lab.open_pr(1, &[("f1", "x"), ("BAD", "")]);
+        let mut same = preflight_env("hub-tool 1");
+        same.checks[0].run = "echo hub-tool 1".into();
+        let machine = chute::env::record(
+            &chute::ext::Ext::from_vars(|k| lab.sb.var(k)),
+            lab.repo.path(),
+            &lab.sb.root().join("env-logs"),
+            &[],
+        );
+        same.host = machine.host.clone();
+        same.machine_id = machine.machine_id.clone();
+        lab.store
+            .update(|s| {
+                s.preflights
+                    .insert("pr-1".into(), preflight_of(&head, same));
+                Ok(())
+            })
+            .unwrap();
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(1).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(report.contains("preflight와 같은 환경이다."), "{report}");
+    }
+
+    #[test]
+    fn a_preflight_of_another_head_is_not_compared() {
+        let lab = Lab::build(BAD, "env_check = [\"echo hub-tool 2\"]", 60);
+        lab.open_pr(1, &[("f1", "x"), ("BAD", "")]);
+        let other = chute::model::Sha::try_from("a".repeat(40)).unwrap();
+        lab.store
+            .update(|s| {
+                s.preflights
+                    .insert("pr-1".into(), preflight_of(&other, preflight_env("old")));
+                Ok(())
+            })
+            .unwrap();
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(1).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(report.contains("## 검사 환경"), "{report}");
+        assert!(!report.contains("preflight를 돌린 PC"), "{report}");
+        assert!(!report.contains("같은 환경"), "{report}");
+    }
+}
