@@ -1397,3 +1397,27 @@ mod env {
         assert!(!report.contains("같은 환경"), "{report}");
     }
 }
+
+mod env_ci {
+    use super::*;
+
+    #[test]
+    fn a_ci_failure_report_carries_the_batch_env_too() {
+        let lab = Lab::build(
+            "",
+            "require_ci = true\nenv_check = [\"echo hub-tool 1\"]",
+            60,
+        );
+        lab.open_pr(1, &[("f1", "x")]);
+        lab.gh_checks(1, &[("build", "fail")]);
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(1).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(
+            report.contains("`echo hub-tool 1`: `hub-tool 1`"),
+            "{report}"
+        );
+    }
+}

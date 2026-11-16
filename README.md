@@ -219,7 +219,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `require_ci` | `false` | `true`면 PR마다 등록된 HEAD의 GitHub check가 통과한 PR만 batch에 넣는다. 아래에 설명한다 |
 | `require_head` | `false` | `true`면 `--head` 없는 submit을 거절한다 |
 | `max_parallel` | `2` | 동시에 도는 preflight 수의 상한(슬롯 수의 상한). 1 이상 |
-| `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]`. 슬롯 폴더에서 `sh -c`로 하나씩 돌리고(30초 제한, 출력 첫 줄 200자) 실패해도 검증은 돈다. 머신 이름과 hc 코어 id는 비어 있어도 늘 남는다. batch는 한 번, preflight는 실행마다 기록하고, 반송 보고서의 "검사 환경" 절이 같은 HEAD의 preflight와 다른 줄만 나란히 보인다 |
+| `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]`. 슬롯 폴더에서 `sh -c`로 하나씩 돌린다. 명령마다 30초 제한이 있고, 출력은 첫 줄 200자만 남긴다. 명령이 실패해도 검증은 그대로 돈다. 머신 이름과 hc 코어 id는 목록이 비어도 남는다. batch는 한 번, preflight는 실행마다 기록한다. 반송 보고서의 "검사 환경" 절은 같은 HEAD의 preflight와 다른 줄만 나란히 보인다 |
 | `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
 | `retention` (`[retention]`) | 아래 두 키 | 정리할 때 남기는 기간 |
 | `logs_days` | `7` | 검증 로그와 preflight 로그를 남기는 날수. 1 이상 |

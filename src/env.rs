@@ -105,10 +105,15 @@ fn read_head(log: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn is_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
+
 fn clean(line: &str) -> String {
     let plain: String = line
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_unsafe(c) { ' ' } else { c })
         .collect();
     plain.trim().chars().take(OUTPUT_CHARS).collect()
 }
@@ -306,6 +311,12 @@ mod tests {
         let env = env_of(&f, &["printf 'a\\rb\\033[31mred\\0z\\n'"], CHECK_TIMEOUT);
         assert!(!env.checks[0].output.contains(|c: char| c.is_control()));
         assert!(env.checks[0].output.starts_with("a b"));
+        let env = env_of(
+            &f,
+            &["printf '\\342\\200\\256evil\\342\\200\\250x\\n'"],
+            CHECK_TIMEOUT,
+        );
+        assert_eq!(env.checks[0].output, "evil x");
     }
 
     #[test]

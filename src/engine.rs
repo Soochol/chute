@@ -665,14 +665,7 @@ impl Run<'_> {
         by_queue.sort_by_key(|i| self.queue_position[&i.pr]);
         let group = self.admit(&by_queue)?;
         if !group.is_empty() {
-            self.record.env = Some(env::record(
-                &self.engine.ext,
-                self.slot.path(),
-                &self.engine.store.batch_dir(self.id()).join("env"),
-                &self.config.env_check,
-                &self.engine.cancel,
-            ));
-            self.save_record()?;
+            self.ensure_env()?;
         }
         self.solve(group)?;
         self.recheck_conflicts()
@@ -895,7 +888,22 @@ impl Run<'_> {
         }
     }
 
-    fn env_section(&self, item: &QueueItem) -> Result<Option<EnvSection>> {
+    fn ensure_env(&mut self) -> Result<()> {
+        if self.record.env.is_none() {
+            self.record.env = Some(env::record(
+                &self.engine.ext,
+                self.slot.path(),
+                &self.engine.store.batch_dir(self.id()).join("env"),
+                &self.config.env_check,
+                &self.engine.cancel,
+            ));
+            self.save_record()?;
+        }
+        Ok(())
+    }
+
+    fn env_section(&mut self, item: &QueueItem) -> Result<Option<EnvSection>> {
+        self.ensure_env()?;
         let Some(env) = self.record.env.clone() else {
             return Ok(None);
         };
