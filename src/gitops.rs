@@ -221,6 +221,35 @@ impl Gitops {
         }
     }
 
+    /// Locks every existing preflight slot numbered above `max_parallel` that nobody holds.
+    /// The caller decides whether to `remove` them; the locks keep a preflight from taking one
+    /// meanwhile. A slot someone holds is left out.
+    pub fn lock_surplus_preflight_slots(&self, max_parallel: u32) -> Result<Vec<SlotLock>> {
+        let entries = match fs::read_dir(&self.slots_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("읽지 못했다: {}", self.slots_dir.display()));
+            }
+        };
+        let mut surplus = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("읽지 못했다: {}", self.slots_dir.display()))?;
+            let slot = entry.file_name().to_str().and_then(SlotName::parse);
+            if let Some(slot @ SlotName::Preflight(k)) = slot
+                && k > max_parallel
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+                && let Some(lock) = self.lock_slot(slot)?
+            {
+                surplus.push(lock);
+            }
+        }
+        surplus.sort_by_key(|lock| lock.name);
+        Ok(surplus)
+    }
+
     /// Overwrites an existing ref.
     pub fn set_failed_ref(&self, name: &str, commit: &Sha) -> Result<()> {
         let full = failed_ref(name)?;
@@ -503,6 +532,35 @@ impl SlotLock {
 
     pub fn name(&self) -> SlotName {
         self.name
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.git.slot_path(self.name)
+    }
+
+    /// Deletes the slot's worktree and its registration in the repository. The lock file
+    /// stays: a holder that already opened it would otherwise lock a file nobody else sees.
+    pub fn remove(self) -> Result<()> {
+        let path = self.path();
+        let _admin = self.git.lock_worktree_admin()?;
+        let args = [
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            // Twice, so a registration someone locked is removed too.
+            OsStr::new("--force"),
+            OsStr::new("--force"),
+            path.as_os_str(),
+        ];
+        let removed = self.git.ext.git(&self.git.repo, args)?;
+        if !removed.success() || path.exists() {
+            remove_tree(&path).with_context(|| format!("지우지 못했다: {}", path.display()))?;
+            self.git
+                .ext
+                .git(&self.git.repo, ["worktree", "prune"])?
+                .ok()
+                .context("슬롯의 등록을 정리하지 못했다")?;
+        }
+        Ok(())
     }
 
     /// Makes sure the worktree exists, creating or repairing it. Its content is whatever the

@@ -11,6 +11,7 @@ use nix::sys::signal::{SigHandler, Signal, signal};
 use super::Ctx;
 use crate::engine::{Engine, Pass};
 use crate::feedback;
+use crate::gc;
 use crate::hub::{Route, route};
 use crate::model::{DaemonInfo, EpochMs, PrNumber, Warning, WarningKind};
 use crate::store::RepoStore;
@@ -23,6 +24,7 @@ const BLOCKED_POLL: Duration = Duration::from_secs(15);
 const ERROR_POLL: Duration = Duration::from_secs(10);
 const MAX_ERROR_POLL: Duration = Duration::from_secs(600);
 const STALE_STOP: Duration = Duration::from_secs(2);
+const GC_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(clap::Args, Debug)]
 pub struct Args {}
@@ -113,7 +115,13 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     };
     engine_warning(&store, None);
     println!("chute 데몬을 시작한다: {} (pid {})", info.slug, me.pid);
-    let served = serve(&engine, &store, &mut me, &flags);
+    let site = gc::Site {
+        ext: &ctx.ext,
+        home: &ctx.home,
+        info: &info,
+        store: &store,
+    };
+    let served = serve(&engine, &site, &mut me, &flags);
     flags.done.store(true, Ordering::SeqCst);
     let _ = watcher.join();
     let _ = store.clear_daemon();
@@ -205,7 +213,9 @@ fn backoff(failures: u32) -> Duration {
         .min(MAX_ERROR_POLL)
 }
 
-fn serve(engine: &Engine, store: &RepoStore, me: &mut DaemonInfo, flags: &Flags) -> Result<()> {
+fn serve(engine: &Engine, site: &gc::Site, me: &mut DaemonInfo, flags: &Flags) -> Result<()> {
+    let store = site.store;
+    let mut next_gc = Instant::now();
     let mut recovered = false;
     let mut failures = 0u32;
     let mut warned = false;
@@ -217,6 +227,17 @@ fn serve(engine: &Engine, store: &RepoStore, me: &mut DaemonInfo, flags: &Flags)
         nap(flags, backoff(*failures));
     };
     while !flags.stopping() {
+        if Instant::now() >= next_gc {
+            next_gc = Instant::now() + GC_EVERY;
+            doing(store, me, "오래된 파일을 정리하는 중");
+            if let Some(swept) = gc::auto(site, true).filter(|s| !s.items.is_empty()) {
+                println!(
+                    "오래된 파일 {}건({}바이트)을 지웠다",
+                    swept.items.len(),
+                    swept.bytes()
+                );
+            }
+        }
         if !recovered {
             doing(store, me, "지난 실행이 남긴 것을 정리하는 중");
             match engine.recover() {

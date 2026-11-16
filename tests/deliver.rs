@@ -502,3 +502,49 @@ fn a_banner_before_the_answer_does_not_hide_a_delivery_that_happened() {
         }
     );
 }
+
+#[test]
+fn deliver_ends_with_a_gc_of_the_receiving_pc_and_only_once_an_hour() {
+    let w = world(true);
+    w.desk()
+        .sb
+        .fake("hc")
+        .respond("get t7*", terminal("t7", "live", RECORDED_MS))
+        .respond("send t7 *", Reply::ok("{}"));
+    let store = Home::at(w.desk().sb.chute_home())
+        .repo(&chute::model::Slug::new("acme", "widget").unwrap());
+    let old_report = |name: &str| {
+        let dir = store.dir().join("reports").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1.md"), "x").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        fs::File::open(&dir)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        dir
+    };
+    let first = old_report("pr-9");
+    let desk_head = w.desk().repo.head();
+    w.desk().repo.git(&[
+        "update-ref",
+        "refs/chute/failed/pr9-b20200101-000000",
+        &desk_head,
+    ]);
+
+    w.bounce(&w.item(w.agent_on_desk()));
+
+    assert!(!first.exists(), "받은 PC가 오래된 보고서를 지웠다");
+    assert!(
+        w.desk()
+            .repo
+            .git(&["for-each-ref", "refs/chute/failed/pr9-*"])
+            .is_empty(),
+        "오래된 실패 참조도 지웠다"
+    );
+    assert!(store.dir().join("gc.json").is_file());
+
+    let second = old_report("pr-10");
+    w.bounce(&w.item(w.agent_on_desk()));
+    assert!(second.exists(), "한 시간 안에는 다시 정리하지 않는다");
+}
