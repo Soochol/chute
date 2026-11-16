@@ -231,6 +231,7 @@ impl Feedback<'_> {
                 next: next_steps(
                     subject,
                     &cause,
+                    &self.repo.remote_name,
                     &self.repo.default_branch,
                     self.config.require_head,
                 ),
@@ -354,6 +355,7 @@ impl Feedback<'_> {
             shell_word(&configured.run)
         );
         let git = format!("git -c core.hooksPath=/dev/null -C {repo}");
+        let remote = &self.repo.remote_name;
         let at_tree = format!(
             "{git} worktree add --detach {dir} {} && (cd {dir} && {run})",
             step.tree
@@ -372,8 +374,10 @@ impl Feedback<'_> {
                     .map(|head| format!("git merge --no-ff --no-edit {head} && "))
                     .collect();
                 vec![
-                    "# 허브의 실패한 트리를 이 머신에 가져오지 못했다. origin에서 같은 트리를 만든다".to_owned(),
-                    format!("{git} fetch origin"),
+                    format!(
+                        "# 허브의 실패한 트리를 이 머신에 가져오지 못했다. {remote}에서 같은 트리를 만든다"
+                    ),
+                    format!("{git} fetch {remote}"),
                     format!(
                         "{git} worktree add --detach {dir} {} && (cd {dir} && {merges}{run})",
                         rebuild.base
@@ -381,7 +385,9 @@ impl Feedback<'_> {
                 ]
             }
             (Placement::Delivered { rebuild: None }, None) => vec![
-                "# 허브의 실패한 트리를 이 머신에 가져오지 못했고 origin에서 만드는 방법도 알지 못했다. 아래 커밋은 허브에만 있을 수 있다".to_owned(),
+                format!(
+                    "# 허브의 실패한 트리를 이 머신에 가져오지 못했고 {remote}에서 만드는 방법도 알지 못했다. 아래 커밋은 허브에만 있을 수 있다"
+                ),
                 at_tree,
             ],
         };
@@ -666,11 +672,13 @@ fn summarize(cause: &Cause) -> String {
 fn next_steps(
     subject: &Subject,
     cause: &Cause,
+    remote: &str,
     default_branch: &str,
     require_head: bool,
 ) -> Vec<String> {
     let this = subject.this();
-    let merge = format!("`git fetch origin`, `git merge origin/{default_branch}` 순서로 실행해");
+    let merge =
+        format!("`git fetch {remote}`, `git merge {remote}/{default_branch}` 순서로 실행해");
     let (fix, give_up) = match subject {
         Subject::Pr { .. } if require_head => (
             "고쳐서 커밋하고 push한 뒤 PR 번호와 새 HEAD를 보고한다. 이 저장소는 `require_head = true`라 submit하지 않는다.",
@@ -1417,9 +1425,10 @@ impl Feedback<'_> {
             .workdir(item)
             .map_err(|e| Unreachable::Failed(format!("{e:#}")))?;
         let task = format!(
-            "너는 chute(머지 큐)가 돌려보낸 PR의 담당 에이전트다. PR: {}, 브랜치: {}. 지금 폴더가 그 브랜치의 worktree다. 먼저 `git fetch origin`과 `git status`로 이 폴더가 PR의 최신 HEAD인지 본다. push는 `git push -u origin <브랜치>`로 한다. chute 사용법은 `chute --skill`로 읽는다. {line}",
+            "너는 chute(머지 큐)가 돌려보낸 PR의 담당 에이전트다. PR: {}, 브랜치: {}. 지금 폴더가 그 브랜치의 worktree다. 먼저 `git fetch {remote}`과 `git status`로 이 폴더가 PR의 최신 HEAD인지 본다. push는 `git push -u {remote} <브랜치>`로 한다. chute 사용법은 `chute --skill`로 읽는다. {line}",
             item.pr,
-            code_span(&item.branch)
+            code_span(&item.branch),
+            remote = self.repo.remote_name
         );
         let (name, out) = match self.run_with_free_name(item.pr, &cwd, task)? {
             Started::Launched { name, out } => (name, out),
@@ -1710,7 +1719,7 @@ impl Feedback<'_> {
                 .git(&self.repo.path, ["rev-parse", "--verify", "--quiet", &name])?
                 .success())
         };
-        let remote = format!("refs/remotes/origin/{branch}");
+        let remote = format!("refs/remotes/{}/{branch}", self.repo.remote_name);
         let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
         // git refuses a branch that a worktree record still holds, even once that folder is gone.
         if holder_folder_gone {

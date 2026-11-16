@@ -341,8 +341,11 @@ impl Engine {
 
     fn load_config(&self) -> Result<Config> {
         let branch = &self.info.default_branch;
-        Config::load_remote_branch(&self.ext, &self.info.path, branch)?.ok_or_else(|| {
-            anyhow!("chute.toml을 origin/{branch}에서 읽지 못했다. 기본 브랜치에 올렸는지 확인한다")
+        let remote = &self.info.remote_name;
+        Config::load_remote_branch(&self.ext, &self.info.path, remote, branch)?.ok_or_else(|| {
+            anyhow!(
+                "chute.toml을 {remote}/{branch}에서 읽지 못했다. 기본 브랜치에 올렸는지 확인한다"
+            )
         })
     }
 
@@ -357,7 +360,10 @@ impl Engine {
         let slot = lock.open()?;
         slot.fetch_base()?;
         let state = self.store.load()?;
-        let main = format!("refs/remotes/origin/{}", self.info.default_branch);
+        let main = format!(
+            "refs/remotes/{}/{}",
+            self.info.remote_name, self.info.default_branch
+        );
         let mut settled: Vec<(QueueItem, Option<Sha>)> = Vec::new();
         for item in state.queue.iter().filter(|i| i.state == ItemState::InBatch) {
             if self.is_ancestor(&item.head, &main)? {

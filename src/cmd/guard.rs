@@ -9,6 +9,8 @@ use serde::Deserialize;
 use super::Ctx;
 use crate::config::Config;
 use crate::ext::Ext;
+use crate::model::{RepoInfo, Slug};
+use crate::repo::{self, Remote};
 
 /// Claude Code reads exit code 2 from a PreToolUse hook as "block the tool call and show stderr
 /// to the model". Any other non-zero code only shows stderr to the user and lets the call run.
@@ -31,7 +33,7 @@ struct ToolInput {
 }
 
 pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
-    match judge(&ctx.ext) {
+    match judge(ctx) {
         Ok(None) => Ok(ExitCode::SUCCESS),
         Ok(Some(reason)) => {
             eprintln!("{reason}");
@@ -44,17 +46,18 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     }
 }
 
-fn judge(ext: &Ext) -> Result<Option<String>> {
+fn judge(ctx: &Ctx) -> Result<Option<String>> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
         .context("훅 입력을 읽지 못했다")?;
     let cwd = std::env::current_dir().context("지금 폴더를 알지 못했다")?;
     decide(
-        ext,
+        &ctx.ext,
         &raw,
         &cwd,
         std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        &|| ctx.home.repos().unwrap_or_default(),
     )
 }
 
@@ -63,6 +66,7 @@ fn decide(
     raw: &str,
     fallback_cwd: &Path,
     home: Option<&Path>,
+    registry: &dyn Fn() -> Vec<RepoInfo>,
 ) -> Result<Option<String>> {
     let input: HookInput = serde_json::from_str(raw).context("훅 입력이 JSON이 아니다")?;
     if input.tool_name.as_deref() != Some("Bash") {
@@ -74,7 +78,7 @@ fn decide(
     let cwd = input.cwd.unwrap_or_else(|| fallback_cwd.to_owned());
     for action in actions(&command) {
         let dir = action.dir.resolve(&cwd, home);
-        let Some(repo) = Repo::open(ext, &dir) else {
+        let Some(repo) = Repo::open(ext, &dir, registry) else {
             continue;
         };
         if let Some(reason) = action.kind.verdict(&repo) {
@@ -98,6 +102,8 @@ enum Kind {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Push {
+    /// The remote the command names, as a remote name or a URL.
+    remote: Option<String>,
     all_branches: bool,
     tags_only: bool,
     destinations: Vec<Destination>,
@@ -134,24 +140,46 @@ impl Dir {
 struct Repo<'a> {
     ext: &'a Ext,
     dir: PathBuf,
-    default_branches: Vec<String>,
+    remotes: Vec<Remote>,
+    /// The remote chute manages. `None` when chute cannot tell which it is, and then every
+    /// remote is treated as managed.
+    managed: Option<Remote>,
+}
+
+/// Where a push goes.
+struct Target {
+    /// The remote's name, when the command names a configured remote.
+    name: Option<String>,
+    slug: Slug,
 }
 
 impl<'a> Repo<'a> {
-    fn open(ext: &'a Ext, dir: &Path) -> Option<Repo<'a>> {
+    fn open(ext: &'a Ext, dir: &Path, registry: &dyn Fn() -> Vec<RepoInfo>) -> Option<Repo<'a>> {
         let top = ext.git(dir, ["rev-parse", "--show-toplevel"]).ok()?;
-        if !top.success()
-            || !Path::new(top.stdout_text().trim())
-                .join("chute.toml")
-                .is_file()
-        {
+        let top_dir = PathBuf::from(top.stdout_text().trim());
+        if !top.success() || !top_dir.join("chute.toml").is_file() {
             return None;
         }
+        let remotes = repo::remotes(ext, dir).unwrap_or_default();
+        let managed = repo::managed(
+            &remotes,
+            repo::local_remote_key(&top_dir).as_deref(),
+            &registry(),
+        )
+        .ok()
+        .cloned();
         Some(Repo {
             ext,
             dir: dir.to_owned(),
-            default_branches: default_branches(ext, dir),
+            remotes,
+            managed,
         })
+    }
+
+    fn config_value(&self, key: &str) -> Option<String> {
+        let out = self.ext.git(&self.dir, ["config", "--get", key]).ok()?;
+        let value = out.stdout_text().trim().to_owned();
+        (out.success() && !value.is_empty()).then_some(value)
     }
 
     fn current_branch(&self) -> Option<String> {
@@ -175,49 +203,97 @@ impl<'a> Repo<'a> {
             .then(|| tracked.split_once('/').map(|(_, branch)| branch.to_owned()))?
     }
 
-    fn requires_head(&self) -> bool {
-        self.default_branches.iter().any(|branch| {
-            Config::load_remote_branch(self.ext, &self.dir, branch)
-                .ok()
-                .flatten()
-                .is_some_and(|config| config.require_head)
+    /// The remote a push goes to, in git's own order: the one on the command line, the
+    /// branch's `pushRemote`, `remote.pushDefault`, the branch's upstream remote, and `origin`.
+    fn push_remote(&self, push: &Push) -> Option<String> {
+        if let Some(named) = &push.remote {
+            return Some(named.clone());
+        }
+        let branch = self.current_branch();
+        let per_branch = |setting: &str| {
+            branch
+                .as_ref()
+                .and_then(|b| self.config_value(&format!("branch.{b}.{setting}")))
+        };
+        per_branch("pushRemote")
+            .or_else(|| self.config_value("remote.pushDefault"))
+            .or_else(|| per_branch("remote"))
+            .or_else(|| self.has_remote("origin").then(|| "origin".to_owned()))
+    }
+
+    fn has_remote(&self, name: &str) -> bool {
+        self.ext
+            .git(&self.dir, ["remote", "get-url", "--push", name])
+            .is_ok_and(|out| out.success())
+    }
+
+    fn target(&self, push: &Push) -> Option<Target> {
+        let word = self.push_remote(push)?;
+        if self.has_remote(&word) {
+            let out = self
+                .ext
+                .git(&self.dir, ["remote", "get-url", "--push", &word])
+                .ok()?;
+            let slug = repo::parse_slug(out.stdout_text().trim()).ok()?;
+            return Some(Target {
+                name: Some(word),
+                slug,
+            });
+        }
+        let slug = repo::parse_slug(&word).ok()?;
+        Some(Target { name: None, slug })
+    }
+
+    fn is_managed(&self, target: &Target) -> bool {
+        self.managed.as_ref().is_none_or(|m| m.slug == target.slug)
+    }
+
+    /// The branch `<remote>/HEAD` points at, or `main` and `master` when it is unset.
+    fn default_branches(&self, remote: Option<&str>) -> Vec<String> {
+        let head = remote.and_then(|name| {
+            let out = self
+                .ext
+                .git(
+                    &self.dir,
+                    ["symbolic-ref", "-q", &format!("refs/remotes/{name}/HEAD")],
+                )
+                .ok()?;
+            let head = out.stdout_text();
+            out.success().then(|| {
+                head.trim()
+                    .strip_prefix(&format!("refs/remotes/{name}/"))
+                    .map(str::to_owned)
+            })?
+        });
+        head.map_or_else(|| vec!["main".to_owned(), "master".to_owned()], |b| vec![b])
+    }
+
+    /// Whether the `chute.toml` on the default branch of any of `remotes` sets `require_head`.
+    fn requires_head(&self, remotes: &[&str]) -> bool {
+        remotes.iter().any(|remote| {
+            self.default_branches(Some(remote)).iter().any(|branch| {
+                Config::load_remote_branch(self.ext, &self.dir, remote, branch)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|config| config.require_head)
+            })
         })
     }
 
-    fn hand_in(&self) -> &'static str {
-        if self.requires_head() {
+    /// `remote` is where the push goes. Without one, the managed remote's settings apply, or
+    /// every remote's when chute cannot tell which is managed.
+    fn hand_in(&self, remote: Option<&str>) -> &'static str {
+        let names: Vec<&str> = match (remote, &self.managed) {
+            (Some(name), _) => vec![name],
+            (None, Some(managed)) => vec![managed.name.as_str()],
+            (None, None) => self.remotes.iter().map(|r| r.name.as_str()).collect(),
+        };
+        if self.requires_head(&names) {
             "PR 번호와 HEAD를 보고한다(이 저장소는 `require_head = true`라 submit하지 않는다)"
         } else {
             "`chute submit`으로 큐에 넣는다"
         }
     }
-
-    fn is_default(&self, branch: &str) -> bool {
-        self.default_branches.iter().any(|d| d == branch)
-    }
-}
-
-fn default_branches(ext: &Ext, dir: &Path) -> Vec<String> {
-    let listed = ext
-        .git(dir, ["for-each-ref", "--format=%(symref)", "refs/remotes"])
-        .ok()
-        .filter(|out| out.success())
-        .map(|out| out.stdout_text())
-        .unwrap_or_default();
-    let mut named: Vec<String> = Vec::new();
-    for symref in listed.lines() {
-        let branch = symref
-            .strip_prefix("refs/remotes/")
-            .and_then(|r| r.split_once('/'))
-            .map(|(_, branch)| branch.to_owned());
-        if let Some(branch) = branch.filter(|b| !named.contains(b)) {
-            named.push(branch);
-        }
-    }
-    if named.is_empty() {
-        named = vec!["main".to_owned(), "master".to_owned()];
-    }
-    named
 }
 
 impl Kind {
@@ -227,24 +303,38 @@ impl Kind {
                 "chute: 이 저장소는 chute가 머지한다. `gh pr merge`는 쓰지 않는다. \
                  PR을 올린 뒤 `chute preflight`로 검증하고 {}. \
                  절차는 `chute --skill`에 있다.",
-                repo.hand_in()
+                repo.hand_in(None)
             )),
-            Kind::Push(push) => push.hits_default_branch(repo).map(|branch| {
-                format!(
-                    "chute: 기본 브랜치({branch})로 직접 push하지 않는다. \
-                     PR 브랜치에 push하고 `chute preflight`로 검증한 뒤 {}. \
-                     절차는 `chute --skill`에 있다.",
-                    repo.hand_in()
-                )
-            }),
+            Kind::Push(push) => {
+                let Some(target) = repo.target(push) else {
+                    return Some(
+                        "chute: 이 push가 어느 원격으로 가는지 알 수 없어 막는다. \
+                         `git push <원격> <브랜치>`처럼 원격 이름을 적는다. \
+                         원격 목록은 `git remote -v`로 본다."
+                            .to_owned(),
+                    );
+                };
+                if !repo.is_managed(&target) {
+                    return None;
+                }
+                push.hits_default_branch(repo, &target).map(|branch| {
+                    format!(
+                        "chute: 기본 브랜치({branch})로 직접 push하지 않는다. \
+                         PR 브랜치에 push하고 `chute preflight`로 검증한 뒤 {}. \
+                         절차는 `chute --skill`에 있다.",
+                        repo.hand_in(target.name.as_deref())
+                    )
+                })
+            }
         }
     }
 }
 
 impl Push {
-    fn hits_default_branch(&self, repo: &Repo) -> Option<String> {
+    fn hits_default_branch(&self, repo: &Repo, target: &Target) -> Option<String> {
+        let defaults = repo.default_branches(target.name.as_deref());
         if self.all_branches {
-            return repo.default_branches.first().cloned();
+            return defaults.first().cloned();
         }
         if self.destinations.is_empty() {
             if self.tags_only {
@@ -253,15 +343,15 @@ impl Push {
             return [repo.current_branch(), repo.push_target_branch()]
                 .into_iter()
                 .flatten()
-                .find(|b| repo.is_default(b));
+                .find(|b| defaults.contains(b));
         }
         self.destinations.iter().find_map(|destination| {
             let branch = match destination {
                 Destination::Branch(name) => Some(name.clone()),
                 Destination::CurrentBranch => repo.current_branch(),
-                Destination::Pattern => return repo.default_branches.first().cloned(),
+                Destination::Pattern => return defaults.first().cloned(),
             }?;
-            repo.is_default(&branch).then_some(branch)
+            defaults.contains(&branch).then_some(branch)
         })
     }
 }
@@ -452,13 +542,22 @@ fn parse_push<'a>(args: impl Iterator<Item = &'a str>) -> Push {
             "--" => options_done = true,
             "--all" | "--mirror" | "--branches" => push.all_branches = true,
             "--tags" => tags = true,
-            "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" => {
+            "--repo" => push.remote = args.next().map(str::to_owned),
+            "-o" | "--push-option" | "--receive-pack" | "--exec" => {
                 args.next();
             }
-            _ => {}
+            _ => {
+                if let Some(repo) = word.strip_prefix("--repo=") {
+                    push.remote = Some(repo.to_owned());
+                }
+            }
         }
     }
-    let mut refspecs = positional.into_iter().skip(1).peekable();
+    let mut positional = positional.into_iter();
+    if push.remote.is_none() {
+        push.remote = positional.next().map(str::to_owned);
+    }
+    let mut refspecs = positional.peekable();
     push.tags_only = tags && refspecs.peek().is_none();
     push.destinations = refspecs.filter_map(destination).collect();
     push
@@ -733,6 +832,8 @@ mod tests {
     struct Fixture {
         sb: Sandbox,
         repo: TestRepo,
+        /// What `chute init` has registered, as the hook reads it.
+        known: Vec<RepoInfo>,
     }
 
     impl Fixture {
@@ -743,7 +844,11 @@ mod tests {
             if with_chute_toml {
                 repo.commit_file("chute.toml", "approval = \"agent\"\n", "chore: chute 설정");
             }
-            Fixture { sb, repo }
+            Fixture {
+                sb,
+                repo,
+                known: Vec::new(),
+            }
         }
 
         fn ext(&self) -> Ext {
@@ -760,7 +865,14 @@ mod tests {
                 "tool_input": {"command": command},
                 "cwd": cwd,
             });
-            decide(&self.ext(), &input.to_string(), cwd, Some(&self.sb.home())).unwrap()
+            decide(
+                &self.ext(),
+                &input.to_string(),
+                cwd,
+                Some(&self.sb.home()),
+                &|| self.known.clone(),
+            )
+            .unwrap()
         }
     }
 
@@ -831,6 +943,163 @@ mod tests {
         fx.repo.git(&["remote", "set-head", "origin", "-d"]);
         let reason = fx.verdict("git push origin master").unwrap();
         assert!(reason.contains("PR 번호와 HEAD를 보고한다"), "{reason}");
+    }
+
+    const CONFIG: &str = "[[verify]]\nname = \"t\"\nrun = \"true\"\n";
+
+    /// `upstream` is the repository chute manages and `origin` is the user's fork. Both
+    /// default to `main`.
+    fn forked(top: &str) -> Fixture {
+        let fx = Fixture::new(false);
+        let at = fx.sb.root().join("clones/me/widget.git");
+        let (at_s, from) = (
+            at.to_string_lossy().into_owned(),
+            fx.repo.origin().to_string_lossy().into_owned(),
+        );
+        fx.repo.git(&["clone", "--quiet", "--bare", &from, &at_s]);
+        fx.repo.git(&["remote", "rename", "origin", "upstream"]);
+        fx.repo.git(&["remote", "add", "origin", &at_s]);
+        fx.repo.git(&["fetch", "--quiet", "origin"]);
+        fx.repo.git(&["remote", "set-head", "origin", "main"]);
+        fx.repo
+            .commit_file("chute.toml", &format!("{top}{CONFIG}"), "chore: chute 설정");
+        fx.repo.git(&["push", "--quiet", "upstream", "main"]);
+        fx
+    }
+
+    #[test]
+    fn only_the_managed_remote_is_guarded_when_origin_is_a_fork() {
+        let fx = forked("remote = \"upstream\"\n");
+        for command in [
+            "git push upstream main",
+            "git push upstream HEAD:main",
+            "git push --force upstream main",
+        ] {
+            let reason = fx.verdict(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(reason.contains("chute preflight"), "{reason}");
+        }
+        for command in [
+            "git push origin main",
+            "git push -f origin HEAD:main",
+            "git push origin :main",
+            "git push --all origin",
+            "git push upstream feat/a",
+            "git push origin",
+        ] {
+            assert_eq!(fx.verdict(command), None, "{command}");
+        }
+        assert!(fx.verdict("gh pr merge 12").is_some());
+    }
+
+    #[test]
+    fn the_registered_repository_picks_the_guarded_remote_without_a_key() {
+        let mut fx = forked("");
+        assert!(
+            fx.verdict("git push origin main").is_some(),
+            "정할 수 없으면 대상 원격을 지킨다"
+        );
+        fx.known = vec![RepoInfo {
+            slug: repo::parse_slug("acme/widget").unwrap(),
+            path: PathBuf::from("/unused"),
+            remote: "unused".into(),
+            remote_name: "upstream".into(),
+            default_branch: "main".into(),
+        }];
+        assert_eq!(fx.verdict("git push origin main"), None);
+        assert!(fx.verdict("git push upstream main").is_some());
+    }
+
+    #[test]
+    fn a_bare_push_goes_where_git_would_send_it() {
+        let fx = forked("remote = \"upstream\"\n");
+        fx.repo.git(&["config", "push.default", "current"]);
+        assert!(
+            fx.verdict("git push").is_some(),
+            "main의 upstream은 upstream"
+        );
+        fx.repo.git(&["branch", "--quiet", "--unset-upstream"]);
+        assert_eq!(fx.verdict("git push"), None, "origin이 기본이다");
+
+        fx.repo.git(&["config", "branch.main.remote", "upstream"]);
+        assert!(fx.verdict("git push").is_some(), "upstream 원격");
+        fx.repo.git(&["config", "remote.pushDefault", "origin"]);
+        assert_eq!(fx.verdict("git push"), None, "pushDefault가 먼저다");
+        fx.repo
+            .git(&["config", "branch.main.pushRemote", "upstream"]);
+        assert!(fx.verdict("git push").is_some(), "pushRemote가 먼저다");
+        assert_eq!(
+            fx.verdict("git push origin"),
+            None,
+            "명령에 적힌 원격이 먼저다"
+        );
+        assert!(fx.verdict("git push upstream").is_some());
+        assert!(fx.verdict("git push --repo=upstream").is_some());
+        assert_eq!(fx.verdict("git push --repo origin main"), None);
+    }
+
+    #[test]
+    fn a_url_is_matched_by_its_repository() {
+        let fx = forked("remote = \"upstream\"\n");
+        assert!(
+            fx.verdict("git push git@github.com:acme/widget.git main")
+                .is_some()
+        );
+        assert!(
+            fx.verdict("git push https://github.com/acme/widget main")
+                .is_some()
+        );
+        assert_eq!(
+            fx.verdict("git push https://github.com/me/widget.git main"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_push_whose_remote_is_unknown_is_blocked_and_says_why() {
+        let fx = Fixture::new(true);
+        for command in ["git push nowhere main", "git push nowhere feat/a"] {
+            let reason = fx.verdict(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                reason.contains("어느 원격으로 가는지 알 수 없어"),
+                "{reason}"
+            );
+        }
+        fx.repo.git(&["remote", "remove", "origin"]);
+        let reason = fx.verdict("git push").unwrap();
+        assert!(
+            reason.contains("어느 원격으로 가는지 알 수 없어"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn the_hand_in_advice_follows_the_remote_the_push_goes_to() {
+        let fx = Fixture::new(false);
+        let at = fx.sb.root().join("clones/acme/widget.git");
+        let (at_s, from) = (
+            at.to_string_lossy().into_owned(),
+            fx.repo.origin().to_string_lossy().into_owned(),
+        );
+        fx.repo.git(&["clone", "--quiet", "--bare", &from, &at_s]);
+        fx.repo.git(&["remote", "add", "mirror", &at_s]);
+        let config = |require_head: bool| format!("require_head = {require_head}\n{CONFIG}");
+        fx.repo
+            .commit_file("chute.toml", &config(true), "chore: 설정");
+        fx.repo.git(&["push", "--quiet", "origin", "main"]);
+        fx.repo.git(&["checkout", "--quiet", "-b", "alt", "HEAD~1"]);
+        fx.repo
+            .commit_file("chute.toml", &config(false), "chore: 설정");
+        fx.repo
+            .git(&["push", "--quiet", "--force", "mirror", "alt:main"]);
+        fx.repo.git(&["fetch", "--quiet", "mirror"]);
+        fx.repo.git(&["remote", "set-head", "mirror", "main"]);
+        fx.repo.git(&["checkout", "--quiet", "main"]);
+
+        let origin = fx.verdict("git push origin main").unwrap();
+        assert!(origin.contains("PR 번호와 HEAD를 보고한다"), "{origin}");
+        let mirror = fx.verdict("git push mirror main").unwrap();
+        assert!(mirror.contains("`chute submit`"), "{mirror}");
+        assert!(!mirror.contains("PR 번호와 HEAD를 보고한다"), "{mirror}");
     }
 
     #[test]
@@ -1111,8 +1380,12 @@ mod tests {
             r#"{"tool_name":"Bash"}"#,
             r#"{}"#,
         ] {
-            assert_eq!(decide(&ext, raw, cwd, None).unwrap(), None, "{raw}");
+            assert_eq!(
+                decide(&ext, raw, cwd, None, &Vec::new).unwrap(),
+                None,
+                "{raw}"
+            );
         }
-        assert!(decide(&ext, "not json", cwd, None).is_err());
+        assert!(decide(&ext, "not json", cwd, None, &Vec::new).is_err());
     }
 }

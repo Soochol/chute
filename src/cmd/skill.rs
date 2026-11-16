@@ -41,7 +41,12 @@ fn requires_head(ctx: &Ctx) -> bool {
 
 fn try_requires_head(ctx: &Ctx) -> Result<bool> {
     let (info, _) = ctx.registered_repo()?;
-    let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)?;
+    let config = Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    )?;
     Ok(config.is_some_and(|config| config.require_head))
 }
 
@@ -160,7 +165,7 @@ mod tests {
         }
         let ext = Ext::from_vars(|k| sb.var(k));
         let home = Home::at(sb.chute_home());
-        let info = crate::repo::discover(&ext, repo.path()).unwrap();
+        let info = crate::repo::discover(&ext, repo.path(), &[]).unwrap();
         home.repo(&info.slug).register(&info).unwrap();
         let ctx = Ctx::new(home, ext, Some(repo.path().to_path_buf()));
         (sb, repo, ctx)

@@ -265,7 +265,10 @@ impl Feedback<'_> {
     }
 
     fn base_of(&self, tree: &Sha) -> Result<Sha> {
-        let origin = format!("refs/remotes/origin/{}", self.repo.default_branch);
+        let origin = format!(
+            "refs/remotes/{}/{}",
+            self.repo.remote_name, self.repo.default_branch
+        );
         let out = self
             .ext
             .git(&self.repo.path, ["merge-base", tree.as_str(), &origin])?

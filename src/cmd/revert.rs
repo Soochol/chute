@@ -411,9 +411,13 @@ fn verify_tree(
     id: &BatchId,
 ) -> Result<()> {
     let branch = &info.default_branch;
-    let config = Config::load_remote_branch(&ctx.ext, &info.path, branch)?.ok_or_else(|| {
-        anyhow!("chute.toml을 origin/{branch}에서 읽지 못했다. 기본 브랜치에 올렸는지 확인한다")
-    })?;
+    let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.remote_name, branch)?
+        .ok_or_else(|| {
+            anyhow!(
+                "chute.toml을 {}/{branch}에서 읽지 못했다. 기본 브랜치에 올렸는지 확인한다",
+                info.remote_name
+            )
+        })?;
     let log_dir = store.batch_dir(id).join("revert-logs");
     match verify::run(&config, store, slot.path(), &log_dir, &Options::default())? {
         Outcome::Passed { .. } => Ok(()),
@@ -483,8 +487,8 @@ fn report(
     }
     for p in &record.prs {
         out.push_str(&format!(
-            "  #{}: git merge origin/{branch} && git revert {}\n",
-            p.pr.0, p.revert
+            "  #{}: git merge {}/{branch} && git revert {}\n",
+            p.pr.0, info.remote_name, p.revert
         ));
     }
     out

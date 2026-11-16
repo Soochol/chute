@@ -134,6 +134,33 @@ fn submit_json_reports_pr_head_state_and_place_and_status_shows_the_agent() {
 }
 
 #[test]
+fn submit_reads_the_config_from_the_remote_named_upstream_when_origin_is_a_fork() {
+    let w = World::with_config(None);
+    let fork = w.sb.root().join("remotes/me/widget.git");
+    let (fork_s, upstream) = (
+        fork.to_string_lossy().into_owned(),
+        w.repo.origin().to_string_lossy().into_owned(),
+    );
+    w.repo
+        .git(&["clone", "--quiet", "--bare", &upstream, &fork_s]);
+    w.repo.git(&["remote", "rename", "origin", "upstream"]);
+    w.repo.git(&["remote", "add", "origin", &fork_s]);
+    w.repo.git(&["fetch", "--quiet", "origin"]);
+    let config = format!("remote = \"upstream\"\n{}", chute::config::draft("true"));
+    w.repo
+        .commit_file("chute.toml", &config, "chore: chute 설정");
+    w.repo.git(&["push", "--quiet", "upstream", "main"]);
+    w.ok(w.repo.path(), &["init"]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    hc_knows_impl_a(&w, "t1rs");
+
+    let out = submit(&w, &["12", "--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert_eq!(w.state().queue.len(), 1);
+}
+
+#[test]
 fn trust_mode_queues_the_pr_and_records_its_head_and_agent() {
     let w = World::new();
     gh_pr(&w, Some(12), pr(12, HEAD));

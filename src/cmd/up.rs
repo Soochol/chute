@@ -146,6 +146,7 @@ mod tests {
             slug: Slug::new("acme", name).unwrap(),
             path: "/w/repo".into(),
             remote: "git@github.com:acme/repo.git".to_owned(),
+            remote_name: "origin".into(),
             default_branch: "main".to_owned(),
         }
     }

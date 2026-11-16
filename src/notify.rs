@@ -479,10 +479,15 @@ impl<'a> Notifier<'a> {
 
     fn require_head(&self) -> bool {
         *self.require_head.get_or_init(|| {
-            Config::load_remote_branch(self.ext, &self.repo.path, &self.repo.default_branch)
-                .ok()
-                .flatten()
-                .is_some_and(|config| config.require_head)
+            Config::load_remote_branch(
+                self.ext,
+                &self.repo.path,
+                &self.repo.remote_name,
+                &self.repo.default_branch,
+            )
+            .ok()
+            .flatten()
+            .is_some_and(|config| config.require_head)
         })
     }
 
@@ -971,6 +976,7 @@ mod tests {
                 slug: slug(),
                 path: sb.root().join("work"),
                 remote: "origin".into(),
+                remote_name: "origin".into(),
                 default_branch: "main".into(),
             };
             let store = Home::at(sb.chute_home()).repo(&info.slug);

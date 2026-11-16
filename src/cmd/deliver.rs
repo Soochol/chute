@@ -29,14 +29,20 @@ pub fn deliver(ctx: &Ctx, input: &[u8]) -> Result<Delivery> {
     }
     let parcel = Parcel::decode(input)?;
     let (info, store) = ctx.registered_repo()?;
-    fetch_origin(ctx, &info.path);
-    let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)?
-        .ok_or_else(|| {
-            anyhow!(
-                "origin/{}에서 chute.toml을 읽지 못했다. 기본 브랜치에 올렸는지 확인한다",
-                info.default_branch
-            )
-        })?;
+    fetch_remote(ctx, &info.path, &info.remote_name);
+    let config = Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "{}/{}에서 chute.toml을 읽지 못했다. 기본 브랜치에 올렸는지 확인한다",
+            info.remote_name,
+            info.default_branch
+        )
+    })?;
     let worktrees_root = feedback::worktrees_root(|key| std::env::var_os(key))?;
     let feedback = Feedback {
         ext: &ctx.ext,
@@ -58,13 +64,13 @@ pub fn deliver(ctx: &Ctx, input: &[u8]) -> Result<Delivery> {
     Ok(delivery)
 }
 
-fn fetch_origin(ctx: &Ctx, repo: &Path) {
-    match ctx.ext.git(repo, ["fetch", "--quiet", "origin"]) {
+fn fetch_remote(ctx: &Ctx, repo: &Path, remote: &str) {
+    match ctx.ext.git(repo, ["fetch", "--quiet", remote]) {
         Ok(out) if out.success() => {}
         Ok(out) => eprintln!(
-            "경고: origin을 가져오지 못했다: {}",
+            "경고: {remote}을 가져오지 못했다: {}",
             out.stderr_text().trim()
         ),
-        Err(e) => eprintln!("경고: origin을 가져오지 못했다: {e}"),
+        Err(e) => eprintln!("경고: {remote}을 가져오지 못했다: {e}"),
     }
 }

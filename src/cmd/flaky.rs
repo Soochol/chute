@@ -41,7 +41,12 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
         return Ok(code);
     }
     let (info, store) = ctx.registered_repo()?;
-    let policy = match Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch) {
+    let policy = match Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    ) {
         Ok(Some(config)) => config.flaky,
         Ok(None) => {
             eprintln!("경고: chute.toml을 읽지 못해 기본 기준으로 센다");

@@ -15,6 +15,7 @@ pub const PROBE_PLACEHOLDER: &str = "{tests}";
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub remote: Option<String>,
     pub approval: Approval,
     pub budget: u32,
     pub max_batch: u32,
@@ -72,6 +73,8 @@ pub struct VerifyStep {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default)]
+    remote: Option<String>,
     #[serde(default)]
     approval: Approval,
     #[serde(default = "default_budget")]
@@ -224,6 +227,11 @@ impl Config {
         if let Some((key, _)) = at_least_one.iter().find(|(_, value)| *value == 0) {
             bail!("chute.toml의 {key}는 1 이상이어야 한다");
         }
+        if let Some(name) = &raw.remote
+            && !is_remote_name(name)
+        {
+            bail!("chute.toml의 remote {name:?}은 git 원격 이름이 아니다");
+        }
         if raw.env_check.iter().any(|run| run.trim().is_empty()) {
             bail!("chute.toml의 env_check에 빈 항목이 있다");
         }
@@ -282,6 +290,7 @@ impl Config {
         let verify = NonEmpty::new(steps)
             .ok_or_else(|| anyhow!("chute.toml에 [[verify]] 단계가 하나도 없다"))?;
         Ok(Config {
+            remote: raw.remote,
             approval: raw.approval,
             budget: raw.budget,
             max_batch: raw.max_batch,
@@ -308,12 +317,17 @@ impl Config {
         })
     }
 
-    /// Reads `chute.toml` from `refs/remotes/origin/<branch>`, or returns `None` when that ref
-    /// or the file is missing. The exact ref is named on purpose: `origin/<branch>` resolves
+    /// Reads `chute.toml` from `refs/remotes/<remote>/<branch>`, or returns `None` when that ref
+    /// or the file is missing. The exact ref is named on purpose: `<remote>/<branch>` resolves
     /// to a local branch or tag of that name first, and even the full ref name falls back to
     /// `refs/tags/<name>` and `refs/heads/<name>` when the remote-tracking ref is absent.
-    pub fn load_remote_branch(ext: &Ext, repo: &Path, branch: &str) -> Result<Option<Config>> {
-        let remote_ref = format!("refs/remotes/origin/{branch}");
+    pub fn load_remote_branch(
+        ext: &Ext,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+    ) -> Result<Option<Config>> {
+        let remote_ref = format!("refs/remotes/{remote}/{branch}");
         let found = ext.git(
             repo,
             ["show-ref", "--verify", "--hash", remote_ref.as_str()],
@@ -329,7 +343,7 @@ impl Config {
         }
         Config::parse(&shown.stdout_text())
             .map(Some)
-            .with_context(|| format!("origin/{branch}의 설정을 읽지 못했다"))
+            .with_context(|| format!("{remote}/{branch}의 설정을 읽지 못했다"))
     }
 
     pub fn load_at(ext: &Ext, repo: &Path, rev: &str) -> Result<Config> {
@@ -343,6 +357,20 @@ impl Config {
         }
         Config::parse(&out.stdout_text()).with_context(|| format!("설정이 잘못됐다: {spec}"))
     }
+}
+
+fn is_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains(|c: char| c.is_whitespace() || c.is_control() || c == '/')
+}
+
+/// The `remote` key alone, read without validating the rest of the file, so that a repository
+/// with several matching remotes can be told apart before any config can be loaded.
+pub fn remote_key(text: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(text).ok()?;
+    let name = value.get("remote")?.as_str()?;
+    is_remote_name(name).then(|| name.to_owned())
 }
 
 pub fn draft(verify_run: &str) -> String {
@@ -361,6 +389,8 @@ env_check = []          # 검증 전에 돌려 결과를 남길 명령. 예: ["c
 # 값을 넣으면 그 명령으로 새 에이전트를 띄운다.
 # 주의: --dangerously-skip-permissions를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행한다.
 respawn = []
+# 원격이 여러 개면 chute가 쓸 git 원격의 이름을 적는다. 예: remote = "upstream"
+# remote = "origin"
 
 [retention]
 logs_days = 7           # 검증 로그와 preflight 로그를 남기는 날수
@@ -623,6 +653,31 @@ probe = "cargo test {tests} -- --exact"
         assert_eq!(drafted.env_check, minimal.env_check);
         assert_eq!(drafted.require_head, minimal.require_head);
         assert!(text.contains("# probe = "));
+    }
+
+    #[test]
+    fn the_remote_key_names_a_git_remote() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().remote, None);
+        let named = format!("remote = \"upstream\"\n{MINIMAL}");
+        assert_eq!(
+            Config::parse(&named).unwrap().remote.as_deref(),
+            Some("upstream")
+        );
+        for bad in ["", "a b", "-x", "a/b"] {
+            let text = format!("remote = {bad:?}\n{MINIMAL}");
+            assert!(Config::parse(&text).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_remote_key_is_read_even_when_the_rest_of_the_file_is_wrong() {
+        assert_eq!(
+            remote_key("remote = \"upstream\"\nbudget = \"x\"\n").as_deref(),
+            Some("upstream")
+        );
+        assert_eq!(remote_key("budget = 3\n"), None);
+        assert_eq!(remote_key("remote = \"a b\"\n"), None);
+        assert_eq!(remote_key("not toml ["), None);
     }
 
     #[test]
