@@ -1381,8 +1381,6 @@ impl Run<'_> {
         }
     }
 
-    /// `Scope::Changed` leaves out the steps whose `paths` match no file the tree changes
-    /// against the batch's start base. A base check runs every step.
     fn verify(&mut self, tree: &Sha, scope: Scope) -> Result<Verdict> {
         self.record.verifications += 1;
         let round = self.record.verifications;

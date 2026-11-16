@@ -698,7 +698,6 @@ pub struct BatchRecord {
     pub pushed: Vec<Sha>,
     #[serde(default)]
     pub verifications: u32,
-    /// Steps left out because the changed files matched none of their `paths`.
     #[serde(default)]
     pub skipped: Vec<SkippedStep>,
     #[serde(default)]

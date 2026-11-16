@@ -115,6 +115,11 @@ struct FlakyReport {
     tests: Vec<String>,
 }
 
+struct Steps {
+    outcome: Outcome,
+    skipped: Vec<String>,
+}
+
 struct Target {
     head: Sha,
     branch: Option<String>,
@@ -461,7 +466,10 @@ impl Run<'_> {
 
     fn verify(&self, tip: &Sha) -> Result<Judged> {
         let with = self.with();
-        let (outcome, skipped_steps) = self.run_steps(&self.log_dir.join("with-queue"), true)?;
+        let Steps {
+            outcome,
+            skipped: skipped_steps,
+        } = self.run_steps(&self.log_dir.join("with-queue"), true)?;
         let failed = match outcome {
             Outcome::Passed { flaky } => {
                 return Ok(Judged {
@@ -526,7 +534,7 @@ impl Run<'_> {
             return Ok(None);
         }
         self.slot.checkout(self.base)?;
-        match self.run_steps(&self.log_dir.join("base"), false)?.0 {
+        match self.run_steps(&self.log_dir.join("base"), false)?.outcome {
             Outcome::Passed { .. } => Ok(None),
             Outcome::Failed(failed) => Ok(Some(BrokenBase {
                 step: failed.step,
@@ -546,7 +554,7 @@ impl Run<'_> {
         if let Some(ItemResult::Conflict(files)) = solo.items.first().map(|item| &item.result) {
             return Ok(Alone::Conflicts(files.clone()));
         }
-        match self.run_steps(&self.log_dir.join("solo"), true)?.0 {
+        match self.run_steps(&self.log_dir.join("solo"), true)?.outcome {
             Outcome::Passed { .. } => Ok(Alone::Passes),
             Outcome::Failed(failed) => Ok(Alone::Fails(failed, solo.tip)),
             Outcome::Cancelled => bail!("검증이 취소됐다"),
@@ -581,10 +589,7 @@ impl Run<'_> {
             .write_report_with_env(&self.subject(), failure, failed_ref, Some(section))
     }
 
-    /// Runs the steps on the slot's HEAD. With `only_changed`, a step whose `paths` match none
-    /// of the files HEAD changes against the preflight's base is left out and named in the
-    /// second value. The base itself is verified with every step.
-    fn run_steps(&self, log_dir: &Path, only_changed: bool) -> Result<(Outcome, Vec<String>)> {
+    fn run_steps(&self, log_dir: &Path, only_changed: bool) -> Result<Steps> {
         let changed = if only_changed {
             Some(self.slot.changed_files(self.base)?)
         } else {
@@ -606,7 +611,10 @@ impl Run<'_> {
         let outcome = verify::run(self.config, self.store, self.slot.path(), log_dir, &options)
             .with_context(|| format!("검증을 돌리지 못했다 (저장소 {})", self.info.slug))?;
         drop(options);
-        Ok((outcome, skipped.into_inner()))
+        Ok(Steps {
+            outcome,
+            skipped: skipped.into_inner(),
+        })
     }
 }
 
