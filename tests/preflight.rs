@@ -1562,3 +1562,99 @@ fn a_skip_leaves_origin_the_worktree_and_the_queue_untouched() {
     assert_eq!(w.repo.head(), head);
     assert!(w.sb.fake("gh").calls().is_empty(), "gh가 불렸다");
 }
+
+#[test]
+fn a_skip_sees_a_policy_change_on_origin_main_and_the_base_it_reports_is_exact() {
+    let marks = tempfile::tempdir().unwrap();
+    let (mark, run) = ran_marker(&marks);
+    let w = policy_world(None, &run);
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+    assert!(!mark.exists());
+
+    let tracking_before = w.repo.git(&["rev-parse", "origin/main"]).trim().to_owned();
+    w.repo
+        .git(&["checkout", "--quiet", "-B", "tmp", "origin/main"]);
+    let pushed = w.repo.commit_file(
+        chute::config::FILE_NAME,
+        &format!("preflight = \"always\"\n{}", config(&run)),
+        "chore: 항상 검사한다",
+    );
+    w.repo
+        .git(&["push", "--quiet", "origin", "tmp:refs/heads/main"]);
+    w.repo.git(&[
+        "push",
+        "--quiet",
+        "origin",
+        "tmp:refs/heads/a/refs/heads/main",
+    ]);
+    w.repo.git(&["checkout", "--quiet", "feat/mine"]);
+    w.repo
+        .git(&["update-ref", "refs/remotes/origin/main", &tracking_before]);
+    w.repo.git(&["branch", "--quiet", "-D", "tmp"]);
+
+    let doc = json(&preflight(&w, &["--json"]));
+    assert_eq!(doc["result"], "pass", "{doc}");
+    assert_eq!(doc["head"], head);
+    assert_eq!(doc["base"], pushed);
+    assert!(mark.exists(), "검증이 돌지 않았다");
+}
+
+#[test]
+fn a_skip_reports_the_exact_default_branch_tip_even_when_another_branch_name_ends_like_it() {
+    let w = policy_world(None, "true");
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    w.repo.git(&[
+        "push",
+        "--quiet",
+        "origin",
+        "HEAD:refs/heads/a/refs/heads/main",
+    ]);
+    let main = w.repo.git(&["rev-parse", "origin/main"]).trim().to_owned();
+    let doc = json(&preflight(&w, &["--json"]));
+    assert_eq!(doc["result"], "skipped");
+    assert_eq!(doc["base"], main);
+}
+
+#[test]
+fn a_skip_keeps_the_real_result_recorded_for_the_same_head() {
+    let w = policy_world(None, "true");
+    queue_pr(&w, 7, "a.txt", "a\n", ItemState::Queued(None));
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let mut mine = item(12, ItemState::AwaitingApproval);
+    mine.branch = "feat/mine".into();
+    mine.head = Sha::try_from(head.clone()).unwrap();
+    w.seed(vec![mine]);
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "pass");
+
+    w.store()
+        .update(|state| {
+            state.queue.retain(|item| item.pr == PrNumber(12));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+    let record = &w.state().preflights["feat/mine"];
+    assert_eq!(record.result, chute::model::PreflightResult::Pass);
+    assert_eq!(record.with, vec![PrNumber(7)]);
+    assert!(record.env.is_some());
+}
+
+#[test]
+fn a_skip_replaces_the_record_of_an_older_head() {
+    let w = policy_world(None, "true");
+    queue_pr(&w, 7, "a.txt", "a\n", ItemState::Queued(None));
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "pass");
+    w.store()
+        .update(|state| {
+            state.queue.clear();
+            Ok(())
+        })
+        .unwrap();
+    let newer = w.repo.commit_file("more.txt", "m\n", "feat: 더");
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+    let record = &w.state().preflights["feat/mine"];
+    assert_eq!(record.head.as_str(), newer);
+    assert_eq!(record.result, chute::model::PreflightResult::Skipped);
+}

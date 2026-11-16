@@ -163,6 +163,50 @@ impl Gitops {
         }
     }
 
+    /// Fetches the default branch and moves its tracking ref forward without opening a slot.
+    /// The tip is returned even when a lost race leaves the tracking ref for the next fetch.
+    pub fn fetch_base_tip(&self) -> Result<Sha> {
+        let branch = &self.default_branch;
+        let tracking = format!("refs/remotes/{}/{branch}", self.remote);
+        let refspec = format!("refs/heads/{branch}");
+        let before = self.repo_git(&["rev-parse", "--verify", "--quiet", &tracking])?;
+        let before = before
+            .success()
+            .then(|| Sha::try_from(before.stdout_text().trim().to_owned()))
+            .transpose()
+            .map_err(|e| anyhow!(e))?;
+        self.repo_git(&[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--refmap=",
+            &self.remote,
+            &refspec,
+        ])?
+        .ok()?;
+        let tip = self
+            .repo_git(&["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?
+            .ok()?;
+        let tip = Sha::try_from(tip.trim().to_owned()).map_err(|e| anyhow!(e))?;
+        let forward = match &before {
+            None => true,
+            Some(old) => {
+                let ancestry =
+                    self.repo_git(&["merge-base", "--is-ancestor", old.as_str(), tip.as_str()])?;
+                ancestry.code == Some(0)
+            }
+        };
+        if forward {
+            let old = before.as_ref().map_or("", Sha::as_str);
+            self.repo_git(&["update-ref", &tracking, tip.as_str(), old])?;
+        }
+        Ok(tip)
+    }
+
+    fn repo_git(&self, args: &[&str]) -> Result<Output> {
+        Ok(self.ext.git(&self.repo, NO_HOOKS.iter().chain(args))?)
+    }
+
     /// Paths, relative to a slot, that a new or rebuilt slot copies from the slot used last.
     pub fn with_cache_seed(mut self, seed: Vec<String>) -> Gitops {
         self.cache_seed = seed;

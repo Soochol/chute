@@ -183,6 +183,7 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .filter(|item| Some(item.branch.as_str()) != target.branch.as_deref())
         .collect();
 
+    let fetched_base = Gitops::new(&ctx.ext, &ctx.home, &info).fetch_base_tip()?;
     let last_fetched_config = Config::load_remote_branch(
         &ctx.ext,
         &info.path,
@@ -195,8 +196,7 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .as_ref()
         .and_then(|c| skip_reason(c.preflight, queued.len()));
     if let Some(reason) = skip_why {
-        let base = remote_base(ctx, &info)?;
-        let report = Report::skipped(reason, &target, base, blocked, EpochMs::now());
+        let report = Report::skipped(reason, &target, fetched_base, blocked, EpochMs::now());
         if let Err(e) = record(ctx, &store, &target, &report) {
             eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
         }
@@ -302,34 +302,6 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         false,
     );
     Ok(report)
-}
-
-fn remote_base(ctx: &Ctx, info: &RepoInfo) -> Result<Sha> {
-    let branch = format!("refs/heads/{}", info.default_branch);
-    let listed = ctx
-        .ext
-        .git(
-            &info.path,
-            ["ls-remote", info.remote_name.as_str(), branch.as_str()],
-        )?
-        .ok()
-        .with_context(|| {
-            format!(
-                "{}/{}의 기준 커밋을 묻지 못했다",
-                info.remote_name, info.default_branch
-            )
-        })?;
-    let first = listed
-        .lines()
-        .find_map(|line| line.split_whitespace().next())
-        .ok_or_else(|| {
-            anyhow!(
-                "{}/{}의 기준 커밋을 찾지 못했다",
-                info.remote_name,
-                info.default_branch
-            )
-        })?;
-    Sha::try_from(first.to_owned()).map_err(|e| anyhow!(e))
 }
 
 struct Waiting {
@@ -858,9 +830,15 @@ fn write_record(store: &RepoStore, entry: &Recorded) -> Result<()> {
         state
             .preflights
             .retain(|name, old| old.at_ms.0 >= cutoff || queued.contains(name));
-        state
-            .preflights
-            .insert(entry.branch.clone(), entry.record.clone());
+        let keeps_real_result = entry.record.result == PreflightResult::Skipped
+            && state.preflights.get(&entry.branch).is_some_and(|old| {
+                old.head == entry.record.head && old.result != PreflightResult::Skipped
+            });
+        if !keeps_real_result {
+            state
+                .preflights
+                .insert(entry.branch.clone(), entry.record.clone());
+        }
         Ok(())
     })
 }

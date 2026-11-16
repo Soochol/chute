@@ -304,7 +304,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `require_ci` | `false` | `true`면 PR마다 등록된 HEAD의 GitHub check가 통과한 PR만 batch에 넣는다. 아래에 설명한다 |
 | `require_head` | `false` | `true`면 `--head` 없는 submit을 거절한다 |
 | `max_parallel` | `2` | 동시에 도는 preflight 수의 상한(슬롯 수의 상한). 1 이상 |
-| `preflight` | `"when_queued"` | `chute preflight`가 검사를 돌리는 때. `"when_queued"`는 합칠 PR(큐의 `queued`와 `in_batch` 가운데 자기 브랜치가 아닌 것)이 있을 때만 검사하고, `"always"`는 늘, `"never"`는 한 번도 검사하지 않는다. 생략하면 검사 슬롯을 잡지 않고 종료 코드 0으로 끝나며 `result`는 `skipped`, 이유는 `skip_reason`(`no_queue`, `never`)과 출력에 남는다. 커밋하지 않은 변경 거절, 저장소 등록 확인, 허브 확인은 생략할 때도 한다. 정책은 이 PC가 마지막으로 가져온 기본 브랜치의 `chute.toml`에서 읽는다. 읽지 못하면 생략하지 않는다 |
+| `preflight` | `"when_queued"` | `chute preflight`가 검사를 돌리는 때. `"when_queued"`는 합칠 PR(큐의 `queued`와 `in_batch` 가운데 자기 브랜치가 아닌 것)이 있을 때만 검사하고, `"always"`는 늘, `"never"`는 한 번도 검사하지 않는다. 생략하면 검사 슬롯을 잡지 않고 종료 코드 0으로 끝나며 `result`는 `skipped`, 이유는 `skip_reason`(`no_queue`, `never`)과 출력에 남는다. 커밋하지 않은 변경 거절, 저장소 등록 확인, 허브 확인은 생략할 때도 한다. 정책은 preflight가 방금 가져온 기본 브랜치의 `chute.toml`에서 읽는다. 읽지 못하면 생략하지 않는다. 생략한 결과는 상태에 `skipped`로 기록하지만 같은 HEAD의 실제 검사 결과가 이미 있으면 덮어쓰지 않는다. 구버전 chute는 `skipped`를 읽지 못하니 PC마다 같은 버전을 쓴다 |
 | `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]`. 슬롯 폴더에서 `sh -c`로 하나씩 돌린다. 명령마다 30초 제한이 있고, 출력은 첫 줄 200자만 남긴다. 명령이 실패해도 검증은 그대로 돈다. 머신 이름과 hc 코어 id는 목록이 비어도 남는다. batch는 한 번, preflight는 실행마다 기록한다. 반송 보고서의 "검사 환경" 절은 같은 HEAD의 preflight와 다른 줄만 나란히 보인다 |
 | `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
 | `remote` | 없음 | chute가 관리하는 GitHub 저장소를 가리키는 git 원격의 이름. 없으면 chute가 정한다. 아래 "원격이 여러 개일 때"를 본다. `chute init`은 작업 폴더의 `chute.toml`에서 이 키를 읽는다 |
