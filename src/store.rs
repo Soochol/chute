@@ -215,6 +215,16 @@ impl RepoStore {
         write_json_atomic(&dir.join(BATCH_FILE), record)
     }
 
+    pub fn remove_batch(&self, id: &BatchId) -> Result<()> {
+        let dir = self.batch_dir(id);
+        match fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("지우지 못했다: {}", dir.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn read_batch(&self, id: &BatchId) -> Result<Option<BatchRecord>> {
         read_json(&self.batch_dir(id).join(BATCH_FILE))
     }

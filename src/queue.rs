@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 
@@ -82,7 +82,7 @@ pub fn step(from: ItemState, action: Action) -> Option<Next> {
         } else {
             Queued(None)
         }),
-        (Queued(None), Take) => to(InBatch),
+        (Queued(_), Take) => to(InBatch),
         (InBatch, Requeue) => to(Queued(None)),
         (InBatch, Merge | Close) => Some(Next::Remove),
         (InBatch, Bounce(reason)) => to(Bounced(reason)),
@@ -396,15 +396,25 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
     move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
 }
 
-pub fn take_batch(state: &mut State, max_batch: u32) -> Vec<PrNumber> {
+pub fn take_batch(
+    state: &mut State,
+    max_batch: u32,
+    due_waiters: &BTreeSet<PrNumber>,
+) -> Vec<PrNumber> {
     let mut taken = Vec::new();
-    for item in &mut state.queue {
-        if taken.len() >= max_batch as usize {
-            break;
-        }
-        if let Some(Next::To(to)) = step(item.state, Action::Take) {
-            item.state = to;
-            taken.push(item.pr);
+    let mut others = 0;
+    for ci_pass in [true, false] {
+        for item in &mut state.queue {
+            let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
+            let due = !is_waiting || due_waiters.contains(&item.pr);
+            if is_waiting != ci_pass || !due || (!ci_pass && others >= max_batch) {
+                continue;
+            }
+            if let Some(Next::To(to)) = step(item.state, Action::Take) {
+                item.state = to;
+                taken.push(item.pr);
+                others += u32::from(!ci_pass);
+            }
         }
     }
     taken
@@ -587,7 +597,7 @@ mod tests {
         allow(&mut t, &waiting, resubmit(true, true), To(AWAITING));
         allow(&mut t, &waiting, resubmit(true, false), To(QUEUED));
 
-        allow(&mut t, &[QUEUED], Action::Take, To(IN_BATCH));
+        allow(&mut t, &[QUEUED, CI_PENDING], Action::Take, To(IN_BATCH));
         allow(&mut t, &[IN_BATCH], Action::Requeue, To(QUEUED));
         allow(&mut t, &[IN_BATCH], Action::Merge, Remove);
         allow(&mut t, &[IN_BATCH], Action::Close, Remove);
@@ -678,6 +688,11 @@ mod tests {
         }
     }
 
+    fn take_all(state: &mut State) -> Vec<PrNumber> {
+        let due = state.queue.iter().map(|i| i.pr).collect();
+        take_batch(state, 8, &due)
+    }
+
     fn sha(s: &str) -> Sha {
         Sha::try_from(s.to_owned()).unwrap()
     }
@@ -726,7 +741,7 @@ mod tests {
             (4, QUEUED),
             (5, QUEUED),
         ]);
-        let taken = take_batch(&mut state, 3);
+        let taken = take_batch(&mut state, 3, &BTreeSet::new());
         assert_eq!(prs(&taken), [7, 3, 9]);
         assert_eq!(state_of(&state, 7), IN_BATCH);
         assert_eq!(state_of(&state, 9), IN_BATCH);
@@ -735,22 +750,33 @@ mod tests {
     }
 
     #[test]
-    fn take_batch_takes_only_waiting_prs_without_a_ci_wait() {
+    fn take_batch_takes_queued_prs_and_leaves_every_other_state_alone() {
         let mut state = queue_of(&[
             (1, AWAITING),
-            (2, CI_PENDING),
+            (2, ItemState::NeedsHuman(HumanReason::GaveUp)),
             (3, IN_BATCH),
             (4, ItemState::Bounced(BounceReason::Verify)),
             (5, ItemState::NeedsHuman(HumanReason::Budget)),
             (6, QUEUED),
         ]);
         let before = state.clone();
-        assert_eq!(prs(&take_batch(&mut state, 8)), [6]);
+        assert_eq!(prs(&take_all(&mut state)), [6]);
         assert_eq!(state_of(&state, 6), IN_BATCH);
         for pr in 1..=5 {
             assert_eq!(state_of(&state, pr), state_of(&before, pr), "#{pr}");
         }
-        assert!(take_batch(&mut state, 8).is_empty());
+        assert!(take_all(&mut state).is_empty());
+    }
+
+    #[test]
+    fn take_batch_takes_only_the_due_ci_waiters_first_without_a_cap() {
+        let due = |prs: &[u64]| prs.iter().copied().map(PrNumber).collect::<BTreeSet<_>>();
+        let mut state = queue_of(&[(1, CI_PENDING), (2, QUEUED), (3, CI_PENDING), (4, QUEUED)]);
+        assert_eq!(prs(&take_batch(&mut state, 1, &due(&[1, 3]))), [1, 3, 2]);
+        assert_eq!(state_of(&state, 4), QUEUED);
+        let mut state = queue_of(&[(1, CI_PENDING), (2, CI_PENDING), (3, QUEUED)]);
+        assert_eq!(prs(&take_batch(&mut state, 8, &due(&[2]))), [2, 3]);
+        assert_eq!(state_of(&state, 1), CI_PENDING);
     }
 
     #[test]
@@ -759,10 +785,10 @@ mod tests {
         set_ci_pending(&mut state, PrNumber(1)).unwrap();
         set_ci_pending(&mut state, PrNumber(1)).unwrap();
         assert_eq!(state_of(&state, 1), CI_PENDING);
-        assert!(take_batch(&mut state, 8).is_empty());
         clear_ci_pending(&mut state, PrNumber(1)).unwrap();
         clear_ci_pending(&mut state, PrNumber(1)).unwrap();
-        assert_eq!(prs(&take_batch(&mut state, 8)), [1]);
+        assert_eq!(state_of(&state, 1), QUEUED);
+        assert_eq!(prs(&take_all(&mut state)), [1]);
         assert!(set_ci_pending(&mut state, PrNumber(1)).is_err());
     }
 
@@ -804,7 +830,7 @@ mod tests {
     }
 
     fn fail_once(state: &mut State, pr: u64, kind: FailureKind, budget: u32) -> ItemState {
-        assert!(prs(&take_batch(state, 8)).contains(&pr));
+        assert!(prs(&take_all(state)).contains(&pr));
         record_failure(state, PrNumber(pr), failure(kind), budget).unwrap()
     }
 
@@ -856,7 +882,7 @@ mod tests {
         }
 
         let mut state = queue_of(&[(1, QUEUED)]);
-        take_batch(&mut state, 8);
+        take_all(&mut state);
         head_changed(&mut state, PrNumber(1)).unwrap();
         assert_eq!(
             state_of(&state, 1),
@@ -870,7 +896,7 @@ mod tests {
     fn head_changed_does_not_use_up_budget_even_when_it_is_gone() {
         let mut state = queue_of(&[(1, QUEUED)]);
         state.queue[0].attempts = 3;
-        take_batch(&mut state, 8);
+        take_all(&mut state);
         head_changed(&mut state, PrNumber(1)).unwrap();
         assert_eq!(
             state_of(&state, 1),
