@@ -110,6 +110,34 @@ fn an_empty_queue_passes_with_an_unpushed_commit() {
 }
 
 #[test]
+fn a_pass_keeps_the_verified_tree_for_the_batch_and_a_failure_keeps_nothing() {
+    let w = world("test -f mine.txt");
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let tree = w.repo.git(&["rev-parse", "HEAD^{tree}"]).trim().to_owned();
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    let kept = w.state().verified_trees;
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].key.tree.as_str(), tree);
+    assert_eq!(kept[0].by, chute::model::VerifiedBy::Preflight);
+    assert!(kept[0].key.skipped.is_empty());
+    assert!(!kept[0].key.config.is_empty());
+    assert!(kept[0].env.is_some());
+
+    let w = world("test ! -f bad.txt");
+    work_on(&w, "feat/mine", "bad.txt", "x\n");
+    assert_eq!(code(&preflight(&w, &[])), 1);
+    assert!(w.state().verified_trees.is_empty());
+
+    let w = World::with_config(Some(format!(
+        "reuse_verified = false\n{}",
+        config_always("true")
+    )));
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    assert!(w.state().verified_trees.is_empty());
+}
+
+#[test]
 fn a_change_that_breaks_the_check_fails_alone_with_a_report() {
     let w = world("test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }");
     let head = work_on(&w, "feat/bad", "bad.txt", "x\n");

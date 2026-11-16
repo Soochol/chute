@@ -270,6 +270,9 @@ require_head = false
 max_parallel = 2
 preflight = "when_queued"
 env_check = []
+reuse_verified = true
+reuse_hours = 24
+reuse_other_machines = false
 respawn = []
 # remote = "origin"
 
@@ -306,6 +309,9 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `max_parallel` | `2` | 동시에 도는 preflight 수의 상한(슬롯 수의 상한). 1 이상 |
 | `preflight` | `"when_queued"` | `chute preflight`가 검사를 돌리는 때. `"when_queued"`는 합칠 PR(큐의 `queued`와 `in_batch` 가운데 자기 브랜치가 아닌 것)이 있을 때만 검사하고, `"always"`는 늘, `"never"`는 한 번도 검사하지 않는다. 생략하면 검사 슬롯을 잡지 않고 종료 코드 0으로 끝나며 `result`는 `skipped`, 이유는 `skip_reason`(`no_queue`, `never`)과 출력에 남는다. 커밋하지 않은 변경 거절, 저장소 등록 확인, 허브 확인은 생략할 때도 한다. 정책은 preflight가 방금 가져온 기본 브랜치의 `chute.toml`에서 읽는다. 읽지 못하면 생략하지 않는다. 생략한 결과는 상태에 `skipped`로 기록하지만 같은 HEAD의 실제 검사 결과가 이미 있으면 덮어쓰지 않는다. 구버전 chute는 `skipped`를 읽지 못하니 PC마다 같은 버전을 쓴다 |
 | `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]`. 슬롯 폴더에서 `sh -c`로 하나씩 돌린다. 명령마다 30초 제한이 있고, 출력은 첫 줄 200자만 남긴다. 명령이 실패해도 검증은 그대로 돈다. 머신 이름과 hc 코어 id는 목록이 비어도 남는다. batch는 한 번, preflight는 실행마다 기록한다. 반송 보고서의 "검사 환경" 절은 같은 HEAD의 preflight와 다른 줄만 나란히 보인다 |
+| `reuse_verified` | `true` | `true`면 batch가 합친 트리가 이미 통과한 트리와 같을 때 검증을 다시 하지 않고 그 통과를 쓴다. 트리 SHA(같은 기준, 같은 큐 구성, 같은 PR HEAD로 합친 결과), 검증 설정의 지문(`verify` 단계의 이름, `run`, `timeout`, `paths`), `paths`로 건너뛴 단계가 모두 같아야 같은 트리다. preflight와 batch가 통과하면 그 트리를 상태에 기록한다. 실패는 기록하지 않는다. 다시 돌아서 통과한 검증도 기록하지 않는다. 흔들림 장부(`chronic_days` 안의 `chute flaky` 목록)에 오른 단계를 도는 검증은 다시 쓰지 않는다. 다시 쓰면 `chute events`와 batch 기록에 `reused`로 어느 검증(`preflight`나 `batch`)의 결과인지 남고 `status --json`의 `batch.reused`에도 보인다. 검증 실패와 이분 탐색의 판정은 바뀌지 않는다 |
+| `reuse_hours` | `24` | 통과 기록을 다시 쓸 수 있는 시간(시간 단위). 지나면 환경이 바뀌었을 수 있어 다시 검증한다. 1 이상 168 이하 |
+| `reuse_other_machines` | `false` | 기본으로는 같은 머신에서 검증한 결과만 다시 쓴다. preflight는 작업자 PC에서, batch는 허브에서 도는 v2에서는 둘이 다른 머신이라 다시 쓰지 않는다. `true`면 `env_check`가 비어 있지 않고 두 머신의 `env_check` 결과(명령과 출력, 모두 성공)가 같을 때 다른 머신의 통과도 쓴다 |
 | `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
 | `remote` | 없음 | chute가 관리하는 GitHub 저장소를 가리키는 git 원격의 이름. 없으면 chute가 정한다. 아래 "원격이 여러 개일 때"를 본다. `chute init`은 작업 폴더의 `chute.toml`에서 이 키를 읽는다 |
 | `retention` (`[retention]`) | 아래 두 키 | 정리할 때 남기는 기간 |

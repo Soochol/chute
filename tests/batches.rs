@@ -19,6 +19,7 @@ fn record(id: &str, finished: u64) -> BatchRecord {
         pushed: Vec::new(),
         verifications: 1,
         skipped: Vec::new(),
+        reused: Vec::new(),
         env: None,
     }
 }

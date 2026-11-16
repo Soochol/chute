@@ -468,6 +468,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null,"isDraft":%s,"baseRe
                     round: 1,
                     started_ms: EpochMs::now(),
                     waiting_machine: false,
+                    reused: None,
                 });
                 Ok(())
             })

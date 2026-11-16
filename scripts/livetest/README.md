@@ -30,7 +30,7 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 
 ## 샌드박스 검증 단계
 
-`sandbox/`가 시드다. `chute.toml`은 `require_head = true`, `respawn = []`이고 검증 단계는 `sh check.sh` 하나다(제한 시간 12초). `check.sh`는 `cases/` 아래 파일마다 내용으로 결과를 정한다.
+`sandbox/`가 시드다. `chute.toml`은 `require_head = true`, `respawn = []`, `preflight = "always"`이고 검증 단계는 `sh check.sh` 하나다(제한 시간 12초). `check.sh`는 `cases/` 아래 파일마다 내용으로 결과를 정한다.
 
 | 내용 | 결과 |
 |---|---|
@@ -60,6 +60,7 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 | `11-revert` | `chute revert`는 revert PR이 아니라 main에 revert 커밋을 쌓음 |
 | `12-pr-closed` | batch 도중 닫힌 PR은 머지되지 않고 나머지는 머지 |
 | `13-main-broken` | 깨진 main에서 큐가 멈추고 `--repair`로 풀림 |
+| `14-tree-reuse` | preflight를 통과한 트리를 batch가 다시 검증하지 않고(`reused`), main이 움직여 트리가 달라지면 다시 검증 |
 
 ## 시나리오 더하기
 

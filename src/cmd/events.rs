@@ -7,7 +7,7 @@ use super::batches::short;
 use super::{Ctx, run_on_hub};
 use crate::model::{
     BounceReason, Delivered, EpochMs, Event, EventKind, HumanReason, NotifyKind, PrNumber,
-    ProbeEvidence, ResumedBy,
+    ProbeEvidence, ResumedBy, VerifiedBy,
 };
 
 const DEFAULT_LIMIT: u64 = 500;
@@ -118,7 +118,10 @@ fn involves(kind: &EventKind, target: PrNumber) -> bool {
             merged, bounced, ..
         } => merged.contains(&target) || bounced.contains(&target),
         EventKind::Reverted { prs, .. } => prs.contains(&target),
-        EventKind::Flaky { .. } | EventKind::Blocked { .. } | EventKind::FlakyProbe { .. } => false,
+        EventKind::Flaky { .. }
+        | EventKind::Blocked { .. }
+        | EventKind::FlakyProbe { .. }
+        | EventKind::Reused { .. } => false,
     }
 }
 
@@ -216,6 +219,18 @@ fn describe(kind: &EventKind) -> String {
             prs(list),
             short(commit)
         ),
+        EventKind::Reused {
+            batch,
+            tree,
+            by,
+            verified_ms,
+        } => format!(
+            "검증 생략 · batch {} · 트리 {} · {} 검증의 통과 결과를 다시 썼다(검증 시각 epoch {}ms)",
+            batch.0,
+            short(tree),
+            verified_by(*by),
+            verified_ms.0
+        ),
         EventKind::GaveUp { pr, reason } => format!("{pr} 포기됨 · {reason}"),
         EventKind::Closed { pr } => format!("{pr} 닫힘"),
         EventKind::NeedsHuman { pr, reason, detail } => {
@@ -305,6 +320,13 @@ fn names(list: &[String]) -> String {
         "-".to_owned()
     } else {
         list.join(", ")
+    }
+}
+
+fn verified_by(by: VerifiedBy) -> &'static str {
+    match by {
+        VerifiedBy::Preflight => "preflight",
+        VerifiedBy::Batch => "batch",
     }
 }
 

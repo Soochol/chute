@@ -41,7 +41,8 @@
     "step": "test",
     "round": 1,
     "started_ms": 1794724200000,
-    "waiting_machine": false
+    "waiting_machine": false,
+    "reused": "preflight"
   },
   "queue": [
     {

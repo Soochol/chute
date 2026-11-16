@@ -10,8 +10,8 @@ use crate::hub::{self, Route};
 use crate::machine::Machines;
 use crate::model::{
     Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemView,
-    MachineId, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, Warning,
-    WarningKind,
+    MachineId, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today,
+    VerifiedBy, Warning, WarningKind,
 };
 use crate::queue;
 
@@ -436,7 +436,8 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
             | EventKind::Dropped { .. }
             | EventKind::Notified { .. }
             | EventKind::Resumed { .. }
-            | EventKind::FlakyProbe { .. } => {}
+            | EventKind::FlakyProbe { .. }
+            | EventKind::Reused { .. } => {}
         }
     }
     leads.sort_unstable();
@@ -496,8 +497,13 @@ fn human(v: &StatusView) -> String {
         } else {
             ""
         };
+        let reused = match b.reused {
+            Some(VerifiedBy::Preflight) => " · preflight의 통과 결과를 다시 씀",
+            Some(VerifiedBy::Batch) => " · 앞선 batch의 통과 결과를 다시 씀",
+            None => "",
+        };
         line(format!(
-            "batch {} {:?} {} · {}회차 · {}{waiting}",
+            "batch {} {:?} {} · {}회차 · {}{waiting}{reused}",
             b.id.0,
             b.phase,
             b.step.as_deref().unwrap_or("-"),
@@ -726,6 +732,21 @@ mod tests {
         assert!(human(&view).contains("PC 자리를 기다리는 중"));
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["batch"]["waiting_machine"], true);
+    }
+
+    #[test]
+    fn a_batch_that_took_over_a_pass_says_whose_in_the_text_and_the_json() {
+        let fixture = include_str!("../../tests/fixtures/status-full.json");
+        let mut view: StatusView = serde_json::from_str(fixture).unwrap();
+        assert!(human(&view).contains("preflight의 통과 결과를 다시 씀"));
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["batch"]["reused"],
+            "preflight"
+        );
+        view.batch.as_mut().unwrap().reused = Some(VerifiedBy::Batch);
+        assert!(human(&view).contains("앞선 batch의 통과 결과를 다시 씀"));
+        view.batch.as_mut().unwrap().reused = None;
+        assert!(!human(&view).contains("통과 결과를 다시 씀"));
     }
 
     #[test]

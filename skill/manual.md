@@ -56,7 +56,7 @@ HEAD 1a2b3c4d5e6f · 기준 9f8e7d6a5b4c · 함께 검증한 PR #12
 
 출력에 `건너뛴 PR`이 나오면 큐의 다른 PR 하나를 합치지 못해 뺀 것이다. 내 변경의 문제가 아니다. `흔들린 단계`가 나오면 한 번 실패한 뒤 다시 돌리니 통과한 것이고 통과로 본다. `건너뛴 검증 단계`가 나오면 바뀐 파일이 그 단계의 `paths`에 없어 돌리지 않은 것이다. 문제가 아니다. stderr에 `이 PC에서 검증 N개가 돌고 있어 기다린다`가 나오면 이 PC의 검증 자리가 모두 차서 기다리는 것이다. 멈춘 것이 아니니 끄지 않는다.
 
-preflight를 통과해도 머지가 보장되지는 않는다. 최종 판정은 큐의 batch 검증이다.
+preflight를 통과해도 머지가 보장되지는 않는다. 최종 판정은 큐의 batch 검증이다. 다만 batch가 합친 트리(같은 기준, 같은 큐 구성, 같은 PR HEAD)가 preflight나 앞선 batch가 통과한 트리와 완전히 같고 `chute.toml`의 `reuse_verified`가 켜져 있으면(기본), 같은 머신에서 24시간 안의 통과일 때 batch는 다시 검증하지 않고 그 통과를 쓴다. 그때 `status`의 batch에 `reused`가, `chute events`에 `검증 생략`이 남는다. 기준이나 큐가 바뀌어 트리가 달라졌으면 batch가 다시 검증한다.
 
 ### `chute submit [<pr>] [--head <SHA>] [--agent <주소>] [--priority] [--after <PR>]… [--repair] [--json]`
 
@@ -273,6 +273,7 @@ chute 결과 halted slug=acme/widget at=1763270100456 base=9f8e7d6a5b4c step=tes
 ### 바뀐 동작
 
 - **기본 설정에서 chute는 새 에이전트를 띄우지 않는다.** 반송을 받을 작업자가 없으면 그 PR은 사람 차례(`전달 실패`)가 되고 submit한 터미널이 `human reason=unreachable`을 받는다. 오케스트레이터가 다음을 정한다. 사용자가 `chute.toml`의 `respawn`에 명령을 넣었을 때만 띄운다.
+- **같은 트리는 다시 검증하지 않는다.** 위 `preflight`의 끝 문단과 README의 `reuse_verified`.
 - **큐 멈춤은 사람이 아니라 복구 PR로 푼다.** 위 "복구 PR".
 - **머지 성공이 알려진다.** 받는 쪽은 submit한 터미널이다.
 - **chute가 push한 main도 늘 믿지 않는다.** 위 "기준 재검증".

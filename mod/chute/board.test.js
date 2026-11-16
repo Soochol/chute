@@ -216,6 +216,15 @@ test("batch shows that it waits for a free slot on this PC", () => {
   assert.equal(batch.waitingMachine, true);
 });
 
+test("batch says which verification's pass it took over, and nothing when it ran its own", () => {
+  const [reused] = section(only([fixture]), "batch").items;
+  assert.equal(reused.reused, "preflight의 통과 결과를 다시 씀");
+  const own = { ...fixture, batch: { ...fixture.batch, reused: null } };
+  assert.equal(section(only([own]), "batch").items[0].reused, null);
+  const unknown = { ...fixture, batch: { ...fixture.batch, reused: "elsewhere" } };
+  assert.equal(section(only([unknown]), "batch").items[0].reused, null);
+});
+
 test("an in_batch item with no batch record is still shown", () => {
   const data = withQueue(itemOf(12));
   data.batch = null;
