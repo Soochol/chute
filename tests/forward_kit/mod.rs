@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::Read;
 use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -94,14 +95,30 @@ pub fn chute_within(node: &Node, args: &[&str], limit: Duration) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
     let deadline = Instant::now() + limit;
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() >= deadline {
             child.kill().unwrap();
             let _ = child.wait();
             panic!("{args:?}가 {}초 안에 끝나지 않았다", limit.as_secs());
         }
         thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
 }
