@@ -9,23 +9,22 @@ use chute::model::{ItemState, PrNumber, Sha, State};
 use queue_kit::{World, item, stderr};
 use serde_json::Value;
 
-/// Most tests here want the check to run whatever the queue holds, so they ask for `always`.
-fn config(run: &str) -> String {
-    format!("preflight = \"always\"\n{}", config_without_policy(run))
+fn config_always(run: &str) -> String {
+    format!("preflight = \"always\"\n{}", config(run))
 }
 
-fn config_without_policy(run: &str) -> String {
+fn config(run: &str) -> String {
     format!(
         "approval = \"agent\"\n\n[[verify]]\nname = \"check\"\nrun = {run:?}\ntimeout = 60\nfailed = 'FAIL (\\S+)'\n"
     )
 }
 
 fn world(run: &str) -> World {
-    World::with_config(Some(config(run)))
+    World::with_config(Some(config_always(run)))
 }
 
 fn env_config(run: &str, env_check: &str) -> String {
-    format!("env_check = {env_check}\n{}", config(run))
+    format!("env_check = {env_check}\n{}", config_always(run))
 }
 
 /// Publishes `branch` as PR `pr` on origin and queues it the way `submit` would have.
@@ -488,7 +487,7 @@ fn a_busy_batch_slot_does_not_stop_a_preflight_and_two_can_run_at_once() {
 fn preflight_waits_for_a_free_slot_when_max_parallel_are_held_and_says_so_once() {
     let w = World::with_config(Some(format!(
         "max_parallel = 1\n{}",
-        config("test -d \"$CHUTE_CACHE_DIR\"")
+        config_always("test -d \"$CHUTE_CACHE_DIR\"")
     )));
     work_on(&w, "feat/mine", "mine.txt", "x\n");
     let held = hold_slot(&w, chute::gitops::SlotName::Preflight(1));
@@ -906,7 +905,7 @@ mod remote {
     }
 
     fn mesh(run: &str) -> Net {
-        mesh_with(config(run))
+        mesh_with(config_always(run))
     }
 
     fn mesh_with(config: String) -> Net {
@@ -1109,9 +1108,11 @@ mod remote {
 
         let net = mesh("true");
         let run = cut(&net);
-        net.node("a")
-            .repo
-            .commit_file("chute.toml", &config(&run), "chore: 검증 중 허브가 끊긴다");
+        net.node("a").repo.commit_file(
+            "chute.toml",
+            &config_always(&run),
+            "chore: 검증 중 허브가 끊긴다",
+        );
         net.node("a")
             .repo
             .git(&["push", "--quiet", "origin", "main"]);
@@ -1136,9 +1137,11 @@ mod remote {
             "sed -i 's/connected/unreachable/' {}; test ! -f mine.txt || {{ echo 'FAIL boom'; exit 1; }}",
             net.node("b").sb.root().join("net").join("peers").display()
         );
-        net.node("a")
-            .repo
-            .commit_file("chute.toml", &config(&run), "chore: 검증이 실패한다");
+        net.node("a").repo.commit_file(
+            "chute.toml",
+            &config_always(&run),
+            "chore: 검증이 실패한다",
+        );
         net.node("a")
             .repo
             .git(&["push", "--quiet", "origin", "main"]);
@@ -1184,7 +1187,7 @@ mod remote {
         let run = format!("printf '{{' > {}", hub_state.display());
         net.node("a").repo.commit_file(
             "chute.toml",
-            &config(&run),
+            &config_always(&run),
             "chore: 검증 중 허브 상태가 깨진다",
         );
         net.node("a")
@@ -1393,7 +1396,7 @@ fn moving_a_file_out_of_a_step_s_paths_still_runs_that_step() {
 
 fn policy_world(policy: Option<&str>, run: &str) -> World {
     let key = policy.map_or(String::new(), |p| format!("preflight = {p:?}\n"));
-    World::with_config(Some(format!("{key}{}", config_without_policy(run))))
+    World::with_config(Some(format!("{key}{}", config(run))))
 }
 
 fn ran_marker(dir: &tempfile::TempDir) -> (PathBuf, String) {
@@ -1402,8 +1405,6 @@ fn ran_marker(dir: &tempfile::TempDir) -> (PathBuf, String) {
     (mark, run)
 }
 
-/// Runs `chute preflight --json` while every preflight slot is held, so a run that took a slot
-/// would wait for it. Fails instead of hanging when it does.
 fn preflight_with_slots_held(w: &World) -> Output {
     let _held = [1, 2].map(|k| hold_slot(w, chute::gitops::SlotName::Preflight(k)));
     let mut command = w.sb.command(env!("CARGO_BIN_EXE_chute"));

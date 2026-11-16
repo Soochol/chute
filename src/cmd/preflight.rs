@@ -75,16 +75,13 @@ struct Report {
     blocked: Option<Blocked>,
     skip_reason: Option<SkipReason>,
     at_ms: EpochMs,
-    /// Absent when no slot was opened to record it.
     env: Option<EnvRecord>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SkipReason {
-    /// No other PR waits in the queue, so the batch runs the same checks.
     NoQueue,
-    /// `chute.toml` says `preflight = "never"`.
     Never,
 }
 
@@ -194,7 +191,6 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     )
     .ok()
     .flatten();
-    // Without a readable config the full run below fetches the base and reports why.
     let skip_why = last_fetched_config
         .as_ref()
         .and_then(|c| skip_reason(c.preflight, queued.len()));
@@ -308,7 +304,6 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     Ok(report)
 }
 
-/// The default-branch tip on the remote, read without fetching into a slot.
 fn remote_base(ctx: &Ctx, info: &RepoInfo) -> Result<Sha> {
     let branch = format!("refs/heads/{}", info.default_branch);
     let listed = ctx
