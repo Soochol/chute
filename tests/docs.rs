@@ -50,6 +50,7 @@ fn readme_states_the_respawn_default_and_its_permission_effect() {
         "`--dangerously-skip-permissions`를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행하게 한다"
     ));
     assert!(!text.contains("| `respawn` | `[\"claude\""));
+    assert!(!text.contains("에이전트가 없으면 새로 띄운다"));
 }
 
 #[test]
