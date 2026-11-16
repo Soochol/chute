@@ -174,15 +174,28 @@ pub fn exec_on(
     argv: &[&str],
     timeout: Duration,
 ) -> Result<Forwarded, ForwardError> {
+    exec_on_input(ext, name, env, argv, None, timeout)
+}
+
+pub fn exec_on_input(
+    ext: &Ext,
+    name: &str,
+    env: &[(&str, &str)],
+    argv: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Forwarded, ForwardError> {
     let seconds = timeout.as_secs().clamp(1, 600);
-    let mut args = vec![
-        "exec".to_owned(),
-        "--json".into(),
+    let mut args = vec!["exec".to_owned(), "--json".into()];
+    if input.is_some() {
+        args.push("-i".into());
+    }
+    args.extend([
         "--on".into(),
         name.to_owned(),
         "--timeout".into(),
         seconds.to_string(),
-    ];
+    ]);
     for (k, v) in env {
         args.push("--env".into());
         args.push(format!("{k}={v}"));
@@ -192,7 +205,13 @@ pub fn exec_on(
 
     let slack = Duration::from_secs(10);
     let out = ext
-        .call(Tool::Hc, None, &args, Duration::from_secs(seconds) + slack)
+        .call_with_input(
+            Tool::Hc,
+            None,
+            &args,
+            Duration::from_secs(seconds) + slack,
+            input,
+        )
         .map_err(|e| match e {
             ExtError::Timeout { .. } => timed_out(name, seconds),
             e => ForwardError::new(
@@ -354,7 +373,23 @@ pub fn view(home: &Home, ext: &Ext, slug: &Slug, repo_path: PathBuf) -> Result<S
     })
 }
 
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |bits, (i, b)| bits | u32::from(*b) << (16 - 8 * i));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[(bits >> (18 - 6 * i) & 63) as usize]));
+        }
+        out.extend(std::iter::repeat_n('=', 3 - chunk.len()));
+    }
+    out
+}
+
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let mut bits = 0u32;
     let mut count = 0;
@@ -409,6 +444,23 @@ mod tests {
         for bad in ["a", "aGk", "aG=k", "aGk!", "=aGk"] {
             assert_eq!(base64_decode(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn base64_encodes_what_it_decodes() {
+        for bytes in [
+            &b""[..],
+            b"h",
+            b"hi",
+            b"hi\n",
+            b"\x00\xff\xfe\x01",
+            "슈레트".as_bytes(),
+        ] {
+            assert_eq!(base64_decode(&base64_encode(bytes)).as_deref(), Some(bytes));
+        }
+        assert_eq!(base64_encode(b"hi"), "aGk=");
+        assert_eq!(base64_encode(b"h"), "aA==");
+        assert_eq!(base64_encode(b"hi\n"), "aGkK");
     }
 
     #[test]

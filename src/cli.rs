@@ -59,6 +59,9 @@ pub enum Command {
     Install(cmd::install::Args),
     /// 이 저장소의 허브(대기열을 가진 머신)를 보거나 정한다
     Hub(cmd::hub::Args),
+    /// 다른 머신의 허브가 보고서 묶음을 넘길 때 쓴다. 사람이 쓰지 않는다
+    #[command(hide = true)]
+    Deliver(cmd::deliver::Args),
     /// Claude Code PreToolUse 훅. 기본 브랜치로의 push와 `gh pr merge`를 막는다
     Guard(cmd::guard::Args),
 }
@@ -123,6 +126,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Hub(args) => cmd::hub::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),
         Command::Guard(args) => cmd::guard::run(args, ctx),
+        Command::Deliver(args) => cmd::deliver::run(args, ctx),
     }
 }
 
