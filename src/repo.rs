@@ -112,7 +112,13 @@ pub fn managed<'a>(
     }
     let named: Vec<String> = candidates
         .iter()
-        .map(|r| format!("{} ({})", r.name, r.url))
+        .map(|r| {
+            if r.push_url == r.url {
+                format!("{} ({})", r.name, r.url)
+            } else {
+                format!("{} ({}, push {})", r.name, r.url, r.push_url)
+            }
+        })
         .collect();
     bail!(
         "chute가 쓸 git 원격을 하나로 정하지 못했다: {}. `git remote -v`로 확인하고 chute.toml에 `remote = \"<이름>\"`을 적는다",
@@ -149,14 +155,14 @@ fn address(remote: &Remote) -> (String, String) {
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let without_scheme = match trimmed.split_once("://") {
+    let hosted = match trimmed.split_once("://") {
         Some((_, rest)) => rest.to_owned(),
-        None if !trimmed.starts_with('/') => trimmed.replacen(':', "/", 1),
-        None => trimmed.to_owned(),
+        None if trimmed.contains(':') && !trimmed.starts_with(['/', '.']) => {
+            trimmed.replacen(':', "/", 1)
+        }
+        None => return trimmed.to_owned(),
     };
-    let (authority, path) = without_scheme
-        .split_once('/')
-        .unwrap_or((without_scheme.as_str(), ""));
+    let (authority, path) = hosted.split_once('/').unwrap_or((hosted.as_str(), ""));
     let host = authority.rsplit('@').next().unwrap_or_default();
     if host.is_empty() {
         format!("/{path}")
@@ -498,7 +504,11 @@ mod tests {
             "origin",
             &elsewhere.to_string_lossy(),
         ]);
-        assert!(discover(&ext, repo.path(), &|| Ok(Vec::new())).is_err());
+        let err = format!(
+            "{:#}",
+            discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap_err()
+        );
+        assert!(err.contains("push "), "{err}");
     }
 
     #[test]
@@ -512,6 +522,10 @@ mod tests {
             forms
                 .iter()
                 .all(|u| normalize_url(u) == normalize_url(forms[0]))
+        );
+        assert_ne!(
+            normalize_url("../w/Acme/widget.git"),
+            normalize_url("../w/acme/widget.git")
         );
         assert_ne!(
             normalize_url("https://github.com/acme/widget"),
