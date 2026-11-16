@@ -362,15 +362,20 @@ impl Engine {
         Ok(())
     }
 
-    fn ci_due(&self, state: &State) -> bool {
+    fn due_ci_waiters(&self, state: &State) -> BTreeSet<PrNumber> {
         let mut looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
         looked.retain(|pr, _| state.queue.iter().any(|i| i.pr == *pr));
-        state.queue.iter().any(|i| {
-            i.state == ItemState::Queued(Some(QueuedReason::CiPending))
-                && looked
+        state
+            .queue
+            .iter()
+            .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
+            .filter(|i| {
+                looked
                     .get(&i.pr)
                     .is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
-        })
+            })
+            .map(|i| i.pr)
+            .collect()
     }
 
     fn prune_no_checks_warnings(&self, require_ci: Option<bool>) -> Result<()> {
@@ -404,11 +409,11 @@ impl Engine {
 
     pub fn run_once(&self) -> Result<Pass> {
         self.prune_no_checks_warnings(None)?;
-        let ci_due = self.ci_due(&self.store.load()?);
+        let due_waiters = self.due_ci_waiters(&self.store.load()?);
         let waiting = |s: &crate::model::State| {
             s.queue.iter().any(|i| match i.state {
                 ItemState::Queued(None) => true,
-                ItemState::Queued(Some(_)) => ci_due,
+                ItemState::Queued(Some(_)) => !due_waiters.is_empty(),
                 _ => false,
             })
         };
@@ -440,7 +445,7 @@ impl Engine {
                 .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
                 .map(|i| i.pr)
                 .collect();
-            let prs = queue::take_batch(s, config.max_batch, ci_due);
+            let prs = queue::take_batch(s, config.max_batch, &due_waiters);
             if !prs.is_empty() {
                 s.batch = Some(Batch {
                     id: id.clone(),
@@ -488,6 +493,7 @@ impl Engine {
             merged: Vec::new(),
             bounced: Vec::new(),
             deferred: BTreeSet::new(),
+            closed_any: false,
             was_waiting_on_ci,
             queue_position,
             bisecting: false,
@@ -630,6 +636,7 @@ struct Run<'e> {
     merged: Vec<PrNumber>,
     bounced: Vec<PrNumber>,
     deferred: BTreeSet<PrNumber>,
+    closed_any: bool,
     was_waiting_on_ci: BTreeSet<PrNumber>,
     queue_position: BTreeMap<PrNumber, usize>,
     bisecting: bool,
@@ -643,8 +650,9 @@ impl Run<'_> {
 
     fn execute(&mut self, taken: &[QueueItem]) -> Result<()> {
         self.save_record()?;
-        let mut group = self.admit(taken)?;
-        group.sort_by_key(|pr| self.queue_position[pr]);
+        let mut by_queue = taken.to_vec();
+        by_queue.sort_by_key(|i| self.queue_position[&i.pr]);
+        let group = self.admit(&by_queue)?;
         self.solve(group)?;
         self.recheck_conflicts()
     }
@@ -663,6 +671,7 @@ impl Run<'_> {
                         .store
                         .update(|s| Ok(queue::closed(s, item.pr)?))?;
                     self.engine.history(EventKind::Closed { pr: item.pr })?;
+                    self.closed_any = true;
                 }
                 Inspection::Merged { commit } => {
                     self.engine.history(EventKind::Merged {
@@ -792,6 +801,7 @@ impl Run<'_> {
                 .items
                 .keys()
                 .all(|pr| self.was_waiting_on_ci.contains(pr) || self.deferred.contains(pr))
+            && !self.closed_any
             && self.merged.is_empty()
             && self.bounced.is_empty()
             && self.landed.is_empty()

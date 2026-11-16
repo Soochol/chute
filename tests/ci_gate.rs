@@ -619,3 +619,56 @@ fn failed_gh_reads_with_only_ci_waiters_leave_no_batch_records_behind() {
     assert!(lab.batch_ids().is_empty(), "{:?}", lab.batch_ids());
     assert_eq!(lab.item_state(1), Some(CI_PENDING));
 }
+
+#[test]
+fn when_the_batch_is_full_the_earlier_queued_pr_keeps_its_place_over_a_ci_waiter() {
+    let lab = Lab::build("", "require_ci = true\nmax_batch = 1", 60);
+    lab.open_pr(1, &[("x.txt", "one\n")]);
+    lab.open_pr(2, &[("x.txt", "two\n")]);
+    lab.gh_checks(1, &[("build", "pass")]);
+    lab.gh_checks(2, &[("build", "pass")]);
+    mark_ci_pending(&lab, &[2]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(summary.bounced.is_empty());
+    assert_eq!(lab.item_state(2), Some(CI_PENDING));
+}
+
+#[test]
+fn only_the_ci_waiters_whose_interval_has_passed_are_read_again() {
+    let lab = Lab::build("", REQUIRE_CI, 60);
+    let engine = lab.engine_rechecking_ci_every(Duration::from_millis(400));
+    lab.open_pr(1, &[("f1.txt", "x\n")]);
+    lab.gh_checks(1, &[("build", "pending")]);
+    engine.run_once().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    lab.open_pr(2, &[("f2.txt", "x\n")]);
+    lab.gh_checks(2, &[("build", "pending")]);
+    engine.run_once().unwrap();
+    assert_eq!(lab.gh_check_reads(), 2);
+    std::thread::sleep(Duration::from_millis(250));
+
+    engine.run_once().unwrap();
+
+    assert_eq!(
+        lab.gh_check_reads(),
+        3,
+        "only #1 is due, #2 was read 250ms ago"
+    );
+}
+
+#[test]
+fn a_run_that_removes_a_closed_ci_waiter_is_a_finished_batch_not_an_idle_pass() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    mark_ci_pending(&lab, &[1]);
+    lab.gh_says_closed(1);
+
+    let pass = lab.engine().run_once().unwrap();
+
+    assert!(matches!(pass, Pass::Done(_)), "{pass:?}");
+    assert!(lab.state().queue.is_empty());
+    assert_eq!(lab.batch_ids().len(), 1);
+}
