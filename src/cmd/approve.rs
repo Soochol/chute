@@ -17,11 +17,11 @@ pub struct Args {
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let pr = args.pr.0.to_string();
-    let mut forwarded = vec!["approve", pr.as_str()];
-    if let Some(head) = args.head.as_deref() {
-        forwarded.push("--head");
-        forwarded.push(head);
-    }
+    let head = args.head.as_deref().map(|head| format!("--head={head}"));
+    let forwarded: Vec<&str> = ["approve", pr.as_str()]
+        .into_iter()
+        .chain(head.as_deref())
+        .collect();
     if let Some(code) = run_on_hub(ctx, &forwarded)? {
         return Ok(code);
     }

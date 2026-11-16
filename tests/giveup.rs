@@ -318,3 +318,18 @@ fn giveup_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
     forward_kit::assert_unreachable_hub(&net, &["giveup", "12", "--reason", "x"]);
     forward_kit::assert_not_hub_answer(&net, &["giveup", "12", "--reason", "x"]);
 }
+
+#[test]
+fn giveup_on_another_pc_forwards_a_reason_that_starts_with_a_hyphen_as_a_value() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::Queued(None))]);
+
+    let out = a.chute(
+        forward_kit::BIN,
+        &["giveup", "12", "--reason=-1 재시도 남음"],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(forward_kit::out(&out).contains("(포기: -1 재시도 남음)"));
+}

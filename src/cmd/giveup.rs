@@ -28,7 +28,8 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
         }
         .0
         .to_string();
-        let forwarded = ["giveup", pr.as_str(), "--reason", args.reason.as_str()];
+        let reason = format!("--reason={}", args.reason);
+        let forwarded = ["giveup", pr.as_str(), reason.as_str()];
         if let Some(code) = run_on_hub(ctx, &forwarded)? {
             return Ok(code);
         }

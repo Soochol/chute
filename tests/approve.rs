@@ -191,3 +191,16 @@ fn approve_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
     forward_kit::assert_unreachable_hub(&net, &["approve", "12"]);
     forward_kit::assert_not_hub_answer(&net, &["approve", "12"]);
 }
+
+#[test]
+fn a_head_that_starts_with_a_hyphen_is_refused_by_the_hub_not_by_the_parser() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::AwaitingApproval)]);
+
+    let remote = a.chute(forward_kit::BIN, &["approve", "12", "--head=-abc"]);
+    let direct = b.chute(forward_kit::BIN, &["approve", "12", "--head=-abc"]);
+
+    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
+    assert_eq!(remote.stderr, direct.stderr);
+}
