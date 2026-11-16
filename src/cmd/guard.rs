@@ -194,8 +194,15 @@ impl<'a> Repo<'a> {
             .ok()?;
         let target = out.stdout_text();
         let tracked = target.trim().strip_prefix("refs/remotes/")?;
-        out.success()
-            .then(|| tracked.split_once('/').map(|(_, branch)| branch.to_owned()))?
+        if !out.success() {
+            return None;
+        }
+        let names = self.ext.git(&self.dir, ["remote"]).ok()?.stdout_text();
+        names
+            .lines()
+            .filter_map(|name| tracked.strip_prefix(name)?.strip_prefix('/'))
+            .min_by_key(|branch| branch.len())
+            .map(str::to_owned)
     }
 
     fn push_remote(&self, push: &Push) -> Option<String> {
@@ -1090,6 +1097,17 @@ mod tests {
             "git@github.com:acme/widget.git",
         ]);
         assert!(fx.verdict("git push upstream main").is_some());
+    }
+
+    #[test]
+    fn a_remote_name_with_a_slash_still_gives_the_upstream_branch() {
+        let fx = forked("remote = \"team/up\"\n");
+        fx.repo.git(&["remote", "rename", "upstream", "team/up"]);
+        fx.repo.git(&["fetch", "--quiet", "team/up"]);
+        fx.repo.git(&["checkout", "--quiet", "-b", "feat"]);
+        fx.repo.git(&["branch", "--quiet", "-u", "team/up/main"]);
+        fx.repo.git(&["config", "push.default", "upstream"]);
+        assert!(fx.verdict("git push").is_some());
     }
 
     #[test]
