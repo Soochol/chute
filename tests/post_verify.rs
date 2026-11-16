@@ -13,7 +13,6 @@ use engine_kit::Lab;
 
 const POST_STEP: &str = "[[post_verify]]\nname = \"slow\"\nrun = \"sh @ROOT@/post.sh\"\ntimeout = 60\nfailed = 'FAILED (\\S+)'\n";
 
-/// The steps after the merge run `post.sh`. Each run first logs the commit it checks.
 fn post_lab(body: &str, top: &str, step: &str) -> Lab {
     let lab = Lab::build_with_step("", top, 60, step);
     let script = format!(
@@ -24,8 +23,6 @@ fn post_lab(body: &str, top: &str, step: &str) -> Lab {
     lab
 }
 
-/// The commits the steps ran on, in order. A failing step runs twice on its commit, which
-/// counts once here.
 fn runs(lab: &Lab) -> Vec<String> {
     let mut commits: Vec<String> = fs::read_to_string(lab.sb.root().join("post-runs.log"))
         .map(|text| text.lines().map(str::to_owned).collect())
@@ -470,4 +467,119 @@ fn without_hold_a_failure_does_not_touch_the_queue() {
     lab.open_pr(2, &[("svc/b.rs", "b\n")]);
     assert!(matches!(lab.engine().run_once().unwrap(), Pass::Done(_)));
     assert!(lab.merged_prs().contains(&2));
+}
+
+#[test]
+fn a_new_failure_after_a_fix_nobody_checked_is_blamed_on_the_merge_that_caused_it() {
+    let lab = post_lab("", "", POST_STEP);
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script).unwrap().replace(
+        "\nexit 0\n",
+        "\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\nif [ -e svc/BREAK2 ]; then echo 'FAILED other_test'; exit 1; fi\nexit 0\n",
+    );
+    fs::write(&script, text).unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    merge(&lab, 1, &[("svc/BREAK", "x\n")]);
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let fix = lab.push_pr_branch_removing(2, "svc/BREAK");
+    let new_break = lab.push_pr_branch(3, &[("svc/BREAK2", "y\n")]);
+    lab.queue_pr(2, &fix, Some(lab.agent()), chute::model::Approval::Agent);
+    lab.queue_pr(
+        3,
+        &new_break,
+        Some(lab.agent()),
+        chute::model::Approval::Agent,
+    );
+    merged(&lab);
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["other_test"]);
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(3)));
+}
+
+#[test]
+fn a_step_that_wobbles_while_the_culprit_is_searched_for_still_reaches_the_flaky_ledger() {
+    let lab = post_lab("", "", POST_STEP);
+    let marker = lab.sb.root().join("wobble-marker");
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script).unwrap().replace(
+        "\nexit 0\n",
+        &format!(
+            "\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\nif [ -e a.txt ] && [ ! -e '{m}' ]; then touch '{m}'; echo 'FAILED wobbly_test'; exit 1; fi\nexit 0\n",
+            m = marker.display()
+        ),
+    );
+    fs::write(&script, text).unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    for (n, file) in [(1, "a.txt"), (2, "svc/BREAK"), (3, "c.txt")] {
+        let head = lab.push_pr_branch(n, &[(file, "x\n")]);
+        lab.queue_pr(n, &head, Some(lab.agent()), chute::model::Approval::Agent);
+    }
+    merged(&lab);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    assert_eq!(
+        lab.state().post.red.unwrap().culprit.unwrap().pr,
+        Some(PrNumber(2))
+    );
+    let wobbles = events_of(
+        &lab,
+        |e| matches!(e, EventKind::Flaky { tests, .. } if tests == &["wobbly_test"]),
+    );
+    assert_eq!(wobbles.len(), 1);
+}
+
+#[test]
+fn serialize_does_not_make_the_queue_wait_for_the_check() {
+    let lab = post_lab("", "serialize = true", POST_STEP);
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script).unwrap().replace(
+        "\nexit 0\n",
+        &format!(
+            "\nwhile [ -e '{}/gate' ]; do sleep 0.05; done\nexit 0\n",
+            lab.sb.root().display()
+        ),
+    );
+    fs::write(&script, text).unwrap();
+    fs::write(lab.sb.root().join("gate"), "").unwrap();
+    let post = lab.post();
+
+    thread::scope(|scope| {
+        let run = scope.spawn(|| post.run_once().unwrap());
+        wait_until("the step runs", || {
+            lab.state().post.run.is_some_and(|r| r.step.is_some())
+        });
+        merge(&lab, 1, &[("a.txt", "a\n")]);
+        assert!(lab.state().post.run.is_some());
+        fs::remove_file(lab.sb.root().join("gate")).unwrap();
+        assert_eq!(run.join().unwrap(), PostPass::Passed);
+    });
+}
+
+#[test]
+fn a_repo_without_post_verify_is_not_fetched_for_it_and_gets_no_warning() {
+    let lab = Lab::new("");
+    lab.repo
+        .git(&["remote", "set-url", "origin", "/nonexistent/origin.git"]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Idle);
+}
+
+#[test]
+fn an_unreadable_batch_record_does_not_keep_a_failure_from_being_recorded() {
+    let lab = post_lab("", "", POST_STEP);
+    breaking(&lab);
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    merge(&lab, 1, &[("a.txt", "a\n")]);
+    let first = lab.batch_ids().remove(0);
+    fs::write(lab.store.batch_dir(&first).join("batch.json"), "{not json").unwrap();
+    lab.main_commit(&[("svc/BREAK", "x\n")], "chore: 직접 push로 깨뜨린다");
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.culprit.as_ref().unwrap().pr, None);
 }

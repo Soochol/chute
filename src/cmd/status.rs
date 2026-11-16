@@ -477,12 +477,21 @@ fn post_lines(post: &PostState) -> Vec<String> {
     }
     if let Some(red) = &post.red {
         let culprit = red.culprit.as_ref().map_or(String::new(), |c| {
-            c.pr.map_or(format!(" · 범인 커밋 {}", c.commit.short()), |pr| {
-                format!(" · 범인 {pr}")
-            })
+            let who =
+                c.pr.map_or(format!("범인 커밋 {}", c.commit.short()), |pr| {
+                    format!("범인 {pr}")
+                });
+            let revert = c.batch.as_ref().map_or(String::new(), |b| {
+                format!(" · 되돌리려면 chute revert {}", b.0)
+            });
+            format!(" · {who}{revert}")
         });
+        let green = red
+            .last_green
+            .as_ref()
+            .map_or(String::new(), |g| format!(" · 마지막 통과 {}", g.short()));
         lines.push(format!(
-            "머지 뒤 검사 실패: 커밋 {} · 단계 {}{culprit}",
+            "머지 뒤 검사 실패: 커밋 {} · 단계 {}{green}{culprit}",
             red.commit.short(),
             red.step
         ));

@@ -292,7 +292,8 @@ function postVerifyStats(post) {
   const green = isObject(post.last_green) ? post.last_green : null;
   const run = isObject(post.run) ? post.run : null;
   if (!green && !run) return [];
-  const doing = run ? ` · ${run.phase === "searching" ? "범인 찾는 중" : "검사 중"}` : "";
+  const step = run && str(run.step) ? ` ${run.step}` : "";
+  const doing = run ? ` · ${run.phase === "searching" ? "범인 찾는 중" : "검사 중"}${step}` : "";
   return [{ key: "post_green", label: `머지 뒤 검사 마지막 통과${doing}`, value: green ? shortSha(green.commit) : "—" }];
 }
 

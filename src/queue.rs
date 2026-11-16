@@ -566,7 +566,6 @@ pub fn take_batch(
     take_batch_except(state, max_batch, due_waiters, &BTreeSet::new())
 }
 
-/// `take_batch` that leaves the PRs in `skip` queued: they wait for the check after the merge.
 pub fn take_batch_except(
     state: &mut State,
     max_batch: u32,

@@ -31,19 +31,13 @@ pub struct Config {
     pub cache: Cache,
     pub flaky: FlakyPolicy,
     pub verify: NonEmpty<VerifyStep>,
-    /// The steps that run on the default branch after a merge. `None` leaves the check off.
     pub post: Option<PostVerify>,
 }
 
-/// The check after the merge: steps too slow for the batch, run on the default branch's tip
-/// beside the queue.
 #[derive(Clone, Debug)]
 pub struct PostVerify {
     pub steps: NonEmpty<VerifyStep>,
-    /// Minutes between the starts of two runs. 0 starts a run whenever the tip moved and the
-    /// last run is over.
     pub interval_minutes: u32,
-    /// Queued PRs that touch a failed step's paths wait until a later run passes.
     pub hold: bool,
 }
 
@@ -438,7 +432,6 @@ impl Config {
     }
 }
 
-/// What `[[verify]]` and `[[post_verify]]` steps share. `probe` belongs to `[[verify]]` only.
 struct RawStepParts {
     name: String,
     run: String,
@@ -474,8 +467,6 @@ impl From<RawPostStep> for RawStepParts {
     }
 }
 
-/// `section` names the table in messages. `names` holds every step name seen so far in both
-/// tables, because the flaky ledger keys a step by its name alone.
 fn build_step(
     section: &str,
     names: &mut BTreeSet<String>,

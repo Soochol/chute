@@ -1181,7 +1181,7 @@ test("a failed check after the merge is an alert with the culprit, the last gree
 test("the last passing commit of the check after the merge sits among today's numbers, with the phase while it runs", () => {
   const stat = (data) => section(only(data), "today").items.find((s) => s.key === "post_green");
   assert.equal(stat(fixture).value, "1e2d3c4");
-  assert.equal(stat(fixture).label, "머지 뒤 검사 마지막 통과 · 범인 찾는 중");
+  assert.equal(stat(fixture).label, "머지 뒤 검사 마지막 통과 · 범인 찾는 중 e2e");
   const data = clone(fixture);
   data.post_verify.run = null;
   assert.equal(stat(data).label, "머지 뒤 검사 마지막 통과");

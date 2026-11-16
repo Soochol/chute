@@ -88,7 +88,6 @@ impl Default for Timing {
 pub enum Pass {
     Idle,
     Blocked,
-    /// Every PR that could be taken waits for a fix of the check after the merge.
     Held,
     Cancelled,
     Done(Summary),
@@ -119,7 +118,6 @@ pub struct Engine {
     cancel: Cancel,
     timing: Timing,
     ci_looked: Mutex<BTreeMap<PrNumber, Instant>>,
-    /// The files each PR head changes, which `post_verify_hold` compares with a step's paths.
     pr_files: Mutex<BTreeMap<(PrNumber, Sha), Vec<String>>>,
 }
 
@@ -743,8 +741,6 @@ impl Engine {
         }
     }
 
-    /// With `post_verify_hold` on and the check after the merge failing, the queued PRs that
-    /// touch a failed step's paths. A PR whose files cannot be read is not held.
     fn held_by_post_verify(
         &self,
         slot: &Slot,

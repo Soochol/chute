@@ -22,7 +22,6 @@ const STOP_FILE: &str = "stop";
 const WATCH_POLL: Duration = Duration::from_millis(100);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 const BLOCKED_POLL: Duration = Duration::from_secs(15);
-/// Looking at the default branch's tip costs a fetch, so the check after the merge looks less often.
 const POST_POLL: Duration = Duration::from_secs(10);
 const ERROR_POLL: Duration = Duration::from_secs(10);
 const MAX_ERROR_POLL: Duration = Duration::from_secs(600);
@@ -171,7 +170,6 @@ fn watch(store: &RepoStore, flags: &Flags, cancel: &Cancel, post_cancel: &Cancel
             Some(Stop::AfterBatch) => flags.after_batch.store(true, Ordering::SeqCst),
             None => {}
         }
-        // The check after the merge is no batch to wait for. It starts over on the next start.
         if flags.stopping() {
             post_cancel.cancel();
         }
@@ -240,7 +238,6 @@ fn post_warning(store: &RepoStore, message: Option<&str>) {
     }
 }
 
-/// Runs beside `serve`: the check after the merge never holds the queue.
 fn serve_post(post: &PostVerifier, store: &RepoStore, flags: &Flags) {
     let mut recovered = false;
     let mut failures = 0u32;

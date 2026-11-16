@@ -34,7 +34,6 @@ pub enum SlotName {
     /// Numbered from 1.
     Preflight(u32),
     Revert,
-    /// The check after the merge, which runs beside the queue.
     Post,
 }
 
@@ -664,8 +663,6 @@ impl Slot {
             .collect())
     }
 
-    /// The commits `from..to` follows on the first parent of `to`, oldest first: each merge
-    /// into the default branch between the two. `to` is the last one.
     pub fn first_parent_range(&self, from: &Sha, to: &Sha) -> Result<Vec<Sha>> {
         let out = self
             .git(&[
@@ -681,8 +678,6 @@ impl Slot {
             .collect()
     }
 
-    /// The files a PR head changes against `base`, as `changed_files` lists them. Both commits
-    /// must already be in the repository.
     pub fn changed_since_fork(&self, base: &Sha, head: &Sha) -> Result<Vec<String>> {
         let out = self
             .git(&[
@@ -838,7 +833,6 @@ impl Slot {
         }
     }
 
-    /// Whether `commit` is `of` or lies in its history. A commit the repository lacks is an error.
     pub fn is_ancestor(&self, commit: &Sha, of: &Sha) -> Result<bool> {
         let out = self.git(&["merge-base", "--is-ancestor", commit.as_str(), of.as_str()])?;
         match out.code {

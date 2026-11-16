@@ -1,11 +1,3 @@
-//! The check after the merge: the steps of `[[post_verify]]` run on the default branch's tip,
-//! beside the queue and in a slot of their own.
-//!
-//! A run checks the newest tip. A merge that lands while a run is going waits for it to end,
-//! and the next run takes the tip as it is then, so the commits in between are never checked
-//! one by one. When the steps fail, the run looks for the first merge they fail on among the
-//! merges since the last passing commit, and tells the PR's worker.
-
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
@@ -33,7 +25,6 @@ const REPORT_TAIL_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostPass {
-    /// Nothing to check: the check is off, the tip was checked, or the interval has not passed.
     Idle,
     Passed,
     Failed,
@@ -46,8 +37,6 @@ enum Checked {
     Cancelled,
 }
 
-/// What one run works with besides the verifier: the slot, the steps, and the last passing
-/// commit the changed files are counted from.
 struct Scope<'a> {
     slot: &'a Slot,
     config: &'a Config,
@@ -93,8 +82,6 @@ impl PostVerifier {
         std::path::absolute(&dir).unwrap_or(dir)
     }
 
-    /// Forgets a run an earlier daemon left unfinished and ends what it still runs. The caller
-    /// holds the daemon lock, so nothing of this repository's check is alive.
     pub fn recover(&self) -> Result<()> {
         let lock = self.lock_slot(&[])?;
         reap_orphans(&self.slot_dir())?;
@@ -118,14 +105,20 @@ impl PostVerifier {
         bail!("머지 뒤 검사 슬롯을 다른 프로세스가 쥐고 있다")
     }
 
-    /// Checks the default branch's tip once when it is due.
     pub fn run_once(&self) -> Result<PostPass> {
         if self.cancel.is_cancelled() {
             return Ok(PostPass::Cancelled);
         }
+        let known = Config::load_remote_branch(
+            &self.ext,
+            &self.info.path,
+            &self.info.remote_name,
+            &self.info.default_branch,
+        );
+        if !matches!(known, Ok(Some(Config { post: Some(_), .. }))) {
+            return Ok(PostPass::Idle);
+        }
         let tip = self.gitops.fetch_base_tip()?;
-        // A missing or unreadable `chute.toml` leaves the check off. The batch reports the
-        // same file when it needs it.
         let Ok(config) = Config::load_at(&self.ext, &self.info.path, tip.as_str()) else {
             return Ok(PostPass::Idle);
         };
@@ -186,8 +179,6 @@ impl PostVerifier {
         }
     }
 
-    /// Runs the steps on `commit`. A step with `paths` runs only when a file under one of them
-    /// changed since the last passing commit.
     fn check(&self, scope: &Scope, commit: &Sha, phase: PostPhase) -> Result<Checked> {
         let slot = scope.slot;
         slot.checkout(commit)?;
@@ -219,6 +210,7 @@ impl PostVerifier {
             });
         };
         let steps = Config {
+            serialize: false,
             verify: scope.post.steps.clone(),
             ..scope.config.clone()
         };
@@ -257,8 +249,6 @@ impl PostVerifier {
         Ok(at_ms)
     }
 
-    /// A step that failed and passed on the re-run goes to the flaky ledger like the batch's.
-    /// The ledger names a batch, so the commit stands in for one.
     fn record_flaky(&self, slot: &Slot, commit: &Sha, flaky: Vec<FlakyStep>) -> Result<()> {
         for step in flaky {
             self.history(EventKind::Flaky {
@@ -307,8 +297,6 @@ impl PostVerifier {
         Ok(())
     }
 
-    /// The tip failed. Returns false when the search was cut short by a stop request, which
-    /// leaves nothing recorded: the next run checks the tip again.
     fn fail(&self, scope: &Scope, tip: &Sha, before: &PostState, failed: &Failed) -> Result<bool> {
         let baseline = scope.baseline;
         let tests = failed_tests(failed);
@@ -327,7 +315,7 @@ impl PostVerifier {
             })?;
             return Ok(true);
         }
-        let culprit = match self.locate(scope, tip)? {
+        let culprit = match self.locate(scope, tip, failed)? {
             Search::Found(culprit) => culprit,
             Search::Cancelled => return Ok(false),
         };
@@ -379,18 +367,16 @@ impl PostVerifier {
         Ok(true)
     }
 
-    /// Whether an earlier failure is the one still failing: its culprit is in the tip's
-    /// history, or it never had one.
     fn still_there(&self, slot: &Slot, old: &PostRed, tip: &Sha) -> bool {
         old.culprit
             .as_ref()
             .is_none_or(|c| slot.is_ancestor(&c.commit, tip).unwrap_or(false))
     }
 
-    /// The first merge since the last passing commit that the steps fail on, found by bisection:
-    /// each round runs the steps on the middle of the merges still in doubt, and a round costs
-    /// one full run. `None` when there is no passing commit to start from.
-    fn locate(&self, scope: &Scope, tip: &Sha) -> Result<Search> {
+    fn locate(&self, scope: &Scope, tip: &Sha, failure: &Failed) -> Result<Search> {
+        let same = |other: &Failed| {
+            other.step == failure.step && failed_tests(other) == failed_tests(failure)
+        };
         let Some(good) = scope.baseline else {
             return Ok(Search::Found(None));
         };
@@ -401,15 +387,18 @@ impl PostVerifier {
         if commits.is_empty() {
             return Ok(Search::Found(None));
         }
-        // commits[bad] fails; everything up to and including `passing` passes.
         let mut passing: isize = -1;
         let mut bad = commits.len() - 1;
         while bad as isize - passing > 1 {
             let mid = ((passing + bad as isize) / 2) as usize;
             match self.check(scope, &commits[mid], PostPhase::Searching)? {
                 Checked::Cancelled => return Ok(Search::Cancelled),
-                Checked::Passed { .. } => passing = mid as isize,
-                Checked::Failed(_) => bad = mid,
+                Checked::Passed { flaky } => {
+                    self.record_flaky(scope.slot, &commits[mid], flaky)?;
+                    passing = mid as isize;
+                }
+                Checked::Failed(other) if same(&other) => bad = mid,
+                Checked::Failed(_) => passing = mid as isize,
             }
         }
         Ok(Search::Found(Some(Culprit {
@@ -419,10 +408,9 @@ impl PostVerifier {
         })))
     }
 
-    /// The batch merge a main commit came from.
     fn merge_of(&self, commit: &Sha) -> Result<Option<(BatchId, MergeRef)>> {
         for id in self.store.batch_ids()?.into_iter().rev() {
-            let Some(record) = self.store.read_batch(&id)? else {
+            let Ok(Some(record)) = self.store.read_batch(&id) else {
                 continue;
             };
             if let Some(found) = record.merges.into_iter().find(|m| m.commit == *commit) {
@@ -432,8 +420,6 @@ impl PostVerifier {
         Ok(None)
     }
 
-    /// Tells the PR's submitter and its worker, once each when they are one terminal. With no
-    /// PR the line goes nowhere and the event log shows a missed notification.
     fn tell(&self, merge: Option<&MergeRef>, pr: Option<PrNumber>, at: EpochMs, line: &Line) {
         let notifier = Notifier::new(&self.ext, &self.info, &self.store);
         let (Some(merge), Some(pr)) = (merge, pr) else {
@@ -500,8 +486,6 @@ fn failed_tests(failed: &Failed) -> Vec<String> {
     }
 }
 
-/// Whether the tip needs a run: it is not the commit last checked, and the interval since the
-/// last run's start is over.
 fn is_due(state: &PostState, tip: &Sha, post: &PostVerify, now: EpochMs) -> bool {
     if state.last_green.as_ref().is_some_and(|g| g.commit == *tip) {
         return false;

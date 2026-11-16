@@ -88,14 +88,11 @@ pub enum Line {
         made: bool,
         chronic: bool,
     },
-    /// The steps after the merge failed on the default branch.
     PostFailed {
         commit: Sha,
         step: String,
         tests: Vec<String>,
         last_green: Option<Sha>,
-        /// The merge the failure starts at. `None` for a commit chute did not merge or when
-        /// there is no passing commit to search from.
         pr: Option<PrNumber>,
         batch: Option<BatchId>,
         log: PathBuf,
