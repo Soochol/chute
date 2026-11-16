@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{Feedback, Notice, Unreachable, Written, plain_ref_name, short, strip_terminal_noise};
+use crate::env::EnvSection;
 use crate::gitops::FAILED_REF_PREFIX;
 use crate::hub::{base64_decode, base64_encode};
 use crate::model::{Failure, Partner, QueueItem, Sha, VerifyMode};
@@ -48,6 +49,8 @@ pub enum ParcelNotice {
         failure: Failure,
         failed_ref: Option<String>,
         rebuild: Option<Rebuild>,
+        #[serde(default)]
+        env: Option<Box<EnvSection>>,
     },
     HeadChanged {
         registered: Sha,
@@ -211,6 +214,7 @@ impl Feedback<'_> {
             failure: written.doc.failure.clone(),
             failed_ref,
             rebuild,
+            env: written.doc.env.clone().map(Box::new),
         }
     }
 

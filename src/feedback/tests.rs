@@ -3950,3 +3950,191 @@ fn a_log_cut_after_reading_it_as_text_still_says_so() {
 
     assert!(text_of(&parcel.files[0]).starts_with("[chute: 로그가 길어"));
 }
+
+fn env_of(host: &str, checks: &[(&str, &str, bool)]) -> crate::model::EnvRecord {
+    crate::model::EnvRecord {
+        machine_id: None,
+        host: host.to_owned(),
+        checks: checks
+            .iter()
+            .map(|(run, output, ok)| crate::model::EnvCheck {
+                run: (*run).to_owned(),
+                output: (*output).to_owned(),
+                ok: *ok,
+            })
+            .collect(),
+    }
+}
+
+impl Lab {
+    fn env_report(&self, item: &QueueItem, section: Option<EnvSection>) -> (String, ReportDoc) {
+        let written = self
+            .fb()
+            .write_report_with_env(&Subject::from(item), &self.solo(&["a::b"]), None, section)
+            .unwrap();
+        let doc: ReportDoc = serde_json::from_str(&read(&written.json)).unwrap();
+        (read(&written.md), doc)
+    }
+}
+
+#[test]
+fn env_section_names_the_hub_machine_and_its_checks() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let hub = env_of("hub-pc", &[("cargo --version", "cargo 1.90.0", true)]);
+    let section = EnvSection {
+        env: hub.clone(),
+        preflight: None,
+    };
+
+    let (md, doc) = lab.env_report(&item, Some(section.clone()));
+
+    assert!(md.contains("## 검사 환경"), "{md}");
+    assert!(md.contains("`hub-pc`"), "{md}");
+    assert!(md.contains("`cargo --version`: `cargo 1.90.0`"), "{md}");
+    assert!(!md.contains("나란히"), "{md}");
+    assert_eq!(doc.env, Some(section));
+}
+
+#[test]
+fn a_report_without_env_has_no_env_section() {
+    let lab = Lab::new();
+    let (md, doc) = lab.env_report(&lab.item(12, "feat/a"), None);
+    assert!(!md.contains("검사 환경"), "{md}");
+    assert_eq!(doc.env, None);
+}
+
+#[test]
+fn env_section_puts_only_the_differing_rows_beside_the_preflight() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let preflight = env_of(
+        "laptop",
+        &[
+            ("cargo --version", "cargo 1.90.0", true),
+            ("git --version", "git 2.50", true),
+        ],
+    );
+    let hub = env_of(
+        "hub-pc",
+        &[
+            ("cargo --version", "cargo 1.85.0", true),
+            ("git --version", "git 2.50", true),
+        ],
+    );
+
+    let (md, _) = lab.env_report(
+        &item,
+        Some(EnvSection {
+            env: hub,
+            preflight: Some(preflight),
+        }),
+    );
+
+    assert!(md.contains("| 항목 | preflight를 돌린 PC | 허브 |"), "{md}");
+    assert!(md.contains("| `머신` | `laptop` | `hub-pc` |"), "{md}");
+    assert!(
+        md.contains("| `cargo --version` | `cargo 1.90.0` | `cargo 1.85.0` |"),
+        "{md}"
+    );
+    assert!(!md.contains("| `git --version`"), "{md}");
+    assert!(!md.contains("같은 환경"), "{md}");
+}
+
+#[test]
+fn env_section_says_so_when_the_preflight_environment_is_the_same() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let env = env_of("pc", &[("cargo --version", "cargo 1.90.0", true)]);
+
+    let (md, _) = lab.env_report(
+        &item,
+        Some(EnvSection {
+            env: env.clone(),
+            preflight: Some(env),
+        }),
+    );
+
+    assert!(md.contains("preflight와 같은 환경이다."), "{md}");
+    assert!(!md.contains("| 항목 |"), "{md}");
+}
+
+#[test]
+fn env_section_shows_a_command_only_one_side_ran_and_a_failed_one() {
+    let lab = Lab::new();
+    let item = lab.item(12, "feat/a");
+    let preflight = env_of("pc", &[("node --version", "v22", true)]);
+    let hub = env_of("pc", &[("node --version", "not found", false)]);
+
+    let (md, _) = lab.env_report(
+        &item,
+        Some(EnvSection {
+            env: hub,
+            preflight: Some(preflight),
+        }),
+    );
+
+    assert!(
+        md.contains("| `node --version` | `v22` | `실패: not found` |"),
+        "{md}"
+    );
+}
+
+#[test]
+fn env_section_crosses_to_the_receiving_pc_in_a_parcel() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let section = EnvSection {
+        env: env_of("hub-pc", &[("cargo --version", "cargo 1.85.0", true)]),
+        preflight: Some(env_of(
+            "laptop",
+            &[("cargo --version", "cargo 1.90.0", true)],
+        )),
+    };
+    let written = lab
+        .fb()
+        .write_report_with_env(
+            &Subject::from(&item),
+            &failure,
+            Some(FAILED),
+            Some(section.clone()),
+        )
+        .unwrap();
+    let parcel = lab
+        .fb()
+        .parcel(&item, &Notice::Bounced(&written), &Limits::default())
+        .unwrap();
+    let decoded = Parcel::decode(&parcel.encode().unwrap()).unwrap();
+    lab.stub_spawn();
+
+    lab.fb().receive(&decoded).unwrap();
+
+    let report = lab.latest_report(7);
+    assert!(report.contains("## 검사 환경"), "{report}");
+    assert!(
+        report.contains("| `cargo --version` | `cargo 1.90.0` | `cargo 1.85.0` |"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_parcel_without_env_from_an_older_hub_still_decodes() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let parcel = lab.parcel_of(&item, &failure, &Limits::default()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&parcel.encode().unwrap()).unwrap();
+    value["notice"].as_object_mut().unwrap().remove("env");
+
+    let decoded = Parcel::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let ParcelNotice::Bounced { env, .. } = &decoded.notice else {
+        panic!("반송 묶음이어야 한다");
+    };
+    assert_eq!(env, &None);
+}
