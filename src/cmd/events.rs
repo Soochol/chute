@@ -131,6 +131,9 @@ fn parse_since(text: &str, now: EpochMs) -> Result<EpochMs> {
     if let Ok(ms) = text.parse::<u64>() {
         return Ok(EpochMs(ms));
     }
+    if text.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("--since `{text}`가 epoch 밀리초로 쓸 수 있는 범위를 넘는다");
+    }
     if let Some((digits, unit)) = text.split_at_checked(text.len() - 1)
         && let Ok(count) = digits.parse::<u64>()
     {
@@ -155,9 +158,9 @@ fn render<Tz: TimeZone>(event: &Event, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
-    let at = tz
-        .timestamp_millis_opt(event.at_ms.0 as i64)
-        .single()
+    let at = i64::try_from(event.at_ms.0)
+        .ok()
+        .and_then(|ms| tz.timestamp_millis_opt(ms).single())
         .map_or_else(
             || format!("at={}", event.at_ms.0),
             |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -430,6 +433,26 @@ mod tests {
                 .to_string()
                 .contains("1970")
         );
+    }
+
+    #[test]
+    fn a_number_too_big_for_epoch_millis_is_called_out_of_range() {
+        for big in ["99999999999999999999", "18446744073709551616"] {
+            let message = since(big).unwrap_err().to_string();
+            assert!(message.contains("범위"), "{big}: {message}");
+            assert!(!message.contains("단위"), "{big}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_time_beyond_the_calendar_prints_the_raw_millis() {
+        for at in [u64::MAX, 1 << 63] {
+            let event = Event {
+                at_ms: EpochMs(at),
+                kind: EventKind::Closed { pr: PrNumber(1) },
+            };
+            assert_eq!(render(&event, &Utc), format!("at={at}  #1 닫힘"));
+        }
     }
 
     #[test]
