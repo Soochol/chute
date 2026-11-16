@@ -172,6 +172,69 @@ fn a_failure_that_also_happens_alone_is_solo_even_with_a_queue() {
     assert_eq!(doc["with"], serde_json::json!([7]));
 }
 
+const BROKEN_BASE_CHECK: &str = "test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }";
+
+fn break_main(w: &World) -> String {
+    w.repo
+        .commit_file("bad.txt", "x\n", "feat: main이 검증을 깨뜨린다");
+    w.repo.git(&["push", "--quiet", "origin", "main"]);
+    w.repo.git(&["rev-parse", "origin/main"]).trim().to_owned()
+}
+
+#[test]
+fn a_solo_failure_on_a_base_that_fails_too_is_blamed_on_the_base() {
+    let w = world(BROKEN_BASE_CHECK);
+    let base = break_main(&w);
+    work_on(&w, "feat/docs", "docs.txt", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "base_broken");
+    assert_eq!(doc["base"], base);
+    assert_eq!(doc["base_broken"]["step"], "check");
+    assert!(read(&doc["base_broken"]["log"]).contains("FAIL bad_case"));
+    assert_eq!(doc["report"], Value::Null);
+    assert!(failed_refs(&w).is_empty());
+    let plain = text(&preflight(&w, &[]));
+    assert!(
+        plain.contains("기준이 깨졌다. 이 커밋 탓이 아니다"),
+        "{plain}"
+    );
+    assert!(!plain.contains("검증 실패(단독)"), "{plain}");
+    let recorded = w.state().preflights["feat/docs"].result;
+    assert_eq!(recorded, chute::model::PreflightResult::BaseBroken);
+}
+
+#[test]
+fn a_solo_failure_on_a_base_that_passes_is_this_commits_fault() {
+    let w = world("test ! -f bad.txt || { echo 'FAIL bad_case'; exit 1; }");
+    work_on(&w, "feat/bad", "bad.txt", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "fail");
+    assert_eq!(doc["mode"], "solo");
+    assert_eq!(doc["base_broken"], Value::Null);
+}
+
+#[test]
+fn a_base_the_queue_already_verified_is_not_run_again() {
+    let w = world(BROKEN_BASE_CHECK);
+    let base = break_main(&w);
+    w.store()
+        .update(|state| {
+            state
+                .verified_bases
+                .push(Sha::try_from(base.clone()).unwrap());
+            Ok(())
+        })
+        .unwrap();
+    work_on(&w, "feat/docs", "docs.txt", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(json(&out)["result"], "fail");
+}
+
 #[test]
 fn a_conflict_with_a_queued_pr_names_the_file_and_the_pr() {
     let w = world("true");
@@ -1008,7 +1071,7 @@ mod remote {
     fn a_failing_result_keeps_exit_code_1_when_the_recording_fails_too() {
         let net = mesh("true");
         let run = format!(
-            "sed -i 's/connected/unreachable/' {}; echo 'FAIL boom'; exit 1",
+            "sed -i 's/connected/unreachable/' {}; test ! -f mine.txt || {{ echo 'FAIL boom'; exit 1; }}",
             net.node("b").sb.root().join("net").join("peers").display()
         );
         net.node("a")

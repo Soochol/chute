@@ -39,8 +39,22 @@ const LISTED_COMMITS: usize = 10;
 const HC_NAME_LIMIT: usize = 32;
 const NAME_TRIES: u32 = 5;
 const SIBLING_TRIES: u32 = 20;
-const SHELLS: [&str; 9] = [
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
+const SHELLS: [&str; 15] = [
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "tcsh",
+    "csh",
+    "nu",
+    "ash",
+    "rc",
+    "elvish",
+    "xonsh",
+    "pwsh",
+    "powershell",
 ];
 pub(crate) const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
@@ -1157,12 +1171,13 @@ impl TerminalInfo {
     }
 
     fn has_left_for_a_shell(&self) -> bool {
-        let in_a_shell = self
-            .foreground
-            .as_ref()
-            .and_then(|f| f.name.as_deref())
-            .is_some_and(|name| SHELLS.contains(&name));
-        matches!(self.status, ProgramStatus::NoProgram) && (self.reported || in_a_shell)
+        if !matches!(self.status, ProgramStatus::NoProgram) {
+            return false;
+        }
+        match self.foreground.as_ref().and_then(|f| f.name.as_deref()) {
+            Some(name) => SHELLS.contains(&name),
+            None => self.reported,
+        }
     }
 }
 

@@ -994,7 +994,7 @@ mod tests {
             self.sb.fake("hc").respond(
                 &format!("get {address} --json"),
                 Reply::ok(format!(
-                    r#"{{"address":"{address}","state":"live","created_ms":{created_ms},"foreground":{{"name":"claude"}}}}"#
+                    r#"{{"address":"{address}","state":"live","created_ms":{created_ms},"foreground":{{"name":"claude"}},"status":null,"reported":true}}"#
                 )),
             );
         }
