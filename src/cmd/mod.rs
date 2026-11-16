@@ -1,5 +1,6 @@
 pub mod approve;
 pub mod batches;
+pub mod config_check;
 pub mod daemon;
 pub mod deliver;
 pub mod down;
@@ -21,7 +22,7 @@ pub mod submit;
 pub mod up;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -93,12 +94,12 @@ impl Ctx {
         self.terminal.as_deref()
     }
 
+    pub fn repo_arg(&self) -> Option<&Path> {
+        self.repo.as_deref()
+    }
+
     pub fn target_dir(&self) -> Result<PathBuf> {
-        match &self.repo {
-            Some(dir) => std::path::absolute(dir)
-                .with_context(|| format!("경로를 절대 경로로 바꾸지 못했다: {}", dir.display())),
-            None => std::env::current_dir().context("지금 폴더를 알지 못했다"),
-        }
+        target_dir_of(self.repo.as_deref())
     }
 
     pub fn slug(&self) -> Result<Slug> {
@@ -115,6 +116,14 @@ impl Ctx {
             anyhow!("chute에 등록되지 않은 저장소다: {slug}. 저장소에서 `chute init`을 실행한다")
         })?;
         Ok((info, store))
+    }
+}
+
+pub fn target_dir_of(repo: Option<&Path>) -> Result<PathBuf> {
+    match repo {
+        Some(dir) => std::path::absolute(dir)
+            .with_context(|| format!("경로를 절대 경로로 바꾸지 못했다: {}", dir.display())),
+        None => std::env::current_dir().context("지금 폴더를 알지 못했다"),
     }
 }
 

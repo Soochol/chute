@@ -681,6 +681,12 @@ pub struct Flaky {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedStep {
+    pub round: u32,
+    pub step: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchRecord {
     pub id: BatchId,
     pub base: Sha,
@@ -695,6 +701,8 @@ pub struct BatchRecord {
     pub pushed: Vec<Sha>,
     #[serde(default)]
     pub verifications: u32,
+    #[serde(default)]
+    pub skipped: Vec<SkippedStep>,
     #[serde(default)]
     pub env: Option<EnvRecord>,
 }

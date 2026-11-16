@@ -594,6 +594,30 @@ impl Slot {
         self.sha("HEAD")
     }
 
+    /// The files whose content differs between `base` and the slot's HEAD, as the `paths` of a
+    /// verification step see them. Renames are listed as a delete and an add, so both the old and
+    /// the new path count.
+    pub fn changed_files(&self, base: &Sha) -> Result<Vec<String>> {
+        let out = self
+            .git(&[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--no-ext-diff",
+                "--ignore-submodules=none",
+                "-z",
+                base.as_str(),
+                "HEAD",
+            ])?
+            .ok()
+            .with_context(|| format!("{base}와 HEAD의 바뀐 파일을 읽지 못했다"))?;
+        Ok(out
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Fetches the default branch and returns its tip. `<remote>/<branch>` is moved to the same
     /// commit.
     pub fn fetch_base(&self) -> Result<Sha> {
@@ -1386,6 +1410,67 @@ mod tests {
 
         assert_eq!(w.origin_main(), theirs);
         fs::remove_file(&lock).unwrap();
+    }
+
+    #[test]
+    fn a_submodule_bump_counts_as_changed_even_when_the_pr_sets_ignore_all() {
+        let w = World::new();
+        let slot = w.slot(SlotName::Batch);
+        let base = slot.fetch_base().unwrap();
+        slot.checkout(&base).unwrap();
+        let gl = base.as_str().to_owned();
+        w.in_slot(
+            &slot,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{gl},vendor/lib"),
+            ],
+        );
+        w.in_slot(
+            &slot,
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@a",
+                "commit",
+                "-qm",
+                "add sub",
+            ],
+        );
+        let b2 = sha(&w.in_slot(&slot, &["rev-parse", "HEAD"]));
+        fs::write(
+            slot.path().join(".gitmodules"),
+            "[submodule \"vendor/lib\"]\n\tpath = vendor/lib\n\turl = ../x\n\tignore = all\n",
+        )
+        .unwrap();
+        w.in_slot(&slot, &["add", ".gitmodules"]);
+        w.in_slot(
+            &slot,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{},vendor/lib", "1".repeat(40)),
+            ],
+        );
+        w.in_slot(
+            &slot,
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@a",
+                "commit",
+                "-qm",
+                "bump + ignore",
+            ],
+        );
+        assert_eq!(
+            slot.changed_files(&b2).unwrap(),
+            [".gitmodules", "vendor/lib"]
+        );
     }
 
     #[test]

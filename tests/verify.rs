@@ -63,6 +63,7 @@ fn step(name: &str, script: impl Into<String>) -> VerifyStep {
         timeout: Duration::from_secs(60),
         failed: None,
         probe: None,
+        paths: None,
     }
 }
 
@@ -1401,4 +1402,61 @@ fn cache_dir_is_not_set_for_a_run_without_one() {
     let rig = Rig::new();
     let config = config(vec![step("one", "test -z \"${CHUTE_CACHE_DIR+x}\"")], false);
     assert!(passed(rig.run(&config, &Options::default())).is_empty());
+}
+
+fn with_paths(mut step: VerifyStep, paths: &[&str]) -> VerifyStep {
+    step.paths = NonEmpty::new(paths.iter().map(|p| (*p).to_owned()).collect());
+    step
+}
+
+#[test]
+fn a_step_whose_paths_match_none_of_the_changed_files_is_skipped_and_named() {
+    let rig = Rig::new();
+    let config = config(
+        vec![
+            with_paths(step("web", "touch ../marks/web"), &["web/"]),
+            with_paths(step("lib", "touch ../marks/lib"), &["Cargo.toml", "src/"]),
+            step("always", "touch ../marks/always"),
+        ],
+        false,
+    );
+    let changed = vec!["src/main.rs".to_owned(), "docs/web/x.md".to_owned()];
+    let skipped = RefCell::new(Vec::new());
+    let on_skip = |name: &str| skipped.borrow_mut().push(name.to_owned());
+    let heard = RefCell::new(Vec::new());
+    let on_step = |name: &str| heard.borrow_mut().push(name.to_owned());
+    let opts = Options {
+        changed: Some(&changed),
+        on_skip: Some(&on_skip),
+        on_step: Some(&on_step),
+        ..Options::default()
+    };
+
+    passed(rig.run(&config, &opts));
+
+    assert_eq!(*skipped.borrow(), ["web"]);
+    assert_eq!(*heard.borrow(), ["lib", "always"]);
+    assert!(!rig.mark("web").exists());
+    assert!(rig.mark("lib").exists());
+    assert!(rig.mark("always").exists());
+}
+
+#[test]
+fn without_a_list_of_changed_files_every_step_runs() {
+    let rig = Rig::new();
+    let config = config(
+        vec![with_paths(step("web", "touch ../marks/web"), &["web/"])],
+        false,
+    );
+    let skipped = RefCell::new(Vec::new());
+    let on_skip = |name: &str| skipped.borrow_mut().push(name.to_owned());
+    let opts = Options {
+        on_skip: Some(&on_skip),
+        ..Options::default()
+    };
+
+    passed(rig.run(&config, &opts));
+
+    assert!(skipped.borrow().is_empty());
+    assert!(rig.mark("web").exists());
 }

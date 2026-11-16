@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,8 +24,8 @@ use crate::gitops::{
 use crate::model::{
     Agent, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs,
     Event, EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, ResumedBy, Sha, State, StepFailure,
-    VerifyMode, Warning, WarningKind,
+    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, ResumedBy, Sha, SkippedStep, State,
+    StepFailure, VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
@@ -687,6 +688,7 @@ impl Engine {
                 pushed: Vec::new(),
                 verifications: 0,
                 env: None,
+                skipped: Vec::new(),
             },
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
@@ -805,6 +807,12 @@ enum Inspection {
 struct Landed {
     pr: PrNumber,
     title: String,
+}
+
+#[derive(Clone, Copy)]
+enum Scope {
+    Changed,
+    Whole,
 }
 
 struct Build {
@@ -1340,7 +1348,7 @@ impl Run<'_> {
             if b.landing.is_empty() {
                 return self.land(&b);
             }
-            match self.verify(&b.tip)? {
+            match self.verify(&b.tip, Scope::Changed)? {
                 Verdict::Pass => {
                     self.set_phase(Phase::Pushing)?;
                     if self.slot.head()? != b.tip {
@@ -1375,7 +1383,7 @@ impl Run<'_> {
         }
     }
 
-    fn verify(&mut self, tree: &Sha) -> Result<Verdict> {
+    fn verify(&mut self, tree: &Sha, scope: Scope) -> Result<Verdict> {
         self.record.verifications += 1;
         let round = self.record.verifications;
         self.update_batch(|b| {
@@ -1408,6 +1416,12 @@ impl Run<'_> {
             .store
             .batch_dir(self.id())
             .join(format!("verify-{round}"));
+        let changed = match scope {
+            Scope::Changed => Some(self.slot.changed_files(&self.start_base)?),
+            Scope::Whole => None,
+        };
+        let skipped = RefCell::new(Vec::new());
+        let on_skip = |name: &str| skipped.borrow_mut().push(name.to_owned());
         let started = Instant::now();
         let outcome = verify::run(
             &self.config,
@@ -1419,10 +1433,18 @@ impl Run<'_> {
                 cache_dir: Some(engine.gitops.cache_dir()),
                 on_step: Some(&on_step),
                 on_machine_wait: Some(&on_machine_wait),
+                changed: changed.as_deref(),
+                on_skip: Some(&on_skip),
                 ..Options::default()
             },
         )?;
         self.verify_time += started.elapsed();
+        self.record.skipped.extend(
+            skipped
+                .into_inner()
+                .into_iter()
+                .map(|step| SkippedStep { round, step }),
+        );
         match outcome {
             Outcome::Passed { flaky } => {
                 self.clear_base_doubt()?;
@@ -1594,7 +1616,7 @@ impl Run<'_> {
         let item = self.merge_item(pr);
         let result = self.slot.merge(base, &[item])?;
         match result.items.into_iter().next().map(|o| o.result) {
-            Some(ItemResult::Merged { .. }) => match self.verify(&result.tip)? {
+            Some(ItemResult::Merged { .. }) => match self.verify(&result.tip, Scope::Changed)? {
                 Verdict::Pass => Ok(Alone::Pass),
                 Verdict::Fail(failed) => Ok(Alone::Fail {
                     failed,
@@ -1613,7 +1635,7 @@ impl Run<'_> {
             return Ok(None);
         }
         self.slot.checkout(base)?;
-        match self.verify(base)? {
+        match self.verify(base, Scope::Whole)? {
             Verdict::Pass => {
                 engine.store.update(|s| {
                     if !s.verified_bases.contains(base) {
