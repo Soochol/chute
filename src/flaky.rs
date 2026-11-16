@@ -12,6 +12,8 @@ use crate::store::RepoStore;
 use crate::verify::{self, Cancel, CommandEnd, Options};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// Linux refuses a single `sh -c` argument of 128 KiB or more.
+const MAX_TESTS_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Key {
@@ -145,8 +147,12 @@ fn chronic_keys(events: &[Event], now: EpochMs, policy: &FlakyPolicy) -> BTreeMa
         .collect()
 }
 
-fn warning_prefix(key: &Key) -> String {
-    format!("{}: ", key.label())
+fn names(warning: &Warning, key: &Key) -> bool {
+    warning.kind == WarningKind::FlakyChronic
+        && warning
+            .message
+            .rsplit_once(": ")
+            .is_some_and(|(label, _)| label == key.label())
 }
 
 /// Brings the `flaky_chronic` warnings in line with the history: one per chronic key, none for a
@@ -162,22 +168,17 @@ pub fn refresh_chronic(
 ) -> Result<Vec<Key>> {
     let chronic = chronic_keys(events, now, policy);
     store.update(|state| {
-        state.warnings.retain(|w| {
-            w.kind != WarningKind::FlakyChronic
-                || chronic
-                    .keys()
-                    .any(|key| w.message.starts_with(&warning_prefix(key)))
-        });
+        state
+            .warnings
+            .retain(|w| w.kind != WarningKind::FlakyChronic || chronic.keys().any(|k| names(w, k)));
         let mut due = Vec::new();
         for (key, count) in &chronic {
             let message = format!(
-                "{}{}일 안에 {count}번 흔들렸다",
-                warning_prefix(key),
+                "{}: {}일 안에 {count}번 흔들렸다",
+                key.label(),
                 policy.chronic_days
             );
-            let held = state.warnings.iter_mut().find(|w| {
-                w.kind == WarningKind::FlakyChronic && w.message.starts_with(&warning_prefix(key))
-            });
+            let held = state.warnings.iter_mut().find(|w| names(w, key));
             match held {
                 Some(warning) => {
                     warning.message = message;
@@ -187,13 +188,18 @@ pub fn refresh_chronic(
                     }
                 }
                 None => {
+                    let announced = touched.contains(key);
                     state.warnings.push(Warning {
                         kind: WarningKind::FlakyChronic,
                         message,
                         pr: None,
-                        at_ms: now,
+                        at_ms: if announced {
+                            now
+                        } else {
+                            EpochMs(now.0.saturating_sub(DAY_MS))
+                        },
                     });
-                    if touched.contains(key) {
+                    if announced {
                         due.push(key.clone());
                     }
                 }
@@ -234,9 +240,9 @@ struct Round {
 /// stops at its first failure, after `probe_repeats` runs or after `probe_seconds`, and a
 /// cancel ends the probe as unresolved. A failure on the base means the flake was already there.
 pub fn probe(job: &ProbeJob) -> Result<ProbeResult> {
-    let command = job
-        .command
-        .replace(PROBE_PLACEHOLDER, &quote_all(job.tests));
+    let quoted = quote_within(job.tests, MAX_TESTS_BYTES)
+        .context("흔들린 시험 이름 하나가 너무 길어 probe 명령에 넣지 못했다")?;
+    let command = job.command.replace(PROBE_PLACEHOLDER, &quoted);
     let log_dir = job.store.batch_dir(job.batch).join("probe");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("만들지 못했다: {}", log_dir.display()))?;
@@ -320,12 +326,22 @@ fn repeat(
     Ok(round)
 }
 
-fn quote_all(tests: &[String]) -> String {
-    tests
-        .iter()
-        .map(|test| format!("'{}'", test.replace('\'', r"'\''")))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The first names that fit in `limit` bytes, each in single quotes. `None` when not even the
+/// first fits.
+fn quote_within(tests: &[String], limit: usize) -> Option<String> {
+    let mut text = String::new();
+    for test in tests {
+        let quoted = format!("'{}'", test.replace('\'', r"'\''"));
+        let added = if text.is_empty() { 0 } else { 1 } + quoted.len();
+        if text.len() + added > limit {
+            break;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&quoted);
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -502,10 +518,98 @@ mod tests {
         assert_eq!(order, ["z", "y", "x"]);
     }
 
+    fn warned(store: &RepoStore, events: &[Event], touched: &[Key]) -> Vec<Key> {
+        refresh_chronic(store, events, NOW, &policy(), touched).unwrap()
+    }
+
+    fn three(test: &str) -> Vec<Event> {
+        (1..=3)
+            .map(|n| flaky(n, &format!("b{n}"), "test", &[test]))
+            .collect()
+    }
+
+    fn store() -> (tempfile::TempDir, RepoStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::store::Home::at(dir.path());
+        let store = home.repo(&crate::model::Slug::new("acme", "widget").unwrap());
+        (dir, store)
+    }
+
+    fn messages(store: &RepoStore) -> Vec<String> {
+        store
+            .load()
+            .unwrap()
+            .warnings
+            .into_iter()
+            .map(|w| w.message)
+            .collect()
+    }
+
+    #[test]
+    fn chronic_warnings_of_tests_whose_names_share_a_prefix_stay_apart() {
+        let (_dir, store) = store();
+        let colliding = key("test", Some("a: b"));
+        let plain = key("test", Some("a"));
+        let both: Vec<Event> = three("a: b").into_iter().chain(three("a")).collect();
+
+        assert_eq!(
+            warned(&store, &three("a: b"), std::slice::from_ref(&colliding)),
+            std::slice::from_ref(&colliding)
+        );
+        assert_eq!(
+            warned(&store, &both, std::slice::from_ref(&plain)),
+            std::slice::from_ref(&plain)
+        );
+        assert_eq!(messages(&store).len(), 2, "{:?}", messages(&store));
+
+        let only_plain = three("a");
+        assert!(warned(&store, &only_plain, &[]).is_empty());
+        assert_eq!(messages(&store).len(), 1, "{:?}", messages(&store));
+        assert!(messages(&store)[0].starts_with("단계 test의 시험 a: 30일"));
+    }
+
+    #[test]
+    fn a_chronic_key_is_announced_once_a_day() {
+        let (_dir, store) = store();
+        let a = key("test", Some("a"));
+
+        assert_eq!(
+            warned(&store, &three("a"), std::slice::from_ref(&a)),
+            std::slice::from_ref(&a)
+        );
+        assert!(warned(&store, &three("a"), std::slice::from_ref(&a)).is_empty());
+        assert_eq!(messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn a_chronic_key_found_without_a_notice_is_still_announced_at_its_next_flake() {
+        let (_dir, store) = store();
+        let a = key("test", Some("a"));
+
+        assert!(warned(&store, &three("a"), &[]).is_empty());
+        assert_eq!(messages(&store).len(), 1);
+        assert_eq!(warned(&store, &three("a"), std::slice::from_ref(&a)), [a]);
+    }
+
     #[test]
     fn tests_are_quoted_for_the_shell() {
         let tests = ["a::b".to_owned(), "it's $HOME".to_owned()];
 
-        assert_eq!(quote_all(&tests), r"'a::b' 'it'\''s $HOME'");
+        assert_eq!(
+            quote_within(&tests, 1000).unwrap(),
+            r"'a::b' 'it'\''s $HOME'"
+        );
+    }
+
+    #[test]
+    fn too_many_tests_are_cut_to_the_names_that_fit() {
+        let tests: Vec<String> = (0..10).map(|n| format!("t{n}")).collect();
+
+        assert_eq!(quote_within(&tests, 8).unwrap(), "'t0'");
+        assert_eq!(quote_within(&tests, 9).unwrap(), "'t0' 't1'");
+        assert_eq!(quote_within(&tests, 13).unwrap(), "'t0' 't1'");
+        assert_eq!(quote_within(&tests, 14).unwrap(), "'t0' 't1' 't2'");
+        assert!(quote_within(&tests, 3).is_none());
+        assert!(quote_within(&[], 100).is_none());
     }
 }

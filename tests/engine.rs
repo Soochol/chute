@@ -1788,3 +1788,44 @@ fn a_chronic_warning_goes_when_the_count_falls_under_the_threshold() {
     assert!(due.is_empty());
     assert!(lab.state().warnings.is_empty());
 }
+
+#[test]
+fn a_flake_on_a_tip_that_was_never_pushed_is_not_probed() {
+    let verify = format!(
+        "m='@ROOT@/moved'\nif [ ! -e \"$m\" ]; then touch \"$m\"; (git clone -q '@ORIGIN@' '@ROOT@/mover' && cd '@ROOT@/mover' && echo x > moved.txt && git add moved.txt && git commit -qm 'chore: other push' && git push -q origin HEAD:main) || fail 'mover failed'; fi\n{FLAKE_ONCE}"
+    );
+    let lab = Lab::build_with_step(
+        &verify,
+        "",
+        60,
+        &probe_step("[ -e moved.txt ] || [ ! -e f1.txt ]; : {tests}"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("f1.txt", "x\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(
+        lab.origin_git(&["ls-tree", "-r", "--name-only", "main"])
+            .contains("moved.txt")
+    );
+    assert!(probes(&lab).is_empty(), "{:?}", probes(&lab));
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn thousands_of_flaked_tests_are_still_probed() {
+    let body = "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; i=0; while [ $i -lt 5000 ]; do echo \"FAILED some_long_test_name_$i\"; i=$((i+1)); done; fail \"FAILED last\"; fi";
+    let lab = Lab::build_with_step(body, "", 60, &probe_step(": {tests}"));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let found = probes(&lab);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1.len(), 5001);
+    assert_eq!(found[0].2, ProbeEvidence::Unresolved);
+}

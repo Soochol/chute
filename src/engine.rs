@@ -1494,10 +1494,11 @@ impl Run<'_> {
                 .iter()
                 .find(|s| s.name == entry.step)
                 .and_then(|s| s.probe.as_deref());
-            let Some(command) = command.filter(|_| !entry.tests.is_empty()) else {
+            let landed = self.record.pushed.contains(&entry.tree);
+            let Some(command) = command.filter(|_| landed && !entry.tests.is_empty()) else {
                 continue;
             };
-            let found = flaky::probe(&flaky::ProbeJob {
+            let found = match flaky::probe(&flaky::ProbeJob {
                 config: &self.config,
                 store: &engine.store,
                 slot: &self.slot,
@@ -1509,7 +1510,16 @@ impl Run<'_> {
                 flaked: &entry.tree,
                 cancel: &engine.cancel,
                 cache_dir: engine.gitops.cache_dir(),
-            })?;
+            }) {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!(
+                        "경고: 단계 {}의 흔들림을 되풀이하지 못했다: {e:#}",
+                        entry.step
+                    );
+                    continue;
+                }
+            };
             engine.history(EventKind::FlakyProbe {
                 batch: self.id().clone(),
                 step: entry.step.clone(),

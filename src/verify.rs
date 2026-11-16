@@ -204,7 +204,7 @@ pub fn run_command(
         opts,
     };
     let step = VerifyStep {
-        name: "command".to_owned(),
+        name: "probe".to_owned(),
         run: command.to_owned(),
         timeout,
         failed: None,
