@@ -17,6 +17,7 @@ use chute::store::{Home, RepoStore};
 use crate::support::{Reply, Sandbox, TestRepo};
 
 pub const AGENT_CREATED_MS: u64 = 1763188200000;
+pub const ORCH_CREATED_MS: u64 = 1763188300000;
 
 pub struct Lab {
     pub sb: Sandbox,
@@ -148,6 +149,44 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         let hc = self.sb.fake("hc");
         hc.respond("get t1rs --json", Reply::file("tests/fixtures/hc/get.json"));
         hc.respond("send t1rs *", Reply::ok(""));
+        hc.respond(
+            "get t1orch --json",
+            Reply::ok(format!(
+                r#"{{"address":"t1orch","name":"orch","state":"live","created_ms":{ORCH_CREATED_MS},"foreground":{{"name":"claude"}}}}"#
+            )),
+        );
+        hc.respond("send t1orch *", Reply::ok(""));
+    }
+
+    pub fn orchestrator(&self) -> Agent {
+        Agent {
+            terminal: TerminalId("t1orch".into()),
+            created_ms: EpochMs(ORCH_CREATED_MS),
+            name: Some("orch".into()),
+            workdir: self.sb.root().join("o"),
+            alive: true,
+            machine: None,
+        }
+    }
+
+    pub fn lines_sent_to(&self, terminal: &str) -> Vec<String> {
+        self.hc_calls("send")
+            .into_iter()
+            .filter(|c| c.get(1).is_some_and(|t| t == terminal))
+            .map(|c| c[2].clone())
+            .collect()
+    }
+
+    pub fn notified(&self) -> Vec<(chute::model::NotifyKind, chute::model::Delivered)> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                EventKind::Notified {
+                    kind, delivered, ..
+                } => Some((kind, delivered)),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn agent(&self) -> Agent {
@@ -225,12 +264,24 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
     }
 
     pub fn queue_pr(&self, n: u64, head: &Sha, agent: Option<Agent>, approval: Approval) {
+        self.queue_pr_by(n, head, agent, None, approval);
+    }
+
+    pub fn queue_pr_by(
+        &self,
+        n: u64,
+        head: &Sha,
+        agent: Option<Agent>,
+        submitter: Option<Agent>,
+        approval: Approval,
+    ) {
         let submission = Submission {
             pr: PrNumber(n),
             title: format!("feat: change {n}"),
             branch: format!("pr-{n}"),
             head: head.clone(),
             agent,
+            submitter,
             touches_config: false,
             approval,
             now: EpochMs::now(),

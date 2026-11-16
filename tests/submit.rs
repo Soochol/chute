@@ -226,10 +226,18 @@ fn submit_reads_the_agent_from_hc_terminal_id_and_the_flag_wins() {
     let w = World::new();
     gh_pr(&w, Some(12), pr(12, HEAD));
     hc_knows_impl_a(&w, "t1flag");
+    hc_knows_impl_a(&w, "t1env");
     let out = submit_as(&w, Some("t1env"), &["12", "--agent", "t1flag"]);
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     assert_eq!(w.entry(12).unwrap()["agent"]["terminal"], "t1flag");
-    assert_eq!(hc_lookups(&w), [vec!["get", "--json", "t1flag"]]);
+    assert_eq!(w.entry(12).unwrap()["submitter"]["terminal"], "t1env");
+    assert_eq!(
+        hc_lookups(&w),
+        [
+            vec!["get", "--json", "t1flag"],
+            vec!["get", "--json", "t1env"]
+        ]
+    );
 }
 
 #[test]
@@ -573,7 +581,14 @@ fn submitting_the_same_head_again_leaves_the_state_as_it_was() {
 
         assert_eq!(code(&out), Some(0), "{before:?}: {}", stderr(&out));
         assert!(String::from_utf8_lossy(&out.stdout).contains("바뀐 것이 없다"));
-        assert_eq!(w.state(), state_before, "{before:?}");
+        let mut after = w.state();
+        let submitter = after.queue[0].submitter.take();
+        assert_eq!(
+            submitter.map(|a| a.terminal.0),
+            Some("t1rs".to_owned()),
+            "{before:?}"
+        );
+        assert_eq!(after, state_before, "{before:?}");
     }
 }
 
@@ -1377,4 +1392,181 @@ fn an_agent_addressed_through_another_machine_keeps_that_machine_not_the_hubs() 
         agent.machine,
         Some(MachineId::try_from(p.pc().id.clone()).unwrap())
     );
+}
+
+fn hc_knows_orchestrator(w: &World) {
+    hc_get(
+        w,
+        "t1orch",
+        terminal("t1orch", "orch", 1763188300000, "/w/orch"),
+    );
+}
+
+#[test]
+fn submitter_and_agent_are_recorded_apart_when_the_orchestrator_submits_for_the_worker() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    hc_knows_impl_a(&w, "t1rs");
+    hc_knows_orchestrator(&w);
+
+    let out = submit_as(
+        &w,
+        Some("t1orch"),
+        &["12", "--head", HEAD, "--agent", "t1rs"],
+    );
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queued = &w.state().queue[0];
+    let agent = queued.agent.clone().unwrap();
+    let submitter = queued.submitter.clone().unwrap();
+    assert_eq!(agent.terminal.0, "t1rs");
+    assert_eq!(submitter.terminal.0, "t1orch");
+    assert_eq!(submitter.created_ms, EpochMs(1763188300000));
+    assert_eq!(submitter.name.as_deref(), Some("orch"));
+    let shown = w.entry(12).unwrap();
+    assert_eq!(shown["agent"]["terminal"], "t1rs");
+    assert_eq!(shown["submitter"]["terminal"], "t1orch");
+}
+
+#[test]
+fn a_worker_that_submits_for_itself_is_both_submitter_and_agent_with_one_hc_lookup() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    hc_knows_impl_a(&w, "t1rs");
+
+    let out = submit_as(&w, Some("t1rs"), &["12"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queued = &w.state().queue[0];
+    assert!(queued.submitter.is_some());
+    assert_eq!(queued.submitter, queued.agent);
+    assert_eq!(hc_lookups(&w).len(), 1);
+}
+
+#[test]
+fn a_submit_from_a_plain_shell_has_no_submitter_even_with_an_agent_flag() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    hc_knows_impl_a(&w, "t1rs");
+
+    let out = submit(&w, &["12", "--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queued = &w.state().queue[0];
+    assert_eq!(queued.agent.as_ref().unwrap().terminal.0, "t1rs");
+    assert_eq!(queued.submitter, None);
+    assert_eq!(w.entry(12).unwrap()["submitter"], Value::Null);
+}
+
+#[test]
+fn a_resubmit_changes_the_submitter_even_for_the_same_head_and_keeps_it_when_none_is_known() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    hc_knows_impl_a(&w, "t1rs");
+    hc_knows_orchestrator(&w);
+    assert_eq!(code(&submit_as(&w, Some("t1rs"), &["12"])), Some(0));
+    let first = w.state().queue[0].submitter.clone().unwrap();
+    assert_eq!(first.terminal.0, "t1rs");
+
+    let again = submit_as(&w, Some("t1orch"), &["12", "--agent", "t1rs"]);
+    assert_eq!(code(&again), Some(0), "{}", stderr(&again));
+    let second = w.state().queue[0].submitter.clone().unwrap();
+    assert_eq!(second.terminal.0, "t1orch");
+
+    let plain = submit(&w, &["12"]);
+    assert_eq!(code(&plain), Some(0), "{}", stderr(&plain));
+    let kept = w.state().queue[0].submitter.clone().unwrap();
+    assert_eq!(kept.terminal.0, "t1orch");
+}
+
+#[test]
+fn a_submit_from_another_pc_leaves_its_submitter_on_the_hub_with_that_pcs_machine() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    p.pc().sb.fake("hc").respond(
+        "get --json t1orch",
+        terminal("t1orch", "orch", 1763188300000, "/w/orch"),
+    );
+
+    let out = p
+        .pc()
+        .sb
+        .command(BIN)
+        .current_dir(p.pc().repo.path())
+        .env("HC_TERMINAL_ID", "t1orch")
+        .args(["submit", "12", "--agent", "t1rs"])
+        .output()
+        .unwrap();
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queued = state_of(p.hub()).queue.remove(0);
+    let pc_id = MachineId::try_from(p.pc().id.clone()).unwrap();
+    let submitter = queued.submitter.unwrap();
+    assert_eq!(submitter.terminal.0, "t1orch");
+    assert_eq!(submitter.machine, Some(pc_id.clone()));
+    assert_eq!(queued.agent.unwrap().terminal.0, "t1rs");
+    assert_eq!(hub_hc_lookups(&p), 0, "허브는 hc get으로 다시 묻지 않는다");
+}
+
+#[test]
+fn the_hidden_submitter_argument_keeps_quotes_spaces_and_korean_when_given_straight_to_the_hub() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    let submitter = Agent {
+        terminal: TerminalId("t9".into()),
+        created_ms: EpochMs(7),
+        name: Some("한글 이름 \"따옴표\"".into()),
+        workdir: "/w/공백 있는 폴더/x".into(),
+        alive: true,
+        machine: Some(MachineId::try_from(p.pc().id.clone()).unwrap()),
+    };
+    let text = serde_json::to_string(&submitter).unwrap();
+
+    let out = p.hub().chute(
+        BIN,
+        &[
+            "submit",
+            "12",
+            "--head",
+            &p.local_head,
+            "--relayed-agent",
+            "null",
+            "--relayed-submitter",
+            &text,
+        ],
+    );
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert_eq!(state_of(p.hub()).queue[0].submitter, Some(submitter));
+}
+
+#[test]
+fn a_submit_from_another_pc_without_an_agent_flag_looks_the_terminal_up_once_for_agent_and_submitter()
+ {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+
+    let out = p
+        .pc()
+        .sb
+        .command(BIN)
+        .current_dir(p.pc().repo.path())
+        .env("HC_TERMINAL_ID", "t1rs")
+        .args(["submit", "12"])
+        .output()
+        .unwrap();
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let lookups = p
+        .pc()
+        .sb
+        .fake("hc")
+        .calls()
+        .into_iter()
+        .filter(|c| c.first().is_some_and(|v| v == "get"))
+        .count();
+    assert_eq!(lookups, 1);
+    let queued = state_of(p.hub()).queue.remove(0);
+    assert!(queued.submitter.is_some());
+    assert_eq!(queued.submitter, queued.agent);
 }
