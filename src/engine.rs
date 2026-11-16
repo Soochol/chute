@@ -1123,6 +1123,7 @@ impl Run<'_> {
             &log_dir,
             &Options {
                 cancel: engine.cancel.clone(),
+                cache_dir: Some(engine.gitops.cache_dir()),
                 on_step: Some(&on_step),
                 ..Options::default()
             },

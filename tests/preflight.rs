@@ -416,6 +416,59 @@ fn a_busy_batch_slot_does_not_stop_a_preflight_and_two_can_run_at_once() {
     }
 }
 
+#[test]
+fn preflight_waits_for_a_free_slot_when_max_parallel_are_held_and_says_so_once() {
+    let w = World::with_config(Some(format!(
+        "max_parallel = 1\n{}",
+        config("test -d \"$CHUTE_CACHE_DIR\"")
+    )));
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let held = hold_slot(&w, chute::gitops::SlotName::Preflight(1));
+
+    let mut command = w.sb.command(env!("CARGO_BIN_EXE_chute"));
+    let mut child = command
+        .current_dir(w.repo.path())
+        .arg("preflight")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let _ = tx.send(line.unwrap());
+        }
+    });
+    let notice = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+    assert_eq!(notice, "다른 preflight 1개가 돌고 있어 기다린다");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert!(child.try_wait().unwrap().is_none(), "슬롯이 없는데 끝났다");
+
+    drop(held);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    let rest: Vec<String> = rx.try_iter().collect();
+    assert!(status.success(), "{rest:?}");
+    let repeats = rest.iter().filter(|line| line.contains("기다린다")).count();
+    assert_eq!(repeats, 0, "기다림 메시지가 두 번 나왔다: {rest:?}");
+}
+
+fn hold_slot(w: &World, name: chute::gitops::SlotName) -> chute::gitops::SlotLock {
+    let home = chute::store::Home::at(w.sb.chute_home());
+    let ext = chute::ext::Ext::from_vars(|key| w.sb.var(key));
+    let info = home
+        .repo(&"acme/widget".to_owned().try_into().unwrap())
+        .info()
+        .unwrap()
+        .unwrap();
+    chute::gitops::Gitops::new(&ext, &home, &info)
+        .lock_slot(name)
+        .unwrap()
+        .expect("슬롯을 잡지 못했다")
+}
+
 fn hold_batch_slot(w: &World) -> chute::gitops::SlotLock {
     let home = chute::store::Home::at(w.sb.chute_home());
     let ext = chute::ext::Ext::from_vars(|key| w.sb.var(key));
