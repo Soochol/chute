@@ -57,6 +57,8 @@ pub enum Command {
     Events(cmd::events::Args),
     /// 흔들린 시험의 장부: 시험마다 횟수, 마지막 시각, 근거, 만성 여부. 허브가 다른 PC면 허브의 것을 보인다
     Flaky(cmd::flaky::Args),
+    /// 오래된 로그, 보고서, 실패 트리 참조와 남는 preflight 슬롯을 지운다. 이 PC만 다룬다
+    Gc(cmd::gc::Args),
     /// batch를 되돌린다. 허브에서만 실행하고 다른 PC에서는 허브에서 실행할 명령을 알려 준다
     Revert(cmd::revert::Args),
     /// mod와 Codex 스킬 파일을 설치한다
@@ -128,6 +130,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Batches(args) => cmd::batches::run(args, ctx),
         Command::Events(args) => cmd::events::run(args, ctx),
         Command::Flaky(args) => cmd::flaky::run(args, ctx),
+        Command::Gc(args) => cmd::gc::run(args, ctx),
         Command::Revert(args) => cmd::revert::run(args, ctx),
         Command::Hub(args) => cmd::hub::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use chute::model::{ItemState, PrNumber, Sha, State};
-use queue_kit::{World, item};
+use queue_kit::{World, item, stderr};
 use serde_json::Value;
 
 fn config(run: &str) -> String {
@@ -562,7 +562,7 @@ fn failures_of_branches_with_similar_names_keep_their_own_refs() {
 }
 
 #[test]
-fn failed_refs_older_than_a_week_are_removed_and_fresh_ones_stay() {
+fn failed_refs_older_than_the_report_retention_are_removed_and_fresh_ones_stay() {
     let w = world("true");
     let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
     let now_ms = std::time::SystemTime::now()
@@ -1002,4 +1002,71 @@ mod remote {
         let kept: Vec<String> = hub_state(net.node("a")).preflights.into_keys().collect();
         assert_eq!(kept, ["feat/skew", "old/keep"]);
     }
+}
+
+fn plant_old_log(w: &World, name: &str) -> PathBuf {
+    let dir = w.store().dir().join("preflight").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.log"), "x").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60);
+    fs::File::open(&dir)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    dir
+}
+
+#[test]
+fn preflight_gc_runs_at_the_end_and_not_twice_within_an_hour() {
+    let w = world("true");
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let first = plant_old_log(&w, "old-1");
+
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    assert!(!first.exists(), "정리가 preflight의 끝에서 돌았다");
+    let marker = w.store().dir().join("gc.json");
+    assert!(marker.is_file());
+
+    let second = plant_old_log(&w, "old-2");
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    assert!(second.exists(), "한 시간 안에는 다시 돌지 않는다");
+
+    let two_hours_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        - 2 * 60 * 60 * 1000;
+    fs::write(&marker, format!(r#"{{"at_ms":{two_hours_ago}}}"#)).unwrap();
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    assert!(!second.exists(), "한 시간이 지나면 다시 돈다");
+}
+
+#[test]
+fn preflight_gc_failure_leaves_a_warning_and_the_next_clean_run_removes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world("true");
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let batches = w.store().dir().join("batches");
+    fs::create_dir_all(&batches).unwrap();
+    fs::set_permissions(&batches, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = preflight(&w, &[]);
+    fs::set_permissions(&batches, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        code(&out),
+        0,
+        "정리가 실패해도 preflight는 통과한다: {}",
+        stderr(&out)
+    );
+    let warnings = w.state().warnings;
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.kind == chute::model::WarningKind::Gc),
+        "{warnings:?}"
+    );
+
+    assert_eq!(code(&preflight(&w, &[])), 0);
+    assert!(w.state().warnings.is_empty());
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,10 +37,36 @@ pub const VERIFIED_BASES_KEPT: usize = 100;
 const NO_CHECKS_WARNING_AFTER_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug)]
+pub enum Clock {
+    System,
+    Frozen(Arc<Mutex<Instant>>),
+}
+
+impl Clock {
+    pub fn frozen() -> Clock {
+        Clock::Frozen(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    pub fn advance(&self, by: Duration) {
+        if let Clock::Frozen(now) = self {
+            *now.lock().unwrap_or_else(|e| e.into_inner()) += by;
+        }
+    }
+
+    fn now(&self) -> Instant {
+        match self {
+            Clock::System => Instant::now(),
+            Clock::Frozen(now) => *now.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Timing {
     pub merged_check: Duration,
     pub merged_poll: Duration,
     pub ci_recheck: Duration,
+    pub clock: Clock,
 }
 
 impl Default for Timing {
@@ -49,6 +75,7 @@ impl Default for Timing {
             merged_check: Duration::from_secs(20),
             merged_poll: Duration::from_secs(1),
             ci_recheck: Duration::from_secs(30),
+            clock: Clock::System,
         }
     }
 }
@@ -440,9 +467,9 @@ impl Engine {
             .iter()
             .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
             .filter(|i| {
-                looked
-                    .get(&i.pr)
-                    .is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
+                looked.get(&i.pr).is_none_or(|at| {
+                    self.timing.clock.now().duration_since(*at) >= self.timing.ci_recheck
+                })
             })
             .map(|i| i.pr)
             .collect()
@@ -789,7 +816,9 @@ impl Run<'_> {
         let verdict = ci::read(&engine.ext, &engine.info.path, pr)?;
         let mut looked = engine.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
         match verdict {
-            CiVerdict::Pending | CiVerdict::NoChecks => looked.insert(pr, Instant::now()),
+            CiVerdict::Pending | CiVerdict::NoChecks => {
+                looked.insert(pr, engine.timing.clock.now())
+            }
             CiVerdict::Passed | CiVerdict::Failed(_) => looked.remove(&pr),
         };
         drop(looked);

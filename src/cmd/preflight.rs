@@ -1,18 +1,16 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{Ctx, FORWARD_TIMEOUT, REFUSED, forward_to_hub};
 use crate::config::{Config, DEFAULT_MAX_PARALLEL};
-use crate::ext::Ext;
 use crate::feedback::{self, Feedback, Subject, Written};
-use crate::gitops::{FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, Slot};
+use crate::gc;
+use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
     Blocked, ConflictFile, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty, Partner,
     PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView, StepFailure, VerifyMode,
@@ -20,10 +18,8 @@ use crate::model::{
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
-const KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const LOG_ROOT: &str = "preflight";
+const RECORD_KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHOWN_PATHS: usize = 5;
-const FAILED_REF_STEM: &str = "preflight-";
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -213,7 +209,15 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     if let Err(e) = record(ctx, &store, &target, &report) {
         eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
     }
-    prune(&ctx.ext, &info, &store, &gitops);
+    gc::auto(
+        &gc::Site {
+            ext: &ctx.ext,
+            home: &ctx.home,
+            info: &info,
+            store: &store,
+        },
+        false,
+    );
     Ok(report)
 }
 
@@ -529,18 +533,15 @@ fn step_failure(failed: &verify::Failed, mode: VerifyMode, tree: &Sha) -> Failur
 }
 
 fn failed_ref_name(at: EpochMs, tree: &Sha) -> String {
-    format!("{FAILED_REF_STEM}{}-{tree}", at.0)
-}
-
-fn failed_ref_made_at(name: &str) -> Option<EpochMs> {
-    let rest = name.strip_prefix(FAILED_REF_STEM)?;
-    let (at, _tree) = rest.split_once('-')?;
-    at.parse().ok().map(EpochMs)
+    format!("{}{}-{tree}", gc::PREFLIGHT_REF_STEM, at.0)
 }
 
 fn log_dir(store: &RepoStore, head: &Sha, at: EpochMs) -> Result<PathBuf> {
     let short = &head.as_str()[..head.as_str().len().min(12)];
-    let dir = store.dir().join(LOG_ROOT).join(format!("{short}-{}", at.0));
+    let dir = store
+        .dir()
+        .join(gc::PREFLIGHT_LOG_DIR)
+        .join(format!("{short}-{}", at.0));
     std::path::absolute(&dir)
         .with_context(|| format!("경로를 절대 경로로 바꾸지 못했다: {}", dir.display()))
 }
@@ -631,7 +632,9 @@ fn deliver(ctx: &Ctx, store: &RepoStore, entry: &Recorded) -> Result<()> {
 }
 
 fn write_record(store: &RepoStore, entry: &Recorded) -> Result<()> {
-    let cutoff = EpochMs::now().0.saturating_sub(KEEP_FOR.as_millis() as u64);
+    let cutoff = EpochMs::now()
+        .0
+        .saturating_sub(RECORD_KEEP_FOR.as_millis() as u64);
     store.update(|state| {
         let queued: Vec<String> = state.queue.iter().map(|i| i.branch.clone()).collect();
         state
@@ -642,60 +645,6 @@ fn write_record(store: &RepoStore, entry: &Recorded) -> Result<()> {
             .insert(entry.branch.clone(), entry.record.clone());
         Ok(())
     })
-}
-
-fn prune(ext: &Ext, info: &RepoInfo, store: &RepoStore, gitops: &Gitops) {
-    let logs = store.dir().join(LOG_ROOT);
-    let reports = store.dir().join("reports");
-    for (dir, only_commit_reports) in [(logs, false), (reports, true)] {
-        if let Err(e) = remove_old(&dir, only_commit_reports) {
-            eprintln!("경고: 오래된 기록을 지우지 못했다 ({}): {e}", dir.display());
-        }
-    }
-    if let Err(e) = remove_old_failed_refs(ext, info, gitops, EpochMs::now()) {
-        eprintln!("경고: 오래된 실패 트리 참조를 지우지 못했다: {e:#}");
-    }
-}
-
-fn remove_old_failed_refs(ext: &Ext, info: &RepoInfo, gitops: &Gitops, now: EpochMs) -> Result<()> {
-    let pattern = format!("{FAILED_REF_PREFIX}{FAILED_REF_STEM}*");
-    let listed = ext
-        .git(
-            &info.path,
-            ["for-each-ref", "--format=%(refname)", pattern.as_str()],
-        )?
-        .ok()?;
-    let cutoff = now.0.saturating_sub(KEEP_FOR.as_millis() as u64);
-    for full in listed.lines() {
-        let Some(name) = full.strip_prefix(FAILED_REF_PREFIX) else {
-            continue;
-        };
-        if failed_ref_made_at(name).is_some_and(|made| made.0 < cutoff) {
-            gitops.delete_failed_ref(name)?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_old(dir: &Path, only_commit_reports: bool) -> io::Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if only_commit_reports && !entry.file_name().to_string_lossy().starts_with("commit-") {
-            continue;
-        }
-        let age = SystemTime::now()
-            .duration_since(entry.metadata()?.modified()?)
-            .unwrap_or_default();
-        if age > KEEP_FOR {
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 fn blocked_notice(blocked: &Blocked) -> String {
@@ -796,9 +745,7 @@ mod tests {
         let tree = sha("0123456789abcdef0123456789abcdef01234567");
         let name = failed_ref_name(EpochMs(1700), &tree);
         assert_eq!(name, format!("preflight-1700-{tree}"));
-        assert_eq!(failed_ref_made_at(&name), Some(EpochMs(1700)));
-        assert_eq!(failed_ref_made_at("preflight-x-abc"), None);
-        assert_eq!(failed_ref_made_at("other-1700-abc"), None);
+        assert_eq!(gc::preflight_ref_made_at(&name), Some(EpochMs(1700)));
     }
 
     #[test]
@@ -837,28 +784,5 @@ mod tests {
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some("검증 실패(단독): test 단계"));
         assert_eq!(lines.next(), Some("보고서: /s/reports/commit-x/1.md"));
-    }
-
-    #[test]
-    fn old_directories_go_and_recent_ones_stay() {
-        let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("commit-old");
-        let new = dir.path().join("commit-new");
-        let other = dir.path().join("pr-1");
-        for path in [&old, &new, &other] {
-            fs::create_dir_all(path).unwrap();
-        }
-        let long_ago = SystemTime::now() - KEEP_FOR - Duration::from_secs(60);
-        for path in [&old, &other] {
-            fs::File::open(path)
-                .unwrap()
-                .set_modified(long_ago)
-                .unwrap();
-        }
-        remove_old(dir.path(), true).unwrap();
-        assert!(!old.exists());
-        assert!(new.exists());
-        assert!(other.exists(), "PR 보고서는 건드리지 않는다");
-        remove_old(&dir.path().join("none"), false).unwrap();
     }
 }
