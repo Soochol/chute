@@ -64,19 +64,19 @@ pub fn acquire(home: &Path, cancel: &Cancel, on_wait: Option<&dyn Fn(Wait)>) -> 
     if let Some(on_wait) = on_wait {
         on_wait(Wait::Begin { running: max });
     }
-    let slot = loop {
+    let waited = (|| loop {
         if cancel.is_cancelled() {
-            break Slot::Cancelled;
+            return Ok(Slot::Cancelled);
         }
         thread::sleep(POLL);
         if let Some(file) = try_any(&dir, max)? {
-            break Slot::Held(file);
+            return Ok(Slot::Held(file));
         }
-    };
+    })();
     if let Some(on_wait) = on_wait {
         on_wait(Wait::End);
     }
-    Ok(slot)
+    waited
 }
 
 fn try_any(dir: &Path, max: u32) -> Result<Option<File>> {

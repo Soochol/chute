@@ -354,6 +354,29 @@ mod pc_slots {
     }
 
     #[test]
+    fn a_wait_that_fails_still_reports_its_end() {
+        let (dir, home) = home_with(Some("max_verify = 1\n"));
+        let _held = take(&home);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let waiter = {
+            let (root, events) = (dir.path().to_owned(), Arc::clone(&events));
+            thread::spawn(move || {
+                let note = |wait: Wait| events.lock().unwrap().push(wait);
+                pc_limit::acquire(&root, &Cancel::new(), Some(&note))
+            })
+        };
+        wait_until("the wait never began", || {
+            !events.lock().unwrap().is_empty()
+        });
+        fs::remove_dir_all(dir.path().join("machine")).unwrap();
+        assert!(waiter.join().unwrap().is_err());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [Wait::Begin { running: 1 }, Wait::End]
+        );
+    }
+
+    #[test]
     fn a_free_slot_is_taken_without_any_wait_notice() {
         let (dir, home) = home_with(Some("max_verify = 2\n"));
         let _held = take(&home);

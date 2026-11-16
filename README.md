@@ -348,7 +348,7 @@ chute는 `origin`이라는 이름을 고정해 쓰지 않는다. 관리하는 �
 max_verify = 3
 ```
 
-batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을 띄우기 전에 `$CHUTE_HOME/machine/verify-<k>.lock` 가운데 빈 것 하나를 잡고 끝나면 놓는다. 모두 잡혀 있으면 자리가 날 때까지 기다린다. `serialize = true`인 저장소는 저장소의 `verify.lock`을 먼저 잡고 PC 자리를 나중에 잡는다. preflight는 기다리기 시작할 때 stderr에 `이 PC에서 검증 N개가 돌고 있어 기다린다`를 한 번 쓴다. 데몬의 batch는 `chute status`에 `PC 자리를 기다리는 중`으로 보이고 `--json`의 `batch.waiting_machine`이 `true`가 된다. 모르는 키나 0 같은 틀린 값은 그 파일 경로를 적은 오류다. 이 상한은 chute의 검증만 센다. chute 밖에서 도는 프로세스는 세지 않는다.
+batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을 띄우기 전에 `$CHUTE_HOME/machine/verify-<k>.lock` 가운데 빈 것 하나를 잡고 끝나면 놓는다. 모두 잡혀 있으면 자리가 날 때까지 기다린다. `serialize = true`인 저장소는 저장소의 `verify.lock`을 먼저 잡고 PC 자리를 나중에 잡는다. preflight는 기다리기 시작할 때 stderr에 `이 PC에서 검증 N개가 돌고 있어 기다린다`를 한 번 쓴다. 데몬의 batch는 `chute status`에 `PC 자리를 기다리는 중`으로 보이고 `--json`의 `batch.waiting_machine`이 `true`가 된다. 모르는 키나 0 같은 틀린 값은 그 파일 경로를 적은 오류다. 이 상한은 chute의 검증만 센다. chute 밖에서 도는 프로세스는 세지 않는다. `max_verify`를 줄이면 옛 값으로 시작한 검증이 끝날 때까지는 새 값을 넘어 돌 수 있다. 다음 검증부터 새 값을 지킨다.
 
 ## 사람이 하는 일
 
