@@ -18,8 +18,9 @@ use crate::hub::{ForwardErrorKind, exec_on_input};
 use crate::machine::{self, Machine};
 use crate::model::{
     Agent, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner, PrNumber,
-    QueueItem, RepoInfo, Sha, StepFailure, TerminalId, VerifyMode,
+    QueueItem, RepoInfo, Sha, Slug, StepFailure, TerminalId, VerifyMode,
 };
+use crate::repo;
 use crate::store::RepoStore;
 
 mod parcel;
@@ -1439,11 +1440,20 @@ impl Feedback<'_> {
         let cwd = self
             .workdir(item)
             .map_err(|e| Unreachable::Failed(format!("{e:#}")))?;
+        let (fetch, push) = match self.pr_remote(item.pr, &cwd) {
+            Some(remote) => (
+                format!("`git fetch {remote}`과 `git status`로"),
+                format!("`git push -u {remote} <브랜치>`로"),
+            ),
+            None => (
+                "PR 브랜치가 있는 원격에서 fetch하고 `git status`로".to_owned(),
+                "PR 브랜치가 있는 원격으로".to_owned(),
+            ),
+        };
         let task = format!(
-            "너는 chute(머지 큐)가 돌려보낸 PR의 담당 에이전트다. PR: {}, 브랜치: {}. 지금 폴더가 그 브랜치의 worktree다. 먼저 `git fetch {remote}`과 `git status`로 이 폴더가 PR의 최신 HEAD인지 본다. push는 `git push -u {remote} <브랜치>`로 한다. chute 사용법은 `chute --skill`로 읽는다. {line}",
+            "너는 chute(머지 큐)가 돌려보낸 PR의 담당 에이전트다. PR: {}, 브랜치: {}. 지금 폴더가 그 브랜치의 worktree다. 먼저 {fetch} 이 폴더가 PR의 최신 HEAD인지 본다. push는 {push} 한다. chute 사용법은 `chute --skill`로 읽는다. {line}",
             item.pr,
             code_span(&item.branch),
-            remote = self.repo.remote_name
         );
         let (name, out) = match self.run_with_free_name(item.pr, &cwd, task)? {
             Started::Launched { name, out } => (name, out),
@@ -1500,6 +1510,56 @@ impl Feedback<'_> {
             alive: true,
             machine: None,
         }))
+    }
+
+    /// The remote that holds the PR branch: the one whose repository is the PR's head
+    /// repository. A fork checkout keeps the fork as `origin`, not the managed remote.
+    fn pr_remote(&self, pr: PrNumber, cwd: &Path) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Owner {
+            login: String,
+        }
+        #[derive(Deserialize)]
+        struct Head {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct View {
+            head_repository_owner: Owner,
+            head_repository: Head,
+        }
+        let text = self
+            .ext
+            .gh(
+                cwd,
+                [
+                    "pr",
+                    "view",
+                    &pr.0.to_string(),
+                    "--json",
+                    "headRepositoryOwner,headRepository",
+                ],
+            )
+            .ok()?
+            .ok()
+            .ok()?;
+        let view: View = serde_json::from_str(&text).ok()?;
+        let head = Slug::new(
+            &view.head_repository_owner.login,
+            &view.head_repository.name,
+        )
+        .ok()?;
+        let mut holders = repo::remotes(self.ext, cwd)
+            .ok()?
+            .into_iter()
+            .filter(|r| r.slug.same_repo(&head));
+        let first = holders.next()?;
+        let managed = self.repo.remote_name.as_str();
+        if first.name == managed {
+            return Some(first.name);
+        }
+        Some(holders.find(|r| r.name == managed).unwrap_or(first).name)
     }
 
     fn run_with_free_name(
