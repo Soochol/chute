@@ -4,12 +4,13 @@ mod support;
 use std::process::Output;
 
 use chute::model::{
-    Agent, BounceReason, EpochMs, HumanReason, ItemState, PrNumber, PreflightRecord,
-    PreflightResult, Sha, State, TerminalId,
+    Agent, BounceReason, EpochMs, HumanReason, ItemState, MachineId, PrNumber, PreflightRecord,
+    PreflightResult, Sha, Slug, State, TerminalId,
 };
+use chute::store::Home;
 use queue_kit::{World, item, stderr};
 use serde_json::{Value, json};
-use support::Reply;
+use support::{Net, Node, Reply};
 
 const HEAD: &str = "12e5678";
 const OLD_HEAD: &str = "0d0d0d0";
@@ -164,7 +165,7 @@ fn trust_mode_queues_the_pr_and_records_its_head_and_agent() {
             name: Some("impl-a".into()),
             workdir: "/w/impl-a".into(),
             alive: true,
-            machine: None,
+            machine: Some(MachineId::try_from(support::SANDBOX_MACHINE_ID.to_owned()).unwrap()),
         })
     );
     assert_eq!((item.attempts, item.touches_config), (0, false));
@@ -1024,4 +1025,355 @@ fn a_daemon_that_cannot_be_started_only_warns_and_the_submit_succeeds() {
         stderr(&out)
     );
     assert!(w.entry(12).is_some());
+}
+
+#[test]
+fn the_hub_can_pin_the_head_it_submits_and_takes_a_short_sha() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let wrong = submit(&w, &["12", "--head", OLD_HEAD]);
+    assert_eq!(code(&wrong), Some(1));
+    let message = stderr(&wrong);
+    assert!(
+        message.contains("push하지 않은 커밋") && message.contains(HEAD),
+        "{message}"
+    );
+    assert!(w.state().queue.is_empty());
+
+    let too_short = submit(&w, &["12", "--head", "12e567"]);
+    assert_eq!(code(&too_short), Some(2), "{}", stderr(&too_short));
+    assert!(w.state().queue.is_empty());
+
+    let full = format!("{HEAD}{}", "0".repeat(33));
+    assert_eq!(code(&submit(&w, &["12", "--head", &full])), Some(1));
+    assert!(w.state().queue.is_empty());
+
+    assert_eq!(code(&submit(&w, &["12", "--head", HEAD])), Some(0));
+    assert_eq!(w.state().queue[0].head, sha(HEAD));
+}
+
+#[test]
+fn a_short_head_matches_the_full_sha_github_returns() {
+    let w = World::new();
+    let full = format!("{HEAD}{}", "a".repeat(33));
+    gh_pr(&w, Some(12), pr(12, &full));
+
+    assert_eq!(code(&submit(&w, &["12", "--head", HEAD])), Some(0));
+    assert_eq!(w.state().queue[0].head, sha(&full));
+}
+
+#[test]
+fn a_hub_never_asks_hc_again_when_the_other_pc_found_no_agent() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    hc_knows_impl_a(&w, "t1rs");
+
+    let out = w.chute_with_env(
+        w.repo.path(),
+        &["submit", "12", "--relayed-agent", "null"],
+        &[("HC_TERMINAL_ID", "t1rs")],
+    );
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert_eq!(w.state().queue[0].agent, None);
+    assert!(hc_lookups(&w).is_empty());
+}
+
+#[test]
+fn no_agent_means_no_machine_id_lookup_and_no_machine_warning() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    w.sb.fake("hc").clear_rules().respond(
+        "server status --json",
+        Reply::ok("").code(1).stderr("core down"),
+    );
+
+    let out = submit(&w, &["12"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("머신 id"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_hub_that_cannot_name_this_pc_still_submits_and_leaves_the_machine_empty() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    w.sb.fake("hc").clear_rules().respond(
+        "server status --json",
+        Reply::ok("").code(1).stderr("core down"),
+    );
+    hc_knows_impl_a(&w, "t1rs");
+
+    let out = submit(&w, &["12", "--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("머신 id를 읽지 못했다"),
+        "{}",
+        stderr(&out)
+    );
+    let agent = w.state().queue[0].agent.clone().unwrap();
+    assert_eq!((agent.terminal.0.as_str(), agent.machine), ("t1rs", None));
+}
+
+const SLUG: &str = "acme/widget";
+const BIN: &str = env!("CARGO_BIN_EXE_chute");
+const AGENT_NAME: &str = "구현 에이전트 a";
+const AGENT_DIR: &str = "/w/내 작업 폴더/impl a";
+
+struct Pair {
+    net: Net,
+    local_head: String,
+}
+
+impl Pair {
+    fn hub(&self) -> &Node {
+        self.net.node("hub")
+    }
+
+    fn pc(&self) -> &Node {
+        self.net.node("pc")
+    }
+}
+
+fn state_of(node: &Node) -> State {
+    let slug = Slug::try_from(SLUG.to_owned()).unwrap();
+    Home::at(node.sb.chute_home()).repo(&slug).load().unwrap()
+}
+
+fn state_bytes(node: &Node) -> Option<Vec<u8>> {
+    let dir = node.sb.chute_home().join("repos/acme__widget");
+    std::fs::read(dir.join("state.json")).ok()
+}
+
+fn gh_view(node: &Node, number: u64, reply: Value) {
+    node.sb.fake("gh").respond(
+        &format!("pr view {number} --json *"),
+        Reply::ok(reply.to_string()),
+    );
+}
+
+fn pair() -> Pair {
+    let net = Net::new(SLUG, &["hub", "pc"], BIN);
+    let (hub, pc) = (net.node("hub"), net.node("pc"));
+    hub.repo.commit_file(
+        chute::config::FILE_NAME,
+        &chute::config::draft("true"),
+        "chore: chute 설정",
+    );
+    hub.repo.git(&["push", "--quiet", "origin", "main"]);
+    pc.repo.git(&["pull", "--quiet", "origin", "main"]);
+    for node in &net.nodes {
+        let out = node.chute(BIN, &["init"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    net.connect_all();
+    let hub_id = MachineId::try_from(hub.id.clone()).unwrap();
+    let slug = Slug::try_from(SLUG.to_owned()).unwrap();
+    Home::at(pc.sb.chute_home())
+        .repo(&slug)
+        .set_hub(hub_id)
+        .unwrap();
+    let local_head =
+        pc.repo
+            .commit_file("src/a.rs", "fn a() {}\n", "feat: 아직 push하지 않은 커밋");
+    pc.sb.fake("hc").respond(
+        "get --json t1rs",
+        terminal("t1rs", AGENT_NAME, 1763188200000, AGENT_DIR),
+    );
+    Pair { net, local_head }
+}
+
+fn both_see_pr(pair: &Pair, head: &str) {
+    for node in &pair.net.nodes {
+        gh_view(node, 12, pr(12, head));
+    }
+}
+
+fn pc_submit(pair: &Pair, args: &[&str]) -> Output {
+    let argv = [&["submit", "12"][..], args].concat();
+    pair.pc().chute(BIN, &argv)
+}
+
+fn hub_hc_lookups(pair: &Pair) -> usize {
+    pair.hub()
+        .sb
+        .fake("hc")
+        .calls()
+        .iter()
+        .filter(|call| call.first().is_some_and(|verb| verb == "get"))
+        .count()
+}
+
+#[test]
+fn a_submit_from_another_pc_lands_in_the_hubs_queue_with_the_agent_read_on_that_pc() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    let before = state_bytes(p.pc());
+
+    let out = pc_submit(&p, &["--agent", "t1rs", "--json"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["pr"], 12);
+    assert_eq!(report["head"], p.local_head);
+    assert_eq!(report["change"], "added");
+
+    let queue = state_of(p.hub()).queue;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].head, sha(&p.local_head));
+    assert_eq!(
+        queue[0].agent,
+        Some(Agent {
+            terminal: TerminalId("t1rs".into()),
+            created_ms: EpochMs(1763188200000),
+            name: Some(AGENT_NAME.into()),
+            workdir: AGENT_DIR.into(),
+            alive: true,
+            machine: Some(MachineId::try_from(p.pc().id.clone()).unwrap()),
+        })
+    );
+    assert_eq!(state_bytes(p.pc()), before);
+    assert_eq!(hub_hc_lookups(&p), 0, "허브는 hc get으로 다시 묻지 않는다");
+}
+
+#[test]
+fn a_submit_from_another_pc_without_an_agent_records_none_and_warns_on_that_pc() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+
+    let out = pc_submit(&p, &[]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("에이전트를 알 수 없다"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(state_of(p.hub()).queue[0].agent, None);
+    assert_eq!(hub_hc_lookups(&p), 0);
+}
+
+#[test]
+fn the_hub_refuses_a_pc_whose_head_is_not_the_one_on_github() {
+    let p = pair();
+    both_see_pr(&p, OLD_HEAD);
+
+    let out = pc_submit(&p, &["--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("push하지 않은 커밋"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(state_of(p.hub()).queue.is_empty());
+    assert!(state_of(p.pc()).queue.is_empty());
+}
+
+#[test]
+fn an_explicit_head_replaces_the_local_one_when_submitting_from_another_pc() {
+    let p = pair();
+    both_see_pr(&p, OLD_HEAD);
+
+    let wrong = pc_submit(&p, &["--agent", "t1rs", "--head", &p.local_head[..9]]);
+    assert_eq!(code(&wrong), Some(1), "{}", stderr(&wrong));
+    assert!(state_of(p.hub()).queue.is_empty());
+
+    let right = pc_submit(&p, &["--agent", "t1rs", "--head", OLD_HEAD]);
+    assert_eq!(code(&right), Some(0), "{}", stderr(&right));
+    assert_eq!(state_of(p.hub()).queue[0].head, sha(OLD_HEAD));
+}
+
+#[test]
+fn the_hub_refuses_an_agent_on_a_pc_it_does_not_know_and_says_how_to_add_it() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    std::fs::write(p.hub().sb.root().join("net/peers"), "").unwrap();
+
+    let out = pc_submit(&p, &["--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("hc machine add"), "{}", stderr(&out));
+    assert!(state_of(p.hub()).queue.is_empty());
+}
+
+#[test]
+fn a_hub_that_is_down_ends_with_exit_code_2_and_no_queue_anywhere_has_the_item() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    p.net.set_state("pc", "hub", "unreachable");
+    let before = state_bytes(p.pc());
+
+    let out = pc_submit(&p, &["--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("기록되지 않았다"), "{}", stderr(&out));
+    assert!(state_of(p.hub()).queue.is_empty());
+    assert_eq!(state_bytes(p.pc()), before);
+    assert!(state_of(p.pc()).queue.is_empty());
+}
+
+#[test]
+fn the_hidden_agent_argument_keeps_quotes_spaces_and_korean_when_given_straight_to_the_hub() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    let agent = Agent {
+        terminal: TerminalId("t9".into()),
+        created_ms: EpochMs(7),
+        name: Some("한글 이름 \"따옴표\"".into()),
+        workdir: "/w/공백 있는 폴더/x".into(),
+        alive: true,
+        machine: Some(MachineId::try_from(p.pc().id.clone()).unwrap()),
+    };
+    let text = serde_json::to_string(&agent).unwrap();
+
+    let out = p.hub().chute(
+        BIN,
+        &[
+            "submit",
+            "12",
+            "--head",
+            &p.local_head,
+            "--relayed-agent",
+            &text,
+        ],
+    );
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert_eq!(state_of(p.hub()).queue[0].agent, Some(agent));
+}
+
+#[test]
+fn an_agent_addressed_through_another_machine_keeps_that_machine_not_the_hubs() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    p.hub().sb.fake("hc").respond(
+        "get --json pc/t1rs",
+        terminal("pc/t1rs", AGENT_NAME, 1763188200000, AGENT_DIR),
+    );
+
+    let out = p.hub().chute(
+        BIN,
+        &[
+            "submit",
+            "12",
+            "--head",
+            &p.local_head,
+            "--agent",
+            "pc/t1rs",
+        ],
+    );
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let agent = state_of(p.hub()).queue[0].agent.clone().unwrap();
+    assert_eq!(
+        agent.machine,
+        Some(MachineId::try_from(p.pc().id.clone()).unwrap())
+    );
 }
