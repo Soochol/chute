@@ -4,8 +4,8 @@ mod support;
 use std::process::Output;
 
 use chute::model::{
-    Agent, BounceReason, EpochMs, HumanReason, ItemState, MachineId, PrNumber, PreflightRecord,
-    PreflightResult, Sha, Slug, State, TerminalId,
+    Agent, BounceReason, EpochMs, EventKind, HumanReason, ItemState, MachineId, PrNumber,
+    PreflightRecord, PreflightResult, Sha, Slug, State, TerminalId,
 };
 use chute::store::Home;
 use queue_kit::{World, item, stderr};
@@ -1171,13 +1171,14 @@ fn gh_view(node: &Node, number: u64, reply: Value) {
 }
 
 fn pair() -> Pair {
+    pair_with_config(&chute::config::draft("true"))
+}
+
+fn pair_with_config(config: &str) -> Pair {
     let net = Net::new(SLUG, &["hub", "pc"], BIN);
     let (hub, pc) = (net.node("hub"), net.node("pc"));
-    hub.repo.commit_file(
-        chute::config::FILE_NAME,
-        &chute::config::draft("true"),
-        "chore: chute 설정",
-    );
+    hub.repo
+        .commit_file(chute::config::FILE_NAME, config, "chore: chute 설정");
     hub.repo.git(&["push", "--quiet", "origin", "main"]);
     pc.repo.git(&["pull", "--quiet", "origin", "main"]);
     for node in &net.nodes {
@@ -1569,4 +1570,244 @@ fn a_submit_from_another_pc_without_an_agent_flag_looks_the_terminal_up_once_for
     let queued = state_of(p.hub()).queue.remove(0);
     assert!(queued.submitter.is_some());
     assert_eq!(queued.submitter, queued.agent);
+}
+
+fn requiring_head() -> String {
+    let draft = chute::config::draft("true");
+    assert!(draft.contains("require_head = false"));
+    draft.replace("require_head = false", "require_head = true")
+}
+
+#[test]
+fn require_head_refuses_a_submit_without_head_and_takes_one_with_it() {
+    let w = World::with_config(Some(requiring_head()));
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("확인한 HEAD(`--head`) 없이 submit을 받지 않는다"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("PR과 HEAD를 보고한다"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(w.state().queue.is_empty());
+
+    assert_eq!(code(&submit(&w, &["12", "--head", HEAD])), Some(0));
+    assert_eq!(w.state().queue[0].head, sha(HEAD));
+}
+
+#[test]
+fn require_head_off_still_takes_a_submit_without_head() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    assert_eq!(code(&submit(&w, &["12"])), Some(0));
+    assert_eq!(w.state().queue.len(), 1);
+}
+
+#[test]
+fn require_head_refuses_a_submit_from_another_pc_that_gave_no_head() {
+    let p = pair_with_config(&requiring_head());
+    both_see_pr(&p, &p.local_head);
+
+    let out = pc_submit(&p, &["--agent", "t1rs"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("확인한 HEAD(`--head`) 없이 submit을 받지 않는다"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(state_of(p.hub()).queue.is_empty());
+
+    let given = pc_submit(&p, &["--agent", "t1rs", "--head", &p.local_head]);
+    assert_eq!(code(&given), Some(0), "{}", stderr(&given));
+    assert_eq!(state_of(p.hub()).queue.len(), 1);
+}
+
+#[test]
+fn submit_priority_marks_the_item_and_a_second_submit_can_clear_it() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let first = w.ok(w.repo.path(), &["submit", "12", "--priority", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&first).unwrap()["change"],
+        "added"
+    );
+    assert!(w.state().queue[0].priority);
+
+    let same = w.ok(w.repo.path(), &["submit", "12", "--priority", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&same).unwrap()["change"],
+        "unchanged"
+    );
+
+    let cleared = w.ok(w.repo.path(), &["submit", "12", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&cleared).unwrap()["change"],
+        "options_updated"
+    );
+    assert!(!w.state().queue[0].priority);
+}
+
+#[test]
+fn submit_records_a_submitted_event_only_when_it_changes_the_queue() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    submit(&w, &["12", "--priority"]);
+    submit(&w, &["12", "--priority"]);
+    submit(&w, &["12"]);
+
+    let events: Vec<_> = w
+        .store()
+        .history()
+        .unwrap()
+        .events
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    let priorities: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventKind::Submitted {
+                pr: PrNumber(12),
+                priority,
+                after,
+                repair: false,
+                ..
+            } if after.is_empty() => Some(*priority),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(priorities, [true, false]);
+}
+
+#[test]
+fn submit_priority_from_another_pc_reaches_the_hub() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+
+    let out = pc_submit(&p, &["--agent", "t1rs", "--priority"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(state_of(p.hub()).queue[0].priority);
+}
+
+fn queued_with_after(w: &World, pr: u64, after: &[u64]) {
+    let mut queued = item(pr, ItemState::Queued(None));
+    queued.after = after.iter().map(|n| PrNumber(*n)).collect();
+    w.seed(vec![queued]);
+}
+
+#[test]
+fn submit_after_a_queued_pr_holds_the_item_behind_it() {
+    let w = World::new();
+    w.seed(vec![item(1, ItemState::Queued(None))]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12", "--after", "1", "--after", "#1"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queue = w.state().queue;
+    assert_eq!(queue[1].pr, PrNumber(12));
+    assert_eq!(queue[1].after, [PrNumber(1)]);
+    assert_eq!(queue[1].state, ItemState::Queued(None));
+}
+
+#[test]
+fn submit_after_a_pr_already_merged_on_github_is_taken_without_a_mark() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    gh_pr(&w, Some(7), json!({"state": "MERGED"}));
+
+    let out = submit(&w, &["12", "--after", "7"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(w.state().queue[0].after.is_empty());
+}
+
+#[test]
+fn submit_after_a_pr_that_is_neither_queued_nor_merged_is_refused() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    gh_pr(&w, Some(9), json!({"state": "OPEN"}));
+    w.sb.fake("gh").respond(
+        "pr view 8 --json *",
+        Reply::ok("").code(1).stderr(
+            "GraphQL: Could not resolve to a PullRequest with the number of 8. (repository.pullRequest)",
+        ),
+    );
+
+    for n in ["9", "8"] {
+        let out = submit(&w, &["12", "--after", n]);
+        assert_eq!(code(&out), Some(1), "{n}: {}", stderr(&out));
+        assert!(stderr(&out).contains("--after"), "{}", stderr(&out));
+    }
+    assert!(w.state().queue.is_empty());
+}
+
+#[test]
+fn submit_after_itself_or_a_pr_that_waits_for_it_is_refused() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let itself = submit(&w, &["12", "--after", "12"]);
+    assert_eq!(code(&itself), Some(1), "{}", stderr(&itself));
+    assert!(stderr(&itself).contains("자기 자신"), "{}", stderr(&itself));
+
+    queued_with_after(&w, 1, &[12]);
+    let cycle = submit(&w, &["12", "--after", "1"]);
+    assert_eq!(code(&cycle), Some(1), "{}", stderr(&cycle));
+    assert!(
+        stderr(&cycle).contains("서로 기다리게"),
+        "{}",
+        stderr(&cycle)
+    );
+    assert_eq!(w.state().queue.len(), 1);
+}
+
+#[test]
+fn submit_after_changes_on_the_same_head_and_empties_without_the_flag() {
+    let w = World::new();
+    w.seed(vec![
+        item(1, ItemState::Queued(None)),
+        item(2, ItemState::Queued(None)),
+    ]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    submit(&w, &["12", "--after", "1"]);
+    let moved = w.ok(w.repo.path(), &["submit", "12", "--after", "2", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&moved).unwrap()["change"],
+        "options_updated"
+    );
+    assert_eq!(w.state().queue[2].after, [PrNumber(2)]);
+
+    submit(&w, &["12"]);
+    assert!(w.state().queue[2].after.is_empty());
+}
+
+#[test]
+fn submit_after_with_gh_down_is_an_error_and_not_a_refusal() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    w.sb.fake("gh").respond(
+        "pr view 8 --json *",
+        Reply::ok("")
+            .code(1)
+            .stderr("error connecting to api.github.com\nCould not resolve host: api.github.com"),
+    );
+
+    let out = submit(&w, &["12", "--after", "8"]);
+
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    assert!(w.state().queue.is_empty());
 }

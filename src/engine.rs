@@ -26,7 +26,7 @@ use crate::model::{
     ProbeEvidence, QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning,
     WarningKind,
 };
-use crate::notify::{BounceDelivery, Line, Notifier, mode_of};
+use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
 use crate::queue;
 use crate::store::{Home, RepoStore};
 use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome};
@@ -202,6 +202,45 @@ impl Engine {
         let at_ms = EpochMs::now();
         self.store.append_history(&Event { at_ms, kind })?;
         Ok(at_ms)
+    }
+
+    /// A PR that left the queue without merging through chute may still have been merged on
+    /// GitHub, which satisfies the items waiting for it. An unreadable state fails the pass.
+    fn release_merged_after(&self) -> Result<()> {
+        let state = self.store.load()?;
+        let gone: BTreeSet<PrNumber> = state
+            .queue
+            .iter()
+            .flat_map(|i| i.after.iter().copied())
+            .filter(|n| !state.queue.iter().any(|i| i.pr == *n))
+            .collect();
+        for n in gone {
+            if self.merged_on_github(n)? {
+                self.store.update(|s| {
+                    queue::release_after(s, n);
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merged_on_github(&self, pr: PrNumber) -> Result<bool> {
+        #[derive(serde::Deserialize)]
+        struct Found {
+            state: String,
+        }
+        let text = self
+            .ext
+            .gh(
+                &self.info.path,
+                ["pr", "view", &pr.0.to_string(), "--json", "state"],
+            )?
+            .ok()
+            .with_context(|| format!("{pr}의 상태를 gh로 읽지 못했다"))?;
+        let found: Found =
+            serde_json::from_str(&text).with_context(|| format!("{pr}의 gh 출력을 읽지 못했다"))?;
+        Ok(found.state == "MERGED")
     }
 
     fn notifier(&self) -> Notifier<'_> {
@@ -506,6 +545,7 @@ impl Engine {
     }
 
     pub fn run_once(&self) -> Result<Pass> {
+        self.release_merged_after()?;
         self.prune_no_checks_warnings(None)?;
         let due_waiters = self.due_ci_waiters(&self.store.load()?);
         let waiting = |s: &crate::model::State| {
@@ -566,7 +606,11 @@ impl Engine {
                 .iter()
                 .filter_map(|pr| s.queue.iter().find(|i| i.pr == *pr).cloned())
                 .collect();
-            let position = s.queue.iter().enumerate().map(|(n, i)| (i.pr, n)).collect();
+            let position = queue::batch_order(&s.queue)
+                .into_iter()
+                .enumerate()
+                .map(|(n, pr)| (pr, n))
+                .collect();
             Ok((items, waiting_on_ci, position))
         })?;
         if taken.is_empty() {
@@ -789,7 +833,10 @@ impl Run<'_> {
                     self.engine
                         .store
                         .update(|s| Ok(queue::closed(s, item.pr)?))?;
-                    self.engine.history(EventKind::Closed { pr: item.pr })?;
+                    let at = self.engine.history_at(EventKind::Closed { pr: item.pr })?;
+                    self.engine
+                        .notifier()
+                        .notify_waiters(item.pr, WaitingWhy::Closed, at);
                     self.closed_any = true;
                 }
                 Inspection::Merged { commit } => {
@@ -956,7 +1003,9 @@ impl Run<'_> {
             report: None,
         };
         self.tell_bounce(item, told, &delivery, at);
-        self.note_unreachable(pr, unreachable)
+        let at = self.note_unreachable(pr, unreachable, at)?;
+        self.tell_waiters(pr, at);
+        Ok(())
     }
 
     fn tell_bounce(&self, item: &QueueItem, told: Told<'_>, delivery: &Delivery, at: EpochMs) {
@@ -1016,8 +1065,8 @@ impl Run<'_> {
         Ok((to, unreachable, delivery))
     }
 
-    fn note_unreachable(&self, pr: PrNumber, why: Option<String>) -> Result<()> {
-        let Some(detail) = why else { return Ok(()) };
+    fn note_unreachable(&self, pr: PrNumber, why: Option<String>, at: EpochMs) -> Result<EpochMs> {
+        let Some(detail) = why else { return Ok(at) };
         let at = self.engine.history_at(EventKind::NeedsHuman {
             pr,
             reason: HumanReason::Unreachable,
@@ -1025,7 +1074,21 @@ impl Run<'_> {
         })?;
         self.engine
             .tell_human(&self.items[&pr], HumanReason::Unreachable, detail, at);
-        Ok(())
+        Ok(at)
+    }
+
+    fn tell_waiters(&self, pr: PrNumber, at: EpochMs) {
+        let why = match self
+            .engine
+            .store
+            .load()
+            .map(|s| s.queue.iter().find(|i| i.pr == pr).map(|i| i.state))
+        {
+            Ok(Some(ItemState::Bounced(_))) => WaitingWhy::Bounced,
+            Ok(Some(ItemState::NeedsHuman(_))) => WaitingWhy::Human,
+            _ => return,
+        };
+        self.engine.notifier().notify_waiters(pr, why, at);
     }
 
     fn ensure_env(&mut self) -> Result<()> {
@@ -1083,7 +1146,7 @@ impl Run<'_> {
         self.bounced.push(pr);
         self.conflicted.remove(&pr);
         self.save_record()?;
-        match to {
+        let at = match to {
             ItemState::Bounced(reason) => {
                 let at = engine.history_at(EventKind::Bounced {
                     pr,
@@ -1100,6 +1163,7 @@ impl Run<'_> {
                     };
                     self.tell_bounce(&item, told, delivery, at);
                 }
+                at
             }
             ItemState::NeedsHuman(reason) => {
                 let detail = format!("재시도 예산 {budget}번을 모두 썼다");
@@ -1109,10 +1173,13 @@ impl Run<'_> {
                     detail: Some(detail.clone()),
                 })?;
                 engine.tell_human(&item, reason, detail, at);
+                at
             }
             other => bail!("{pr}의 실패 처리가 뜻밖의 상태로 끝났다: {other:?}"),
-        }
-        self.note_unreachable(pr, unreachable)
+        };
+        let at = self.note_unreachable(pr, unreachable, at)?;
+        self.tell_waiters(pr, at);
+        Ok(())
     }
 
     fn save_record(&mut self) -> Result<()> {

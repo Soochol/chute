@@ -6,7 +6,7 @@ use serde::Deserialize;
 use super::{Ctx, Refusal, finish, run_on_hub};
 use crate::hub::{Route, route};
 use crate::model::{EpochMs, Event, EventKind, HumanReason, PrNumber};
-use crate::notify::{Line, Notifier};
+use crate::notify::{Line, Notifier, WaitingWhy};
 use crate::queue;
 
 #[derive(clap::Args, Debug)]
@@ -77,7 +77,9 @@ fn giveup(args: &Args, ctx: &Ctx) -> Result<()> {
         reason: HumanReason::GaveUp,
         detail: Some(reason.to_owned()),
     };
-    Notifier::new(&ctx.ext, &info, &store).notify(submitter.as_ref(), at_ms, &line);
+    let notifier = Notifier::new(&ctx.ext, &info, &store);
+    notifier.notify(submitter.as_ref(), at_ms, &line);
+    notifier.notify_waiters(pr, WaitingWhy::Human, at_ms);
     println!("사람 차례로 넘겼다: {pr} (포기: {reason})");
     Ok(())
 }

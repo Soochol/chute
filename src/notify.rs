@@ -533,6 +533,24 @@ impl<'a> Notifier<'a> {
         }
     }
 
+    pub fn notify_waiters(&self, held: PrNumber, why: WaitingWhy, at: EpochMs) {
+        let state = match self.store.load() {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("경고: 기다리는 PR에 알릴 큐를 읽지 못했다: {e:#}");
+                return;
+            }
+        };
+        for item in state.queue.iter().filter(|i| i.after.contains(&held)) {
+            let line = Line::Waiting {
+                pr: item.pr,
+                after: held,
+                why,
+            };
+            self.notify(item.submitter.as_ref(), at, &line);
+        }
+    }
+
     pub fn address_of(&self, agent: &Agent) -> TerminalId {
         self.address(agent)
             .unwrap_or_else(|_| agent.terminal.clone())

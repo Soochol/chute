@@ -124,6 +124,15 @@ pub enum TransitionError {
         pr: PrNumber,
         given: String,
     },
+    AfterSelf(PrNumber),
+    AfterCycle {
+        pr: PrNumber,
+        after: PrNumber,
+    },
+    AfterGone {
+        pr: PrNumber,
+        after: PrNumber,
+    },
 }
 
 impl fmt::Display for TransitionError {
@@ -145,6 +154,17 @@ impl fmt::Display for TransitionError {
                     "{pr}: 승인하지 않았다. `--head`는 4자 이상의 16진수 커밋 SHA이고 지금 HEAD보다 길 수 없다. 받은 값: `{shown}{cut}`"
                 )
             }
+            TransitionError::AfterSelf(pr) => {
+                write!(f, "{pr}: 자기 자신 뒤에 둘 수 없다. `--after`에서 뺀다")
+            }
+            TransitionError::AfterGone { pr, after } => write!(
+                f,
+                "{pr}: --after {after}가 그사이 큐에서 빠졌다. 다시 submit한다"
+            ),
+            TransitionError::AfterCycle { pr, after } => write!(
+                f,
+                "{pr}: {after}가 이미 {pr} 뒤에 있어 서로 기다리게 된다. `--after`를 고치거나 {after}를 `--after` 없이 다시 submit한다"
+            ),
         }
     }
 }
@@ -254,6 +274,8 @@ pub struct Submission {
     pub submitter: Option<Agent>,
     pub touches_config: bool,
     pub approval: Approval,
+    pub priority: bool,
+    pub after: Vec<PrNumber>,
     pub now: EpochMs,
 }
 
@@ -280,8 +302,10 @@ pub struct Submitted {
     pub change: Change,
 }
 
-pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionError> {
+pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, TransitionError> {
     let needs_approval = s.needs_approval();
+    let pr = s.pr;
+    s.after = checked_after(state, s.pr, &s.after)?;
     let Some(at) = state.queue.iter().position(|i| i.pr == s.pr) else {
         let entry = entry_state(needs_approval);
         forget_other_heads(&mut state.preflights, &s.branch, &s.head);
@@ -297,13 +321,13 @@ pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionE
             touches_config: s.touches_config,
             last_failure: None,
             submitter: s.submitter,
-            priority: false,
-            after: Vec::new(),
+            priority: s.priority,
+            after: s.after,
             repair: false,
         });
         return Ok(Submitted {
             state: entry,
-            position: place(state.queue.len() - 1),
+            position: place_in_batch_order(&state.queue, pr),
             change: Change::Added,
         });
     };
@@ -321,14 +345,21 @@ pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionE
     if s.submitter.is_some() {
         item.submitter = s.submitter;
     }
+    let options_changed = item.priority != s.priority || !same_set(&item.after, &s.after);
+    item.priority = s.priority;
+    item.after = s.after;
     let change = match (was_bounced, head_changed) {
         (true, _) => Change::Requeued,
         (false, true) => Change::HeadUpdated,
         (false, false) => {
             return Ok(Submitted {
                 state: item.state,
-                position: place(at),
-                change: Change::Unchanged,
+                position: place_in_batch_order(&state.queue, pr),
+                change: if options_changed {
+                    Change::OptionsUpdated
+                } else {
+                    Change::Unchanged
+                },
             });
         }
     };
@@ -342,9 +373,52 @@ pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionE
     }
     Ok(Submitted {
         state: to,
-        position: place(at),
+        position: place_in_batch_order(&state.queue, pr),
         change,
     })
+}
+
+fn checked_after(
+    state: &State,
+    pr: PrNumber,
+    after: &[PrNumber],
+) -> Result<Vec<PrNumber>, TransitionError> {
+    let mut kept: Vec<PrNumber> = Vec::new();
+    for &n in after {
+        if n == pr {
+            return Err(TransitionError::AfterSelf(pr));
+        }
+        if !state.queue.iter().any(|i| i.pr == n) {
+            return Err(TransitionError::AfterGone { pr, after: n });
+        }
+        if waits_for(&state.queue, n, pr) {
+            return Err(TransitionError::AfterCycle { pr, after: n });
+        }
+        if !kept.contains(&n) {
+            kept.push(n);
+        }
+    }
+    Ok(kept)
+}
+
+fn waits_for(queue: &[QueueItem], pr: PrNumber, target: PrNumber) -> bool {
+    let mut seen = vec![pr];
+    let mut todo = vec![pr];
+    while let Some(next) = todo.pop() {
+        let Some(item) = queue.iter().find(|i| i.pr == next) else {
+            continue;
+        };
+        for &n in &item.after {
+            if n == target {
+                return true;
+            }
+            if !seen.contains(&n) {
+                seen.push(n);
+                todo.push(n);
+            }
+        }
+    }
+    false
 }
 
 fn forget_other_heads(
@@ -353,6 +427,19 @@ fn forget_other_heads(
     head: &Sha,
 ) {
     preflights.retain(|b, p| b != branch || &p.head == head);
+}
+
+fn same_set(a: &[PrNumber], b: &[PrNumber]) -> bool {
+    a.len() == b.len() && a.iter().all(|n| b.contains(n))
+}
+
+/// Where `pr` stands in the order a batch takes items.
+fn place_in_batch_order(queue: &[QueueItem], pr: PrNumber) -> NonZeroUsize {
+    let at = batch_order(queue)
+        .iter()
+        .position(|p| *p == pr)
+        .unwrap_or(0);
+    place(at)
 }
 
 fn place(zero_based_index: usize) -> NonZeroUsize {
@@ -405,6 +492,12 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
     move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
 }
 
+pub fn batch_order(queue: &[QueueItem]) -> Vec<PrNumber> {
+    let mut order: Vec<&QueueItem> = queue.iter().collect();
+    order.sort_by_key(|item| !item.priority);
+    order.into_iter().map(|item| item.pr).collect()
+}
+
 pub fn take_batch(
     state: &mut State,
     max_batch: u32,
@@ -412,11 +505,16 @@ pub fn take_batch(
 ) -> Vec<PrNumber> {
     let mut taken = Vec::new();
     let mut others = 0;
+    let order = batch_order(&state.queue);
     for ci_pass in [true, false] {
-        for item in &mut state.queue {
+        for pr in &order {
+            let Some(item) = state.queue.iter_mut().find(|i| i.pr == *pr) else {
+                continue;
+            };
             let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
             let due = !is_waiting || due_waiters.contains(&item.pr);
-            if is_waiting != ci_pass || !due || (!ci_pass && others >= max_batch) {
+            let held = !item.after.is_empty();
+            if is_waiting != ci_pass || !due || held || (!ci_pass && others >= max_batch) {
                 continue;
             }
             if let Some(Next::To(to)) = step(item.state, Action::Take) {
@@ -430,7 +528,16 @@ pub fn take_batch(
 }
 
 pub fn merged(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
-    take_out(state, pr, Action::Merge)
+    let item = take_out(state, pr, Action::Merge)?;
+    release_after(state, pr);
+    Ok(item)
+}
+
+/// Frees every item that waited for `pr`, which is now in the default branch.
+pub fn release_after(state: &mut State, pr: PrNumber) {
+    for waiting in &mut state.queue {
+        waiting.after.retain(|n| *n != pr);
+    }
 }
 
 pub fn closed(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
@@ -762,6 +869,168 @@ mod tests {
         assert_eq!(state_of(&state, 5), QUEUED);
     }
 
+    fn flag(state: &mut State, pr: u64, priority: bool, after: &[u64]) {
+        let item = state
+            .queue
+            .iter_mut()
+            .find(|i| i.pr == PrNumber(pr))
+            .unwrap();
+        item.priority = priority;
+        item.after = after.iter().map(|n| PrNumber(*n)).collect();
+    }
+
+    #[test]
+    fn take_batch_takes_priority_items_first_and_each_group_in_submit_order() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED), (4, QUEUED)]);
+        flag(&mut state, 3, true, &[]);
+        flag(&mut state, 4, true, &[]);
+        assert_eq!(
+            prs(&take_batch(&mut state, 8, &BTreeSet::new())),
+            [3, 4, 1, 2]
+        );
+    }
+
+    #[test]
+    fn max_batch_counts_priority_and_other_items_together() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED), (4, QUEUED)]);
+        flag(&mut state, 4, true, &[]);
+        assert_eq!(prs(&take_batch(&mut state, 2, &BTreeSet::new())), [4, 1]);
+        assert_eq!(state_of(&state, 2), QUEUED);
+        assert_eq!(state_of(&state, 3), QUEUED);
+    }
+
+    #[test]
+    fn a_priority_item_waiting_on_ci_still_waits_for_its_turn_to_be_due() {
+        let mut state = queue_of(&[(1, QUEUED), (2, CI_PENDING)]);
+        flag(&mut state, 2, true, &[]);
+        assert_eq!(prs(&take_batch(&mut state, 8, &BTreeSet::new())), [1]);
+        assert_eq!(state_of(&state, 2), CI_PENDING);
+    }
+
+    #[test]
+    fn an_item_with_after_left_is_not_taken_and_stays_queued() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED)]);
+        flag(&mut state, 2, true, &[1]);
+        assert_eq!(prs(&take_batch(&mut state, 8, &BTreeSet::new())), [1, 3]);
+        assert_eq!(state_of(&state, 2), QUEUED);
+    }
+
+    #[test]
+    fn a_merged_pr_is_removed_from_every_after_and_the_next_batch_takes_the_waiter() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED)]);
+        flag(&mut state, 2, false, &[1]);
+        flag(&mut state, 3, false, &[1, 2]);
+        assert_eq!(prs(&take_batch(&mut state, 8, &BTreeSet::new())), [1]);
+        merged(&mut state, PrNumber(1)).unwrap();
+        assert!(state.queue[1].after == [PrNumber(2)]);
+        assert!(state.queue[0].after.is_empty());
+        assert_eq!(prs(&take_batch(&mut state, 8, &BTreeSet::new())), [2]);
+        merged(&mut state, PrNumber(2)).unwrap();
+        assert_eq!(prs(&take_batch(&mut state, 8, &BTreeSet::new())), [3]);
+    }
+
+    #[test]
+    fn a_dropped_pr_leaves_its_waiters_held() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED)]);
+        flag(&mut state, 2, false, &[1]);
+        drop_item(&mut state, PrNumber(1)).unwrap();
+        assert!(take_batch(&mut state, 8, &BTreeSet::new()).is_empty());
+        assert_eq!(state.queue[0].after, [PrNumber(1)]);
+    }
+
+    fn options(pr: u64, priority: bool, after: &[u64]) -> Submission {
+        Submission {
+            priority,
+            after: after.iter().map(|n| PrNumber(*n)).collect(),
+            ..submission(pr, "abc1234", Approval::Agent, false)
+        }
+    }
+
+    #[test]
+    fn a_new_submission_keeps_its_priority_and_after_and_drops_duplicates() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        let done = submit(&mut state, options(2, true, &[1, 1])).unwrap();
+        assert_eq!(done.change, Change::Added);
+        let item = &state.queue[1];
+        assert!(item.priority);
+        assert_eq!(item.after, [PrNumber(1)]);
+    }
+
+    #[test]
+    fn submitting_the_same_head_again_changes_priority_and_after_and_says_so() {
+        let mut state = queue_of(&[(1, QUEUED), (3, QUEUED)]);
+        submit(&mut state, options(2, false, &[])).unwrap();
+
+        let done = submit(&mut state, options(2, true, &[1])).unwrap();
+        assert_eq!(done.change, Change::OptionsUpdated);
+        assert!(state.queue[2].priority);
+        assert_eq!(state.queue[2].after, [PrNumber(1)]);
+
+        let same = submit(&mut state, options(2, true, &[1])).unwrap();
+        assert_eq!(same.change, Change::Unchanged);
+
+        let swapped = submit(&mut state, options(2, true, &[3])).unwrap();
+        assert_eq!(swapped.change, Change::OptionsUpdated);
+        assert_eq!(state.queue[2].after, [PrNumber(3)]);
+
+        let cleared = submit(&mut state, options(2, false, &[])).unwrap();
+        assert_eq!(cleared.change, Change::OptionsUpdated);
+        assert!(!state.queue[2].priority);
+        assert!(state.queue[2].after.is_empty());
+    }
+
+    #[test]
+    fn an_after_pr_that_left_the_queue_meanwhile_refuses_the_submit() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        assert_eq!(
+            submit(&mut state, options(2, false, &[9])).unwrap_err(),
+            TransitionError::AfterGone {
+                pr: PrNumber(2),
+                after: PrNumber(9)
+            }
+        );
+        assert_eq!(state.queue.len(), 1);
+    }
+
+    #[test]
+    fn the_same_after_set_in_another_order_is_unchanged_and_position_follows_batch_order() {
+        let mut state = queue_of(&[(1, QUEUED), (3, QUEUED)]);
+        submit(&mut state, options(2, false, &[1, 3])).unwrap();
+        let same = submit(&mut state, options(2, false, &[3, 1])).unwrap();
+        assert_eq!(same.change, Change::Unchanged);
+
+        let urgent = submit(&mut state, options(4, true, &[])).unwrap();
+        assert_eq!(urgent.position, place(0));
+    }
+
+    #[test]
+    fn a_pr_cannot_wait_for_itself_or_for_a_pr_that_waits_for_it() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        assert_eq!(
+            submit(&mut state, options(1, false, &[1])).unwrap_err(),
+            TransitionError::AfterSelf(PrNumber(1))
+        );
+        submit(&mut state, options(2, false, &[1])).unwrap();
+        submit(&mut state, options(3, false, &[2])).unwrap();
+        assert_eq!(
+            submit(&mut state, options(1, false, &[3])).unwrap_err(),
+            TransitionError::AfterCycle {
+                pr: PrNumber(1),
+                after: PrNumber(3)
+            }
+        );
+        assert!(state.queue[0].after.is_empty());
+    }
+
+    #[test]
+    fn a_refused_resubmit_leaves_the_options_as_they_were() {
+        let mut state = queue_of(&[(1, QUEUED), (2, IN_BATCH)]);
+        let err = submit(&mut state, options(2, true, &[1])).unwrap_err();
+        assert!(matches!(err, TransitionError::NotAllowed { .. }));
+        assert!(!state.queue[1].priority);
+        assert!(state.queue[1].after.is_empty());
+    }
+
     #[test]
     fn take_batch_takes_queued_prs_and_leaves_every_other_state_alone() {
         let mut state = queue_of(&[
@@ -1051,6 +1320,8 @@ mod tests {
             submitter: None,
             touches_config,
             approval,
+            priority: false,
+            after: Vec::new(),
             now: EpochMs(1000 + pr),
         }
     }
