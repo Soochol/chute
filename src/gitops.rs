@@ -447,19 +447,10 @@ fn failed_ref(name: &str) -> Result<String> {
 fn drop_links_leaving(entry: &Path, slot: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(entry)?;
     if meta.file_type().is_symlink() {
-        let link = fs::read_link(entry)?;
-        let parent = fs::canonicalize(entry.parent().unwrap_or(Path::new("/")))?;
-        let mut resolved = PathBuf::new();
-        for part in parent.join(link).components() {
-            match part {
-                Component::ParentDir => {
-                    resolved.pop();
-                }
-                Component::CurDir => {}
-                other => resolved.push(other),
-            }
-        }
-        if !resolved.starts_with(slot) {
+        // The filesystem resolves the whole chain, `..` after a link included. A link that
+        // does not resolve at all is dropped too.
+        let inside = fs::canonicalize(entry).is_ok_and(|real| real.starts_with(slot));
+        if !inside {
             eprintln!(
                 "경고: 슬롯 밖을 가리키는 링크를 지웠다: {}",
                 entry.display()
@@ -1505,6 +1496,25 @@ mod tests {
         assert!(target.join("a.bin").exists());
         assert!(fs::symlink_metadata(target.join("inside")).is_ok());
         for gone in ["escape", "to-donor"] {
+            assert!(fs::symlink_metadata(target.join(gone)).is_err(), "{gone}");
+        }
+    }
+
+    #[test]
+    fn seed_drops_a_link_that_leaves_the_slot_through_dot_dot_after_another_link() {
+        let w = World::new();
+        let donor = used_slot(&w, SlotName::Preflight(1), &[("target/a.bin", "a")]);
+        let slots = donor.path().parent().unwrap().to_owned();
+        fs::write(slots.join("marker"), "m").unwrap();
+        std::os::unix::fs::symlink("..", donor.path().join("target/d")).unwrap();
+        std::os::unix::fs::symlink("d/../marker", donor.path().join("target/L")).unwrap();
+        std::os::unix::fs::symlink("missing", donor.path().join("target/dangling")).unwrap();
+
+        let fresh = open_seeded(&w, &["target"], SlotName::Preflight(2));
+
+        let target = fresh.path().join("target");
+        assert!(target.join("a.bin").exists());
+        for gone in ["L", "dangling"] {
             assert!(fs::symlink_metadata(target.join(gone)).is_err(), "{gone}");
         }
     }
