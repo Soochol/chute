@@ -388,7 +388,7 @@ chute는 `origin`이라는 이름을 고정해 쓰지 않는다. 관리하는 �
 
 ## 첫 가동 점검
 
-chute는 검증한 batch를 기본 브랜치에 직접 push하고 PR마다 merge commit을 남겨 GitHub이 PR을 Merged로 표시하길 기대한다. **이 가정은 자동 시험으로 확인되지 않았다.** 시험은 가짜 `gh`와 가짜 `hc`, 로컬 bare 원격으로 도는데, 가짜는 GitHub의 판정을 흉내 낼 뿐이다. 실제 저장소에서 처음 쓸 때 다음 절차로 확인한다.
+chute는 검증한 batch를 기본 브랜치에 직접 push하고 PR마다 merge commit을 남겨 GitHub이 PR을 Merged로 표시하길 기대한다. 자동 시험은 가짜 `gh`와 가짜 `hc`, 로컬 bare 원격으로 돌아서 이 가정을 확인하지 못한다. 2026-11-16 Soochol/chute에서 처음 실제로 돌려 확인했다. chute가 push한 #40, #41이 GitHub에서 Merged로 표시됐고, 기준이 깨졌을 때의 대기열 멈춤과 `--repair` 복구도 설계대로 돌았다. 다른 저장소에서 처음 쓸 때도 다음 절차로 확인한다.
 
 1. 실제 저장소에서 `chute init`, 설정 커밋과 push, `chute up`까지 마친다.
 2. 내용이 사소한 PR을 하나 올린다(문서 한 줄 고치기면 충분하다).
