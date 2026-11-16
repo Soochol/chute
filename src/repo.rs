@@ -10,6 +10,7 @@ use crate::model::{RepoInfo, Slug};
 pub struct Remote {
     pub name: String,
     pub url: String,
+    pub push_url: String,
     pub slug: Slug,
 }
 
@@ -65,9 +66,18 @@ pub fn remotes(ext: &Ext, dir: &Path) -> Result<Vec<Remote>> {
         if let Ok(slug) = parse_slug(&url) {
             found.push(Remote {
                 name: name.to_owned(),
+                push_url: url.clone(),
                 url,
                 slug,
             });
+        }
+    }
+    if found.len() > 1 {
+        for remote in &mut found {
+            let push = ext.git(dir, ["remote", "get-url", "--push", &remote.name])?;
+            if push.success() {
+                remote.push_url = push.stdout_text().trim().to_owned();
+            }
         }
     }
     Ok(found)
@@ -113,8 +123,8 @@ pub fn managed<'a>(
 /// Remotes whose normalized URLs are all equal are one repository: `origin` wins, then the
 /// first name in order.
 fn pick_among_same_url<'a>(candidates: &[&'a Remote]) -> Option<&'a Remote> {
-    let first = normalize_url(&candidates.first()?.url);
-    if candidates.iter().any(|r| normalize_url(&r.url) != first) {
+    let first = address(candidates.first()?);
+    if candidates.iter().any(|r| address(r) != first) {
         return None;
     }
     candidates
@@ -123,19 +133,19 @@ fn pick_among_same_url<'a>(candidates: &[&'a Remote]) -> Option<&'a Remote> {
         .min_by_key(|r| (r.name != "origin", r.name.as_str()))
 }
 
-/// The remotes that point at the same URL as `chosen`, `chosen` included, by name.
 pub fn same_url_peers<'a>(remotes: &'a [Remote], chosen: &Remote) -> Vec<&'a Remote> {
-    let url = normalize_url(&chosen.url);
-    let mut peers: Vec<&Remote> = remotes
-        .iter()
-        .filter(|r| normalize_url(&r.url) == url)
-        .collect();
+    let wanted = address(chosen);
+    let mut peers: Vec<&Remote> = remotes.iter().filter(|r| address(r) == wanted).collect();
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     peers
 }
 
+fn address(remote: &Remote) -> (String, String) {
+    (normalize_url(&remote.url), normalize_url(&remote.push_url))
+}
+
 /// Drops scheme, user, `.git`, trailing slashes and the scp-style colon, so ssh and https
-/// forms of one address compare equal. Host names are case-insensitive, local paths are not.
+/// forms of one address compare equal. Hosted addresses are case-insensitive like GitHub, local paths are not.
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
@@ -151,13 +161,13 @@ fn normalize_url(url: &str) -> String {
     if host.is_empty() {
         format!("/{path}")
     } else {
-        format!("{}/{path}", host.to_ascii_lowercase())
+        format!("{host}/{path}").to_ascii_lowercase()
     }
 }
 
 /// The `remote` key of the work tree's chute.toml. Without one there, a key committed on a
 /// remote's default branch counts, so a checkout that lags behind still resolves.
-fn remote_key(ext: &Ext, dir: &Path, tree: &Path, remotes: &[Remote]) -> Option<String> {
+pub fn remote_key(ext: &Ext, dir: &Path, tree: &Path, remotes: &[Remote]) -> Option<String> {
     if let Some(key) = local_remote_key(tree) {
         return Some(key);
     }
@@ -387,6 +397,7 @@ mod tests {
         let remote = |name: &str, url: &str| Remote {
             name: name.into(),
             url: url.into(),
+            push_url: url.into(),
             slug: parse_slug(url).unwrap(),
         };
         let all = [
@@ -472,11 +483,30 @@ mod tests {
     }
 
     #[test]
+    fn a_different_push_url_makes_remotes_of_one_fetch_url_differ() {
+        let sb = Sandbox::new();
+        let repo = TestRepo::new(&sb, "acme/widget");
+        add_same_url_remote(&repo, "twin");
+        let ext = Ext::from_vars(|k| sb.var(k));
+        assert!(discover(&ext, repo.path(), &|| Ok(Vec::new())).is_ok());
+
+        let elsewhere = sb.root().join("elsewhere/acme/widget.git");
+        repo.git(&[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            &elsewhere.to_string_lossy(),
+        ]);
+        assert!(discover(&ext, repo.path(), &|| Ok(Vec::new())).is_err());
+    }
+
+    #[test]
     fn urls_that_differ_only_in_form_normalize_equal() {
         let forms = [
             "git@github.com:acme/widget.git",
             "https://github.com/acme/widget",
-            "ssh://git@GitHub.com/acme/widget/",
+            "ssh://git@GitHub.com/Acme/Widget/",
         ];
         assert!(
             forms

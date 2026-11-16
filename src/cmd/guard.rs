@@ -158,7 +158,7 @@ impl<'a> Repo<'a> {
         let remotes = repo::remotes(ext, dir).unwrap_or_default();
         let managed = repo::managed(
             &remotes,
-            repo::local_remote_key(&top_dir).as_deref(),
+            repo::remote_key(ext, dir, &top_dir, &remotes).as_deref(),
             &registry(),
         )
         .ok()

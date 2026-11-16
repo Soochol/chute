@@ -487,7 +487,7 @@ fn init_with_remotes_of_one_url_uses_origin_and_says_so() {
 
     let out = ok(chute(&sb, repo.path(), &["init"]));
     assert!(
-        out.contains("주소가 같은 원격이 2개(origin, paseo-pr-109) 있어 origin을 쓴다"),
+        out.contains("주소가 같은 원격이 2개(origin, paseo-pr-109) 있다. 쓰는 원격: origin"),
         "{out}"
     );
     let repo_json = sb.chute_home().join("repos/acme__widget/repo.json");

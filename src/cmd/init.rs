@@ -25,7 +25,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         if peers.len() > 1 {
             let names: Vec<&str> = peers.iter().map(|r| r.name.as_str()).collect();
             println!(
-                "주소가 같은 원격이 {}개({}) 있어 {}을 쓴다.",
+                "주소가 같은 원격이 {}개({}) 있다. 쓰는 원격: {}",
                 peers.len(),
                 names.join(", "),
                 chosen.name
