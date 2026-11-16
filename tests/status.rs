@@ -66,7 +66,6 @@ fn write_queue(node: &Node, slug_dir: &str, items: Vec<Value>) {
     .unwrap();
 }
 
-/// `hub` is the hub, `pc` points at it. `lap` is known to both, `desk` only to the hub.
 fn net() -> Net {
     let net = Net::new(SLUG, &["hub", "pc", "lap", "desk"], BIN);
     for node in &net.nodes {
@@ -285,4 +284,59 @@ fn all_draws_a_dead_hub_and_a_local_hub_together() {
         .find(|v| v["repo"]["slug"] == SLUG)
         .unwrap();
     assert_eq!(widget["queue"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn all_asks_the_hubs_of_different_repos_at_the_same_time() {
+    let net = net();
+    let (hub, pc) = (net.node("hub"), net.node("pc"));
+    for (name, repo) in [("acme/other", "other"), ("acme/third", "third")] {
+        let on_hub = TestRepo::new(&hub.sb, name);
+        let on_pc = TestRepo::clone_of(&pc.sb, &on_hub);
+        for (node, dir) in [(hub, &on_hub), (pc, &on_pc)] {
+            ok(&node
+                .sb
+                .command(BIN)
+                .current_dir(dir.path())
+                .arg("init")
+                .output()
+                .unwrap());
+        }
+        Home::at(pc.sb.chute_home())
+            .repo(&slug(name))
+            .set_hub(id(hub))
+            .unwrap();
+        write_queue(hub, &format!("acme__{repo}"), vec![item(7, None)]);
+    }
+    let launcher = hub.sb.root().join("net/chute");
+    let body = fs::read_to_string(&launcher).unwrap();
+    fs::write(&launcher, body.replacen('\n', "\nsleep 3\n", 1)).unwrap();
+
+    let started = std::time::Instant::now();
+    let all = json(&ok(&pc.chute(BIN, &["status", "--json", "--all"])));
+    let reachable = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["hub"]["reachable"] == true)
+        .count();
+    assert_eq!(reachable, 3, "{all}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_hub_followed_after_it_moved_is_named_as_it_is_now_even_when_it_fails() {
+    let net = net();
+    let (hub, pc, lap) = (net.node("hub"), net.node("pc"), net.node("lap"));
+    point_at(hub, lap);
+    fs::write(lap.sb.root().join("net/chute"), "#!/bin/sh\nexit 1\n").unwrap();
+
+    let v = status(pc, &[]);
+    assert_eq!(v["hub"]["reachable"], false);
+    assert_eq!(v["hub"]["machine_id"], lap.id.as_str());
+    assert_eq!(v["hub"]["machine"], "lappy");
 }

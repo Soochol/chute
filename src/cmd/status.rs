@@ -10,7 +10,8 @@ use crate::hub::{self, Route};
 use crate::machine::Machines;
 use crate::model::{
     Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemView,
-    RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, Warning, WarningKind,
+    MachineId, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, Warning,
+    WarningKind,
 };
 use crate::queue;
 
@@ -30,11 +31,16 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(20);
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let now = Local::now();
     let views = if args.all {
-        ctx.home
-            .repos()?
-            .iter()
-            .map(|info| view_from_hub(ctx, info, &now))
-            .collect::<Result<Vec<_>>>()?
+        let repos = ctx.home.repos()?;
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = repos
+                .iter()
+                .map(|info| scope.spawn(|| view_from_hub(ctx, info, &now)))
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().expect("status thread panicked"))
+                .collect::<Result<Vec<_>>>()
+        })?
     } else {
         let (info, _) = ctx.registered_repo()?;
         vec![view_from_hub(ctx, &info, &now)?]
@@ -55,8 +61,6 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The status of one repository as this PC should show it: built here when this PC is the hub,
-/// asked from the hub otherwise.
 fn view_from_hub(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusView> {
     if ctx.forwarded() {
         return view(ctx, info, now);
@@ -101,7 +105,11 @@ fn from_remote_hub(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> StatusV
     }
     match ask_hub(ctx, info) {
         Ok(received) => rebase(ctx, info, received, now),
-        Err(reason) => hub_down(ctx, info, seen.view, reason, now),
+        Err(reason) => {
+            let hub = hub::view(&ctx.home, &ctx.ext, &info.slug, info.path.clone())
+                .map_or(seen.view, |now_seen| now_seen.view);
+            hub_down(ctx, info, hub, reason, now)
+        }
     }
 }
 
@@ -134,7 +142,6 @@ fn ask_hub(ctx: &Ctx, info: &RepoInfo) -> Result<StatusView, String> {
         .map_err(|e| format!("허브가 보낸 상태를 읽지 못했다: {e}"))
 }
 
-/// Rewrites the hub's status into this PC's terms: its own paths and its own names for machines.
 fn rebase(ctx: &Ctx, info: &RepoInfo, mut v: StatusView, now: &DateTime<Local>) -> StatusView {
     let store = ctx.home.repo(&info.slug);
     let seen = match hub::view(&ctx.home, &ctx.ext, &info.slug, info.path.clone()) {
@@ -156,7 +163,8 @@ fn rebase(ctx: &Ctx, info: &RepoInfo, mut v: StatusView, now: &DateTime<Local>) 
         v.warnings.push(hub_warning(note, now));
     }
     if let Some(machines) = &seen.machines {
-        if let Some(hub_id) = &seen.view.machine_id {
+        let hub_id = seen.view.machine_id.as_ref();
+        if let Some(hub_id) = hub_id {
             v.daemon.terminal = v
                 .daemon
                 .terminal
@@ -164,7 +172,7 @@ fn rebase(ctx: &Ctx, info: &RepoInfo, mut v: StatusView, now: &DateTime<Local>) 
                 .map(|t| machines.address(hub_id, &bare(&t)));
         }
         for item in &mut v.queue {
-            item.agent = item.agent.take().map(|a| rebase_agent(machines, a));
+            item.agent = item.agent.take().map(|a| rebase_agent(machines, hub_id, a));
         }
     }
     v
@@ -181,9 +189,13 @@ fn bare(terminal: &TerminalId) -> TerminalId {
     )
 }
 
-fn rebase_agent(machines: &Machines, agent: AgentView) -> AgentView {
-    let Some(id) = agent.machine_id.clone() else {
+fn rebase_agent(machines: &Machines, hub: Option<&MachineId>, agent: AgentView) -> AgentView {
+    let Some(id) = agent.machine_id.clone().or(hub.cloned()) else {
         return agent;
+    };
+    let agent = AgentView {
+        machine_id: Some(id.clone()),
+        ..agent
     };
     if id == machines.local().id {
         return AgentView {
@@ -216,7 +228,6 @@ fn hub_warning(message: String, now: &DateTime<Local>) -> Warning {
     }
 }
 
-/// What this PC knows when the hub cannot be asked. Its own `state.json` is not the queue.
 fn hub_down(
     ctx: &Ctx,
     info: &RepoInfo,
@@ -500,7 +511,7 @@ fn human(v: &StatusView) -> String {
 mod tests {
     use super::*;
     use crate::machine::{Core, Machine};
-    use crate::model::{BatchId, BounceReason, MachineId, PrNumber, Sha};
+    use crate::model::{BatchId, BounceReason, PrNumber, Sha};
     use chrono::Utc;
 
     fn id(s: &str) -> MachineId {
@@ -538,7 +549,7 @@ mod tests {
     fn rebase_writes_agent_addresses_in_the_viewers_words() {
         let m = viewer();
         let show = |terminal: &str, machine: &str| {
-            let a = rebase_agent(&m, agent(terminal, machine));
+            let a = rebase_agent(&m, None, agent(terminal, machine));
             (a.terminal.0, a.host, a.machine)
         };
         assert_eq!(
@@ -564,6 +575,18 @@ mod tests {
         assert_eq!(
             show("desk/t7", "zzz"),
             ("desk/t7".into(), Some("from-hub".into()), None)
+        );
+    }
+
+    #[test]
+    fn an_agent_without_a_machine_lives_on_the_hub() {
+        let m = viewer();
+        let mut a = agent("t7", "hub");
+        a.machine_id = None;
+        let a = rebase_agent(&m, Some(&id("hub")), a);
+        assert_eq!(
+            (a.terminal.0, a.machine_id, a.machine),
+            ("main/t7".into(), Some(id("hub")), Some("main".into()))
         );
     }
 
