@@ -20,6 +20,28 @@ fn skill_flag_prints_the_manual_unchanged() {
 }
 
 #[test]
+fn skill_flag_prints_the_manual_when_no_state_folder_can_be_named() {
+    let sb = Sandbox::new();
+    let out = sb
+        .command(env!("CARGO_BIN_EXE_chute"))
+        .arg("--skill")
+        .env_remove("HOME")
+        .env_remove("CHUTE_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .current_dir(sb.root())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manual = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("skill/manual.md")).unwrap();
+    assert_eq!(out.stdout, manual);
+}
+
+#[test]
 fn skill_flag_rejects_a_subcommand() {
     let sb = Sandbox::new();
     let out = sb

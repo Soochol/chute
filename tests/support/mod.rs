@@ -423,9 +423,11 @@ if [ "$feed" = 1 ]; then in=/dev/stdin; else in=/dev/null; fi
 timeout "$secs" "$launcher" "$@" < "$in" > "$out" 2> "$err"
 code=$?
 timed_out=false
+truncated=false
+[ -e "$d/truncate" ] && truncated=true
 if [ "$code" = 124 ]; then timed_out=true; code=null; fi
-printf '{"code":%s,"ms":1,"signal":null,"stderr":"%s","stdout":"%s","timed_out":%s,"truncated":false}\n' \
-  "$code" "$(base64 < "$err" | tr -d '\n')" "$(base64 < "$out" | tr -d '\n')" "$timed_out"
+printf '{"code":%s,"ms":1,"signal":null,"stderr":"%s","stdout":"%s","timed_out":%s,"truncated":%s}\n' \
+  "$code" "$(base64 < "$err" | tr -d '\n')" "$(base64 < "$out" | tr -d '\n')" "$timed_out" "$truncated"
 rm -f "$out" "$err"
 "#;
 
@@ -499,6 +501,10 @@ impl Node {
             .replace("@RULES@", &rules.to_string_lossy());
         write_executable(&self.sb.root().join("bin").join("hc"), &body);
         self.sb.fake("hc").clear_rules();
+    }
+
+    pub fn truncate_exec_output(&self) {
+        fs::write(self.net_dir().join("truncate"), "").unwrap();
     }
 
     pub fn set_chute(&self, chute: &str) {

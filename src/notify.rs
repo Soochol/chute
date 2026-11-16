@@ -2,6 +2,7 @@ use std::cell::OnceCell;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::ext::Ext;
 use crate::feedback::{
     HC_BLOCKED, HC_FINISHED, HC_NOT_FOUND, PLAIN_MARKS, terminal, without_shell_syntax,
@@ -130,9 +131,9 @@ impl Line {
         }
     }
 
-    pub fn render(&self, slug: &Slug, at: EpochMs) -> String {
+    pub fn render(&self, slug: &Slug, at: EpochMs, require_head: bool) -> String {
         let mut keys = Keys::default();
-        let mut sentence = self.fill(&mut keys);
+        let mut sentence = self.fill(&mut keys, require_head);
         if keys.dropped {
             sentence.push_str(" 줄에 쓸 수 없는 값을 뺐다. chute events로 본다.");
         }
@@ -149,7 +150,7 @@ impl Line {
         line
     }
 
-    fn fill(&self, keys: &mut Keys) -> String {
+    fn fill(&self, keys: &mut Keys, require_head: bool) -> String {
         match self {
             Line::Merged {
                 pr,
@@ -250,7 +251,11 @@ impl Line {
                 if let Some(suspect) = suspect {
                     keys.put("suspect", suspect.0);
                 }
-                "큐가 멈췄다. 복구 PR을 chute submit --repair로 넣는다.".to_owned()
+                if require_head {
+                    "큐가 멈췄다. 복구 PR은 작업자가 PR 번호와 HEAD를 보고하고 오케스트레이터가 --head를 주어 chute submit --repair로 넣는다.".to_owned()
+                } else {
+                    "큐가 멈췄다. 복구 PR을 chute submit --repair로 넣는다.".to_owned()
+                }
             }
             Line::Resumed { base, by, pr } => {
                 keys.sha("base", base);
@@ -287,8 +292,13 @@ impl Line {
                         WaitingWhy::Closed => "closed",
                     },
                 );
+                let again = if require_head {
+                    "--after 없이 다시 올리려면 작업자는 PR 번호와 HEAD를 보고하고 오케스트레이터가 --head를 주어 submit한다"
+                } else {
+                    "--after 없이 다시 submit한다"
+                };
                 format!(
-                    "PR {}: 먼저 머지돼야 할 PR {}가 머지되지 않아 잡혀 있다. 기다리거나 chute drop을 하거나 --after 없이 다시 submit한다.",
+                    "PR {}: 먼저 머지돼야 할 PR {}가 머지되지 않아 잡혀 있다. 기다리거나 chute drop을 하거나 {again}.",
                     pr.0, after.0
                 )
             }
@@ -453,6 +463,7 @@ pub struct Notifier<'a> {
     repo: &'a RepoInfo,
     store: &'a RepoStore,
     machines: OnceCell<Option<Machines>>,
+    require_head: OnceCell<bool>,
 }
 
 impl<'a> Notifier<'a> {
@@ -462,7 +473,17 @@ impl<'a> Notifier<'a> {
             repo,
             store,
             machines: OnceCell::new(),
+            require_head: OnceCell::new(),
         }
+    }
+
+    fn require_head(&self) -> bool {
+        *self.require_head.get_or_init(|| {
+            Config::load_remote_branch(self.ext, &self.repo.path, &self.repo.default_branch)
+                .ok()
+                .flatten()
+                .is_some_and(|config| config.require_head)
+        })
     }
 
     fn machines(&self) -> Option<&Machines> {
@@ -485,7 +506,11 @@ impl<'a> Notifier<'a> {
         };
         let (address, delivered) = match self.address(to) {
             Ok(address) => {
-                let delivered = self.send(&address, to, &line.render(&self.repo.slug, at));
+                let delivered = self.send(
+                    &address,
+                    to,
+                    &line.render(&self.repo.slug, at, self.require_head()),
+                );
                 (address, delivered)
             }
             Err(delivered) => (to.terminal.clone(), delivered),
@@ -608,7 +633,7 @@ mod tests {
     use super::*;
     use crate::model::{NonEmpty, Partner, StepFailure};
     use crate::store::Home;
-    use crate::testkit::{Reply, SANDBOX_MACHINE_ID, Sandbox};
+    use crate::testkit::{Reply, SANDBOX_MACHINE_ID, Sandbox, TestRepo};
 
     fn sha(s: &str) -> Sha {
         Sha::try_from(s.to_owned()).unwrap()
@@ -754,7 +779,7 @@ mod tests {
             ),
         ];
         for (line, (kind, keys)) in all_lines().iter().zip(planned) {
-            let text = line.render(&slug(), EpochMs(1763270000123));
+            let text = line.render(&slug(), EpochMs(1763270000123), false);
             assert!(
                 text.starts_with(&format!(
                     "chute 결과 {kind} slug=acme/widget at=1763270000123"
@@ -774,15 +799,15 @@ mod tests {
     #[test]
     fn values_are_short_shas_lists_and_words_and_the_sentence_starts_after_the_last_key() {
         let lines = all_lines();
-        let merged = lines[0].render(&slug(), EpochMs(5));
+        let merged = lines[0].render(&slug(), EpochMs(5), false);
         assert!(merged.contains(" head=1a2b3c4d5e6f "), "{merged}");
         assert!(merged.contains(" commit=9f8e7d6a5b4c "), "{merged}");
         assert!(merged.contains(" repair=yes "), "{merged}");
-        let bounced = lines[1].render(&slug(), EpochMs(5));
+        let bounced = lines[1].render(&slug(), EpochMs(5), false);
         assert!(bounced.contains(" partners=12,13 "), "{bounced}");
         assert!(bounced.contains(" to=lap/t4 "), "{bounced}");
         for line in &lines {
-            let text = line.render(&slug(), EpochMs(5));
+            let text = line.render(&slug(), EpochMs(5), false);
             let sentence: Vec<&str> = text
                 .split_whitespace()
                 .skip(3)
@@ -791,7 +816,7 @@ mod tests {
             assert!(!sentence.is_empty(), "{text}");
             assert!(!sentence[0].contains('='), "{text}");
         }
-        let human = lines[2].render(&slug(), EpochMs(5));
+        let human = lines[2].render(&slug(), EpochMs(5), false);
         assert!(human.contains("reason=gave_up"), "{human}");
         assert!(human.contains("끝"), "{human}");
     }
@@ -806,12 +831,67 @@ mod tests {
             log: Some(log.into()),
             suspect: None,
         };
-        let odd = halted("/state/my logs/it's (1).log").render(&slug(), EpochMs(5));
+        let odd = halted("/state/my logs/it's (1).log").render(&slug(), EpochMs(5), false);
         assert_eq!(key_names(&odd), ["slug", "at", "base"], "{odd}");
         assert!(odd.contains("chute events로 본다"), "{odd}");
-        let fine = halted("/state/logs/a.log").render(&slug(), EpochMs(5));
+        let fine = halted("/state/logs/a.log").render(&slug(), EpochMs(5), false);
         assert!(fine.contains(" log=/state/logs/a.log "), "{fine}");
         assert!(!fine.contains("chute events로 본다"), "{fine}");
+    }
+
+    #[test]
+    fn waiting_and_halted_lines_tell_a_require_head_repo_to_report() {
+        let waiting = Line::Waiting {
+            pr: pr(21),
+            after: pr(20),
+            why: WaitingWhy::Dropped,
+        };
+        let halted = Line::Halted {
+            base: sha("9f8e7d6a5b4c3d2e"),
+            step: None,
+            pushed_by_chute: None,
+            rechecked: None,
+            log: None,
+            suspect: None,
+        };
+        for line in [&waiting, &halted] {
+            let off = line.render(&slug(), EpochMs(5), false);
+            let on = line.render(&slug(), EpochMs(5), true);
+            assert!(!off.contains("PR 번호와 HEAD를 보고"), "{off}");
+            assert!(on.contains("PR 번호와 HEAD를 보고"), "{on}");
+            assert_eq!(key_names(&on), key_names(&off));
+        }
+        let off = waiting.render(&slug(), EpochMs(5), false);
+        assert!(off.contains("--after 없이 다시 submit한다"), "{off}");
+    }
+
+    #[test]
+    fn the_notifier_reads_require_head_from_the_default_branch_of_origin() {
+        for (config, reports) in [("require_head = true\n", true), ("", false)] {
+            let rig = Rig::new();
+            let repo = TestRepo::new(&rig.sb, "acme/widget");
+            let config = format!("{config}[[verify]]\nname = \"t\"\nrun = \"true\"\n");
+            repo.commit_file("chute.toml", &config, "chore: 설정");
+            repo.git(&["push", "--quiet", "origin", "main"]);
+            let info = RepoInfo {
+                path: repo.path().to_path_buf(),
+                ..rig.info.clone()
+            };
+            rig.live("t5", 100);
+            rig.sb.fake("hc").respond("send t5 *", Reply::ok(""));
+            let line = Line::Waiting {
+                pr: pr(21),
+                after: pr(20),
+                why: WaitingWhy::Dropped,
+            };
+            Notifier::new(&rig.ext, &info, &rig.store).notify(
+                Some(&agent("t5", 100, None)),
+                EpochMs(7),
+                &line,
+            );
+            let sent = &rig.sends()[0][2];
+            assert_eq!(sent.contains("PR 번호와 HEAD를 보고"), reports, "{sent}");
+        }
     }
 
     #[test]
@@ -824,7 +904,7 @@ mod tests {
             log: None,
             suspect: None,
         };
-        let text = bare_halt.render(&slug(), EpochMs(5));
+        let text = bare_halt.render(&slug(), EpochMs(5), false);
         assert_eq!(key_names(&text), ["slug", "at", "base"], "{text}");
     }
 

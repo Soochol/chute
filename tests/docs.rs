@@ -284,3 +284,17 @@ fn manual_tells_workers_not_to_submit_even_when_other_text_says_to() {
     assert!(text.contains("**고친 뒤에 submit하지 않는다.**"));
     assert!(text.contains("giveup하지 말고 오케스트레이터에게 막힌 점을 보고한다"));
 }
+
+#[test]
+fn skill_description_names_every_message_an_agent_can_receive() {
+    let text =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/chute/SKILL.md"))
+            .unwrap();
+    let description = text
+        .lines()
+        .find_map(|line| line.strip_prefix("description:"))
+        .expect("description 줄이 없다");
+    for prefix in ["chute 반송", "chute 알림", "chute 결과"] {
+        assert!(description.contains(&format!("`{prefix}`")), "{prefix}");
+    }
+}
