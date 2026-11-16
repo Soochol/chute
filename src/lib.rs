@@ -11,6 +11,7 @@ pub mod store;
 pub mod ci;
 pub mod engine;
 pub mod feedback;
+pub mod gc;
 pub mod gitops;
 pub mod queue;
 pub mod verify;

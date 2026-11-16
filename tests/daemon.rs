@@ -402,3 +402,27 @@ fn daemon_on_a_pc_that_is_not_the_hub_is_refused_and_starts_nothing() {
     assert!(!forward_kit::store(a).daemon_running().unwrap());
     assert!(forward_kit::out(&out).is_empty());
 }
+
+#[test]
+fn the_daemon_runs_gc_when_it_starts_and_leaves_the_records() {
+    let lab = Lab::new("");
+    let log = lab.store.dir().join("preflight/old-1");
+    std::fs::create_dir_all(&log).unwrap();
+    std::fs::write(log.join("a.log"), "x").unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    std::fs::File::open(&log)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    let record = lab.store.dir().join("batches/b1/batch.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(&record, "{}").unwrap();
+
+    let mut daemon = start_daemon(&lab);
+    wait_until("시작할 때 정리가 돌지 않았다", || !log.exists());
+
+    assert!(lab.store.dir().join("gc.json").is_file());
+    assert!(record.exists());
+    ok(chute(&lab, &["down", "--now"]).output().unwrap());
+    wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+}
