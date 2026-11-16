@@ -28,6 +28,14 @@ impl Key {
             None => format!("단계 {}", self.step),
         }
     }
+
+    /// Names the key in a warning. The quotes make two different keys never read the same.
+    fn identity(&self) -> String {
+        match &self.test {
+            Some(test) => format!("단계 {:?}의 시험 {test:?}", self.step),
+            None => format!("단계 {:?}", self.step),
+        }
+    }
 }
 
 pub fn keys_of(step: &str, tests: &[String]) -> Vec<Key> {
@@ -152,7 +160,7 @@ fn names(warning: &Warning, key: &Key) -> bool {
         && warning
             .message
             .rsplit_once(": ")
-            .is_some_and(|(label, _)| label == key.label())
+            .is_some_and(|(identity, _)| identity == key.identity())
 }
 
 /// Brings the `flaky_chronic` warnings in line with the history: one per chronic key, none for a
@@ -175,7 +183,7 @@ pub fn refresh_chronic(
         for (key, count) in &chronic {
             let message = format!(
                 "{}: {}일 안에 {count}번 흔들렸다",
-                key.label(),
+                key.identity(),
                 policy.chronic_days
             );
             let held = state.warnings.iter_mut().find(|w| names(w, key));
@@ -209,9 +217,11 @@ pub fn refresh_chronic(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeResult {
     pub evidence: ProbeEvidence,
+    /// The tests the command ran with. A long list is cut to what fits.
+    pub tests: Vec<String>,
     pub runs: u32,
     pub failures: u32,
 }
@@ -240,8 +250,8 @@ struct Round {
 /// stops at its first failure, after `probe_repeats` runs or after `probe_seconds`, and a
 /// cancel ends the probe as unresolved. A failure on the base means the flake was already there.
 pub fn probe(job: &ProbeJob) -> Result<ProbeResult> {
-    let quoted = quote_within(job.tests, MAX_TESTS_BYTES)
-        .context("흔들린 시험 이름 하나가 너무 길어 probe 명령에 넣지 못했다")?;
+    let (quoted, tests) = quote_within(job.tests, MAX_TESTS_BYTES)
+        .context("흔들린 시험 이름이 모두 너무 길어 probe 명령에 넣지 못했다")?;
     let command = job.command.replace(PROBE_PLACEHOLDER, &quoted);
     let log_dir = job.store.batch_dir(job.batch).join("probe");
     std::fs::create_dir_all(&log_dir)
@@ -265,6 +275,7 @@ pub fn probe(job: &ProbeJob) -> Result<ProbeResult> {
         if round.failed {
             return Ok(ProbeResult {
                 evidence: found,
+                tests,
                 runs,
                 failures: 1,
             });
@@ -275,6 +286,7 @@ pub fn probe(job: &ProbeJob) -> Result<ProbeResult> {
     }
     Ok(ProbeResult {
         evidence: ProbeEvidence::Unresolved,
+        tests,
         runs,
         failures: 0,
     })
@@ -326,22 +338,24 @@ fn repeat(
     Ok(round)
 }
 
-/// The first names that fit in `limit` bytes, each in single quotes. `None` when not even the
-/// first fits.
-fn quote_within(tests: &[String], limit: usize) -> Option<String> {
+/// The names that fit in `limit` bytes, each in single quotes, and the names themselves. A name
+/// too long to fit is left out. `None` when no name fits.
+fn quote_within(tests: &[String], limit: usize) -> Option<(String, Vec<String>)> {
     let mut text = String::new();
+    let mut taken = Vec::new();
     for test in tests {
         let quoted = format!("'{}'", test.replace('\'', r"'\''"));
         let added = if text.is_empty() { 0 } else { 1 } + quoted.len();
         if text.len() + added > limit {
-            break;
+            continue;
         }
         if !text.is_empty() {
             text.push(' ');
         }
         text.push_str(&quoted);
+        taken.push(test.clone());
     }
-    (!text.is_empty()).then_some(text)
+    (!taken.is_empty()).then_some((text, taken))
 }
 
 #[cfg(test)]
@@ -565,7 +579,27 @@ mod tests {
         let only_plain = three("a");
         assert!(warned(&store, &only_plain, &[]).is_empty());
         assert_eq!(messages(&store).len(), 1, "{:?}", messages(&store));
-        assert!(messages(&store)[0].starts_with("단계 test의 시험 a: 30일"));
+        assert!(messages(&store)[0].starts_with("단계 \"test\"의 시험 \"a\": 30일"));
+    }
+
+    #[test]
+    fn a_step_named_like_a_test_label_does_not_share_a_warning_with_that_test() {
+        let (_dir, store) = store();
+        let named = key("x", Some("y"));
+        let odd_step = key("x의 시험 y", None);
+        let events: Vec<Event> = (1..=3)
+            .flat_map(|n| {
+                [
+                    flaky(n, &format!("b{n}"), "x", &["y"]),
+                    flaky(n, &format!("c{n}"), "x의 시험 y", &[]),
+                ]
+            })
+            .collect();
+
+        let due = warned(&store, &events, &[named.clone(), odd_step.clone()]);
+
+        assert_eq!(due.len(), 2, "{due:?}");
+        assert_eq!(messages(&store).len(), 2, "{:?}", messages(&store));
     }
 
     #[test]
@@ -596,7 +630,7 @@ mod tests {
         let tests = ["a::b".to_owned(), "it's $HOME".to_owned()];
 
         assert_eq!(
-            quote_within(&tests, 1000).unwrap(),
+            quote_within(&tests, 1000).unwrap().0,
             r"'a::b' 'it'\''s $HOME'"
         );
     }
@@ -605,11 +639,15 @@ mod tests {
     fn too_many_tests_are_cut_to_the_names_that_fit() {
         let tests: Vec<String> = (0..10).map(|n| format!("t{n}")).collect();
 
-        assert_eq!(quote_within(&tests, 8).unwrap(), "'t0'");
-        assert_eq!(quote_within(&tests, 9).unwrap(), "'t0' 't1'");
-        assert_eq!(quote_within(&tests, 13).unwrap(), "'t0' 't1'");
-        assert_eq!(quote_within(&tests, 14).unwrap(), "'t0' 't1' 't2'");
+        assert_eq!(quote_within(&tests, 8).unwrap().0, "'t0'");
+        assert_eq!(quote_within(&tests, 9).unwrap().0, "'t0' 't1'");
+        assert_eq!(quote_within(&tests, 13).unwrap().0, "'t0' 't1'");
+        let (text, taken) = quote_within(&tests, 14).unwrap();
+        assert_eq!(text, "'t0' 't1' 't2'");
+        assert_eq!(taken, ["t0", "t1", "t2"]);
         assert!(quote_within(&tests, 3).is_none());
+        let mixed = ["x".repeat(100), "short".to_owned()];
+        assert_eq!(quote_within(&mixed, 50).unwrap().1, ["short"]);
         assert!(quote_within(&[], 100).is_none());
     }
 }

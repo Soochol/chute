@@ -1515,7 +1515,7 @@ impl Run<'_> {
         if flaky.is_empty() && !chronic_warned {
             return Ok(());
         }
-        let mut made = vec![false; flaky.len()];
+        let mut made: Vec<Option<Vec<String>>> = vec![None; flaky.len()];
         for (n, entry) in flaky.iter().enumerate() {
             let command = self
                 .config
@@ -1552,12 +1552,14 @@ impl Run<'_> {
             engine.history(EventKind::FlakyProbe {
                 batch: self.id().clone(),
                 step: entry.step.clone(),
-                tests: entry.tests.clone(),
+                tests: found.tests.clone(),
                 evidence: found.evidence,
                 runs: found.runs,
                 failures: found.failures,
             })?;
-            made[n] = found.evidence == ProbeEvidence::Made;
+            if found.evidence == ProbeEvidence::Made {
+                made[n] = Some(found.tests);
+            }
         }
         let touched: Vec<flaky::Key> = flaky
             .iter()
@@ -1580,15 +1582,15 @@ impl Run<'_> {
             let keys = flaky::keys_of(&entry.step, &entry.tests);
             let chronic = keys.iter().any(|k| due.contains(k));
             due.retain(|k| !keys.contains(k));
-            if (made || chronic) && !targets.is_empty() {
+            if (made.is_some() || chronic) && !targets.is_empty() {
                 engine
                     .notifier()
                     .notify_each(&targets, EpochMs::now(), |prs| Line::Flaky {
                         batch: self.id().clone(),
                         prs: prs.to_vec(),
                         step: entry.step.clone(),
-                        tests: entry.tests.clone(),
-                        made,
+                        tests: made.clone().unwrap_or_else(|| entry.tests.clone()),
+                        made: made.is_some(),
                         chronic,
                     });
             }
