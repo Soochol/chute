@@ -3,7 +3,7 @@ mod support;
 
 use std::time::Duration;
 
-use chute::engine::{Pass, Summary};
+use chute::engine::{Clock, Pass, Summary};
 use chute::model::{
     Approval, BounceReason, EpochMs, Failure, HumanReason, ItemState, PrNumber, QueuedReason,
     WarningKind,
@@ -484,12 +484,13 @@ fn reading_new_prs_does_not_push_back_the_next_look_at_the_ones_already_waiting(
     let lab = Lab::build("", REQUIRE_CI, 60);
     lab.open_pr(1, &[("f1.txt", "x\n")]);
     lab.gh_checks(1, &[("build", "pending")]);
-    let engine = lab.engine_rechecking_ci_every(Duration::from_millis(400));
+    let clock = Clock::frozen();
+    let engine = lab.engine_with_clock(Duration::from_millis(400), clock.clone());
     engine.run_once().unwrap();
     lab.gh_checks(1, &[("build", "pass")]);
 
     for n in 2..=3 {
-        std::thread::sleep(Duration::from_millis(250));
+        clock.advance(Duration::from_millis(250));
         lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
         lab.gh_checks(n, &[("build", "pending")]);
         engine.run_once().unwrap();
@@ -639,16 +640,17 @@ fn when_the_batch_is_full_the_earlier_queued_pr_keeps_its_place_over_a_ci_waiter
 #[test]
 fn only_the_ci_waiters_whose_interval_has_passed_are_read_again() {
     let lab = Lab::build("", REQUIRE_CI, 60);
-    let engine = lab.engine_rechecking_ci_every(Duration::from_millis(400));
+    let clock = Clock::frozen();
+    let engine = lab.engine_with_clock(Duration::from_millis(400), clock.clone());
     lab.open_pr(1, &[("f1.txt", "x\n")]);
     lab.gh_checks(1, &[("build", "pending")]);
     engine.run_once().unwrap();
-    std::thread::sleep(Duration::from_millis(250));
+    clock.advance(Duration::from_millis(250));
     lab.open_pr(2, &[("f2.txt", "x\n")]);
     lab.gh_checks(2, &[("build", "pending")]);
     engine.run_once().unwrap();
     assert_eq!(lab.gh_check_reads(), 2);
-    std::thread::sleep(Duration::from_millis(250));
+    clock.advance(Duration::from_millis(250));
 
     engine.run_once().unwrap();
 
