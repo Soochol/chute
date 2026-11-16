@@ -10,7 +10,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::model::{
-    BatchId, BatchRecord, DaemonInfo, Event, PrNumber, RepoInfo, RevertRecord, Slug, State,
+    BatchId, BatchRecord, DaemonInfo, Event, HubConfig, MachineId, PrNumber, RepoInfo,
+    RevertRecord, Slug, State,
 };
 
 #[derive(Clone, Debug)]
@@ -88,6 +89,7 @@ const HISTORY_FILE: &str = "history.jsonl";
 const LAUNCH_LOCK_FILE: &str = "up.lock";
 const BATCH_FILE: &str = "batch.json";
 const REVERT_FILE: &str = "revert.json";
+const HUB_FILE: &str = "hub.json";
 
 #[derive(Clone, Debug)]
 pub struct RepoStore {
@@ -201,6 +203,26 @@ impl RepoStore {
 
     pub fn clear_daemon(&self) -> Result<()> {
         let path = self.dir.join(DAEMON_FILE);
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("지우지 못했다: {}", path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn hub(&self) -> Result<Option<MachineId>> {
+        Ok(read_json::<HubConfig>(&self.dir.join(HUB_FILE))?.map(|c| c.machine_id))
+    }
+
+    pub fn set_hub(&self, machine_id: MachineId) -> Result<()> {
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("만들지 못했다: {}", self.dir.display()))?;
+        write_json_atomic(&self.dir.join(HUB_FILE), &HubConfig { machine_id })
+    }
+
+    pub fn clear_hub(&self) -> Result<()> {
+        let path = self.dir.join(HUB_FILE);
         match fs::remove_file(&path) {
             Err(e) if e.kind() != ErrorKind::NotFound => {
                 Err(e).with_context(|| format!("지우지 못했다: {}", path.display()))
@@ -391,6 +413,38 @@ mod tests {
             touches_config: false,
             last_failure: None,
         }
+    }
+
+    #[test]
+    fn hub_json_is_absent_set_replaced_and_cleared() {
+        let (_dir, store) = store();
+        assert_eq!(store.hub().unwrap(), None);
+        store.clear_hub().unwrap();
+        let id = |s: &str| MachineId::try_from(s.to_owned()).unwrap();
+        store.set_hub(id("aaa")).unwrap();
+        store.set_hub(id("bbb")).unwrap();
+        assert_eq!(store.hub().unwrap(), Some(id("bbb")));
+        let text = fs::read_to_string(store.dir().join("hub.json")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!({"machine_id": "bbb"})
+        );
+        let leftovers: Vec<_> = fs::read_dir(store.dir())
+            .unwrap()
+            .filter_map(|e| e.unwrap().file_name().into_string().ok())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        store.clear_hub().unwrap();
+        assert_eq!(store.hub().unwrap(), None);
+    }
+
+    #[test]
+    fn a_corrupt_hub_json_is_an_error_not_this_pc_as_hub() {
+        let (_dir, store) = store();
+        fs::create_dir_all(store.dir()).unwrap();
+        fs::write(store.dir().join("hub.json"), "{").unwrap();
+        assert!(store.hub().is_err());
     }
 
     #[test]

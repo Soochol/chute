@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "repo": {
+    "slug": "Soochol/chute",
+    "path": "/home/dev/code/chute",
+    "default_branch": "main",
+    "state_dir": "/home/dev/.local/state/chute/repos/Soochol__chute"
+  },
+  "hub": {
+    "local": false,
+    "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+    "host": "desk-host",
+    "machine": "desk",
+    "repo_path": null,
+    "reachable": false,
+    "error": "허브 `desk`에 닿지 않는다(머신 `desk`의 상태가 unreachable이다). 명령은 기록되지 않았다. `hc machine ls`로 상태를 보고, 로그인이 필요하면 `hc machine login desk`을 실행한다"
+  },
+  "approval": "agent",
+  "daemon": {
+    "running": false,
+    "terminal": null,
+    "pid": null
+  },
+  "blocked": null,
+  "batch": null,
+  "queue": [],
+  "today": {
+    "merged": 0,
+    "bounced": 0,
+    "flaky": 0,
+    "batches": 0,
+    "median_lead_s": null,
+    "verify_s": 0
+  },
+  "recent": [],
+  "warnings": [
+    {
+      "kind": "hub",
+      "message": "허브 `desk`에 닿지 않는다: 머신 `desk`의 상태가 unreachable이다",
+      "pr": null,
+      "at_ms": 1794724500000
+    }
+  ]
+}

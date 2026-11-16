@@ -5,9 +5,10 @@ use chrono::{DateTime, Local, TimeZone};
 
 use super::Ctx;
 use crate::config::{self, Config};
+use crate::hub;
 use crate::model::{
-    Approval, DaemonView, EpochMs, Event, EventKind, ItemView, RecentBatch, RepoInfo, RepoView,
-    SchemaV1, StatusView, Today, Warning, WarningKind,
+    Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, ItemView, RecentBatch,
+    RepoInfo, RepoView, SchemaV1, StatusView, Today, Warning, WarningKind,
 };
 use crate::queue;
 
@@ -75,6 +76,26 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
             (Approval::default(), config::DEFAULT_BUDGET)
         }
     };
+    let seen = hub::view(&ctx.home, &ctx.ext, &info.slug, info.path.clone())?;
+    if let Some(note) = seen.note {
+        warnings.push(Warning {
+            kind: WarningKind::Hub,
+            message: note,
+            pr: None,
+            at_ms: EpochMs(now.timestamp_millis().max(0) as u64),
+        });
+    }
+    let agent_view = |agent: &Agent| match (&seen.machines, &seen.view.machine_id) {
+        (Some(machines), Some(home)) => machines.agent_view(home, agent),
+        _ => AgentView {
+            terminal: agent.terminal.clone(),
+            name: agent.name.clone(),
+            alive: agent.alive,
+            machine_id: agent.machine.clone(),
+            host: None,
+            machine: None,
+        },
+    };
     let running = store.daemon_running()?;
     let daemon = if running { store.daemon()? } else { None };
     let history = store.history()?;
@@ -98,6 +119,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
             default_branch: info.default_branch.clone(),
             state_dir: store.dir().to_owned(),
         },
+        hub: seen.view.clone(),
         approval,
         daemon: DaemonView {
             running,
@@ -109,7 +131,14 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
         queue: state
             .queue
             .iter()
-            .map(|item| ItemView::new(item, budget, state.preflights.get(&item.branch)))
+            .map(|item| {
+                ItemView::new(
+                    item,
+                    budget,
+                    state.preflights.get(&item.branch),
+                    item.agent.as_ref().map(agent_view),
+                )
+            })
             .collect(),
         today,
         recent,

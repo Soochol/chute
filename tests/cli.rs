@@ -365,7 +365,9 @@ fn status_shows_queue_items_from_the_state_folder() {
         serde_json::json!({
             "pr": 7, "title": "설정 바꾸기", "branch": "feat/cfg", "head": "abc1234",
             "state": "awaiting_approval", "state_reason": null,
-            "agent": {"terminal": "t1rs", "name": "impl-a", "alive": false},
+            "agent": {"terminal": "t1rs", "name": "impl-a", "alive": false,
+                      "machine_id": support::SANDBOX_MACHINE_ID, "host": "sandbox-pc",
+                      "machine": null},
             "attempts": 1, "budget": 5, "submitted_ms": 10, "touches_config": true,
             "preflight": {"result": "pass", "head": "abc1234"},
             "last_failure": {"kind": "verify", "mode": "solo", "summary": "test 실패", "report": "/r/1.md"}
