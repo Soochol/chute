@@ -184,15 +184,8 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .collect();
 
     let fetched_base = Gitops::new(&ctx.ext, &ctx.home, &info).fetch_base_tip()?;
-    let last_fetched_config = Config::load_remote_branch(
-        &ctx.ext,
-        &info.path,
-        &info.remote_name,
-        &info.default_branch,
-    )
-    .ok()
-    .flatten();
-    let skip_why = last_fetched_config
+    let base_config = Config::load_at(&ctx.ext, &info.path, fetched_base.as_str()).ok();
+    let skip_why = base_config
         .as_ref()
         .and_then(|c| skip_reason(c.preflight, queued.len()));
     if let Some(reason) = skip_why {
@@ -202,12 +195,10 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         }
         return Ok(report);
     }
-    let max_parallel = last_fetched_config
+    let max_parallel = base_config
         .as_ref()
         .map_or(DEFAULT_MAX_PARALLEL, |c| c.max_parallel);
-    let seed = last_fetched_config
-        .map(|c| c.cache.seed)
-        .unwrap_or_default();
+    let seed = base_config.map(|c| c.cache.seed).unwrap_or_default();
     let gitops = Gitops::new(&ctx.ext, &ctx.home, &info).with_cache_seed(seed);
     let slot = gitops.lock_preflight_slot(max_parallel)?.open()?;
     let base = slot.fetch_base()?;
