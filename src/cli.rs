@@ -53,6 +53,8 @@ pub enum Command {
     Daemon(cmd::daemon::Args),
     /// 최근 batch 목록을 보인다
     Batches(cmd::batches::Args),
+    /// 놓친 알림 따라잡기: history의 사건을 시간 순으로 보인다. 허브가 다른 PC면 허브의 것을 보인다
+    Events(cmd::events::Args),
     /// batch를 되돌린다. 허브에서만 실행하고 다른 PC에서는 허브에서 실행할 명령을 알려 준다
     Revert(cmd::revert::Args),
     /// mod와 Codex 스킬 파일을 설치한다
@@ -122,6 +124,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Down(args) => cmd::down::run(args, ctx),
         Command::Daemon(args) => cmd::daemon::run(args, ctx),
         Command::Batches(args) => cmd::batches::run(args, ctx),
+        Command::Events(args) => cmd::events::run(args, ctx),
         Command::Revert(args) => cmd::revert::run(args, ctx),
         Command::Hub(args) => cmd::hub::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),
