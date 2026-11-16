@@ -280,9 +280,10 @@ impl Ctx<'_> {
             .arg(&step.run)
             .current_dir(self.dir)
             .env("CHUTE_RUN_ID", &self.run_id);
-        if let Some(cache) = &self.opts.cache_dir {
-            command.env("CHUTE_CACHE_DIR", cache);
-        }
+        match &self.opts.cache_dir {
+            Some(cache) => command.env("CHUTE_CACHE_DIR", cache),
+            None => command.env_remove("CHUTE_CACHE_DIR"),
+        };
         let mut child = command
             .stdin(Stdio::null())
             .stdout(out)
