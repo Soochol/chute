@@ -13,20 +13,36 @@ pub struct Remote {
     pub slug: Slug,
 }
 
-pub fn slug(ext: &Ext, dir: &Path, registered: &[RepoInfo]) -> Result<Slug> {
-    let tree = work_tree(ext, dir)?;
-    let all = remotes(ext, dir)?;
-    Ok(
-        managed(&all, local_remote_key(&tree).as_deref(), registered)?
-            .slug
-            .clone(),
-    )
+pub type Registry<'a> = dyn Fn() -> Result<Vec<RepoInfo>> + 'a;
+
+/// Only asks for the registered repositories when the remote cannot be told apart without
+/// them, so an unreadable registration cannot stop a repository that has one remote.
+fn known_repos(
+    remotes: &[Remote],
+    key: Option<&str>,
+    registered: &Registry,
+) -> Result<Vec<RepoInfo>> {
+    if key.is_none() && remotes.len() > 1 {
+        registered()
+    } else {
+        Ok(Vec::new())
+    }
 }
 
-pub fn discover(ext: &Ext, dir: &Path, registered: &[RepoInfo]) -> Result<RepoInfo> {
+pub fn slug(ext: &Ext, dir: &Path, registered: &Registry) -> Result<Slug> {
+    let tree = work_tree(ext, dir)?;
+    let all = remotes(ext, dir)?;
+    let key = local_remote_key(&tree);
+    let known = known_repos(&all, key.as_deref(), registered)?;
+    Ok(managed(&all, key.as_deref(), &known)?.slug.clone())
+}
+
+pub fn discover(ext: &Ext, dir: &Path, registered: &Registry) -> Result<RepoInfo> {
     let path = work_tree(ext, dir)?;
     let all = remotes(ext, dir)?;
-    let chosen = managed(&all, local_remote_key(&path).as_deref(), registered)?;
+    let key = local_remote_key(&path);
+    let known = known_repos(&all, key.as_deref(), registered)?;
+    let chosen = managed(&all, key.as_deref(), &known)?;
     let default_branch = default_branch(ext, &path, &chosen.name)?;
     Ok(RepoInfo {
         slug: chosen.slug.clone(),
@@ -71,7 +87,7 @@ pub fn managed<'a>(
     }
     let known: Vec<&Remote> = remotes
         .iter()
-        .filter(|r| registered.iter().any(|info| info.slug == r.slug))
+        .filter(|r| registered.iter().any(|info| info.slug.same_repo(&r.slug)))
         .collect();
     match (known.as_slice(), remotes) {
         ([one], _) => Ok(one),
@@ -178,7 +194,7 @@ mod tests {
             &linked.to_string_lossy(),
         ]);
 
-        let info = discover(&Ext::from_vars(|k| sb.var(k)), &linked, &[]).unwrap();
+        let info = discover(&Ext::from_vars(|k| sb.var(k)), &linked, &|| Ok(Vec::new())).unwrap();
         assert_eq!(info.slug.to_string(), "acme/widget");
         assert_eq!(info.path, repo.path().canonicalize().unwrap());
         assert_eq!(info.default_branch, "main");
@@ -218,7 +234,10 @@ mod tests {
         let repo = fork_and_upstream(&sb);
         repo.write("chute.toml", "remote = \"upstream\"\n");
 
-        let info = discover(&Ext::from_vars(|k| sb.var(k)), repo.path(), &[]).unwrap();
+        let info = discover(&Ext::from_vars(|k| sb.var(k)), repo.path(), &|| {
+            Ok(Vec::new())
+        })
+        .unwrap();
         assert_eq!(info.slug.to_string(), "acme/widget");
         assert_eq!(info.remote_name, "upstream");
         assert_eq!(info.default_branch, "main");
@@ -230,11 +249,14 @@ mod tests {
         let repo = fork_and_upstream(&sb);
         let ext = Ext::from_vars(|k| sb.var(k));
 
-        let err = format!("{:#}", discover(&ext, repo.path(), &[]).unwrap_err());
+        let err = format!(
+            "{:#}",
+            discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap_err()
+        );
         for needed in ["upstream", "origin", "git remote -v", "remote = "] {
             assert!(err.contains(needed), "{needed}: {err}");
         }
-        assert!(slug(&ext, repo.path(), &[]).is_err());
+        assert!(slug(&ext, repo.path(), &|| Ok(Vec::new())).is_err());
     }
 
     #[test]
@@ -245,10 +267,12 @@ mod tests {
         let known = [registered("acme/widget", "upstream")];
 
         assert_eq!(
-            slug(&ext, repo.path(), &known).unwrap().to_string(),
+            slug(&ext, repo.path(), &|| Ok(known.to_vec()))
+                .unwrap()
+                .to_string(),
             "acme/widget"
         );
-        let info = discover(&ext, repo.path(), &known).unwrap();
+        let info = discover(&ext, repo.path(), &|| Ok(known.to_vec())).unwrap();
         assert_eq!(info.remote_name, "upstream");
     }
 
@@ -260,15 +284,21 @@ mod tests {
         let ext = Ext::from_vars(|k| sb.var(k));
         let known = [registered("acme/widget", "origin")];
 
-        let err = format!("{:#}", discover(&ext, repo.path(), &known).unwrap_err());
+        let err = format!(
+            "{:#}",
+            discover(&ext, repo.path(), &|| Ok(known.to_vec())).unwrap_err()
+        );
         assert!(err.contains("origin") && err.contains("mirror"), "{err}");
 
         repo.write("chute.toml", "remote = \"mirror\"\n");
-        let info = discover(&ext, repo.path(), &known).unwrap();
+        let info = discover(&ext, repo.path(), &|| Ok(known.to_vec())).unwrap();
         assert_eq!(info.remote_name, "mirror");
 
         repo.write("chute.toml", "remote = \"gone\"\n");
-        let err = format!("{:#}", discover(&ext, repo.path(), &known).unwrap_err());
+        let err = format!(
+            "{:#}",
+            discover(&ext, repo.path(), &|| Ok(known.to_vec())).unwrap_err()
+        );
         assert!(err.contains("gone"), "{err}");
     }
 
@@ -307,8 +337,8 @@ mod tests {
         let ext = Ext::from_vars(|k| sb.var(k));
 
         for dir in [&wt, &bare] {
-            assert!(discover(&ext, dir, &[]).is_err());
-            assert!(slug(&ext, dir, &[]).is_err());
+            assert!(discover(&ext, dir, &|| Ok(Vec::new())).is_err());
+            assert!(slug(&ext, dir, &|| Ok(Vec::new())).is_err());
         }
     }
 }

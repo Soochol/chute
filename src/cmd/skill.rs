@@ -165,7 +165,7 @@ mod tests {
         }
         let ext = Ext::from_vars(|k| sb.var(k));
         let home = Home::at(sb.chute_home());
-        let info = crate::repo::discover(&ext, repo.path(), &[]).unwrap();
+        let info = crate::repo::discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
         home.repo(&info.slug).register(&info).unwrap();
         let ctx = Ctx::new(home, ext, Some(repo.path().to_path_buf()));
         (sb, repo, ctx)

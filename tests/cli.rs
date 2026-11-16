@@ -95,6 +95,22 @@ fn init_with_several_remotes_asks_for_the_remote_key_and_then_uses_it() {
 }
 
 #[test]
+fn an_unreadable_registration_of_another_repository_does_not_stop_a_single_remote_repository() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    repo.commit_file("chute.toml", &chute::config::draft("true"), "chore: 설정");
+    repo.git(&["push", "--quiet", "origin", "main"]);
+    ok(chute(&sb, repo.path(), &["init"]));
+    let broken = sb.chute_home().join("repos/zzz__broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("repo.json"), "{").unwrap();
+
+    let status: Value =
+        serde_json::from_str(&ok(chute(&sb, repo.path(), &["status", "--json"]))).unwrap();
+    assert_eq!(status["repo"]["slug"], "acme/widget");
+}
+
+#[test]
 fn a_repository_registered_before_remote_name_existed_still_uses_origin() {
     let sb = Sandbox::new();
     let repo = TestRepo::new(&sb, "acme/widget");

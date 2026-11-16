@@ -71,7 +71,7 @@ impl Lab {
         );
         let repo = TestRepo::new(&sb, "acme/widget");
         let ext = Ext::from_vars(|k| sb.var(k));
-        let info = repo::discover(&ext, repo.path(), &[]).unwrap();
+        let info = repo::discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
         let store = Home::at(sb.chute_home()).repo(&info.slug);
         let worktrees = sb.root().join("herdr-worktrees");
         Lab {

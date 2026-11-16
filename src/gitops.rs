@@ -979,7 +979,7 @@ mod tests {
             repo.git(&["commit", "--quiet", "-m", "chore: 기준 파일"]);
             repo.git(&["push", "--quiet", "origin", "main"]);
             let ext = hermetic_ext(&sb);
-            let info = repo::discover(&ext, repo.path(), &[]).unwrap();
+            let info = repo::discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
             let gitops = Gitops::new(&ext, &Home::at(sb.chute_home()), &info);
             let peer = sb.root().join("peer");
             let origin = repo.origin().to_string_lossy().into_owned();
@@ -1826,7 +1826,7 @@ mod tests {
     #[test]
     fn a_relative_state_folder_still_puts_slots_outside_the_users_checkout() {
         let w = World::new();
-        let info = repo::discover(&hermetic_ext(&w.sb), w.repo.path(), &[]).unwrap();
+        let info = repo::discover(&hermetic_ext(&w.sb), w.repo.path(), &|| Ok(Vec::new())).unwrap();
 
         let gitops = Gitops::new(
             &Ext::from_vars(|_| None),
@@ -2224,7 +2224,7 @@ mod tests {
             return;
         };
         let ext = Ext::from_vars(|_| None);
-        let info = repo::discover(&ext, Path::new(&repo), &[]).unwrap();
+        let info = repo::discover(&ext, Path::new(&repo), &|| Ok(Vec::new())).unwrap();
         let gitops = Gitops::new(&ext, &Home::from_env().unwrap(), &info);
         let slot = gitops.lock_preflight_slot(2).unwrap().open().unwrap();
         let base = slot.fetch_base().unwrap();

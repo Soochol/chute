@@ -112,7 +112,7 @@ fn a_batch_merges_into_the_remote_named_upstream_and_leaves_the_fork_alone() {
     lab.info = chute::repo::discover(
         &chute::ext::Ext::from_vars(|k| lab.sb.var(k)),
         lab.repo.path(),
-        &[],
+        &|| Ok(Vec::new()),
     )
     .unwrap();
     assert_eq!(lab.info.remote_name, "upstream");

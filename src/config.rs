@@ -362,13 +362,13 @@ impl Config {
 fn is_remote_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
-        && !name.contains(|c: char| c.is_whitespace() || c.is_control() || c == '/')
+        && !name.contains(|c: char| c.is_whitespace() || c.is_control())
 }
 
 pub fn remote_key(text: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(text).ok()?;
     let name = value.get("remote")?.as_str()?;
-    is_remote_name(name).then(|| name.to_owned())
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 pub fn draft(verify_run: &str) -> String {
@@ -661,7 +661,7 @@ probe = "cargo test {tests} -- --exact"
             Config::parse(&named).unwrap().remote.as_deref(),
             Some("upstream")
         );
-        for bad in ["", "a b", "-x", "a/b"] {
+        for bad in ["", "a b", "-x"] {
             let text = format!("remote = {bad:?}\n{MINIMAL}");
             assert!(Config::parse(&text).is_err(), "{bad:?}");
         }
@@ -674,7 +674,10 @@ probe = "cargo test {tests} -- --exact"
             Some("upstream")
         );
         assert_eq!(remote_key("budget = 3\n"), None);
-        assert_eq!(remote_key("remote = \"a b\"\n"), None);
+        assert_eq!(
+            remote_key("remote = \"team/up\"\n").as_deref(),
+            Some("team/up")
+        );
         assert_eq!(remote_key("not toml ["), None);
     }
 

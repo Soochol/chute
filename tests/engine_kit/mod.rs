@@ -116,7 +116,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         repo.git(&["push", "--quiet", "origin", "main"]);
 
         let ext = Ext::from_vars(|k| sb.var(k));
-        let info = chute::repo::discover(&ext, repo.path(), &[]).unwrap();
+        let info = chute::repo::discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
         let store = Home::at(sb.chute_home()).repo(&info.slug);
         store.register(&info).unwrap();
         let lab = Lab {

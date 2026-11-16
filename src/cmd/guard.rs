@@ -145,7 +145,7 @@ struct Repo<'a> {
 
 struct Target {
     name: Option<String>,
-    slug: Slug,
+    slugs: Vec<Slug>,
 }
 
 impl<'a> Repo<'a> {
@@ -225,20 +225,36 @@ impl<'a> Repo<'a> {
         if self.has_remote(&word) {
             let out = self
                 .ext
-                .git(&self.dir, ["remote", "get-url", "--push", &word])
+                .git(&self.dir, ["remote", "get-url", "--push", "--all", &word])
                 .ok()?;
-            let slug = repo::parse_slug(out.stdout_text().trim()).ok()?;
-            return Some(Target {
+            let slugs: Vec<Slug> = out
+                .stdout_text()
+                .lines()
+                .filter_map(|url| repo::parse_slug(url.trim()).ok())
+                .collect();
+            return (!slugs.is_empty()).then_some(Target {
                 name: Some(word),
-                slug,
+                slugs,
             });
         }
         let slug = repo::parse_slug(&word).ok()?;
-        Some(Target { name: None, slug })
+        Some(Target {
+            name: None,
+            slugs: vec![slug],
+        })
     }
 
     fn is_managed(&self, target: &Target) -> bool {
-        self.managed.as_ref().is_none_or(|m| m.slug == target.slug)
+        self.managed
+            .as_ref()
+            .is_none_or(|m| target.slugs.iter().any(|s| s.same_repo(&m.slug)))
+    }
+
+    fn default_remote<'t>(&'t self, target: &'t Target) -> Option<&'t str> {
+        target
+            .name
+            .as_deref()
+            .or_else(|| self.managed.as_ref().map(|m| m.name.as_str()))
     }
 
     fn default_branches(&self, remote: Option<&str>) -> Vec<String> {
@@ -321,7 +337,7 @@ impl Kind {
 
 impl Push {
     fn hits_default_branch(&self, repo: &Repo, target: &Target) -> Option<String> {
-        let defaults = repo.default_branches(target.name.as_deref());
+        let defaults = repo.default_branches(repo.default_remote(target));
         if self.all_branches {
             return defaults.first().cloned();
         }
@@ -519,6 +535,7 @@ fn git_push(args: &[String], start: &Dir) -> Option<(Dir, Push)> {
 fn parse_push<'a>(args: impl Iterator<Item = &'a str>) -> Push {
     let mut push = Push::default();
     let mut tags = false;
+    let mut repo_flag = None;
     let mut positional = Vec::new();
     let mut args = args;
     let mut options_done = false;
@@ -531,21 +548,19 @@ fn parse_push<'a>(args: impl Iterator<Item = &'a str>) -> Push {
             "--" => options_done = true,
             "--all" | "--mirror" | "--branches" => push.all_branches = true,
             "--tags" => tags = true,
-            "--repo" => push.remote = args.next().map(str::to_owned),
+            "--repo" => repo_flag = args.next().map(str::to_owned),
             "-o" | "--push-option" | "--receive-pack" | "--exec" => {
                 args.next();
             }
             _ => {
                 if let Some(repo) = word.strip_prefix("--repo=") {
-                    push.remote = Some(repo.to_owned());
+                    repo_flag = Some(repo.to_owned());
                 }
             }
         }
     }
     let mut positional = positional.into_iter();
-    if push.remote.is_none() {
-        push.remote = positional.next().map(str::to_owned);
-    }
+    push.remote = positional.next().map(str::to_owned).or(repo_flag);
     let mut refspecs = positional.peekable();
     push.tags_only = tags && refspecs.peek().is_none();
     push.destinations = refspecs.filter_map(destination).collect();
@@ -1020,7 +1035,61 @@ mod tests {
         );
         assert!(fx.verdict("git push upstream").is_some());
         assert!(fx.verdict("git push --repo=upstream").is_some());
-        assert_eq!(fx.verdict("git push --repo origin main"), None);
+        assert!(
+            fx.verdict("git push --repo=origin main").is_some(),
+            "첫 위치 인자가 --repo를 덮는다"
+        );
+        assert_eq!(fx.verdict("git push --repo=origin"), None);
+    }
+
+    #[test]
+    fn the_first_positional_is_the_repository_even_with_repo_and_urls_follow_the_managed_head() {
+        let fx = forked("remote = \"upstream\"\n");
+        for command in [
+            "git push --repo origin upstream main",
+            "git push --repo=origin upstream main",
+        ] {
+            assert!(fx.verdict(command).is_some(), "{command}");
+        }
+        fx.repo.git(&["branch", "-m", "develop"]);
+        fx.repo.git(&["push", "--quiet", "upstream", "develop"]);
+        fx.repo.git(&["fetch", "--quiet", "upstream"]);
+        fx.repo.git(&["remote", "set-head", "upstream", "develop"]);
+        for command in [
+            "git push upstream develop",
+            "git push git@github.com:acme/widget.git develop",
+            "git push --repo=https://github.com/acme/widget develop",
+        ] {
+            assert!(fx.verdict(command).is_some(), "{command}");
+        }
+    }
+
+    #[test]
+    fn owner_and_name_match_without_regard_to_case_and_every_push_url_counts() {
+        let fx = forked("remote = \"upstream\"\n");
+        for command in [
+            "git push https://github.com/Acme/Widget main",
+            "git push git@github.com:ACME/widget.git HEAD:main",
+        ] {
+            assert!(fx.verdict(command).is_some(), "{command}");
+        }
+        fx.repo.git(&[
+            "remote",
+            "set-url",
+            "--push",
+            "upstream",
+            "git@github.com:me/widget.git",
+        ]);
+        assert_eq!(fx.verdict("git push upstream main"), None);
+        fx.repo.git(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "upstream",
+            "git@github.com:acme/widget.git",
+        ]);
+        assert!(fx.verdict("git push upstream main").is_some());
     }
 
     #[test]
