@@ -472,3 +472,29 @@ fn a_head_change_notice_goes_to_the_agents_machine_without_a_report() {
     assert!(sends[0][2].contains("HEAD가 바뀌었다"), "{:?}", sends[0]);
     assert!(calls(w.hub(), "send").is_empty());
 }
+
+#[test]
+fn a_banner_before_the_answer_does_not_hide_a_delivery_that_happened() {
+    let w = world(true);
+    let launcher = w.desk().sb.root().join("net/chute");
+    let body = fs::read_to_string(&launcher).unwrap();
+    fs::write(
+        &launcher,
+        body.replacen("#!/bin/sh\n", "#!/bin/sh\necho 'Welcome to desk'\n", 1),
+    )
+    .unwrap();
+    w.desk()
+        .sb
+        .fake("hc")
+        .respond("get t7*", terminal("t7", "live", RECORDED_MS))
+        .respond("send t7 *", Reply::ok("{}"));
+
+    let (delivery, _) = w.bounce(&w.item(w.agent_on_desk()));
+
+    assert_eq!(
+        delivery,
+        Delivery::Sent {
+            terminal: TerminalId("t7".into())
+        }
+    );
+}

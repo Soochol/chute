@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::ext::{Ext, Output};
 use crate::gitops::FAILED_REF_PREFIX;
 use crate::hub::{ForwardErrorKind, exec_on_input};
-use crate::machine::{Machine, Machines};
+use crate::machine::{self, Machine};
 use crate::model::{
     Agent, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner, PrNumber,
     QueueItem, RepoInfo, Sha, StepFailure, TerminalId, VerifyMode,
@@ -1128,15 +1128,18 @@ impl Feedback<'_> {
         let Some(id) = item.agent.as_ref().and_then(|a| a.machine.as_ref()) else {
             return Ok(None);
         };
-        let machines = Machines::load(self.ext).map_err(|e| {
+        let local = machine::core(self.ext).map_err(|e| {
             Unreachable::Failed(format!(
                 "에이전트가 있는 머신({id})이 이 PC인지 확인하지 못했다: {e:#}"
             ))
         })?;
-        if machines.local().id == *id {
+        if local.id == *id {
             return Ok(None);
         }
-        machines.by_id(id).cloned().map(Some).ok_or_else(|| {
+        let others = machine::list(self.ext).map_err(|e| {
+            Unreachable::Failed(format!("에이전트가 있는 머신({id})을 찾지 못했다: {e:#}"))
+        })?;
+        others.into_iter().find(|m| m.id == *id).map(Some).ok_or_else(|| {
             Unreachable::Failed(format!(
                 "에이전트가 있는 머신({id})을 hc가 모른다. 사람이 `hc machine add`로 더하고 전달한다"
             ))
@@ -1203,8 +1206,13 @@ impl Feedback<'_> {
         let subject = Subject::from(item);
         let dir = self.report_dir(&subject);
         fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
-        for file in &parcel.files {
-            write_file(&dir.join(&file.name), file.bytes()?)?;
+        let files: Vec<(&str, Vec<u8>)> = parcel
+            .files
+            .iter()
+            .map(|file| Ok((file.name.as_str(), file.bytes()?)))
+            .collect::<Result<_>>()?;
+        for (name, bytes) in files {
+            write_file(&dir.join(name), bytes)?;
         }
         let tree = match failure {
             Failure::Verify(step) | Failure::Timeout(step) => Some(&step.tree),
@@ -1229,18 +1237,33 @@ impl Feedback<'_> {
         let bytes = crate::hub::base64_decode(bundle)?;
         let file = dir.join("failed-tree.bundle");
         write_file(&file, bytes).ok()?;
+        let staging = format!("refs/chute/incoming/{}", short(tree));
         let fetched = self.ext.git(
             &self.repo.path,
             [
                 OsString::from("fetch"),
                 "--quiet".into(),
                 file.as_os_str().to_owned(),
-                format!("+{name}:{name}").into(),
+                format!("+{name}:{staging}").into(),
             ],
         );
         let _ = fs::remove_file(&file);
-        fetched.ok()?.success().then_some(())?;
-        self.failed_ref_at(name, tree).ok()
+        let imported = fetched
+            .ok()
+            .filter(|out| out.success())
+            .and_then(|_| self.failed_ref_at(&staging, tree).ok())
+            .and_then(|_| {
+                let moved = self
+                    .ext
+                    .git(&self.repo.path, ["update-ref", name, tree.as_str()])
+                    .ok()?;
+                moved.success().then_some(())
+            })
+            .and_then(|()| self.failed_ref_at(name, tree).ok());
+        let _ = self
+            .ext
+            .git(&self.repo.path, ["update-ref", "-d", &staging]);
+        imported
     }
 
     fn deliver_here(&self, item: &QueueItem, notice: &Notice<'_>) -> Delivery {

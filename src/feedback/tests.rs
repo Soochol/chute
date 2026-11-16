@@ -3833,3 +3833,97 @@ fn a_parcel_cannot_point_outside_its_report_folder_or_the_failed_ref_folder() {
     step.log = PathBuf::from("/etc/passwd");
     assert!(Parcel::decode(&bad.encode().unwrap()).is_err());
 }
+
+#[test]
+fn a_bundle_whose_ref_is_not_the_named_tree_does_not_touch_an_existing_ref() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let mut parcel = lab.parcel_of(&item, &failure, &Limits::default()).unwrap();
+    assert!(parcel.bundle.is_some());
+    let main = lab.repo.git(&["rev-parse", "main"]).trim().to_owned();
+    lab.repo.git(&["update-ref", FAILED, &main]);
+    let ParcelNotice::Bounced { failure, .. } = &mut parcel.notice else {
+        panic!("반송 묶음이어야 한다");
+    };
+    let Failure::Verify(step) = failure else {
+        panic!("검증 실패여야 한다");
+    };
+    step.tree = sha(&head);
+    lab.stub_spawn();
+
+    lab.fb().receive(&parcel).unwrap();
+
+    assert_eq!(lab.repo.git(&["rev-parse", FAILED]).trim(), main);
+    assert!(
+        lab.repo
+            .git(&["for-each-ref", "refs/chute/incoming"])
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_terminal_that_looks_like_an_option_is_refused() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    item.agent = Some(lab.recorded_agent(lab.repo.path()));
+    let mut parcel = lab.parcel_of(&item, &failure, &Limits::default()).unwrap();
+    parcel.item.agent.as_mut().unwrap().terminal = TerminalId("--help".into());
+
+    assert!(Parcel::decode(&parcel.encode().unwrap()).is_err());
+}
+
+#[test]
+fn invalid_utf8_does_not_stretch_a_log_past_its_limit() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let bytes: Vec<u8> = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\n".repeat(500);
+    let log = lab.sb.root().join("raw.log");
+    fs::write(&log, bytes).unwrap();
+    let failure = lab.failed_with_log(&tree, log);
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let limits = Limits {
+        log: 1000,
+        ..Limits::default()
+    };
+
+    let parcel = lab.parcel_of(&item, &failure, &limits).unwrap();
+
+    let text = text_of(&parcel.files[0]);
+    assert!(text.len() < 1100, "{}바이트", text.len());
+}
+
+#[test]
+fn an_agent_on_this_machine_is_delivered_even_when_the_machine_list_fails() {
+    let lab = Lab::new();
+    lab.hc()
+        .clear_rules()
+        .respond(
+            "server status --json",
+            Reply::ok(format!(
+                r#"{{"core":{{"id":"{}","name":"here"}}}}"#,
+                crate::testkit::SANDBOX_MACHINE_ID
+            )),
+        )
+        .respond("machine ls --json", Reply::ok("").code(1))
+        .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+        .respond("send t1rs *", Reply::ok("{}"));
+    let mut agent = lab.recorded_agent(lab.repo.path());
+    agent.machine = Some(
+        crate::model::MachineId::try_from(crate::testkit::SANDBOX_MACHINE_ID.to_owned()).unwrap(),
+    );
+    let mut item = lab.item(12, "feat/a");
+    item.agent = Some(agent);
+    let written = lab.bounced(&item);
+
+    let delivery = lab.fb().deliver(&item, &Notice::Bounced(&written));
+
+    assert!(matches!(delivery, Delivery::Sent { .. }), "{delivery:?}");
+    assert!(!verbs(&lab.hc_calls()).contains(&"machine"));
+}

@@ -104,6 +104,11 @@ impl Parcel {
             }
             seen.push(&file.name);
         }
+        if let Some(agent) = &self.item.agent
+            && !plain_terminal(&agent.terminal.0)
+        {
+            bail!("묶음의 터미널 주소가 올바르지 않다: {:?}", agent.terminal.0);
+        }
         if let ParcelNotice::Bounced {
             failure,
             failed_ref,
@@ -126,6 +131,15 @@ impl Parcel {
         }
         Ok(())
     }
+}
+
+fn plain_terminal(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b))
 }
 
 fn plain_file_name(name: &str) -> bool {
@@ -296,11 +310,15 @@ impl Feedback<'_> {
                 strip_terminal_noise(&String::from_utf8_lossy(&answer.stderr)).trim()
             )));
         }
-        serde_json::from_slice(&answer.stdout).map_err(|e| {
-            Unreachable::Failed(format!(
-                "머신 `{machine}`의 chute가 보낸 결과를 읽지 못했다: {e}"
-            ))
-        })
+        let text = String::from_utf8_lossy(&answer.stdout);
+        text.lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line.trim()).ok())
+            .ok_or_else(|| {
+                Unreachable::Failed(format!(
+                    "머신 `{machine}`의 chute가 보낸 결과를 읽지 못했다. 보고서가 전달됐는지 알 수 없다. 그 머신의 에이전트를 확인한다"
+                ))
+            })
     }
 }
 
@@ -330,8 +348,10 @@ fn log_end(path: &Path, limit: usize) -> String {
         Ok((bytes, len)) => {
             let cut = len - bytes.len() as u64;
             let text = String::from_utf8_lossy(&bytes);
+            let text = tail_of(&text, limit);
+            let cut = cut + bytes.len().saturating_sub(text.len()) as u64;
             if cut == 0 {
-                text.into_owned()
+                text.to_owned()
             } else {
                 format!("[chute: 로그가 길어 앞 {cut}바이트를 잘랐다]\n{text}")
             }
@@ -358,12 +378,31 @@ fn diff_start(path: &Path, limit: usize) -> String {
         Ok((bytes, len)) => {
             let cut = len - bytes.len() as u64;
             let text = String::from_utf8_lossy(&bytes);
+            let text = head_of(&text, limit);
+            let cut = cut + bytes.len().saturating_sub(text.len()) as u64;
             if cut == 0 {
-                text.into_owned()
+                text.to_owned()
             } else {
                 format!("{text}[chute: diff가 길어 뒤 {cut}바이트를 잘랐다]\n")
             }
         }
         Err(e) => format!("diff를 읽지 못했다: {e}\n"),
     }
+}
+
+/// Invalid bytes grow to three when read as text, so the limit is applied again to the text.
+fn tail_of(text: &str, limit: usize) -> &str {
+    let mut from = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(from) {
+        from += 1;
+    }
+    &text[from..]
+}
+
+fn head_of(text: &str, limit: usize) -> &str {
+    let mut to = text.len().min(limit);
+    while !text.is_char_boundary(to) {
+        to -= 1;
+    }
+    &text[..to]
 }
