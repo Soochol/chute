@@ -255,7 +255,7 @@ fn describe(kind: &EventKind) -> String {
         } => {
             let pr = pr.map_or(String::new(), |p| format!(" {p}"));
             let to = to.as_ref().map_or(String::new(), |t| format!(" → {}", t.0));
-            let lost = if *delivered == Delivered::Sent {
+            let lost = if matches!(delivered, Delivered::Sent | Delivered::SameAsAgent) {
                 ""
             } else {
                 " (놓친 알림)"
@@ -670,5 +670,16 @@ mod tests {
             delivered: Delivered::Sent,
         });
         assert!(!sent.contains("놓친"), "{sent}");
+    }
+
+    #[test]
+    fn a_notification_sent_as_the_agents_return_line_is_not_marked_as_missed() {
+        let line = describe(&EventKind::Notified {
+            kind: NotifyKind::Merged,
+            pr: Some(PrNumber(3)),
+            to: None,
+            delivered: Delivered::SameAsAgent,
+        });
+        assert!(!line.contains("놓친"), "{line}");
     }
 }

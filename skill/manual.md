@@ -145,7 +145,7 @@ chute 반송: PR 14. 검증 실패 단독: test 단계, 실패한 시험 2개. �
 
 한 줄에는 요약, 보고서 경로, 할 일이 들어 있다. 셸이 해석할 수 있는 문자(괄호, 백틱 등)는 공백으로 바뀌어 있다. 요약의 `검증 실패 단독`은 보고서의 `검증 실패(단독)`과 같다. 보고서를 읽는다.
 
-기록된 에이전트가 없거나 터미널이 끝났으면, 기본 설정에서는 chute가 새 에이전트를 띄우지 않고 그 PR을 사람 차례로 넘긴다. 사용자가 `chute.toml`의 `respawn`에 명령을 넣었다면 chute가 새 에이전트를 띄우고 같은 내용을 첫 일로 준다. 새로 띄워진 에이전트라면 알아야 할 것이 하나 있다. `respawn`에 `--dangerously-skip-permissions`가 들어 있으면 이 에이전트는 권한 확인 없이 명령을 실행한다. 그러니 보고서가 가리키는 PR의 범위 밖을 건드리지 않는다. 지금 폴더가 그 PR 브랜치의 worktree이니 먼저 `git fetch origin`과 `git status`로 최신 HEAD인지 본다.
+기록된 에이전트가 없거나 터미널이 끝났으면, 기본 설정에서는 chute가 새 에이전트를 띄우지 않고 그 PR을 사람 차례로 넘긴다. 사용자가 `chute.toml`의 `respawn`에 명령을 넣었다면 chute가 새 에이전트를 띄우고 같은 내용을 첫 일로 준다. 새로 띄워진 에이전트라면 알아야 할 것이 하나 있다. `respawn`에 `--dangerously-skip-permissions`가 들어 있으면 이 에이전트는 권한 확인 없이 명령을 실행한다. 그러니 보고서가 가리키는 PR의 범위 밖을 건드리지 않는다. 지금 폴더가 그 PR 브랜치의 worktree이니 먼저 PR 브랜치가 있는 원격(PR의 head 저장소와 주소가 맞는 원격. 맞는 원격이 없으면 이름 없이 "PR 브랜치가 있는 원격")에서 fetch하고 `git status`로 최신 HEAD인지 본다.
 
 ### 보고서 읽는 법
 
@@ -234,7 +234,7 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 - `--since`는 epoch 밀리초, RFC 3339 시각, 상대 시간(`30m`, `2h`, `1d`) 가운데 하나다. 그 시각 이후(같은 시각 포함)의 사건을 낸다. 같은 시각의 사건이 여럿일 수 있으니 이미 처리한 사건은 `(at_ms, event, pr)`로 거른다.
 - 알림 줄의 `at=`는 그 사건의 `at_ms`와 같거나 몇 밀리초 어긋난다(`flaky` 알림은 어긋날 수 있다). `chute events --since <at - 1000>`처럼 조금 앞선 값으로 같은 사건을 찾는다.
 - `--limit`의 기본값은 500이고 가장 최근 것만 남긴다. 잘리면 stderr에 알린다.
-- `--json`은 history 한 줄과 같은 JSON을 한 줄에 하나씩 낸다. 사건 종류에 `submitted`, `dropped`, `notified`, `resumed`, `flaky_probe`가 있다. `notified`의 `delivered`가 `sent`가 아니면 사람용 출력의 그 줄 끝에 `(놓친 알림)`이 붙는다. 값 가운데 `no_terminal`, `gone`, `blocked`, `unknown_machine`, `failed`는 알림이 가지 못한 것이다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄 하나만 보낸 것이니 갔다고 본다. 그 줄에도 표시가 붙는다.
+- `--json`은 history 한 줄과 같은 JSON을 한 줄에 하나씩 낸다. 사건 종류에 `submitted`, `dropped`, `notified`, `resumed`, `flaky_probe`가 있다. `notified`의 `delivered`가 `sent`와 `same_as_agent`가 아니면 사람용 출력의 그 줄 끝에 `(놓친 알림)`이 붙는다. 값 가운데 `no_terminal`, `gone`, `blocked`, `unknown_machine`, `failed`는 알림이 가지 못한 것이다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄 하나만 보낸 것이니 갔다고 보고 표시를 붙이지 않는다.
 
 **`chute flaky [--days <n>] [--json]`.** 흔들린 시험의 장부다. (단계, 시험)마다 흔들린 횟수, 마지막 시각, 근거(`base`, `made`, `unresolved`), 만성 여부를 보인다. `made`는 그 batch가 흔들림을 만들었을 수 있다는 뜻이다. chute는 흔들린 batch를 그대로 머지하고 기록만 한다. 허브가 다른 PC여도 허브의 것을 낸다.
 
