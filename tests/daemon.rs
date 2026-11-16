@@ -393,7 +393,7 @@ fn daemon_on_a_pc_that_is_not_the_hub_is_refused_and_starts_nothing() {
     let net = forward_kit::net();
     let a = net.node("a");
 
-    let out = a.chute(forward_kit::BIN, &["daemon"]);
+    let out = forward_kit::chute_within(a, &["daemon"], Duration::from_secs(20));
 
     assert_eq!(out.status.code(), Some(2), "{}", forward_kit::err(&out));
     let said = forward_kit::err(&out);

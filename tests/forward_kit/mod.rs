@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::process::Output;
+use std::process::{Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chute::model::{QueueItem, Slug, State};
 use chute::store::{Home, RepoStore};
@@ -78,4 +80,28 @@ pub fn assert_not_hub_answer(net: &Net, args: &[&str]) {
         "{args:?}"
     );
     assert_eq!(state_file(a), before, "{args:?}");
+}
+
+/// Like `Node::chute`, but a command that never ends fails the test instead of hanging it.
+pub fn chute_within(node: &Node, args: &[&str], limit: Duration) -> Output {
+    let mut child = node
+        .sb
+        .command(BIN)
+        .current_dir(node.repo.path())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("{args:?}가 {}초 안에 끝나지 않았다", limit.as_secs());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
 }
