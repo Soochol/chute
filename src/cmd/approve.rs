@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use super::{Ctx, finish};
+use super::{Ctx, finish, run_on_hub};
 use crate::model::PrNumber;
 use crate::queue;
 
@@ -16,6 +16,15 @@ pub struct Args {
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    let pr = args.pr.0.to_string();
+    let mut forwarded = vec!["approve", pr.as_str()];
+    if let Some(head) = args.head.as_deref() {
+        forwarded.push("--head");
+        forwarded.push(head);
+    }
+    if let Some(code) = run_on_hub(ctx, &forwarded)? {
+        return Ok(code);
+    }
     finish(approve(&args, ctx))
 }
 

@@ -1,3 +1,4 @@
+mod forward_kit;
 mod queue_kit;
 mod support;
 
@@ -235,4 +236,85 @@ fn a_history_line_that_cannot_be_written_only_warns_after_the_state_moved() {
         w.state().queue[0].state,
         ItemState::NeedsHuman(HumanReason::GaveUp)
     );
+}
+
+#[test]
+fn giveup_without_a_number_on_another_pc_finds_the_pr_here_and_sends_the_hub_item_to_a_human() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::Queued(None))]);
+    a.sb.fake("gh")
+        .respond("pr view*", Reply::ok(r#"{"number": 12}"#));
+    let a_before = forward_kit::state_file(a);
+
+    let out = a.chute(
+        forward_kit::BIN,
+        &["giveup", "--reason", "충돌을 풀 수 없다"],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        forward_kit::out(&out),
+        "사람 차례로 넘겼다: #12 (포기: 충돌을 풀 수 없다)\n"
+    );
+    assert_eq!(
+        forward_kit::state(b).queue[0].state,
+        ItemState::NeedsHuman(HumanReason::GaveUp)
+    );
+    let history = fs::read_to_string(forward_kit::store(b).dir().join("history.jsonl")).unwrap();
+    assert!(history.contains("충돌을 풀 수 없다"), "{history}");
+    assert_eq!(forward_kit::state_file(a), a_before);
+}
+
+#[test]
+fn giveup_with_a_number_on_another_pc_does_not_ask_github() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::Queued(None))]);
+
+    let out = a.chute(forward_kit::BIN, &["giveup", "12", "--reason", "그만둔다"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(a.sb.fake("gh").calls().is_empty());
+    assert_eq!(
+        forward_kit::state(b).queue[0].state,
+        ItemState::NeedsHuman(HumanReason::GaveUp)
+    );
+}
+
+#[test]
+fn giveup_on_another_pc_checks_the_reason_here_and_names_a_missing_pr() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::Queued(None))]);
+
+    let blank = a.chute(forward_kit::BIN, &["giveup", "12", "--reason", " "]);
+    assert_eq!(blank.status.code(), Some(1));
+    assert_eq!(
+        forward_kit::state(b).queue[0].state,
+        ItemState::Queued(None)
+    );
+
+    a.sb.fake("gh").respond(
+        "pr view*",
+        Reply::ok("").code(1).stderr("no pull requests found"),
+    );
+    let none = a.chute(forward_kit::BIN, &["giveup", "--reason", "그만둔다"]);
+    assert_eq!(none.status.code(), Some(2), "{}", stderr(&none));
+    assert!(
+        stderr(&none).contains("PR을 찾지 못했다"),
+        "{}",
+        stderr(&none)
+    );
+    assert_eq!(
+        forward_kit::state(b).queue[0].state,
+        ItemState::Queued(None)
+    );
+}
+
+#[test]
+fn giveup_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
+    let net = forward_kit::net();
+    forward_kit::assert_unreachable_hub(&net, &["giveup", "12", "--reason", "x"]);
+    forward_kit::assert_not_hub_answer(&net, &["giveup", "12", "--reason", "x"]);
 }

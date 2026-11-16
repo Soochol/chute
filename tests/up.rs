@@ -1,4 +1,5 @@
 mod engine_kit;
+mod forward_kit;
 mod support;
 
 use std::process::Output;
@@ -155,4 +156,43 @@ fn agents_starting_the_daemon_at_the_same_moment_start_one() {
 
     let started = std::fs::read_to_string(&calls).unwrap();
     assert_eq!(started.lines().count(), 1, "{started}");
+}
+
+#[test]
+fn up_on_another_pc_starts_the_daemon_on_the_hub_and_not_here() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    b.sb.fake("hc")
+        .respond("run *", Reply::ok(r#"{"address":"t1dd"}"#));
+
+    let out = a.chute(forward_kit::BIN, &["up"]);
+
+    assert!(out.status.success(), "{}", forward_kit::err(&out));
+    assert!(
+        forward_kit::out(&out).contains("t1dd"),
+        "{}",
+        forward_kit::out(&out)
+    );
+    let runs: Vec<Vec<String>> =
+        b.sb.fake("hc")
+            .calls()
+            .into_iter()
+            .filter(|c| c[0] == "run")
+            .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    for flag in ["--bg", "--no-parent"] {
+        assert!(runs[0].iter().any(|x| x == flag), "{flag}: {:?}", runs[0]);
+    }
+    assert_eq!(&runs[0][runs[0].len() - 3..], ["--", "chute", "daemon"]);
+    assert!(a.sb.fake("hc").calls().iter().all(|c| c[0] != "run"));
+}
+
+#[test]
+fn up_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
+    let net = forward_kit::net();
+    forward_kit::assert_unreachable_hub(&net, &["up"]);
+    forward_kit::assert_not_hub_answer(&net, &["up"]);
+    for node in &net.nodes {
+        assert!(node.sb.fake("hc").calls().iter().all(|c| c[0] != "run"));
+    }
 }

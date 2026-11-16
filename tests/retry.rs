@@ -1,3 +1,4 @@
+mod forward_kit;
 mod queue_kit;
 mod support;
 
@@ -89,4 +90,49 @@ fn a_corrupt_state_file_stops_retry_with_exit_code_2_and_is_left_alone() {
     let out = w.chute(w.repo.path(), &["retry", "12"]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(std::fs::read_to_string(w.state_file()).unwrap(), garbage);
+}
+
+#[test]
+fn retry_on_another_pc_resets_the_hub_item_and_leaves_this_pcs_state_alone() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let mut stuck = item(12, ItemState::NeedsHuman(HumanReason::Budget));
+    stuck.attempts = 3;
+    forward_kit::seed(b, vec![stuck]);
+    let a_before = forward_kit::state_file(a);
+
+    let out = a.chute(forward_kit::BIN, &["retry", "12"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        forward_kit::out(&out),
+        "다시 큐에 넣었다: #12. 반송 횟수를 0으로 돌렸다\n"
+    );
+    let queued = &forward_kit::state(b).queue[0];
+    assert_eq!(
+        (&queued.state, queued.attempts),
+        (&ItemState::Queued(None), 0)
+    );
+    assert_eq!(forward_kit::state_file(a), a_before);
+}
+
+#[test]
+fn a_refused_retry_on_another_pc_has_the_hubs_exit_code_and_message() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::Queued(None))]);
+
+    let remote = a.chute(forward_kit::BIN, &["retry", "12"]);
+    let direct = b.chute(forward_kit::BIN, &["retry", "12"]);
+
+    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
+    assert_eq!(remote.status.code(), direct.status.code());
+    assert_eq!(remote.stderr, direct.stderr);
+}
+
+#[test]
+fn retry_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
+    let net = forward_kit::net();
+    forward_kit::assert_unreachable_hub(&net, &["retry", "12"]);
+    forward_kit::assert_not_hub_answer(&net, &["retry", "12"]);
 }

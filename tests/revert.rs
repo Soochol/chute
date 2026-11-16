@@ -1,4 +1,5 @@
 mod engine_kit;
+mod forward_kit;
 mod support;
 
 use std::fs;
@@ -415,4 +416,49 @@ fn a_batch_recorded_only_when_every_pr_has_a_revert_commit_on_main() {
     let list = stdout(&chute(&lab, &["batches", "--json"]));
     let list: serde_json::Value = serde_json::from_str(&list).unwrap();
     assert_eq!(list[0]["reverted"], false);
+}
+
+#[test]
+fn revert_on_a_pc_that_is_not_the_hub_is_refused_and_names_the_command_to_run_on_the_hub() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let hub_path = fs::canonicalize(b.repo.path()).unwrap();
+
+    let out = a.chute(forward_kit::BIN, &["revert", "b1", "--no-verify"]);
+
+    assert_eq!(out.status.code(), Some(2), "{}", forward_kit::err(&out));
+    let said = forward_kit::err(&out);
+    let command = format!(
+        "hc run --on b --cwd {} chute revert b1 --no-verify",
+        hub_path.display()
+    );
+    assert!(said.contains(&command), "{command}\n{said}");
+    assert!(said.contains("허브에서만 실행한다"), "{said}");
+    assert!(a.sb.fake("hc").calls().iter().all(|c| c[0] != "run"));
+}
+
+#[test]
+fn revert_refusal_still_names_the_hub_when_it_cannot_say_where_its_checkout_is() {
+    let net = forward_kit::net();
+    net.set_state("a", "b", "unreachable");
+
+    let out = net.node("a").chute(forward_kit::BIN, &["revert", "b1"]);
+
+    assert_eq!(out.status.code(), Some(2), "{}", forward_kit::err(&out));
+    let said = forward_kit::err(&out);
+    assert!(
+        said.contains("hc run --on b --cwd <허브의 저장소 경로> chute revert b1"),
+        "{said}"
+    );
+}
+
+#[test]
+fn revert_on_the_hub_itself_still_runs() {
+    let net = forward_kit::net();
+    let b = net.node("b");
+
+    let out = b.chute(forward_kit::BIN, &["revert", "nosuch"]);
+
+    assert_eq!(out.status.code(), Some(1), "{}", forward_kit::err(&out));
+    assert!(forward_kit::err(&out).contains("그런 batch가 없다"));
 }
