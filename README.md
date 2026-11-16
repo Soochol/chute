@@ -22,11 +22,20 @@ chute는 검증을 로컬에서 묶음(batch) 단위로 한 번에 돌린다. �
 
 ## 설치
 
-```sh
-cargo install --path .
+Claude Code에서는 plugin으로 설치한다. plugin이 chute 스킬과 막는 훅을 준다.
+
+```
+/plugin marketplace add Soochol/chute
+/plugin install chute@chute
 ```
 
-개발할 때는 `cargo build --release`로 빌드하고 `cargo test`로 시험한다. 실행 파일은 `target/release/chute`다.
+plugin은 실행 파일을 빌드하지 않는다. `chute` 실행 파일은 따로 설치한다.
+
+```sh
+cargo install --git https://github.com/Soochol/chute
+```
+
+저장소를 받아 개발할 때는 `cargo install --path .`로 설치하고, `cargo build --release`로 빌드하고 `cargo test`로 시험한다. 빌드한 실행 파일은 `target/release/chute`다.
 
 필요한 것은 다음과 같다.
 
@@ -35,11 +44,26 @@ cargo install --path .
 - `hc`(herdr-core CLI). 에이전트에게 메시지를 보내고 새 에이전트와 데몬 터미널을 띄우는 데 쓴다.
 - Herdr. 현황판 mod를 보려면 필요하다.
 
+### plugin이 하는 일
+
+- 스킬은 `skills/chute/SKILL.md`다. 에이전트에게 `chute --skill`의 설명서를 읽으라고 알린다. 이 파일이 스킬의 유일한 원본이고 `chute install`도 이 파일을 쓴다.
+- 훅은 Bash 호출 전에 `chute guard`를 실행한다. 대상 저장소의 루트에 `chute.toml`이 있을 때만 다음을 막고, `chute preflight`와 `chute submit`을 쓰라고 안내한다. `chute.toml`이 없는 저장소에서는 아무것도 막지 않는다.
+  - `gh pr merge`와 PR 머지 API(`gh api .../pulls/<번호>/merge`)
+  - 기본 브랜치로 가는 `git push`. `git push origin main`, `git push origin HEAD:main`, `git push --all`, 기본 브랜치를 체크아웃한 상태의 맨 `git push` 같은 형태다. 맨 `git push`는 `push.default`와 upstream이 정하는 브랜치를 본다. 기본 브랜치는 원격의 `HEAD`(`refs/remotes/<원격>/HEAD`)가 가리키는 브랜치이고, 그것이 없으면 `main`과 `master`다. `origin/HEAD`가 없는 clone에서 기본 브랜치가 다른 이름이면 `git remote set-head origin -a`로 만든다.
+  - PR 브랜치로의 push는 막지 않는다.
+- chute 데몬이 직접 하는 push는 Claude Code의 도구 호출이 아니므로 훅이 보지 않는다. 데몬이 머지하는 데는 영향이 없다.
+- 훅은 실수를 막는 장치이지 보안 경계가 아니다. 셸 별칭, 변수, 스크립트 안의 명령은 따라가지 않는다. 중괄호 확장, 함수 정의, 파이프나 `&` 뒤의 `cd`, 작은따옴표 안의 `$(...)`, 큰따옴표 안의 백틱도 따라가지 못한다.
+- `chute` 실행 파일이 `PATH`에 없으면 훅은 호출을 막지 않고 지나간다. `chute.toml`이 있는 저장소에서만 "실행 파일이 없어 막지 못한다"는 안내를 사용자에게 보인다. 훅이 입력을 읽거나 판정하지 못할 때도 호출을 막지 않고 이유만 보인다.
+
+### `chute install`이 하는 일
+
+`chute install`은 plugin이 주지 않는 것만 쓴다. Codex 스킬(`~/.codex/skills/chute/SKILL.md`)과 Herdr 현황판 mod(`~/.config/herdr-app/mods/chute/`)다. Claude Code 스킬은 쓰지 않는다. plugin의 스킬과 같은 스킬이 두 번 뜨는 것을 막기 위해서다. 이전 버전의 `chute install`이 쓴 `~/.claude/skills/chute/SKILL.md`가 남아 있으면 plugin과 겹치니 직접 지운다. `chute install`이 그 파일을 알려 준다.
+
 ## 처음 쓰기
 
 1. 대상 저장소에서 `chute init`을 실행한다. `chute.toml` 초안을 쓰고 저장소를 상태 폴더에 등록한다.
 2. `chute.toml`의 `[[verify]]`를 이 저장소의 검사 명령으로 고치고 커밋해 기본 브랜치에 올린다. chute는 `origin/<기본 브랜치>`에 올라간 `chute.toml`만 읽는다.
-3. `chute install`을 실행한다. 스킬 파일(`~/.claude/skills/chute/SKILL.md`, `~/.codex/skills/chute/SKILL.md`)과 현황판 mod(`~/.config/herdr-app/mods/chute/`)를 쓴다. `~/.claude`나 `~/.codex`가 없으면 그쪽은 건너뛰고, Herdr 홈이 없으면 mod를 건너뛴다. `HERDR_APP_HOME`이 있으면 그 아래에 mod를 쓴다. 다시 실행해도 같은 결과이고, 무엇을 썼고 무엇이 그대로인지 출력한다.
+3. `chute install`을 실행한다. Codex 스킬 파일(`~/.codex/skills/chute/SKILL.md`)과 현황판 mod(`~/.config/herdr-app/mods/chute/`)를 쓴다. `~/.codex`가 없으면 스킬을 건너뛰고, Herdr 홈이 없으면 mod를 건너뛴다. `HERDR_APP_HOME`이 있으면 그 아래에 mod를 쓴다. 다시 실행해도 같은 결과이고, 무엇을 썼고 무엇이 그대로인지 출력한다. Claude Code의 스킬과 훅은 위의 plugin이 준다.
 4. 대상 저장소의 `AGENTS.md`(또는 에이전트 지침 파일)에 한 줄을 넣는다. `chute init`과 `chute install`이 출력하는 문장이다. chute는 지침 파일과 herdr 템플릿을 고치지 않는다.
    ```
    - 이 저장소의 PR은 chute로 머지한다. PR을 올리기 전에 `chute --skill`을 실행해 나온 절차를 따르고, `gh pr merge`나 기본 브랜치로의 직접 push는 하지 않는다.
@@ -166,7 +190,6 @@ v1이 일부러 뺀 것이다.
 - 수리 대신 재생성 판단
 - 반복 실패 유형 집계와 에이전트 지침 제안
 - 위험도에 따른 자동/사람 확인 세분화. `approval`의 켜고 끔과 `chute.toml` 변경 PR의 승인 대기만 있다
-- 에이전트의 우회(`gh pr merge`, 기본 브랜치로의 직접 push)를 훅으로 막는 일. 스킬의 규칙으로만 금지한다
 - orch 스킬의 병합 대기열을 chute로 바꾸거나 잇는 일
 - 머지된 브랜치와 worktree 정리
 - 별도 clone에서의 preflight, fork에서 온 PR, 기본 브랜치가 아닌 곳을 향한 PR

@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod down;
 pub mod drop;
 pub mod giveup;
+pub mod guard;
 pub mod init;
 pub mod install;
 pub mod preflight;

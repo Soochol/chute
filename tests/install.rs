@@ -57,16 +57,15 @@ fn prepare_full_home(sb: &Sandbox) {
 }
 
 #[test]
-fn installs_both_skills_and_the_mod_with_repository_content() {
+fn installs_the_codex_skill_and_the_mod_with_repository_content() {
     let sb = Sandbox::new();
     prepare_full_home(&sb);
     stdout(&install(&sb));
 
-    let skill = repo_file("skill/SKILL.md");
-    for tool in [".claude", ".codex"] {
-        let path = sb.home().join(tool).join("skills/chute/SKILL.md");
-        assert_eq!(fs::read_to_string(path).unwrap(), skill);
-    }
+    let skill = repo_file("skills/chute/SKILL.md");
+    let path = sb.home().join(".codex/skills/chute/SKILL.md");
+    assert_eq!(fs::read_to_string(path).unwrap(), skill);
+    assert!(!sb.home().join(".claude/skills").exists());
     let mod_dir = herdr_home(&sb).join("mods/chute");
     for name in ["main.js", "board.js", "mod.json"] {
         let got = fs::read_to_string(mod_dir.join(name)).unwrap();
@@ -95,7 +94,6 @@ fn skips_codex_when_it_is_not_installed() {
     fs::remove_dir(sb.home().join(".codex")).unwrap();
     let text = stdout(&install(&sb));
     assert!(!sb.home().join(".codex").exists());
-    assert!(sb.home().join(".claude/skills/chute/SKILL.md").exists());
     assert!(herdr_home(&sb).join("mods/chute/main.js").exists());
     assert!(text.contains("건너뛰었다"), "{text}");
     assert!(text.contains(".codex"), "{text}");
@@ -108,7 +106,6 @@ fn skips_the_mod_when_herdr_has_no_home() {
     fs::remove_dir(herdr_home(&sb)).unwrap();
     let text = stdout(&install(&sb));
     assert!(!herdr_home(&sb).exists());
-    assert!(sb.home().join(".claude/skills/chute/SKILL.md").exists());
     assert!(sb.home().join(".codex/skills/chute/SKILL.md").exists());
     assert!(text.contains("Herdr 홈"), "{text}");
 }
@@ -144,9 +141,6 @@ fn leaves_templates_and_agents_md_alone() {
     );
     let expected: BTreeSet<String> = [
         ".claude",
-        ".claude/skills",
-        ".claude/skills/chute",
-        ".claude/skills/chute/SKILL.md",
         ".codex",
         ".codex/skills",
         ".codex/skills/chute",
@@ -216,7 +210,7 @@ fn the_mod_installed_in_a_temporary_home_passes_herdr_app_check() {
 fn concurrent_installs_both_succeed() {
     let sb = Sandbox::new();
     prepare_full_home(&sb);
-    let skill = sb.home().join(".claude/skills/chute/SKILL.md");
+    let skill = sb.home().join(".codex/skills/chute/SKILL.md");
     for round in 0..30 {
         let _ = fs::remove_file(&skill);
         let spawn = || {
@@ -238,7 +232,7 @@ fn concurrent_installs_both_succeed() {
         }
         assert_eq!(
             fs::read_to_string(&skill).unwrap(),
-            repo_file("skill/SKILL.md")
+            repo_file("skills/chute/SKILL.md")
         );
     }
 }
@@ -247,10 +241,9 @@ fn concurrent_installs_both_succeed() {
 fn a_blocked_target_exits_2_and_installs_the_rest() {
     let sb = Sandbox::new();
     prepare_full_home(&sb);
-    fs::create_dir_all(sb.home().join(".claude/skills/chute/SKILL.md")).unwrap();
+    fs::create_dir_all(sb.home().join(".codex/skills/chute/SKILL.md")).unwrap();
     let out = install(&sb);
     assert_eq!(out.status.code(), Some(2));
-    assert!(sb.home().join(".codex/skills/chute/SKILL.md").is_file());
     assert!(herdr_home(&sb).join("mods/chute/mod.json").is_file());
     assert!(String::from_utf8_lossy(&out.stdout).contains("실패했다"));
 }

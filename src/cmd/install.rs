@@ -12,7 +12,7 @@ use super::{CANNOT_RUN, Ctx};
 #[derive(clap::Args, Debug)]
 pub struct Args {}
 
-const SKILL_MD: &str = include_str!("../../skill/SKILL.md");
+const SKILL_MD: &str = include_str!("../../skills/chute/SKILL.md");
 
 const MOD_FILES: [(&str, &str); 3] = [
     ("main.js", include_str!("../../mod/chute/main.js")),
@@ -35,8 +35,12 @@ impl Layout {
         Ok(Layout { home, herdr })
     }
 
-    fn skill_roots(&self) -> [PathBuf; 2] {
-        [self.home.join(".claude"), self.home.join(".codex")]
+    fn codex_root(&self) -> PathBuf {
+        self.home.join(".codex")
+    }
+
+    fn legacy_claude_skill(&self) -> PathBuf {
+        self.home.join(".claude/skills/chute/SKILL.md")
     }
 }
 
@@ -71,16 +75,25 @@ pub fn run(_args: Args, _ctx: &Ctx) -> Result<ExitCode> {
 
 pub fn install(layout: &Layout) -> Vec<Entry> {
     let mut entries = Vec::new();
-    for root in layout.skill_roots() {
-        let file = root.join("skills/chute/SKILL.md");
-        if root.is_dir() {
-            entries.push(sync(&file, SKILL_MD));
-        } else {
-            entries.push(Entry {
-                outcome: Outcome::Skipped(format!("{}가 없다", root.display())),
-                path: file,
-            });
-        }
+    let root = layout.codex_root();
+    let file = root.join("skills/chute/SKILL.md");
+    if root.is_dir() {
+        entries.push(sync(&file, SKILL_MD));
+    } else {
+        entries.push(Entry {
+            outcome: Outcome::Skipped(format!("{}가 없다", root.display())),
+            path: file,
+        });
+    }
+    let legacy = layout.legacy_claude_skill();
+    if legacy.exists() {
+        entries.push(Entry {
+            outcome: Outcome::Skipped(
+                "Claude Code는 plugin이 스킬을 준다. 이 파일은 이전 `chute install`이 쓴 것이라 plugin과 겹치니 직접 지운다"
+                    .to_owned(),
+            ),
+            path: legacy,
+        });
     }
     let mod_dir = layout.herdr.join("mods/chute");
     if layout.herdr.is_dir() {
@@ -225,17 +238,15 @@ mod tests {
     }
 
     #[test]
-    fn installs_skills_and_mod_with_repository_content() {
+    fn installs_the_codex_skill_and_mod_with_repository_content() {
         let home = full_home();
         install(&layout(home.path()));
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for tool in [".claude", ".codex"] {
-            let got = fs::read_to_string(home.path().join(tool).join("skills/chute/SKILL.md"));
-            assert_eq!(
-                got.unwrap(),
-                fs::read_to_string(repo.join("skill/SKILL.md")).unwrap()
-            );
-        }
+        let got = fs::read_to_string(home.path().join(".codex/skills/chute/SKILL.md"));
+        assert_eq!(
+            got.unwrap(),
+            fs::read_to_string(repo.join("skills/chute/SKILL.md")).unwrap()
+        );
         let mod_dir = home.path().join(".config/herdr-app/mods/chute");
         for (name, _) in MOD_FILES {
             let got = fs::read_to_string(mod_dir.join(name)).unwrap();
@@ -263,7 +274,7 @@ mod tests {
         let home = full_home();
         let layout = layout(home.path());
         install(&layout);
-        let skill = home.path().join(".claude/skills/chute/SKILL.md");
+        let skill = home.path().join(".codex/skills/chute/SKILL.md");
         fs::write(&skill, "낡은 내용").unwrap();
         let entries = install(&layout);
         assert_eq!(fs::read_to_string(&skill).unwrap(), SKILL_MD);
@@ -277,7 +288,6 @@ mod tests {
         fs::remove_dir(home.path().join(".codex")).unwrap();
         let entries = install(&layout(home.path()));
         assert!(!home.path().join(".codex").exists());
-        assert!(home.path().join(".claude/skills/chute/SKILL.md").exists());
         assert!(
             home.path()
                 .join(".config/herdr-app/mods/chute/main.js")
@@ -317,7 +327,6 @@ mod tests {
         let home = full_home();
         install(&layout(home.path()));
         let expected: BTreeSet<String> = [
-            ".claude/skills/chute/SKILL.md",
             ".codex/skills/chute/SKILL.md",
             ".config/herdr-app/mods/chute/main.js",
             ".config/herdr-app/mods/chute/board.js",
@@ -326,6 +335,27 @@ mod tests {
         .map(str::to_owned)
         .into();
         assert_eq!(files_under(home.path()), expected);
+    }
+
+    #[test]
+    fn leaves_claude_to_the_plugin_and_points_out_an_old_skill_file() {
+        let home = full_home();
+        let entries = install(&layout(home.path()));
+        assert!(!home.path().join(".claude/skills").exists());
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.path.starts_with(home.path().join(".claude")))
+        );
+
+        let old = home.path().join(".claude/skills/chute/SKILL.md");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "이전 설치").unwrap();
+        let entries = install(&layout(home.path()));
+        assert_eq!(fs::read_to_string(&old).unwrap(), "이전 설치");
+        let entry = entries.iter().find(|e| e.path == old).unwrap();
+        assert!(matches!(entry.outcome, Outcome::Skipped(_)));
+        assert!(render(&entries).contains("plugin"));
     }
 
     #[test]
@@ -341,9 +371,8 @@ mod tests {
     #[test]
     fn a_blocked_target_does_not_stop_the_others() {
         let home = full_home();
-        fs::create_dir_all(home.path().join(".claude/skills/chute/SKILL.md")).unwrap();
+        fs::create_dir_all(home.path().join(".codex/skills/chute/SKILL.md")).unwrap();
         let entries = install(&layout(home.path()));
-        assert!(home.path().join(".codex/skills/chute/SKILL.md").is_file());
         assert!(
             home.path()
                 .join(".config/herdr-app/mods/chute/main.js")
@@ -362,7 +391,7 @@ mod tests {
     #[test]
     fn a_file_that_is_not_utf8_is_replaced() {
         let home = full_home();
-        let skill = home.path().join(".claude/skills/chute/SKILL.md");
+        let skill = home.path().join(".codex/skills/chute/SKILL.md");
         fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::write(&skill, [0xff, 0xfe]).unwrap();
         let entries = install(&layout(home.path()));
@@ -374,7 +403,7 @@ mod tests {
     #[test]
     fn never_writes_through_a_link_left_at_the_temporary_name() {
         let home = full_home();
-        let dir = home.path().join(".claude/skills/chute");
+        let dir = home.path().join(".codex/skills/chute");
         fs::create_dir_all(&dir).unwrap();
         let victim = home.path().join("victim");
         fs::write(&victim, "precious").unwrap();

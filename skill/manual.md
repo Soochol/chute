@@ -13,7 +13,7 @@ chute는 이 저장소의 머지 큐다. 여러 에이전트가 PR을 동시에 
 1. PR을 올리기 전에 `chute preflight`를 실행한다. 통과해야 올린다.
 2. PR을 올린 뒤 `chute submit`을 실행한다. 이것으로 큐에 들어간다.
 3. `gh pr merge`나 다른 방법으로 PR을 직접 머지하지 않는다.
-4. 기본 브랜치인 main에 push하지 않는다. PR 브랜치에만 push한다.
+4. 기본 브랜치인 main에 push하지 않는다. PR 브랜치에만 push한다. plugin이 켜져 있으면 훅이 3과 4를 막고 `chute preflight`와 `chute submit`을 쓰라고 안내한다. 막혀도 다른 방법으로 우회하지 않는다.
 5. chute가 PR을 돌려보내면(아래 "반송") 보고서를 읽고 고쳐서 PR 브랜치에 push한 뒤 다시 `chute submit`을 실행한다.
 6. 못 풀겠으면 `chute giveup --reason "<이유>"`를 실행하고 멈춘다. 사람 차례로 넘어간다.
 7. `chute.toml`의 검증 명령이나 시간 제한을 고쳐서 검증을 통과시키려 하지 않는다. 이 파일을 고치는 PR은 사람 승인을 기다린다.
@@ -163,6 +163,6 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 - `chute drop`: 사람이 PR을 큐에서 뺀다.
 - `chute revert`: 사람이 batch를 되돌린다.
 - `chute up`, `chute down`: 사람이 데몬을 띄우고 멈춘다.
-- `chute install`: 사람이 스킬 파일과 현황판을 설치한다.
+- `chute install`: 사람이 Codex 스킬 파일과 현황판을 설치한다.
 
 `chute batches`, `chute init`, `chute daemon`도 사람이나 데몬의 일이다. 에이전트가 쓸 명령은 `preflight`, `submit`, `giveup`, `status` 넷이다.

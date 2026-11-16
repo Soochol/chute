@@ -1,0 +1,17 @@
+{
+  "description": "chute가 등록된 저장소에서 기본 브랜치 직접 push와 gh pr merge를 막는다",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
