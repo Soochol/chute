@@ -109,7 +109,6 @@ enum Destination {
     Pattern,
 }
 
-/// Where a command runs, relative to the directory the hook was started in.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Dir(Vec<String>);
 
@@ -131,8 +130,6 @@ impl Dir {
     }
 }
 
-/// The facts about one work tree that decide a call. `None` when the directory is not inside a
-/// chute repository: no `chute.toml` at the work tree root, or not a work tree at all.
 struct Repo<'a> {
     ext: &'a Ext,
     dir: PathBuf,
@@ -166,7 +163,6 @@ impl<'a> Repo<'a> {
             .then(|| head.trim().strip_prefix("refs/heads/").map(str::to_owned))?
     }
 
-    /// The branch a bare `git push` lands on, which `push.default` and the upstream decide.
     fn push_target_branch(&self) -> Option<String> {
         let out = self
             .ext
@@ -183,8 +179,6 @@ impl<'a> Repo<'a> {
     }
 }
 
-/// Every remote's `HEAD` names that remote's default branch. Without one, the two usual names
-/// stand in.
 fn default_branches(ext: &Ext, dir: &Path) -> Vec<String> {
     let listed = ext
         .git(dir, ["for-each-ref", "--format=%(symref)", "refs/remotes"])
@@ -253,8 +247,6 @@ impl Push {
     }
 }
 
-/// Every `gh pr merge` and `git push` in a shell command line, in order. The scan is a
-/// guardrail for honest mistakes, not a sandbox: aliases, variables and scripts are not followed.
 fn actions(command: &str) -> Vec<Action> {
     let mut found = Vec::new();
     collect(command, &Dir::default(), &mut found);
@@ -328,7 +320,6 @@ const WRAPPERS: [&str; 9] = [
     "env", "command", "exec", "time", "nohup", "sudo", "nice", "timeout", "xargs",
 ];
 
-/// Whether `flag` of `wrapper` is followed by its own value, as in `env -u NAME`.
 fn flag_takes_value(wrapper: &str, flag: &str) -> bool {
     match wrapper {
         "env" => matches!(flag, "-u" | "-C" | "-S"),
@@ -340,8 +331,6 @@ fn flag_takes_value(wrapper: &str, flag: &str) -> bool {
     }
 }
 
-/// Skips what stands in front of the program: shell keywords, `VAR=value`, and wrappers such as
-/// `env`, `sudo`, `timeout 60` and `xargs` with their flags.
 fn strip_wrappers(words: &[String]) -> &[String] {
     let mut rest = words;
     while let Some(first) = rest.first() {
@@ -397,8 +386,6 @@ fn is_merge_endpoint(endpoint: &str) -> bool {
     path.contains("/pulls/") && path.trim_end_matches('/').ends_with("/merge")
 }
 
-/// `git [-C dir] push ...`: the directory it runs in and what it pushes. `None` for other
-/// subcommands.
 fn git_push(args: &[String], start: &Dir) -> Option<(Dir, Push)> {
     let mut dir = start.clone();
     let mut words = args.iter();
@@ -463,8 +450,6 @@ fn destination(refspec: &str) -> Option<Destination> {
     }
 }
 
-/// Splits a command line into simple commands made of words. Quotes group words, a backslash
-/// escapes one character, `; & | ( ) `` ` and newlines end a command, and redirections are dropped.
 fn segments(command: &str) -> Vec<Vec<String>> {
     let command = strip_heredocs(command);
     let mut all = Vec::new();
@@ -540,7 +525,6 @@ fn segments(command: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Removes the body of `<<WORD` heredocs. Those lines are text for another command, not commands.
 fn strip_heredocs(command: &str) -> String {
     let opener =
         Regex::new(r#"(?:^|[^<])<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#)

@@ -46,8 +46,8 @@ cargo install --git https://github.com/Soochol/chute
 
 ### plugin이 하는 일
 
-- **스킬**: `chute` 스킬(`skills/chute/SKILL.md`)이다. 에이전트가 `chute --skill`의 설명서를 읽게 한다. 이 파일이 스킬의 유일한 원본이고 `chute install`도 이것을 쓴다.
-- **훅**: Bash 호출 전에 `chute guard`를 실행한다. 대상 저장소의 루트에 `chute.toml`이 있을 때만 다음을 막고 `chute preflight`와 `chute submit`을 쓰라고 안내한다. `chute.toml`이 없는 저장소에서는 아무것도 막지 않는다.
+- 스킬은 `skills/chute/SKILL.md`다. 에이전트에게 `chute --skill`의 설명서를 읽으라고 알린다. 이 파일이 스킬의 유일한 원본이고 `chute install`도 이 파일을 쓴다.
+- 훅은 Bash 호출 전에 `chute guard`를 실행한다. 대상 저장소의 루트에 `chute.toml`이 있을 때만 다음을 막고, `chute preflight`와 `chute submit`을 쓰라고 안내한다. `chute.toml`이 없는 저장소에서는 아무것도 막지 않는다.
   - `gh pr merge`와 PR 머지 API(`gh api .../pulls/<번호>/merge`)
   - 기본 브랜치로 가는 `git push`. `git push origin main`, `git push origin HEAD:main`, `git push --all`, 기본 브랜치를 체크아웃한 상태의 맨 `git push` 같은 형태다. 맨 `git push`는 `push.default`와 upstream이 정하는 브랜치를 본다. 기본 브랜치는 원격의 `HEAD`(`refs/remotes/<원격>/HEAD`)가 가리키는 브랜치이고, 그것이 없으면 `main`과 `master`다. `origin/HEAD`가 없는 clone에서 기본 브랜치가 다른 이름이면 `git remote set-head origin -a`로 만든다.
   - PR 브랜치로의 push는 막지 않는다.

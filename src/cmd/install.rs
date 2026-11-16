@@ -39,7 +39,6 @@ impl Layout {
         self.home.join(".codex")
     }
 
-    /// Written by earlier versions of `chute install`. The Claude Code plugin ships the skill now.
     fn legacy_claude_skill(&self) -> PathBuf {
         self.home.join(".claude/skills/chute/SKILL.md")
     }

@@ -1,6 +1,4 @@
 #!/bin/sh
-# Runs `chute guard` for the PreToolUse hook. Without the binary the hook cannot judge, so it
-# lets the call through and, only inside a chute repository, tells the user how to install it.
 if command -v chute >/dev/null 2>&1; then
   exec chute guard
 fi
