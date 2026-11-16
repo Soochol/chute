@@ -204,6 +204,15 @@ pub enum Approval {
     Human,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightPolicy {
+    #[default]
+    WhenQueued,
+    Always,
+    Never,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub slug: Slug,
@@ -612,6 +621,7 @@ pub enum PreflightResult {
     Conflict,
     /// The base commit itself fails verification, so no commit can be judged on it.
     BaseBroken,
+    Skipped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

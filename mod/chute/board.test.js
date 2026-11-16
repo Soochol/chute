@@ -369,11 +369,11 @@ test("unknown values are shown as they are", () => {
 });
 
 test("an unknown batch phase and preflight result are shown as they are", () => {
-  const data = withQueue(itemOf(12), { ...itemOf(21), preflight: { result: "skipped", head: "21e5678" } });
+  const data = withQueue(itemOf(12), { ...itemOf(21), preflight: { result: "vanished", head: "21e5678" } });
   data.batch.phase = "teleporting";
   const repo = only(data);
   assert.equal(section(repo, "batch").items[0].phase, "teleporting");
-  assert.equal(section(repo, "human").items[0].preflight.text, "preflight skipped");
+  assert.equal(section(repo, "human").items[0].preflight.text, "preflight vanished");
 });
 
 test("missing fields do not break the board", () => {
@@ -514,6 +514,7 @@ test("every preflight result has its text and tone", () => {
     ["pass", "preflight 통과", "ok"],
     ["fail", "preflight 실패", "error"],
     ["conflict", "preflight 충돌", "error"],
+    ["skipped", "preflight 생략", "muted"],
   ];
   for (const [result, text, tone] of cases) {
     const item = section(only(withQueue({ ...itemOf(21), preflight: { result, head: "21e5678" } })), "human").items[0];
@@ -747,7 +748,7 @@ test("random malformed status never breaks the board", () => {
     maybe(o, "budget", () => or(() => 3));
     maybe(o, "submitted_ms", () => or(() => pick(NUMS)));
     maybe(o, "touches_config", () => or(() => rnd() < 0.5));
-    maybe(o, "preflight", () => or(() => ({ head: or(() => "abc1234"), result: or(() => pick(["pass", "fail", "conflict"])) })));
+    maybe(o, "preflight", () => or(() => ({ head: or(() => "abc1234"), result: or(() => pick(["pass", "fail", "conflict", "skipped"])) })));
     maybe(o, "last_failure", () => or(() => ({ kind: or(() => "verify"), mode: or(() => "solo"), summary: or(() => "s"), report: or(() => "/r") })));
     maybe(o, "submitter", () => or(() => ({ terminal: or(() => pick(["t1", "t2"])), name: or(() => "orch"), alive: or(() => true) })));
     maybe(o, "priority", () => or(() => rnd() < 0.5));

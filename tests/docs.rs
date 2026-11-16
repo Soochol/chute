@@ -269,6 +269,24 @@ fn readme_default_values_are_the_ones_the_config_parses() {
     }
     assert!(!config.require_head);
     assert!(text.contains("| `require_head` | `false` |"));
+    assert_eq!(config.preflight, chute::model::PreflightPolicy::WhenQueued);
+    assert!(text.contains("| `preflight` | `\"when_queued\"` |"));
+    assert!(text.contains("preflight = \"when_queued\""));
+}
+
+#[test]
+fn manual_tells_workers_what_a_skipped_preflight_looks_like() {
+    let text = manual();
+    for needed in [
+        "`skipped`",
+        "`skip_reason`",
+        "`no_queue`",
+        "생략: 함께 합칠 PR이 큐에 없어",
+    ] {
+        assert!(text.contains(needed), "설명서에 {needed}가 없다");
+    }
+    let code = source();
+    assert!(code.contains("함께 합칠 PR이 큐에 없어 검사하지 않는다"));
 }
 
 #[test]

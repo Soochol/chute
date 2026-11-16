@@ -15,8 +15,8 @@ use crate::gc;
 use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
     Blocked, ConflictFile, EnvRecord, EpochMs, Failure, FailureKind, FailureShape, ItemState, Mode,
-    NonEmpty, Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView,
-    StepFailure, VerifyMode,
+    NonEmpty, Partner, PrNumber, PreflightPolicy, PreflightRecord, PreflightResult, RepoInfo, Sha,
+    StatusView, StepFailure, VerifyMode,
 };
 use crate::pc_limit::Wait;
 use crate::store::RepoStore;
@@ -51,7 +51,7 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
         print!("{}", render(&report));
     }
     Ok(match report.result {
-        PreflightResult::Pass => ExitCode::SUCCESS,
+        PreflightResult::Pass | PreflightResult::Skipped => ExitCode::SUCCESS,
         PreflightResult::Fail | PreflightResult::Conflict => ExitCode::from(REFUSED),
         PreflightResult::BaseBroken => ExitCode::from(BASE_BROKEN),
     })
@@ -73,8 +73,37 @@ struct Report {
     report_json: Option<PathBuf>,
     base_broken: Option<BrokenBase>,
     blocked: Option<Blocked>,
+    skip_reason: Option<SkipReason>,
     at_ms: EpochMs,
-    env: EnvRecord,
+    env: Option<EnvRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SkipReason {
+    NoQueue,
+    Never,
+}
+
+impl SkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            SkipReason::NoQueue => {
+                "함께 합칠 PR이 큐에 없어 검사하지 않는다. batch가 병합 전에 검증한다"
+            }
+            SkipReason::Never => {
+                "chute.toml의 preflight가 \"never\"라 검사하지 않는다. batch가 병합 전에 검증한다"
+            }
+        }
+    }
+}
+
+fn skip_reason(policy: PreflightPolicy, others_queued: usize) -> Option<SkipReason> {
+    match policy {
+        PreflightPolicy::Always => None,
+        PreflightPolicy::Never => Some(SkipReason::Never),
+        PreflightPolicy::WhenQueued => (others_queued == 0).then_some(SkipReason::NoQueue),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -154,20 +183,22 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .filter(|item| Some(item.branch.as_str()) != target.branch.as_deref())
         .collect();
 
-    let last_fetched_config = Config::load_remote_branch(
-        &ctx.ext,
-        &info.path,
-        &info.remote_name,
-        &info.default_branch,
-    )
-    .ok()
-    .flatten();
-    let max_parallel = last_fetched_config
+    let fetched_base = Gitops::new(&ctx.ext, &ctx.home, &info).fetch_base_tip()?;
+    let base_config = Config::load_at(&ctx.ext, &info.path, fetched_base.as_str()).ok();
+    let skip_why = base_config
+        .as_ref()
+        .and_then(|c| skip_reason(c.preflight, queued.len()));
+    if let Some(reason) = skip_why {
+        let report = Report::skipped(reason, &target, fetched_base, blocked, EpochMs::now());
+        if let Err(e) = record(ctx, &store, &target, &report) {
+            eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
+        }
+        return Ok(report);
+    }
+    let max_parallel = base_config
         .as_ref()
         .map_or(DEFAULT_MAX_PARALLEL, |c| c.max_parallel);
-    let seed = last_fetched_config
-        .map(|c| c.cache.seed)
-        .unwrap_or_default();
+    let seed = base_config.map(|c| c.cache.seed).unwrap_or_default();
     let gitops = Gitops::new(&ctx.ext, &ctx.home, &info).with_cache_seed(seed);
     let slot = gitops.lock_preflight_slot(max_parallel)?.open()?;
     let base = slot.fetch_base()?;
@@ -707,8 +738,37 @@ impl Report {
             report_json: judged.written.as_ref().map(|written| written.json.clone()),
             base_broken: judged.base_broken.take(),
             blocked,
+            skip_reason: None,
             at_ms,
-            env,
+            env: Some(env),
+        }
+    }
+
+    fn skipped(
+        reason: SkipReason,
+        target: &Target,
+        base: Sha,
+        blocked: Option<Blocked>,
+        at_ms: EpochMs,
+    ) -> Report {
+        Report {
+            result: PreflightResult::Skipped,
+            head: target.head.clone(),
+            base,
+            with: Vec::new(),
+            skipped: Vec::new(),
+            skipped_steps: Vec::new(),
+            flaky: Vec::new(),
+            kind: None,
+            mode: None,
+            summary: None,
+            report: None,
+            report_json: None,
+            base_broken: None,
+            blocked,
+            skip_reason: Some(reason),
+            at_ms,
+            env: None,
         }
     }
 }
@@ -733,7 +793,7 @@ fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Res
             at_ms: report.at_ms,
             base: Some(report.base.clone()),
             with: report.with.clone(),
-            env: Some(report.env.clone()),
+            env: report.env.clone(),
         },
     };
     deliver(ctx, store, &entry)
@@ -761,9 +821,15 @@ fn write_record(store: &RepoStore, entry: &Recorded) -> Result<()> {
         state
             .preflights
             .retain(|name, old| old.at_ms.0 >= cutoff || queued.contains(name));
-        state
-            .preflights
-            .insert(entry.branch.clone(), entry.record.clone());
+        let keeps_real_result = entry.record.result == PreflightResult::Skipped
+            && state.preflights.get(&entry.branch).is_some_and(|old| {
+                old.head == entry.record.head && old.result != PreflightResult::Skipped
+            });
+        if !keeps_real_result {
+            state
+                .preflights
+                .insert(entry.branch.clone(), entry.record.clone());
+        }
         Ok(())
     })
 }
@@ -792,6 +858,10 @@ fn render(report: &Report) -> String {
             .join(", ")
     };
     match (&report.summary, &report.base_broken) {
+        _ if report.skip_reason.is_some() => {
+            let reason = report.skip_reason.map_or("", SkipReason::label);
+            out.push_str(&format!("생략: {reason}\n"));
+        }
         (Some(summary), _) => out.push_str(&format!("{summary}\n")),
         (None, Some(broken)) => out.push_str(&format!(
             "기준이 깨졌다. 이 커밋 탓이 아니다: 기준 {}의 {} 단계가 실패한다. 이 HEAD는 판정하지 못했고 고칠 것도 없다. 기준을 고친 뒤 다시 실행한다\n검증 로그: {}\n",
@@ -832,9 +902,11 @@ fn render(report: &Report) -> String {
             "건너뛴 검증 단계 {step}: 건너뜀(바뀐 파일이 paths에 없다)\n"
         ));
     }
-    out.push_str(&format!("검사 환경: {}\n", env::machine_line(&report.env)));
-    for check in &report.env.checks {
-        out.push_str(&format!("  {}: {}\n", check.run, env::result_text(check)));
+    if let Some(env) = &report.env {
+        out.push_str(&format!("검사 환경: {}\n", env::machine_line(env)));
+        for check in &env.checks {
+            out.push_str(&format!("  {}: {}\n", check.run, env::result_text(check)));
+        }
     }
     for flaky in &report.flaky {
         let tests = if flaky.tests.is_empty() {
@@ -874,12 +946,13 @@ mod tests {
             report_json: None,
             base_broken: None,
             blocked: None,
+            skip_reason: None,
             at_ms: EpochMs(1),
-            env: EnvRecord {
+            env: Some(EnvRecord {
                 machine_id: None,
                 host: "pc".into(),
                 checks: Vec::new(),
-            },
+            }),
         }
     }
 
@@ -898,6 +971,28 @@ mod tests {
         assert!(text.contains("기준 fedcba987654"));
         assert!(text.contains("#3, #4"));
         assert!(render(&passed(&[])).contains("함께 검증한 PR 없음"));
+    }
+
+    #[test]
+    fn the_policy_decides_from_the_number_of_other_queued_prs() {
+        use PreflightPolicy::{Always, Never, WhenQueued};
+        assert_eq!(skip_reason(WhenQueued, 0), Some(SkipReason::NoQueue));
+        assert_eq!(skip_reason(WhenQueued, 1), None);
+        assert_eq!(skip_reason(Always, 0), None);
+        assert_eq!(skip_reason(Never, 3), Some(SkipReason::Never));
+    }
+
+    #[test]
+    fn a_skip_says_why_and_keeps_head_and_base() {
+        let mut report = passed(&[]);
+        report.result = PreflightResult::Skipped;
+        report.skip_reason = Some(SkipReason::NoQueue);
+        report.env = None;
+        let text = render(&report);
+        assert!(text.starts_with("생략: 함께 합칠 PR이 큐에 없어"), "{text}");
+        assert!(text.contains("batch가 병합 전에 검증한다"));
+        assert!(text.contains("HEAD 0123456789ab · 기준 fedcba987654"));
+        assert!(!text.contains("검사 환경"));
     }
 
     #[test]

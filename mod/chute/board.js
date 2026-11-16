@@ -50,6 +50,7 @@ const PREFLIGHT = table({
   fail: { text: "preflight 실패", tone: "error" },
   conflict: { text: "preflight 충돌", tone: "error" },
   base_broken: { text: "preflight 기준 깨짐", tone: "error" },
+  skipped: { text: "preflight 생략", tone: "muted" },
 });
 
 const plain = (v) => {
