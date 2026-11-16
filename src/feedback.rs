@@ -1156,13 +1156,18 @@ impl TerminalInfo {
             && !self.has_left_for_a_shell()
     }
 
+    /// Whether the terminal's program has gone away, leaving only a shell.
+    /// A null `status` only means the program reports none, so a named
+    /// foreground program that is not a shell is taken as alive. `reported`
+    /// decides only when hc names no foreground program.
     fn has_left_for_a_shell(&self) -> bool {
-        let in_a_shell = self
-            .foreground
-            .as_ref()
-            .and_then(|f| f.name.as_deref())
-            .is_some_and(|name| SHELLS.contains(&name));
-        matches!(self.status, ProgramStatus::NoProgram) && (self.reported || in_a_shell)
+        if !matches!(self.status, ProgramStatus::NoProgram) {
+            return false;
+        }
+        match self.foreground.as_ref().and_then(|f| f.name.as_deref()) {
+            Some(name) => SHELLS.contains(&name),
+            None => self.reported,
+        }
     }
 }
 

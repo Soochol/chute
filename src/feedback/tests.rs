@@ -31,9 +31,13 @@ fn terminal_with_status(
     created_ms: u64,
     status: &str,
     reported: bool,
+    foreground: Option<&str>,
 ) -> Reply {
+    let foreground = foreground.map_or(String::new(), |name| {
+        format!(",\"foreground\":{{\"name\":\"{name}\",\"argv\":[\"{name}\"]}}")
+    });
     Reply::ok(format!(
-        "{{\"address\":\"{address}\",\"state\":\"{state}\",\"created_ms\":{created_ms},\"status\":{status},\"reported\":{reported}}}"
+        "{{\"address\":\"{address}\",\"state\":\"{state}\",\"created_ms\":{created_ms},\"status\":{status},\"reported\":{reported}{foreground}}}"
     ))
 }
 
@@ -1150,31 +1154,99 @@ fn shell_words_are_quoted_only_when_needed() {
     assert_eq!(shell_word(""), "''");
 }
 
-type StatusCase = (&'static str, Option<(&'static str, bool)>, bool);
+struct StatusCase {
+    why: &'static str,
+    status: Option<&'static str>,
+    reported: bool,
+    foreground: Option<&'static str>,
+    sends: bool,
+}
 
-fn status_cases() -> [StatusCase; 4] {
+fn status_cases() -> [StatusCase; 8] {
+    let case = |why, status, reported, foreground, sends| StatusCase {
+        why,
+        status,
+        reported,
+        foreground,
+        sends,
+    };
     [
-        ("the agent left for a shell", Some(("null", true)), false),
-        ("a program that never reported", Some(("null", false)), true),
-        (
-            "an agent reports",
-            Some(("{\"app\":\"claude-code\",\"state\":\"done\"}", true)),
+        case(
+            "no foreground, reported once, status gone",
+            Some("null"),
+            true,
+            None,
+            false,
+        ),
+        case(
+            "a program that never reported",
+            Some("null"),
+            false,
+            None,
             true,
         ),
-        ("no status key, as in the scaffold fixture", None, true),
+        case(
+            "an agent reports",
+            Some("{\"app\":\"claude-code\",\"state\":\"done\"}"),
+            true,
+            None,
+            true,
+        ),
+        case(
+            "no status key, as in the scaffold fixture",
+            None,
+            true,
+            None,
+            true,
+        ),
+        case(
+            "claude in the foreground with a null status",
+            Some("null"),
+            true,
+            Some("claude"),
+            true,
+        ),
+        case(
+            "codex in the foreground with a null status",
+            Some("null"),
+            true,
+            Some("codex"),
+            true,
+        ),
+        case(
+            "a shell in the foreground",
+            Some("null"),
+            true,
+            Some("zsh"),
+            false,
+        ),
+        case(
+            "a shell in the foreground that never reported",
+            Some("null"),
+            false,
+            Some("bash"),
+            false,
+        ),
     ]
 }
 
 #[test]
 fn a_live_pane_where_nothing_reports_a_status_gets_a_new_agent_not_a_send() {
-    for (why, status, sends) in status_cases() {
+    for StatusCase {
+        why,
+        status,
+        reported,
+        foreground,
+        sends,
+    } in status_cases()
+    {
         let lab = Lab::new();
         lab.repo.pr_branch("feat/a", "a.txt", "a\n");
         let mut item = lab.item(12, "feat/a");
         item.agent = Some(lab.recorded_agent(&lab.sb.root().join("gone")));
         let get = match status {
-            Some((status, reported)) => {
-                terminal_with_status("t1rs", "live", RECORDED_MS, status, reported)
+            Some(status) => {
+                terminal_with_status("t1rs", "live", RECORDED_MS, status, reported, foreground)
             }
             None => terminal("t1rs", "live", RECORDED_MS),
         };

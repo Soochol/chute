@@ -607,6 +607,8 @@ pub enum PreflightResult {
     Pass,
     Fail,
     Conflict,
+    /// The base commit itself fails verification, so no commit can be judged on it.
+    BaseBroken,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -13,15 +13,17 @@ use crate::feedback::{self, Feedback, Subject, Written};
 use crate::gc;
 use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
-    Blocked, ConflictFile, EnvRecord, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty,
-    Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView, StepFailure,
-    VerifyMode,
+    Blocked, ConflictFile, EnvRecord, EpochMs, Failure, FailureKind, FailureShape, ItemState, Mode,
+    NonEmpty, Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView,
+    StepFailure, VerifyMode,
 };
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
 const RECORD_KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHOWN_PATHS: usize = 5;
+/// Exit code when the base fails verification: nothing to fix in this commit.
+const BASE_BROKEN: u8 = 4;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -50,6 +52,7 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     Ok(match report.result {
         PreflightResult::Pass => ExitCode::SUCCESS,
         PreflightResult::Fail | PreflightResult::Conflict => ExitCode::from(REFUSED),
+        PreflightResult::BaseBroken => ExitCode::from(BASE_BROKEN),
     })
 }
 
@@ -66,9 +69,16 @@ struct Report {
     summary: Option<String>,
     report: Option<PathBuf>,
     report_json: Option<PathBuf>,
+    base_broken: Option<BrokenBase>,
     blocked: Option<Blocked>,
     at_ms: EpochMs,
     env: EnvRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct BrokenBase {
+    step: String,
+    log: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +130,7 @@ struct Judged {
     with: Vec<PrNumber>,
     flaky: Vec<FlakyStep>,
     written: Option<Written>,
+    base_broken: Option<BrokenBase>,
 }
 
 fn preflight(ctx: &Ctx) -> Result<Report> {
@@ -224,12 +235,12 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         log_dir,
         env: &env,
     };
-    let judged = match &own.result {
+    let mut judged = match &own.result {
         ItemResult::Conflict(files) => run.conflict(files, run.with())?,
         ItemResult::Merged { .. } | ItemResult::AlreadyMerged => run.verify(&merged.tip)?,
     };
 
-    let report = Report::new(&judged, &target, &base, skipped, blocked, at, env);
+    let report = Report::new(&mut judged, &target, &base, skipped, blocked, at, env);
     if let Err(e) = record(ctx, &store, &target, &report) {
         eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
     }
@@ -424,6 +435,7 @@ impl Run<'_> {
             with,
             flaky: Vec::new(),
             written: Some(written),
+            base_broken: None,
         })
     }
 
@@ -453,6 +465,7 @@ impl Run<'_> {
                     with,
                     flaky,
                     written: None,
+                    base_broken: None,
                 });
             }
             Outcome::Failed(failed) => failed,
@@ -480,13 +493,42 @@ impl Run<'_> {
                 }
             }
         };
+        if is_solo(&failure)
+            && let Some(broken) = self.broken_base()?
+        {
+            return Ok(Judged {
+                result: PreflightResult::BaseBroken,
+                with,
+                flaky: Vec::new(),
+                written: None,
+                base_broken: Some(broken),
+            });
+        }
         let written = self.report_failure(&failure, &tree)?;
         Ok(Judged {
             result: PreflightResult::Fail,
             with,
             flaky: Vec::new(),
             written: Some(written),
+            base_broken: None,
         })
+    }
+
+    /// A solo failure blames this commit only if the base passes. A base the
+    /// engine already verified is not run again.
+    fn broken_base(&self) -> Result<Option<BrokenBase>> {
+        if self.store.load()?.verified_bases.contains(self.base) {
+            return Ok(None);
+        }
+        self.slot.checkout(self.base)?;
+        match self.run_steps(&self.log_dir.join("base"))? {
+            Outcome::Passed { .. } => Ok(None),
+            Outcome::Failed(failed) => Ok(Some(BrokenBase {
+                step: failed.step,
+                log: failed.log,
+            })),
+            Outcome::Cancelled => bail!("검증이 취소됐다"),
+        }
     }
 
     fn verify_alone(&self) -> Result<Alone> {
@@ -546,6 +588,13 @@ impl Run<'_> {
     }
 }
 
+fn is_solo(failure: &Failure) -> bool {
+    matches!(
+        failure.shape(),
+        FailureShape::Verify(Mode::Solo) | FailureShape::Timeout(Mode::Solo)
+    )
+}
+
 fn step_failure(failed: &verify::Failed, mode: VerifyMode, tree: &Sha) -> Failure {
     let step = StepFailure {
         step: failed.step.clone(),
@@ -579,7 +628,7 @@ fn log_dir(store: &RepoStore, head: &Sha, at: EpochMs) -> Result<PathBuf> {
 
 impl Report {
     fn new(
-        judged: &Judged,
+        judged: &mut Judged,
         target: &Target,
         base: &Sha,
         skipped: Vec<Skipped>,
@@ -618,6 +667,7 @@ impl Report {
                 .map(|written| written.doc.summary.clone()),
             report: judged.written.as_ref().map(|written| written.md.clone()),
             report_json: judged.written.as_ref().map(|written| written.json.clone()),
+            base_broken: judged.base_broken.take(),
             blocked,
             at_ms,
             env,
@@ -703,9 +753,15 @@ fn render(report: &Report) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    match (&report.summary, report.result) {
+    match (&report.summary, &report.base_broken) {
         (Some(summary), _) => out.push_str(&format!("{summary}\n")),
-        (None, _) => out.push_str(&format!(
+        (None, Some(broken)) => out.push_str(&format!(
+            "기준이 깨졌다. 이 커밋 탓이 아니다: 기준 {}의 {} 단계가 실패한다. 이 HEAD는 판정하지 못했고 고칠 것도 없다. 기준을 고친 뒤 다시 실행한다\n검증 로그: {}\n",
+            short(&report.base),
+            broken.step,
+            broken.log.display()
+        )),
+        (None, None) => out.push_str(&format!(
             "통과: HEAD {} (기준 {}, 함께 검증한 PR {with})\n",
             short(&report.head),
             short(&report.base)
@@ -772,6 +828,7 @@ mod tests {
             summary: None,
             report: None,
             report_json: None,
+            base_broken: None,
             blocked: None,
             at_ms: EpochMs(1),
             env: EnvRecord {
