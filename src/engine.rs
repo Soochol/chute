@@ -21,10 +21,10 @@ use crate::gitops::{
     FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, PushOutcome, Slot, SlotLock, SlotName,
 };
 use crate::model::{
-    Agent, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event,
-    EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning,
-    WarningKind,
+    Agent, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs,
+    Event, EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
+    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, ResumedBy, Sha, State, StepFailure,
+    VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
 use crate::queue;
@@ -279,7 +279,11 @@ impl Engine {
             pushed_by_chute: filled.then_some(blocked.pushed_by_chute),
             rechecked: filled.then_some(blocked.rechecked),
             log: blocked.log.clone(),
-            suspect: None,
+            suspect: state
+                .base_doubt
+                .as_ref()
+                .filter(|d| blocked.rechecked && d.base == blocked.base)
+                .and_then(|d| d.prs.first().copied()),
         };
         let targets: Vec<(Option<&Agent>, PrNumber)> = state
             .queue
@@ -287,6 +291,43 @@ impl Engine {
             .map(|i| (i.submitter.as_ref(), i.pr))
             .collect();
         self.notifier().notify_each(&targets, at, |_| line.clone());
+    }
+
+    fn tell_resumed(&self, base: &Sha, by: ResumedBy, repair: Option<&QueueItem>, at: EpochMs) {
+        let state = match self.store.load() {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("경고: 멈춤 풀림 알림을 보낼 큐를 읽지 못했다: {e:#}");
+                return;
+            }
+        };
+        let pr = repair.map(|i| i.pr);
+        let targets: Vec<(Option<&Agent>, PrNumber)> = state
+            .queue
+            .iter()
+            .chain(repair)
+            .map(|i| (i.submitter.as_ref(), i.pr))
+            .collect();
+        let line = Line::Resumed {
+            base: base.clone(),
+            by,
+            pr,
+        };
+        self.notifier().notify_each(&targets, at, |_| line.clone());
+    }
+
+    fn resume_for_main_moved(&self, base: &Sha) -> Result<()> {
+        self.store.update(|s| {
+            s.blocked = None;
+            Ok(())
+        })?;
+        let at = self.history_at(EventKind::Resumed {
+            base: base.clone(),
+            by: ResumedBy::MainMoved,
+            pr: None,
+        })?;
+        self.tell_resumed(base, ResumedBy::MainMoved, None, at);
+        Ok(())
     }
 
     fn tell_human(&self, item: &QueueItem, reason: HumanReason, detail: String, at: EpochMs) {
@@ -560,14 +601,15 @@ impl Engine {
         }
         let slot = self.lock_batch_slot()?.open()?;
         let base = slot.fetch_base()?;
+        let mut repairing = false;
         if let Some(blocked) = self.store.load()?.blocked {
-            if blocked.base == base {
+            if blocked.base != base {
+                self.resume_for_main_moved(&base)?;
+            } else if queue::repair_ready(&self.store.load()?) {
+                repairing = true;
+            } else {
                 return Ok(Pass::Blocked);
             }
-            self.store.update(|s| {
-                s.blocked = None;
-                Ok(())
-            })?;
         }
         let config = self.load_config()?;
         self.prune_no_checks_warnings(Some(config.require_ci))?;
@@ -589,7 +631,11 @@ impl Engine {
                 } else {
                     &waiting_on_ci
                 };
-                queue::take_batch(s, config.max_batch, due)
+                if repairing {
+                    queue::take_repair(s, due)
+                } else {
+                    queue::take_batch(s, config.max_batch, due)
+                }
             };
             if !prs.is_empty() {
                 s.batch = Some(Batch {
@@ -614,7 +660,7 @@ impl Engine {
             Ok((items, waiting_on_ci, position))
         })?;
         if taken.is_empty() {
-            return Ok(Pass::Idle);
+            return Ok(if repairing { Pass::Blocked } else { Pass::Idle });
         }
         let mut run = Run {
             engine: self,
@@ -648,6 +694,7 @@ impl Engine {
             queue_position,
             bisecting: false,
             verify_time: Duration::ZERO,
+            repairing,
         };
         let result = run.execute(&taken);
         let only_deferred = run.only_deferred();
@@ -801,6 +848,7 @@ struct Run<'e> {
     queue_position: BTreeMap<PrNumber, usize>,
     bisecting: bool,
     verify_time: Duration,
+    repairing: bool,
 }
 
 impl Run<'_> {
@@ -1360,6 +1408,7 @@ impl Run<'_> {
         self.verify_time += started.elapsed();
         match outcome {
             Outcome::Passed { flaky } => {
+                self.clear_base_doubt()?;
                 self.record_flaky(flaky, tree)?;
                 Ok(Verdict::Pass)
             }
@@ -1415,6 +1464,7 @@ impl Run<'_> {
                 submitted_ms: item.submitted_ms,
             })?);
         }
+        let resumes = self.repairing && pushed;
         engine.store.update(|s| {
             for pr in &b.members {
                 queue::merged(s, *pr)?;
@@ -1424,12 +1474,23 @@ impl Run<'_> {
                 let excess = s.verified_bases.len().saturating_sub(VERIFIED_BASES_KEPT);
                 s.verified_bases.drain(..excess);
             }
+            if resumes {
+                s.blocked = None;
+            }
             Ok(())
         })?;
         for (pr, at) in b.members.iter().zip(merged_at) {
             let item = &self.items[pr];
             let commit = commits.get(pr).unwrap_or(&item.head);
             engine.tell_merged(item, self.id(), commit, at);
+        }
+        if let (true, Some((pr, _))) = (resumes, b.landing.first()) {
+            let at = engine.history_at(EventKind::Resumed {
+                base: b.tip.clone(),
+                by: ResumedBy::Repair,
+                pr: Some(*pr),
+            })?;
+            engine.tell_resumed(&b.tip, ResumedBy::Repair, Some(&self.items[pr]), at);
         }
         for pr in &b.members {
             if commits.contains_key(pr) {
@@ -1482,9 +1543,11 @@ impl Run<'_> {
                 }
             }
         };
-        match &blame {
-            Blame::Solo { base } => self.require_sound_base(base)?,
-            Blame::Combo(_) => self.require_sound_base(&b.base)?,
+        if !self.repairing {
+            match &blame {
+                Blame::Solo { base } => self.confirm_solo_base(pr, base)?,
+                Blame::Combo(_) => self.require_sound_base(&b.base)?,
+            }
         }
         let item = self.items[&pr].clone();
         let mode = match blame {
@@ -1527,38 +1590,90 @@ impl Run<'_> {
         }
     }
 
-    fn base_sound(&mut self, base: &Sha) -> Result<bool> {
+    fn check_base(&mut self, base: &Sha, again: bool) -> Result<Option<Failed>> {
         let engine = self.engine;
-        if engine.store.load()?.verified_bases.contains(base) {
-            return Ok(true);
+        if !again && engine.store.load()?.verified_bases.contains(base) {
+            return Ok(None);
         }
         self.slot.checkout(base)?;
         match self.verify(base)? {
             Verdict::Pass => {
                 engine.store.update(|s| {
-                    s.verified_bases.push(base.clone());
+                    if !s.verified_bases.contains(base) {
+                        s.verified_bases.push(base.clone());
+                    }
                     Ok(())
                 })?;
-                Ok(true)
+                Ok(None)
             }
-            Verdict::Fail(_) => Ok(false),
+            Verdict::Fail(failed) => Ok(Some(failed)),
         }
     }
 
+    fn base_sound(&mut self, base: &Sha) -> Result<bool> {
+        Ok(self.check_base(base, false)?.is_none())
+    }
+
     fn require_sound_base(&mut self, base: &Sha) -> Result<()> {
-        if self.base_sound(base)? {
+        match self.check_base(base, false)? {
+            None => Ok(()),
+            Some(failed) => self.halt(base, &failed, false),
+        }
+    }
+
+    fn confirm_solo_base(&mut self, pr: PrNumber, base: &Sha) -> Result<()> {
+        let engine = self.engine;
+        let doubted = engine
+            .store
+            .load()?
+            .base_doubt
+            .is_some_and(|d| d.base == *base && d.prs.iter().any(|p| *p != pr));
+        if doubted {
+            return match self.check_base(base, true)? {
+                None => Ok(()),
+                Some(failed) => self.halt(base, &failed, true),
+            };
+        }
+        self.require_sound_base(base)?;
+        engine.store.update(|s| {
+            let mut doubt = match s.base_doubt.take() {
+                Some(d) if d.base == *base => d,
+                _ => BaseDoubt {
+                    base: base.clone(),
+                    prs: Vec::new(),
+                },
+            };
+            if !doubt.prs.contains(&pr) {
+                doubt.prs.push(pr);
+            }
+            s.base_doubt = Some(doubt);
+            Ok(())
+        })
+    }
+
+    fn clear_base_doubt(&self) -> Result<()> {
+        let store = &self.engine.store;
+        if store.load()?.base_doubt.is_none() {
             return Ok(());
         }
+        store.update(|s| {
+            s.base_doubt = None;
+            Ok(())
+        })
+    }
+
+    fn halt(&mut self, base: &Sha, failed: &Failed, rechecked: bool) -> Result<()> {
         let engine = self.engine;
+        let pushed_by_chute = self.pushed_by_chute(base);
         engine.store.update(|s| {
             s.blocked = Some(Blocked {
                 reason: BlockReason::BaseBroken,
                 base: base.clone(),
                 since_ms: EpochMs::now(),
-                step: None,
-                log: None,
-                pushed_by_chute: false,
-                rechecked: false,
+                step: Some(failed.step.clone()),
+                log: Some(failed.log.clone()),
+                pushed_by_chute,
+                rechecked,
             });
             Ok(())
         })?;
@@ -1568,6 +1683,21 @@ impl Run<'_> {
         })?;
         engine.tell_halted(at);
         Err(Halt::Blocked.into())
+    }
+
+    fn pushed_by_chute(&self, commit: &Sha) -> bool {
+        let store = &self.engine.store;
+        let ids = store.batch_ids().unwrap_or_else(|e| {
+            eprintln!("경고: batch 기록의 목록을 읽지 못했다: {e:#}");
+            Vec::new()
+        });
+        ids.iter().any(|id| match store.read_batch(id) {
+            Ok(record) => record.is_some_and(|r| r.pushed.contains(commit)),
+            Err(e) => {
+                eprintln!("경고: batch {} 기록을 읽지 못했다: {e:#}", id.0);
+                false
+            }
+        })
     }
 
     fn recheck_conflicts(&mut self) -> Result<()> {

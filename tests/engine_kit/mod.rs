@@ -241,6 +241,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         self.repo.git(&[
             "push",
             "--quiet",
+            "--force",
             "origin",
             &format!("{head}:refs/heads/{branch}"),
             &format!("{head}:refs/pull/{n}/head"),
@@ -251,6 +252,12 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
     }
 
     pub fn open_pr_removing(&self, n: u64, path: &str) -> Sha {
+        let head = self.push_pr_branch_removing(n, path);
+        self.queue_pr(n, &head, Some(self.agent()), Approval::Agent);
+        head
+    }
+
+    pub fn push_pr_branch_removing(&self, n: u64, path: &str) -> Sha {
         let branch = format!("pr-{n}");
         self.repo.git(&["fetch", "--quiet", "origin"]);
         self.repo
@@ -262,15 +269,14 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         self.repo.git(&[
             "push",
             "--quiet",
+            "--force",
             "origin",
             &format!("{head}:refs/heads/{branch}"),
             &format!("{head}:refs/pull/{n}/head"),
         ]);
         self.repo.git(&["checkout", "--quiet", "main"]);
         self.gh_says_head(n, &head);
-        let head = sha(&head);
-        self.queue_pr(n, &head, Some(self.agent()), Approval::Agent);
-        head
+        sha(&head)
     }
 
     pub fn queue_pr(&self, n: u64, head: &Sha, agent: Option<Agent>, approval: Approval) {
@@ -285,6 +291,28 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         submitter: Option<Agent>,
         approval: Approval,
     ) {
+        self.queue_pr_as(n, head, agent, submitter, approval, false);
+    }
+
+    pub fn queue_repair_by(
+        &self,
+        n: u64,
+        head: &Sha,
+        agent: Option<Agent>,
+        submitter: Option<Agent>,
+    ) {
+        self.queue_pr_as(n, head, agent, submitter, Approval::Agent, true);
+    }
+
+    fn queue_pr_as(
+        &self,
+        n: u64,
+        head: &Sha,
+        agent: Option<Agent>,
+        submitter: Option<Agent>,
+        approval: Approval,
+        repair: bool,
+    ) {
         let submission = Submission {
             pr: PrNumber(n),
             title: format!("feat: change {n}"),
@@ -296,6 +324,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             approval,
             priority: false,
             after: Vec::new(),
+            repair,
             now: EpochMs::now(),
         };
         self.store

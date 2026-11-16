@@ -133,6 +133,12 @@ pub enum TransitionError {
         pr: PrNumber,
         after: PrNumber,
     },
+    RepairNotHalted(PrNumber),
+    RepairTaken {
+        pr: PrNumber,
+        held: PrNumber,
+        state: ItemState,
+    },
 }
 
 impl fmt::Display for TransitionError {
@@ -160,6 +166,16 @@ impl fmt::Display for TransitionError {
             TransitionError::AfterGone { pr, after } => write!(
                 f,
                 "{pr}: --after {after}가 그사이 큐에서 빠졌다. 다시 submit한다"
+            ),
+            TransitionError::RepairNotHalted(pr) => write!(
+                f,
+                "{pr}: 큐가 멈춰 있지 않아 복구 PR로 받지 않았다. 복구 PR은 기준 커밋이 깨져 큐가 멈췄을 때만 받는다. 일반 PR이면 `--repair` 없이 submit한다"
+            ),
+            TransitionError::RepairTaken { pr, held, state } => write!(
+                f,
+                "{pr}: 복구 PR {held}이 아직 큐에 있어({}) 받지 않았다. 복구 PR은 한 번에 하나만 받는다. {held}이 머지되길 기다리거나 `chute drop {}`으로 뺀 뒤 다시 submit한다",
+                label(*state),
+                held.0
             ),
             TransitionError::AfterCycle { pr, after } => write!(
                 f,
@@ -276,6 +292,7 @@ pub struct Submission {
     pub approval: Approval,
     pub priority: bool,
     pub after: Vec<PrNumber>,
+    pub repair: bool,
     pub now: EpochMs,
 }
 
@@ -305,6 +322,9 @@ pub struct Submitted {
 pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, TransitionError> {
     let needs_approval = s.needs_approval();
     let pr = s.pr;
+    if s.repair {
+        check_repair(state, pr)?;
+    }
     s.after = checked_after(state, s.pr, &s.after)?;
     let Some(at) = state.queue.iter().position(|i| i.pr == s.pr) else {
         let entry = entry_state(needs_approval);
@@ -323,7 +343,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
             submitter: s.submitter,
             priority: s.priority,
             after: s.after,
-            repair: false,
+            repair: s.repair,
         });
         return Ok(Submitted {
             state: entry,
@@ -345,9 +365,12 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     if s.submitter.is_some() {
         item.submitter = s.submitter;
     }
-    let options_changed = item.priority != s.priority || !same_set(&item.after, &s.after);
+    let options_changed = item.priority != s.priority
+        || !same_set(&item.after, &s.after)
+        || (s.repair && !item.repair);
     item.priority = s.priority;
     item.after = s.after;
+    item.repair |= s.repair;
     let change = match (was_bounced, head_changed) {
         (true, _) => Change::Requeued,
         (false, true) => Change::HeadUpdated,
@@ -376,6 +399,20 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
         position: place_in_batch_order(&state.queue, pr),
         change,
     })
+}
+
+fn check_repair(state: &State, pr: PrNumber) -> Result<(), TransitionError> {
+    if state.blocked.is_none() {
+        return Err(TransitionError::RepairNotHalted(pr));
+    }
+    match state.queue.iter().find(|i| i.repair && i.pr != pr) {
+        Some(held) => Err(TransitionError::RepairTaken {
+            pr,
+            held: held.pr,
+            state: held.state,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn checked_after(
@@ -494,8 +531,31 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
 
 pub fn batch_order(queue: &[QueueItem]) -> Vec<PrNumber> {
     let mut order: Vec<&QueueItem> = queue.iter().collect();
-    order.sort_by_key(|item| !item.priority);
+    order.sort_by_key(|item| (!item.repair, !item.priority));
     order.into_iter().map(|item| item.pr).collect()
+}
+
+pub fn repair_ready(state: &State) -> bool {
+    state
+        .queue
+        .iter()
+        .any(|i| i.repair && matches!(i.state, ItemState::Queued(_)))
+}
+
+pub fn take_repair(state: &mut State, due_waiters: &BTreeSet<PrNumber>) -> Vec<PrNumber> {
+    let Some(item) = state.queue.iter_mut().find(|i| {
+        let waiting = i.state == ItemState::Queued(Some(QueuedReason::CiPending));
+        i.repair && i.after.is_empty() && (!waiting || due_waiters.contains(&i.pr))
+    }) else {
+        return Vec::new();
+    };
+    match step(item.state, Action::Take) {
+        Some(Next::To(to)) => {
+            item.state = to;
+            vec![item.pr]
+        }
+        _ => Vec::new(),
+    }
 }
 
 pub fn take_batch(
@@ -1322,6 +1382,7 @@ mod tests {
             approval,
             priority: false,
             after: Vec::new(),
+            repair: false,
             now: EpochMs(1000 + pr),
         }
     }
@@ -1583,5 +1644,154 @@ mod tests {
             label(ItemState::NeedsHuman(HumanReason::GaveUp)),
             "사람 차례(포기)"
         );
+    }
+
+    fn halt(state: &mut State) {
+        state.blocked = Some(crate::model::Blocked {
+            reason: crate::model::BlockReason::BaseBroken,
+            base: sha("abc1234"),
+            since_ms: EpochMs(1),
+            step: None,
+            log: None,
+            pushed_by_chute: false,
+            rechecked: false,
+        });
+    }
+
+    fn repair_options(pr: u64) -> Submission {
+        Submission {
+            repair: true,
+            ..submission(pr, "abc1234", Approval::Agent, false)
+        }
+    }
+
+    fn mark_repair(state: &mut State, pr: u64) {
+        state
+            .queue
+            .iter_mut()
+            .find(|i| i.pr == PrNumber(pr))
+            .unwrap()
+            .repair = true;
+    }
+
+    #[test]
+    fn a_repair_submission_is_refused_while_the_queue_is_not_halted() {
+        let mut state = State::default();
+
+        let err = submit(&mut state, repair_options(1)).unwrap_err();
+
+        assert_eq!(err, TransitionError::RepairNotHalted(PrNumber(1)));
+        assert!(err.to_string().contains("멈춰 있지 않아"), "{err}");
+        assert!(err.to_string().contains("`--repair` 없이"), "{err}");
+        assert!(state.queue.is_empty());
+    }
+
+    #[test]
+    fn a_repair_submission_is_taken_while_halted_and_marks_the_item() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        halt(&mut state);
+
+        let done = submit(&mut state, repair_options(2)).unwrap();
+
+        assert_eq!(done.change, Change::Added);
+        assert!(state.queue[1].repair);
+        assert!(!state.queue[0].repair);
+    }
+
+    #[test]
+    fn a_second_repair_pr_is_refused_until_the_first_is_gone_and_the_same_pr_may_come_again() {
+        let mut state = State::default();
+        halt(&mut state);
+        submit(&mut state, repair_options(2)).unwrap();
+
+        let err = submit(&mut state, repair_options(3)).unwrap_err();
+
+        assert_eq!(
+            err,
+            TransitionError::RepairTaken {
+                pr: PrNumber(3),
+                held: PrNumber(2),
+                state: QUEUED
+            }
+        );
+        assert!(err.to_string().contains("`chute drop 2`"), "{err}");
+        assert!(err.to_string().contains("대기"), "{err}");
+        assert_eq!(state.queue.len(), 1);
+        let mut again = repair_options(2);
+        again.head = sha("def5678");
+        assert_eq!(
+            submit(&mut state, again).unwrap().change,
+            Change::HeadUpdated
+        );
+        drop_item(&mut state, PrNumber(2)).unwrap();
+        submit(&mut state, repair_options(3)).unwrap();
+    }
+
+    #[test]
+    fn a_repair_pr_that_edits_the_config_waits_for_approval() {
+        let mut state = State::default();
+        halt(&mut state);
+        let mut touching = repair_options(2);
+        touching.touches_config = true;
+
+        let done = submit(&mut state, touching).unwrap();
+
+        assert_eq!(done.state, ItemState::AwaitingApproval);
+        assert!(state.queue[0].repair);
+        assert!(!repair_ready(&state));
+    }
+
+    #[test]
+    fn an_existing_item_resubmitted_as_repair_becomes_one_and_keeps_the_mark_afterwards() {
+        let mut state = queue_of(&[(1, QUEUED)]);
+        halt(&mut state);
+        let marked = submit(&mut state, repair_options(1)).unwrap();
+        assert_eq!(marked.change, Change::OptionsUpdated);
+        assert!(state.queue[0].repair);
+
+        let plain = submit(&mut state, submission(1, "abc1234", Approval::Agent, false)).unwrap();
+
+        assert_eq!(plain.change, Change::Unchanged);
+        assert!(state.queue[0].repair, "표시는 기록으로 남는다");
+    }
+
+    #[test]
+    fn batch_order_puts_repair_before_priority_before_the_rest() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED), (4, QUEUED)]);
+        flag(&mut state, 2, true, &[]);
+        mark_repair(&mut state, 4);
+
+        assert_eq!(
+            batch_order(&state.queue),
+            [PrNumber(4), PrNumber(2), PrNumber(1), PrNumber(3)]
+        );
+        let taken = take_batch(&mut state, 2, &BTreeSet::new());
+        assert_eq!(taken, [PrNumber(4), PrNumber(2)]);
+    }
+
+    #[test]
+    fn take_repair_takes_only_the_repair_item_and_only_when_it_may_run() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, CI_PENDING)]);
+        assert!(!repair_ready(&state));
+        assert!(take_repair(&mut state, &BTreeSet::new()).is_empty());
+        mark_repair(&mut state, 3);
+        assert!(repair_ready(&state));
+
+        assert!(take_repair(&mut state, &BTreeSet::new()).is_empty());
+        assert_eq!(state_of(&state, 3), CI_PENDING);
+        let due: BTreeSet<PrNumber> = [PrNumber(3)].into();
+        assert_eq!(take_repair(&mut state, &due), [PrNumber(3)]);
+        assert_eq!(state_of(&state, 3), IN_BATCH);
+        assert_eq!(state_of(&state, 1), QUEUED);
+        assert_eq!(state_of(&state, 2), QUEUED);
+    }
+
+    #[test]
+    fn take_repair_leaves_a_repair_item_that_waits_behind_another_pr() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED)]);
+        mark_repair(&mut state, 2);
+        flag(&mut state, 2, false, &[1]);
+
+        assert!(take_repair(&mut state, &BTreeSet::new()).is_empty());
     }
 }

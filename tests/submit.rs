@@ -4,8 +4,8 @@ mod support;
 use std::process::Output;
 
 use chute::model::{
-    Agent, BounceReason, EpochMs, EventKind, HumanReason, ItemState, MachineId, PrNumber,
-    PreflightRecord, PreflightResult, Sha, Slug, State, TerminalId,
+    Agent, BlockReason, Blocked, BounceReason, EpochMs, EventKind, HumanReason, ItemState,
+    MachineId, PrNumber, PreflightRecord, PreflightResult, Sha, Slug, State, TerminalId,
 };
 use chute::store::Home;
 use queue_kit::{World, item, stderr};
@@ -1810,4 +1810,197 @@ fn submit_after_with_gh_down_is_an_error_and_not_a_refusal() {
 
     assert_eq!(code(&out), Some(2), "{}", stderr(&out));
     assert!(w.state().queue.is_empty());
+}
+
+fn halted() -> Blocked {
+    Blocked {
+        reason: BlockReason::BaseBroken,
+        base: sha("9f8e7d6"),
+        since_ms: EpochMs(1),
+        step: Some("test".to_owned()),
+        log: None,
+        pushed_by_chute: false,
+        rechecked: false,
+    }
+}
+
+fn halt(w: &World) {
+    w.store()
+        .update(|s| {
+            s.blocked = Some(halted());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn submit_repair_is_refused_while_the_queue_is_not_halted() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12", "--repair"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("멈춰 있지 않아"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("`--repair` 없이"), "{}", stderr(&out));
+    assert!(w.state().queue.is_empty());
+}
+
+#[test]
+fn submit_repair_is_refused_while_another_repair_pr_waits_to_merge() {
+    let w = World::new();
+    halt(&w);
+    let mut held = item(20, ItemState::Queued(None));
+    held.repair = true;
+    w.seed(vec![held]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12", "--repair"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("복구 PR #20"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("chute drop 20"), "{}", stderr(&out));
+    assert_eq!(w.state().queue.len(), 1);
+}
+
+#[test]
+fn submit_repair_is_taken_on_a_halted_queue_and_recorded() {
+    let w = World::new();
+    halt(&w);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12", "--repair", "--head", HEAD]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queued = &w.state().queue[0];
+    assert!(queued.repair);
+    assert_eq!(queued.state, ItemState::Queued(None));
+    assert_eq!(w.entry(12).unwrap()["repair"], true);
+    let events: Vec<_> = w
+        .store()
+        .history()
+        .unwrap()
+        .events
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        EventKind::Submitted {
+            pr: PrNumber(12),
+            repair: true,
+            ..
+        }
+    )));
+    assert!(w.state().blocked.is_some(), "받아도 멈춤은 그대로다");
+}
+
+#[test]
+fn submit_repair_with_after_is_refused() {
+    let w = World::new();
+    halt(&w);
+    w.seed(vec![item(5, ItemState::Queued(None))]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12", "--repair", "--after", "5"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("`--after`"), "{}", stderr(&out));
+    assert_eq!(w.state().queue.len(), 1);
+}
+
+#[test]
+fn submit_repair_that_edits_chute_toml_waits_for_a_human_approval() {
+    let w = World::new();
+    halt(&w);
+    let touching = with(
+        pr(12, HEAD),
+        "files",
+        json!([{"path": "src/a.rs"}, {"path": "chute.toml"}]),
+    );
+    gh_pr(&w, Some(12), with(touching, "changedFiles", json!(2)));
+
+    let stdout = w.ok(w.repo.path(), &["submit", "12", "--repair"]);
+
+    assert!(stdout.contains("승인 대기"), "{stdout}");
+    assert!(stdout.contains("`chute approve 12`"), "{stdout}");
+    let queued = &w.state().queue[0];
+    assert_eq!(queued.state, ItemState::AwaitingApproval);
+    assert!(queued.repair);
+}
+
+#[test]
+fn submit_repair_needs_a_head_when_the_repository_requires_one() {
+    let w = World::with_config(Some(requiring_head()));
+    halt(&w);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let out = submit(&w, &["12", "--repair"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("확인한 HEAD(`--head`) 없이 submit을 받지 않는다"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(w.state().queue.is_empty());
+    assert_eq!(
+        code(&submit(&w, &["12", "--repair", "--head", HEAD])),
+        Some(0)
+    );
+    assert!(w.state().queue[0].repair);
+}
+
+fn halt_the_hub(p: &Pair) {
+    let slug = Slug::try_from(SLUG.to_owned()).unwrap();
+    Home::at(p.hub().sb.chute_home())
+        .repo(&slug)
+        .update(|s| {
+            s.blocked = Some(halted());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn submit_repair_from_another_pc_reaches_the_hub() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+    halt_the_hub(&p);
+
+    let out = pc_submit(&p, &["--agent", "t1rs", "--repair"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let queued = state_of(p.hub()).queue.remove(0);
+    assert!(queued.repair);
+    assert!(state_of(p.pc()).queue.is_empty());
+}
+
+#[test]
+fn submit_repair_from_another_pc_is_refused_by_the_hub_when_it_is_not_halted() {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+
+    let out = pc_submit(&p, &["--agent", "t1rs", "--repair"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("멈춰 있지 않아"), "{}", stderr(&out));
+    assert!(state_of(p.hub()).queue.is_empty());
+}
+
+#[test]
+fn submit_repair_from_another_pc_cannot_skip_the_required_head() {
+    let p = pair_with_config(&requiring_head());
+    both_see_pr(&p, &p.local_head);
+    halt_the_hub(&p);
+
+    let out = pc_submit(&p, &["--agent", "t1rs", "--repair"]);
+
+    assert_eq!(code(&out), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("확인한 HEAD(`--head`) 없이 submit을 받지 않는다"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(state_of(p.hub()).queue.is_empty());
 }
