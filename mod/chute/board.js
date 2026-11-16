@@ -102,8 +102,7 @@ const safeHeadOf = (item) => (typeof item.head === "string" && SAFE_HEAD.test(it
 export const actionArgs = (verb, pr, repoPath, head) =>
   verb === "approve" ? [verb, String(pr), "--head", head, "--repo", repoPath] : [verb, String(pr), "--repo", repoPath];
 
-// Herdr resolves `machine/t7` like any terminal address (herdr-app AGENTS.md: "use `machine/address`
-// for another machine"), so an agent on another machine is peeked like a local one.
+// Herdr takes `machine/address` for a terminal on another machine (herdr-app AGENTS.md).
 function agentOf(agent) {
   if (!isObject(agent) || !str(agent.terminal)) return null;
   const name = str(agent.name);
@@ -118,7 +117,6 @@ function agentOf(agent) {
   };
 }
 
-// A status without `hub` comes from a pre-hub chute: the hub is this PC.
 function hubOf(hub) {
   const h = isObject(hub) ? hub : {};
   const local = h.local !== false;
@@ -133,7 +131,6 @@ function hubOf(hub) {
 export const REMOTE_POLL_MS = 5000;
 export const LOCAL_POLL_MS = 15000;
 
-// watchFolder only sees this PC's folders, so a repo whose hub is elsewhere is polled faster.
 export const pollInterval = (board) =>
   board?.kind === "board" && board.repos.some((repo) => !repo.hub.local) ? REMOTE_POLL_MS : LOCAL_POLL_MS;
 

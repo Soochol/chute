@@ -23,7 +23,6 @@ export default class Chute extends View {
     cx.timer.every(TICK_MS, (cx) => this.tick(cx));
   }
 
-  // Counting ticks instead of reading the wall clock keeps a clock step from stalling the poll.
   tick(cx) {
     this.sinceRead += TICK_MS;
     if (!this.reading && this.sinceRead >= this.pollMs) this.request(cx);
