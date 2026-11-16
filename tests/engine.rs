@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use chute::engine::{Pass, Summary};
 use chute::model::{
     Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, HumanReason, ItemState,
-    PrNumber, ProbeEvidence, SkippedStep, StatusView, VerifyMode, WarningKind,
+    PrNumber, ProbeEvidence, QueuedReason, SkippedStep, StatusView, VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -490,6 +490,137 @@ fn a_closed_pr_leaves_the_queue_and_a_pr_merged_elsewhere_counts_as_merged() {
     );
     assert_eq!(lab.merged_prs(), [2, 3]);
     assert_eq!(lab.merge_commits_on_main().len(), 2);
+}
+
+fn changed_during_verification(change: &str) -> Lab {
+    let lab = Lab::new(change);
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    lab
+}
+
+fn assert_only_pr_1_landed_after_a_second_verification(lab: &Lab, summary: &Summary) {
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(lab.merged_prs(), [1]);
+    assert_eq!(lab.verify_runs(), 2);
+    assert_eq!(lab.assert_every_pushed_commit_was_verified(), 1);
+    let files = lab.origin_git(&["ls-tree", "--name-only", "main"]);
+    assert!(files.lines().any(|f| f == "a.txt"), "{files}");
+    assert!(!files.lines().any(|f| f == "b.txt"), "{files}");
+}
+
+#[test]
+fn a_pr_closed_while_the_batch_verifies_is_not_merged_and_the_rest_is_verified_again() {
+    let lab = changed_during_verification("touch @ROOT@/gh-state/2.closed");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_only_pr_1_landed_after_a_second_verification(&lab, &summary);
+    assert!(lab.item(2).is_none());
+    assert!(
+        lab.events()
+            .iter()
+            .any(|e| matches!(e, EventKind::Closed { pr } if pr.0 == 2))
+    );
+    assert!(lab.state().batch.is_none());
+}
+
+#[test]
+fn a_pr_turned_into_a_draft_while_the_batch_verifies_is_not_merged_and_stays_queued() {
+    let lab = changed_during_verification("touch @ROOT@/gh-state/2.draft");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_only_pr_1_landed_after_a_second_verification(&lab, &summary);
+    assert_eq!(
+        lab.item_state(2),
+        Some(ItemState::Queued(Some(QueuedReason::CiPending)))
+    );
+    assert!(lab.bounced_events().is_empty());
+}
+
+#[test]
+fn a_pr_retargeted_while_the_batch_verifies_is_not_merged_and_stays_queued() {
+    let lab = changed_during_verification("echo release > @ROOT@/gh-state/2.base");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_only_pr_1_landed_after_a_second_verification(&lab, &summary);
+    assert_eq!(
+        lab.item_state(2),
+        Some(ItemState::Queued(Some(QueuedReason::CiPending)))
+    );
+}
+
+#[test]
+fn draft_prs_at_the_front_neither_block_the_queue_nor_are_read_on_every_pass() {
+    let lab = Lab::build("", "max_batch = 1\n", 60);
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    fs::write(lab.sb.root().join("gh-state/1.draft"), "").unwrap();
+    let engine = lab.engine_rechecking_ci_every(Duration::from_secs(3600));
+
+    for _ in 0..5 {
+        engine.run_once().unwrap();
+    }
+
+    assert_eq!(lab.merged_prs(), [2]);
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::Queued(Some(QueuedReason::CiPending)))
+    );
+    let calls = fs::read_to_string(lab.sb.root().join("gh-state/calls")).unwrap();
+    let reads_of_1 = calls
+        .lines()
+        .filter(|l| l.starts_with("pr view 1 "))
+        .count();
+    assert_eq!(reads_of_1, 1, "{calls}");
+}
+
+#[test]
+fn a_pr_whose_head_moves_while_the_batch_verifies_is_sent_back_and_not_merged() {
+    let moved = "ab".repeat(20);
+    let lab = changed_during_verification(&format!("echo {moved} > @ROOT@/gh-state/2.head"));
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_only_pr_1_landed_after_a_second_verification(&lab, &summary);
+    assert_eq!(summary.bounced, prs(&[2]));
+    assert_eq!(
+        lab.item_state(2),
+        Some(ItemState::Bounced(BounceReason::HeadChanged))
+    );
+    assert_eq!(lab.bounced_events(), [(2, BounceReason::HeadChanged)]);
+    assert_eq!(lab.hc_calls("send").len(), 1);
+}
+
+#[test]
+fn when_every_pr_is_closed_while_the_batch_verifies_nothing_is_pushed() {
+    let lab =
+        changed_during_verification("touch @ROOT@/gh-state/1.closed @ROOT@/gh-state/2.closed");
+    let before = lab.origin_main();
+
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(lab.origin_main(), before);
+    assert!(lab.merged_prs().is_empty());
+    assert_eq!(lab.verify_runs(), 1);
+    assert!(lab.state().queue.is_empty());
+}
+
+#[test]
+fn when_github_cannot_be_read_before_the_push_nothing_is_pushed_and_the_batch_ends_in_an_error() {
+    let lab = changed_during_verification("touch @ROOT@/gh-state/2.unreadable");
+    let before = lab.origin_main();
+
+    let err = lab.engine().run_once().unwrap_err();
+
+    assert!(format!("{err:#}").contains("push하지 않았다"), "{err:#}");
+    assert_eq!(lab.origin_main(), before);
+    assert!(lab.merged_prs().is_empty());
+    assert!(lab.state().batch.is_none());
+    assert_eq!(lab.item_state(1), Some(ItemState::Queued(None)));
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
 }
 
 #[test]

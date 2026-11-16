@@ -116,6 +116,7 @@ pub struct Engine {
     cancel: Cancel,
     timing: Timing,
     ci_looked: Mutex<BTreeMap<PrNumber, Instant>>,
+    unfit_looked: Mutex<BTreeMap<PrNumber, Instant>>,
 }
 
 impl Engine {
@@ -132,6 +133,7 @@ impl Engine {
             cancel: Cancel::new(),
             timing: Timing::default(),
             ci_looked: Mutex::new(BTreeMap::new()),
+            unfit_looked: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -548,13 +550,26 @@ impl Engine {
         Ok(())
     }
 
+    fn parked_unfit(&self, state: &State) -> BTreeSet<PrNumber> {
+        let mut looked = self.unfit_looked.lock().unwrap_or_else(|e| e.into_inner());
+        looked.retain(|pr, _| state.queue.iter().any(|i| i.pr == *pr));
+        let now = self.timing.clock.now();
+        looked
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) < self.timing.ci_recheck)
+            .map(|(pr, _)| *pr)
+            .collect()
+    }
+
     fn due_ci_waiters(&self, state: &State) -> BTreeSet<PrNumber> {
+        let parked = self.parked_unfit(state);
         let mut looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
         looked.retain(|pr, _| state.queue.iter().any(|i| i.pr == *pr));
         state
             .queue
             .iter()
             .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
+            .filter(|i| !parked.contains(&i.pr))
             .filter(|i| {
                 looked.get(&i.pr).is_none_or(|at| {
                     self.timing.clock.now().duration_since(*at) >= self.timing.ci_recheck
@@ -634,10 +649,11 @@ impl Engine {
                 .map(|i| i.pr)
                 .collect();
             let prs = {
-                let due = if config.require_ci {
-                    &due_waiters
+                let due = &if config.require_ci {
+                    due_waiters.clone()
                 } else {
-                    &waiting_on_ci
+                    let parked = self.parked_unfit(s);
+                    waiting_on_ci.difference(&parked).copied().collect()
                 };
                 if repairing {
                     queue::take_repair(s, due)
@@ -750,7 +766,7 @@ impl Engine {
                     "view",
                     &pr.0.to_string(),
                     "--json",
-                    "state,headRefOid,mergeCommit",
+                    "state,headRefOid,mergeCommit,isDraft,baseRefName",
                 ],
             )?
             .ok()
@@ -770,6 +786,10 @@ impl Engine {
             PrState::Open if view.head_ref_oid != item.head => Inspection::HeadChanged {
                 current: view.head_ref_oid,
             },
+            PrState::Open if view.is_draft => Inspection::Draft,
+            PrState::Open if view.base_ref_name != self.info.default_branch => {
+                Inspection::Retargeted
+            }
             PrState::Open => Inspection::Ready,
         })
     }
@@ -781,6 +801,8 @@ struct PrView {
     state: PrState,
     head_ref_oid: Sha,
     merge_commit: Option<MergeCommit>,
+    is_draft: bool,
+    base_ref_name: String,
 }
 
 #[derive(Deserialize)]
@@ -796,11 +818,14 @@ enum PrState {
     Merged,
 }
 
+#[derive(Clone)]
 enum Inspection {
     Ready,
     Closed,
     Merged { commit: Sha },
     HeadChanged { current: Sha },
+    Draft,
+    Retargeted,
 }
 
 #[derive(Clone, Debug)]
@@ -893,33 +918,68 @@ impl Run<'_> {
                 }
                 Inspection::Ready if self.passes_ci_gate(item)? => ready.push(item.pr),
                 Inspection::Ready => {}
-                Inspection::Closed => {
-                    self.engine
-                        .store
-                        .update(|s| Ok(queue::closed(s, item.pr)?))?;
-                    let at = self.engine.history_at(EventKind::Closed { pr: item.pr })?;
-                    self.engine
-                        .notifier()
-                        .notify_waiters(item.pr, WaitingWhy::Closed, at);
-                    self.closed_any = true;
-                }
-                Inspection::Merged { commit } => {
-                    let at = self.engine.history_at(EventKind::Merged {
-                        pr: item.pr,
-                        batch: self.id().clone(),
-                        commit: commit.clone(),
-                        submitted_ms: item.submitted_ms,
-                    })?;
-                    self.engine
-                        .store
-                        .update(|s| Ok(queue::merged(s, item.pr)?))?;
-                    self.engine.tell_merged(item, self.id(), &commit, at);
-                    self.merged.push(item.pr);
-                }
-                Inspection::HeadChanged { current } => self.head_changed(item, &current)?,
+                other => self.set_aside(item, other)?,
             }
         }
         Ok(ready)
+    }
+
+    fn set_aside(&mut self, item: &QueueItem, why: Inspection) -> Result<()> {
+        match why {
+            Inspection::Ready => {}
+            Inspection::Closed => {
+                self.engine
+                    .store
+                    .update(|s| Ok(queue::closed(s, item.pr)?))?;
+                let at = self.engine.history_at(EventKind::Closed { pr: item.pr })?;
+                self.engine
+                    .notifier()
+                    .notify_waiters(item.pr, WaitingWhy::Closed, at);
+                self.closed_any = true;
+            }
+            Inspection::Merged { commit } => {
+                let at = self.engine.history_at(EventKind::Merged {
+                    pr: item.pr,
+                    batch: self.id().clone(),
+                    commit: commit.clone(),
+                    submitted_ms: item.submitted_ms,
+                })?;
+                self.engine
+                    .store
+                    .update(|s| Ok(queue::merged(s, item.pr)?))?;
+                self.engine.tell_merged(item, self.id(), &commit, at);
+                self.merged.push(item.pr);
+            }
+            Inspection::HeadChanged { current } => self.head_changed(item, &current)?,
+            Inspection::Draft | Inspection::Retargeted => {
+                self.defer(item.pr, false)?;
+                self.engine
+                    .unfit_looked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(item.pr, self.engine.timing.clock.now());
+            }
+        }
+        Ok(())
+    }
+
+    fn all_still_fit(&mut self, b: &Build, group: &mut Vec<PrNumber>) -> Result<bool> {
+        let mut aside = Vec::new();
+        for (pr, _) in &b.landing {
+            let item = self.items[pr].clone();
+            let seen = self
+                .engine
+                .inspect(&item)
+                .with_context(|| format!("push 직전에 {pr}의 상태를 읽지 못해 push하지 않았다"))?;
+            if !matches!(seen, Inspection::Ready) {
+                aside.push((item, seen));
+            }
+        }
+        for (item, seen) in &aside {
+            self.set_aside(item, seen.clone())?;
+        }
+        group.retain(|pr| !aside.iter().any(|(item, _)| item.pr == *pr));
+        Ok(aside.is_empty())
     }
 
     fn passes_ci_gate(&mut self, item: &QueueItem) -> Result<bool> {
@@ -1339,17 +1399,18 @@ impl Run<'_> {
         })
     }
 
-    fn solve(&mut self, group: Vec<PrNumber>) -> Result<()> {
-        if group.is_empty() {
-            return Ok(());
-        }
-        for _ in 0..PUSH_ROUNDS {
+    fn solve(&mut self, mut group: Vec<PrNumber>) -> Result<()> {
+        let mut rounds = 0;
+        while rounds < PUSH_ROUNDS && !group.is_empty() {
             let b = self.build(&group)?;
             if b.landing.is_empty() {
                 return self.land(&b);
             }
             match self.verify(&b.tip, Scope::Changed)? {
                 Verdict::Pass => {
+                    if !self.all_still_fit(&b, &mut group)? {
+                        continue;
+                    }
                     self.set_phase(Phase::Pushing)?;
                     if self.slot.head()? != b.tip {
                         bail!(
@@ -1359,11 +1420,14 @@ impl Run<'_> {
                     }
                     match self.slot.push(&b.tip)? {
                         PushOutcome::Pushed => return self.land(&b),
-                        PushOutcome::MainMoved => continue,
+                        PushOutcome::MainMoved => rounds += 1,
                     }
                 }
                 Verdict::Fail(failed) => return self.split_or_convict(&b, failed),
             }
+        }
+        if group.is_empty() {
+            return Ok(());
         }
         bail!(
             "기본 브랜치가 계속 움직여 {PUSH_ROUNDS}번 다시 만들었지만 push하지 못했다. 큐에 되돌리고 다시 시도한다"

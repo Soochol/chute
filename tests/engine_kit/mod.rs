@@ -95,12 +95,17 @@ fi
 [ "$1" = pr ] && [ "$2" = view ] || {{ echo "fake gh: $*" >&2; exit 97; }}
 n=$3
 echo "$*" >> "$d/calls"
+[ -e "$d/$n.unreadable" ] && {{ echo "fake gh: cannot read" >&2; exit 1; }}
 head=$(cat "$d/$n.head")
+draft=false
+[ -e "$d/$n.draft" ] && draft=true
+base=main
+[ -e "$d/$n.base" ] && base=$(cat "$d/$n.base")
 state=OPEN
 [ -e "$d/$n.closed" ] && state=CLOSED
 if git --git-dir='{origin}' merge-base --is-ancestor "$head" main 2>/dev/null; then state=MERGED; fi
 [ -e "$d/$n.stuck" ] && state=OPEN
-printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head"
+printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null,"isDraft":%s,"baseRefName":"%s"}}\n' "$state" "$head" "$draft" "$base"
 "#,
             gh = gh_dir.display(),
             origin = repo.origin().display()
