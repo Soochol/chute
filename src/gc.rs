@@ -364,7 +364,7 @@ fn last_run(store: &RepoStore) -> Option<EpochMs> {
 fn write_last_run(store: &RepoStore, at_ms: EpochMs) -> Result<()> {
     let dir = store.dir();
     fs::create_dir_all(dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
-    let tmp = dir.join(format!("{LAST_RUN_FILE}.tmp"));
+    let tmp = dir.join(format!("{LAST_RUN_FILE}.{}.tmp", std::process::id()));
     fs::write(&tmp, serde_json::to_vec(&LastRun { at_ms })?)
         .with_context(|| format!("쓰지 못했다: {}", tmp.display()))?;
     fs::rename(&tmp, dir.join(LAST_RUN_FILE))
