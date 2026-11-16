@@ -22,7 +22,6 @@ use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
 const RECORD_KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHOWN_PATHS: usize = 5;
-/// Exit code when the base fails verification: nothing to fix in this commit.
 const BASE_BROKEN: u8 = 4;
 
 #[derive(clap::Args, Debug)]
@@ -514,8 +513,6 @@ impl Run<'_> {
         })
     }
 
-    /// A solo failure blames this commit only if the base passes. A base the
-    /// engine already verified is not run again.
     fn broken_base(&self) -> Result<Option<BrokenBase>> {
         if self.store.load()?.verified_bases.contains(self.base) {
             return Ok(None);

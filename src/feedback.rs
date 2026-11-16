@@ -39,8 +39,22 @@ const LISTED_COMMITS: usize = 10;
 const HC_NAME_LIMIT: usize = 32;
 const NAME_TRIES: u32 = 5;
 const SIBLING_TRIES: u32 = 20;
-const SHELLS: [&str; 9] = [
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
+const SHELLS: [&str; 15] = [
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "tcsh",
+    "csh",
+    "nu",
+    "ash",
+    "rc",
+    "elvish",
+    "xonsh",
+    "pwsh",
+    "powershell",
 ];
 pub(crate) const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
@@ -1156,10 +1170,6 @@ impl TerminalInfo {
             && !self.has_left_for_a_shell()
     }
 
-    /// Whether the terminal's program has gone away, leaving only a shell.
-    /// A null `status` only means the program reports none, so a named
-    /// foreground program that is not a shell is taken as alive. `reported`
-    /// decides only when hc names no foreground program.
     fn has_left_for_a_shell(&self) -> bool {
         if !matches!(self.status, ProgramStatus::NoProgram) {
             return false;

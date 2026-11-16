@@ -3181,9 +3181,7 @@ fn a_worktree_locked_without_a_reason_is_not_taken_over_either() {
 
 #[test]
 fn every_known_shell_in_the_foreground_means_the_agent_has_left() {
-    for shell in [
-        "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
-    ] {
+    for shell in SHELLS {
         let lab = Lab::new();
         lab.repo.pr_branch("feat/a", "a.txt", "a\n");
         let mut item = lab.item(12, "feat/a");
