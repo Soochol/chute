@@ -3549,3 +3549,287 @@ fn a_silent_diff_failure_still_gives_the_exit_code() {
         read(&partner.diff)
     );
 }
+
+fn noise(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(ALPHABET[(x % 62) as usize])
+        })
+        .collect()
+}
+
+const FAILED: &str = "refs/chute/failed/t1";
+
+impl Lab {
+    fn failed_tree(&self, pr: u64, content: &str) -> (String, String) {
+        let head = self.repo.pr_branch("feat/a", "big.txt", content);
+        self.repo
+            .git(&["checkout", "--quiet", "-b", "tree", "main"]);
+        self.repo.git(&[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            &format!("Merge pull request #{pr} from acme/feat/a"),
+            "feat/a",
+        ]);
+        let tree = self.repo.head();
+        self.repo.git(&["update-ref", FAILED, &tree]);
+        self.repo.git(&["checkout", "--quiet", "main"]);
+        (head, tree)
+    }
+
+    fn failed_with_log(&self, tree: &str, log: PathBuf) -> Failure {
+        let mut step = self.step(VerifyMode::Solo, &[], log);
+        step.tree = sha(tree);
+        Failure::Verify(step)
+    }
+
+    fn parcel_of(&self, item: &QueueItem, failure: &Failure, limits: &Limits) -> Result<Parcel> {
+        let written = self
+            .fb()
+            .write_report(&Subject::from(item), failure, Some(FAILED))
+            .unwrap();
+        self.fb().parcel(item, &Notice::Bounced(&written), limits)
+    }
+
+    fn latest_report(&self, pr: u64) -> String {
+        let dir = self.store.report_dir(PrNumber(pr));
+        let latest = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let path = e.unwrap().path();
+                let n: u32 = path.file_stem()?.to_str()?.parse().ok()?;
+                (path.extension()? == "md").then_some((n, path))
+            })
+            .max()
+            .unwrap();
+        read(&latest.1)
+    }
+}
+
+fn text_of(file: &parcel::ParcelFile) -> String {
+    String::from_utf8(file.bytes().unwrap()).unwrap()
+}
+
+#[test]
+fn a_long_log_is_cut_to_its_end_and_says_so() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let long: String = (0..2000).map(|n| format!("line {n}\n")).collect();
+    let failure = lab.failed_with_log(&tree, lab.log(&long));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let limits = Limits {
+        log: 500,
+        ..Limits::default()
+    };
+
+    let parcel = lab.parcel_of(&item, &failure, &limits).unwrap();
+
+    let text = text_of(&parcel.files[0]);
+    assert!(text.len() < 600, "{}바이트", text.len());
+    assert!(text.starts_with("[chute: 로그가 길어 앞 "), "{text}");
+    assert!(text.ends_with("line 1999\n"), "{text}");
+    assert!(!text.contains("line 0\n"));
+    let ParcelNotice::Bounced { failure, .. } = &parcel.notice else {
+        panic!("반송 묶음이어야 한다");
+    };
+    let Failure::Verify(step) = failure else {
+        panic!("검증 실패여야 한다");
+    };
+    assert_eq!(
+        step.log,
+        PathBuf::from(format!("log-{}.log", short(&sha(&tree))))
+    );
+    assert_eq!(parcel.files[0].name, step.log.to_str().unwrap());
+}
+
+#[test]
+fn partner_diffs_share_one_budget() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let partner = |pr: u64| {
+        let diff = lab.sb.root().join(format!("d{pr}.diff"));
+        let body: String = (0..30).map(|n| format!("+line {n}\n")).collect();
+        fs::write(&diff, body).unwrap();
+        Partner {
+            pr: PrNumber(pr),
+            title: "t".into(),
+            files: vec!["a".into()],
+            diff,
+        }
+    };
+    let mut step = lab.step(
+        VerifyMode::Combo {
+            partners: NonEmpty::new(vec![partner(8), partner(9)]).unwrap(),
+        },
+        &[],
+        lab.log("x\n"),
+    );
+    step.tree = sha(&tree);
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let limits = Limits {
+        diffs: 400,
+        ..Limits::default()
+    };
+
+    let parcel = lab
+        .parcel_of(&item, &Failure::Verify(step), &limits)
+        .unwrap();
+
+    let diffs: Vec<String> = parcel.files[1..].iter().map(text_of).collect();
+    assert!(diffs[0].contains("+line 29\n"), "{}", diffs[0]);
+    assert!(!diffs[0].contains("diff가 길어"), "{}", diffs[0]);
+    assert!(diffs[1].contains("+line 0\n"), "{}", diffs[1]);
+    assert!(!diffs[1].contains("+line 29\n"), "{}", diffs[1]);
+    assert!(diffs[1].ends_with("바이트를 잘랐다]\n"), "{}", diffs[1]);
+    assert_eq!(
+        parcel.files[1].name,
+        format!("partner-pr8-{}.diff", short(&sha(&tree)))
+    );
+}
+
+#[test]
+fn a_bundle_that_does_not_fit_is_left_out_and_the_report_says_how_to_rebuild_the_tree() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, &noise(300_000));
+    let base = lab
+        .repo
+        .git(&["rev-parse", "origin/main"])
+        .trim()
+        .to_owned();
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+
+    let full = lab.parcel_of(&item, &failure, &Limits::default()).unwrap();
+    let bundle = full.bundle.clone().expect("넉넉하면 git bundle이 든다");
+    let file = lab.sb.root().join("failed.bundle");
+    fs::write(&file, crate::hub::base64_decode(&bundle).unwrap()).unwrap();
+    let verified = lab
+        .sb
+        .command("git")
+        .current_dir(lab.repo.path())
+        .args(["bundle", "verify"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let verified = format!(
+        "{}{}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(
+        verified.contains(&tree) && verified.contains(&base),
+        "{verified}"
+    );
+    assert!(
+        verified.contains("requires"),
+        "기준 커밋을 뺀 범위여야 한다: {verified}"
+    );
+
+    let bare = Parcel {
+        bundle: None,
+        ..full.clone()
+    };
+    let tight = Limits {
+        total: bare.encode().unwrap().len() + parcel::FRAMING + 1024,
+        ..Limits::default()
+    };
+    let small = lab.parcel_of(&item, &failure, &tight).unwrap();
+    assert_eq!(small.bundle, None);
+    let ParcelNotice::Bounced { rebuild, .. } = &small.notice else {
+        panic!("반송 묶음이어야 한다");
+    };
+    assert_eq!(
+        rebuild,
+        &Some(Rebuild {
+            base: sha(&base),
+            heads: vec![sha(&head)]
+        })
+    );
+
+    lab.stub_spawn();
+    lab.fb().receive(&small).unwrap();
+    let report = lab.latest_report(7);
+    assert!(report.contains("origin에서 같은 트리를 만든다"), "{report}");
+    assert!(report.contains("fetch origin"), "{report}");
+    assert!(report.contains("worktree add --detach"), "{report}");
+    assert!(report.contains(&base), "{report}");
+    assert!(
+        report.contains(&format!("git merge --no-ff --no-edit {head}")),
+        "{report}"
+    );
+    assert!(
+        !lab.store
+            .report_dir(PrNumber(7))
+            .join("failed-tree.bundle")
+            .exists()
+    );
+}
+
+#[test]
+fn a_parcel_over_the_limit_is_refused() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let limits = Limits {
+        total: 100,
+        ..Limits::default()
+    };
+
+    let err = lab.parcel_of(&item, &failure, &limits).unwrap_err();
+
+    assert!(format!("{err:#}").contains("한도"), "{err:#}");
+}
+
+#[test]
+fn a_parcel_cannot_point_outside_its_report_folder_or_the_failed_ref_folder() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let failure = lab.failed_with_log(&tree, lab.log("boom\n"));
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let good = lab.parcel_of(&item, &failure, &Limits::default()).unwrap();
+    Parcel::decode(&good.encode().unwrap()).unwrap();
+
+    for name in ["../x", "a/b", ".hidden", "-x", "", "a b"] {
+        let mut bad = good.clone();
+        bad.files[0].name = name.to_owned();
+        let err = Parcel::decode(&bad.encode().unwrap()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("파일 이름"),
+            "{name:?}: {err:#}"
+        );
+    }
+    for git_ref in [
+        "refs/heads/main",
+        "refs/chute/failed/../x",
+        "refs/chute/failed/-x",
+    ] {
+        let mut bad = good.clone();
+        let ParcelNotice::Bounced { failed_ref, .. } = &mut bad.notice else {
+            panic!("반송 묶음이어야 한다");
+        };
+        *failed_ref = Some(git_ref.to_owned());
+        assert!(Parcel::decode(&bad.encode().unwrap()).is_err(), "{git_ref}");
+    }
+    let mut bad = good.clone();
+    let ParcelNotice::Bounced { failure, .. } = &mut bad.notice else {
+        panic!("반송 묶음이어야 한다");
+    };
+    let Failure::Verify(step) = failure else {
+        panic!("검증 실패여야 한다");
+    };
+    step.log = PathBuf::from("/etc/passwd");
+    assert!(Parcel::decode(&bad.encode().unwrap()).is_err());
+}
