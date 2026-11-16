@@ -1,7 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, props, run, theme, watchFolder } from "herdr";
-import { causeText, failureText, interpret, pollInterval } from "./board.js";
+import { LOCAL_POLL_MS, causeText, failureText, interpret, pollInterval } from "./board.js";
 
 const TICK_MS = 1000;
 const MIN_READ_GAP_MS = 1000;
@@ -17,16 +17,16 @@ export default class Chute extends View {
     this.watching = new Set();
     this.busy = new Map();
     this.errors = new Map();
-    this.lastReadAt = 0;
+    this.sinceRead = 0;
+    this.pollMs = LOCAL_POLL_MS;
     this.request(cx);
     cx.timer.every(TICK_MS, (cx) => this.tick(cx));
   }
 
-  // A tick never queues a read behind a running one; it only starts one when the poll interval has passed.
+  // Counting ticks instead of reading the wall clock keeps a clock step from stalling the poll.
   tick(cx) {
-    if (this.reading) return;
-    const board = this.result ? interpret(this.result) : null;
-    if (Date.now() - this.lastReadAt >= pollInterval(board)) this.request(cx);
+    this.sinceRead += TICK_MS;
+    if (!this.reading && this.sinceRead >= this.pollMs) this.request(cx);
   }
 
   request(cx) {
@@ -35,7 +35,7 @@ export default class Chute extends View {
       return;
     }
     this.reading = true;
-    this.lastReadAt = Date.now();
+    this.sinceRead = 0;
     cx.spawn(async (cx) => {
       try {
         let result;
@@ -62,6 +62,7 @@ export default class Chute extends View {
 
   settle(board, cx) {
     if (board.kind !== "board") return;
+    this.pollMs = pollInterval(board);
     const cards = board.repos.flatMap((repo) => repo.sections).filter((s) => s.id === "human").flatMap((s) => s.items);
     for (const [key, error] of this.errors) {
       if (!cards.some((card) => card.key === key && card.state === error.state)) this.errors.delete(key);
