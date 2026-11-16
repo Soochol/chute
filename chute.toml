@@ -1,6 +1,7 @@
 # chute 자신의 검증 명령. AGENTS.md의 검사와 같다.
 approval = "agent"
 require_head = true
+preflight = "never"
 
 [[verify]]
 name = "fmt"
