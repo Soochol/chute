@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 
 use super::Ctx;
@@ -48,10 +49,20 @@ fn judge(ext: &Ext) -> Result<Option<String>> {
         .read_to_string(&mut raw)
         .context("훅 입력을 읽지 못했다")?;
     let cwd = std::env::current_dir().context("지금 폴더를 알지 못했다")?;
-    decide(ext, &raw, &cwd)
+    decide(
+        ext,
+        &raw,
+        &cwd,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
 }
 
-fn decide(ext: &Ext, raw: &str, fallback_cwd: &Path) -> Result<Option<String>> {
+fn decide(
+    ext: &Ext,
+    raw: &str,
+    fallback_cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Option<String>> {
     let input: HookInput = serde_json::from_str(raw).context("훅 입력이 JSON이 아니다")?;
     if input.tool_name.as_deref() != Some("Bash") {
         return Ok(None);
@@ -61,7 +72,7 @@ fn decide(ext: &Ext, raw: &str, fallback_cwd: &Path) -> Result<Option<String>> {
     };
     let cwd = input.cwd.unwrap_or_else(|| fallback_cwd.to_owned());
     for action in actions(&command) {
-        let dir = action.dir.resolve(&cwd);
+        let dir = action.dir.resolve(&cwd, home);
         let Some(repo) = Repo::open(ext, &dir) else {
             continue;
         };
@@ -109,10 +120,14 @@ impl Dir {
         Dir(steps)
     }
 
-    fn resolve(&self, cwd: &Path) -> PathBuf {
-        self.0
-            .iter()
-            .fold(cwd.to_owned(), |dir, step| dir.join(step))
+    fn resolve(&self, cwd: &Path, home: Option<&Path>) -> PathBuf {
+        self.0.iter().fold(cwd.to_owned(), |dir, step| {
+            let at_home = home.filter(|_| step == "~" || step.starts_with("~/"));
+            match at_home {
+                Some(home) => home.join(step[1..].trim_start_matches('/')),
+                None => dir.join(step),
+            }
+        })
     }
 }
 
@@ -248,7 +263,19 @@ fn actions(command: &str) -> Vec<Action> {
 
 fn collect(command: &str, start: &Dir, found: &mut Vec<Action>) {
     let mut dir = start.clone();
+    let mut outer: Vec<Dir> = Vec::new();
     for words in segments(command) {
+        match words.as_slice() {
+            [mark] if mark == "(" => {
+                outer.push(dir.clone());
+                continue;
+            }
+            [mark] if mark == ")" => {
+                dir = outer.pop().unwrap_or(dir);
+                continue;
+            }
+            _ => {}
+        }
         let words = strip_wrappers(&words);
         let Some((program, args)) = words.split_first() else {
             continue;
@@ -294,25 +321,51 @@ fn basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
-/// Skips `VAR=value` and `env`, `command`, `exec`, `time`, `nohup`, `sudo` with their flags.
+const KEYWORDS: [&str; 9] = [
+    "if", "then", "else", "elif", "do", "while", "until", "{", "!",
+];
+const WRAPPERS: [&str; 9] = [
+    "env", "command", "exec", "time", "nohup", "sudo", "nice", "timeout", "xargs",
+];
+
+/// Whether `flag` of `wrapper` is followed by its own value, as in `env -u NAME`.
+fn flag_takes_value(wrapper: &str, flag: &str) -> bool {
+    match wrapper {
+        "env" => matches!(flag, "-u" | "-C" | "-S"),
+        "sudo" => matches!(flag, "-u" | "-g" | "-C" | "-h" | "-p" | "-U"),
+        "nice" => flag == "-n",
+        "timeout" => matches!(flag, "-s" | "-k"),
+        "xargs" => matches!(flag, "-n" | "-I" | "-P" | "-L" | "-d" | "-E" | "-s"),
+        _ => false,
+    }
+}
+
+/// Skips what stands in front of the program: shell keywords, `VAR=value`, and wrappers such as
+/// `env`, `sudo`, `timeout 60` and `xargs` with their flags.
 fn strip_wrappers(words: &[String]) -> &[String] {
     let mut rest = words;
     while let Some(first) = rest.first() {
         let is_assignment = first.split_once('=').is_some_and(|(name, _)| {
             !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         });
-        let is_wrapper = matches!(
-            basename(first),
-            "env" | "command" | "exec" | "time" | "nohup" | "sudo"
-        );
-        if !is_assignment && !is_wrapper {
-            break;
-        }
-        rest = &rest[1..];
-        if is_wrapper {
-            while rest.first().is_some_and(|w| w.starts_with('-')) {
-                rest = &rest[1..];
+        let wrapper = basename(first);
+        if KEYWORDS.contains(&first.as_str()) || is_assignment {
+            rest = &rest[1..];
+        } else if WRAPPERS.contains(&wrapper) {
+            rest = &rest[1..];
+            while let Some(flag) = rest.first().filter(|w| w.starts_with('-')) {
+                let skip = if flag_takes_value(wrapper, flag) {
+                    2
+                } else {
+                    1
+                };
+                rest = rest.get(skip..).unwrap_or_default();
             }
+            if wrapper == "timeout" {
+                rest = rest.get(1..).unwrap_or_default();
+            }
+        } else {
+            break;
         }
     }
     rest
@@ -352,10 +405,16 @@ fn git_push(args: &[String], start: &Dir) -> Option<(Dir, Push)> {
     loop {
         let word = words.next()?;
         match word.as_str() {
-            "-C" => dir = dir.then(words.next()?),
-            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
-            | "--config-env" => {
+            "-C" | "--work-tree" => dir = dir.then(words.next()?),
+            "--git-dir" => dir = dir.then(&format!("{}/..", words.next()?)),
+            "-c" | "--namespace" | "--super-prefix" | "--config-env" => {
                 words.next();
+            }
+            _ if word.starts_with("--work-tree=") => {
+                dir = dir.then(&word["--work-tree=".len()..]);
+            }
+            _ if word.starts_with("--git-dir=") => {
+                dir = dir.then(&format!("{}/..", &word["--git-dir=".len()..]));
             }
             "push" => break,
             _ if word.starts_with('-') => {}
@@ -407,6 +466,7 @@ fn destination(refspec: &str) -> Option<Destination> {
 /// Splits a command line into simple commands made of words. Quotes group words, a backslash
 /// escapes one character, `; & | ( ) `` ` and newlines end a command, and redirections are dropped.
 fn segments(command: &str) -> Vec<Vec<String>> {
+    let command = strip_heredocs(command);
     let mut all = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
@@ -439,10 +499,13 @@ fn segments(command: &str) -> Vec<Vec<String>> {
                     }
                 }
             }
-            '\\' => {
-                in_word = true;
-                word.extend(chars.next());
-            }
+            '\\' => match chars.next() {
+                Some('\n') | None => {}
+                Some(escaped) => {
+                    in_word = true;
+                    word.push(escaped);
+                }
+            },
             '#' if !in_word => {
                 for rest in chars.by_ref() {
                     if rest == '\n' {
@@ -454,7 +517,12 @@ fn segments(command: &str) -> Vec<Vec<String>> {
             }
             c if c.is_whitespace() && c != '\n' => end_word(&mut words, &mut word, &mut in_word),
             '&' if word.ends_with(['<', '>']) => word.push('&'),
-            ';' | '&' | '|' | '(' | ')' | '`' | '\n' => {
+            '(' | ')' => {
+                end_word(&mut words, &mut word, &mut in_word);
+                all.push(std::mem::take(&mut words));
+                all.push(vec![c.to_string()]);
+            }
+            ';' | '&' | '|' | '`' | '\n' => {
                 end_word(&mut words, &mut word, &mut in_word);
                 all.push(std::mem::take(&mut words));
             }
@@ -470,6 +538,31 @@ fn segments(command: &str) -> Vec<Vec<String>> {
         .map(drop_redirections)
         .filter(|words| !words.is_empty())
         .collect()
+}
+
+/// Removes the body of `<<WORD` heredocs. Those lines are text for another command, not commands.
+fn strip_heredocs(command: &str) -> String {
+    let opener =
+        Regex::new(r#"(?:^|[^<])<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#)
+            .unwrap();
+    let mut kept = Vec::new();
+    let mut lines = command.lines();
+    while let Some(line) = lines.next() {
+        kept.push(line);
+        for opened in opener.captures_iter(line) {
+            let Some(end) = (1..=3)
+                .find_map(|group| opened.get(group))
+                .map(|m| m.as_str())
+            else {
+                continue;
+            };
+            let body: Vec<&str> = lines.clone().collect();
+            if let Some(at) = body.iter().position(|l| l.trim() == end) {
+                lines.nth(at);
+            }
+        }
+    }
+    kept.join("\n")
 }
 
 fn drop_redirections(words: Vec<String>) -> Vec<String> {
@@ -630,7 +723,7 @@ mod tests {
                 "tool_input": {"command": command},
                 "cwd": cwd,
             });
-            decide(&self.ext(), &input.to_string(), cwd).unwrap()
+            decide(&self.ext(), &input.to_string(), cwd, Some(&self.sb.home())).unwrap()
         }
     }
 
@@ -757,6 +850,74 @@ mod tests {
     }
 
     #[test]
+    fn sees_through_continuations_keywords_and_more_wrappers() {
+        let fx = Fixture::new(true);
+        for command in [
+            "git \\\n  push origin main",
+            "gh pr \\\n  merge 5",
+            "git push \\\n  origin main",
+            "if true; then git push origin main; fi",
+            "for i in 1; do git push origin main; done",
+            "{ git push origin main; }",
+            "! git push origin main",
+            "timeout 60 git push origin main",
+            "timeout -s KILL 60 git push origin main",
+            "nice -n 5 git push origin main",
+            "xargs git push origin main",
+            "env -u FOO git push origin main",
+            "sudo -u root git push origin main",
+            "(cd /tmp); git push origin main",
+            "(cd /tmp && true); gh pr merge 5",
+        ] {
+            assert!(fx.verdict(command).is_some(), "막히지 않았다: {command}");
+        }
+    }
+
+    #[test]
+    fn expands_the_home_directory_and_follows_git_dir_and_work_tree() {
+        let fx = Fixture::new(true);
+        let home = fx.sb.home();
+        std::os::unix::fs::symlink(fx.repo.path(), home.join("w")).unwrap();
+        let plain = fx.sb.root().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let repo = fx.repo.path().display();
+        for command in [
+            "cd ~/w && git push origin main".to_owned(),
+            "git -C ~/w push origin main".to_owned(),
+            format!("git --work-tree={repo} push origin main"),
+            format!("git --work-tree {repo} push origin main"),
+            format!("git --git-dir={repo}/.git push origin main"),
+        ] {
+            assert!(
+                fx.verdict_in(&command, &plain).is_some(),
+                "막히지 않았다: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_bodies_are_text_not_commands() {
+        let fx = Fixture::new(true);
+        for command in [
+            "cat > notes.md <<EOF\ngit push origin main\nEOF",
+            "git commit --file - <<'EOF'\ngit push origin main is forbidden\nEOF",
+            "cat <<-EOF\n\tgh pr merge 5 is not allowed\n\tEOF",
+            "cat <<<'git push origin main'",
+        ] {
+            assert_eq!(fx.verdict(command), None, "{command}");
+        }
+        assert!(
+            fx.verdict("cat <<EOF\ntext\nEOF\ngit push origin main")
+                .is_some(),
+            "heredoc 뒤의 명령은 본다"
+        );
+        assert!(
+            fx.verdict("git push origin main <<EOF\nx\nEOF").is_some(),
+            "heredoc를 받는 명령도 본다"
+        );
+    }
+
+    #[test]
     fn follows_directory_changes_inside_the_command() {
         let fx = Fixture::new(true);
         let elsewhere = fx.sb.root().join("elsewhere");
@@ -826,8 +987,8 @@ mod tests {
             r#"{"tool_name":"Bash"}"#,
             r#"{}"#,
         ] {
-            assert_eq!(decide(&ext, raw, cwd).unwrap(), None, "{raw}");
+            assert_eq!(decide(&ext, raw, cwd, None).unwrap(), None, "{raw}");
         }
-        assert!(decide(&ext, "not json", cwd).is_err());
+        assert!(decide(&ext, "not json", cwd, None).is_err());
     }
 }
