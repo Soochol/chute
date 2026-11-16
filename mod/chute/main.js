@@ -219,6 +219,7 @@ export default class Chute extends View {
           .gap(5)
           .flex_wrap()
           .items_center()
+          .children(card.marks.map((mark) => chip(mark.text, tone(mark.tone, t))))
           .child(chip(card.reason, human ? t.blocked : t.ansi1))
           .when(Boolean(card.failure?.mode), (el) => el.child(chip(card.failure.mode, t.muted)))
           .when(Boolean(card.preflight), (el) => el.child(chip(card.preflight.text, tone(card.preflight.tone, t))))
@@ -230,6 +231,7 @@ export default class Chute extends View {
       .when(Boolean(card.failure?.summary), (el) =>
         el.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(card.failure.summary)),
       )
+      .when(Boolean(card.submitter), (el) => el.child(submitterLine(card.submitter, t)))
       .child(
         h_flex()
           .gap(8)
@@ -343,6 +345,10 @@ function agentChip(agent, t, cardKey) {
     .on_click(() => run("terminal.peek", { terminal: agent.terminal }));
 }
 
+function submitterLine(submitter, t) {
+  return div().text_size(12).text_color(t.dim).whitespace_normal().child(submitter.text);
+}
+
 function alertRow(item, t) {
   const color = tone(item.tone, t);
   return h_flex()
@@ -354,7 +360,21 @@ function alertRow(item, t) {
         .flex_1()
         .min_w(0)
         .child(div().whitespace_normal().text_color(item.tone === "error" ? t.ansi1 : t.foreground).child(item.text))
-        .when(Boolean(item.detail), (el) => el.child(div().text_size(12).text_color(t.dim).whitespace_normal().child(item.detail))),
+        .when(Boolean(item.detail), (el) => el.child(div().text_size(12).text_color(t.dim).whitespace_normal().child(item.detail)))
+        .children(item.facts.map((fact) => div().text_size(12).text_color(t.muted).whitespace_normal().child(fact)))
+        .when(Boolean(item.log), (el) =>
+          el.child(
+            div()
+              .w_full()
+              .min_w(0)
+              .overflow_hidden()
+              .whitespace_nowrap()
+              .text_ellipsis_start()
+              .text_size(11)
+              .text_color(t.dim)
+              .child(item.log),
+          ),
+        ),
     );
 }
 
@@ -377,11 +397,19 @@ function batchCard(batch, t) {
     .when(facts.length > 0, (el) => el.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(facts.join(" · "))))
     .children(
       batch.prs.map((entry) =>
-        h_flex()
-          .gap(6)
-          .items_start()
-          .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
-          .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title)),
+        v_flex()
+          .gap(3)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_start()
+              .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
+              .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title)),
+          )
+          .when(entry.marks.length > 0, (el) =>
+            el.child(h_flex().gap(5).flex_wrap().children(entry.marks.map((mark) => chip(mark.text, tone(mark.tone, t))))),
+          )
+          .when(Boolean(entry.submitter), (el) => el.child(submitterLine(entry.submitter, t))),
       ),
     );
 }
@@ -399,16 +427,18 @@ function waitingRow(item, t) {
   return v_flex()
     .gap(3)
     .child(numberedTitle(item.position, item, t))
-    .when(item.ciPending || Boolean(item.note), (el) =>
+    .when(item.ciPending || Boolean(item.note) || item.marks.length > 0, (el) =>
       el.child(
         h_flex()
           .pl(24)
           .gap(5)
           .flex_wrap()
+          .children(item.marks.map((mark) => chip(mark.text, tone(mark.tone, t))))
           .when(item.ciPending, (row) => row.child(chip(item.label, t.ansi3)))
           .when(Boolean(item.note), (row) => row.child(chip(item.note, t.dim))),
       ),
-    );
+    )
+    .when(Boolean(item.submitter), (el) => el.child(div().pl(24).child(submitterLine(item.submitter, t))));
 }
 
 function unknownRow(item, t) {
@@ -433,7 +463,13 @@ function todayGrid(stats, t) {
           .bg(t.surface)
           .border_1()
           .border_color(t.border)
-          .child(div().font_semibold().text_size(15).child(stat.value))
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(div().font_semibold().text_size(15).child(stat.value))
+              .when(Boolean(stat.note), (el) => el.child(chip(stat.note, t.ansi3))),
+          )
           .child(div().text_size(11).text_color(t.dim).whitespace_normal().child(stat.label)),
       ),
     );
