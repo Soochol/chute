@@ -49,6 +49,17 @@ pub struct FlakyPolicy {
     pub chronic_days: u32,
 }
 
+impl Default for FlakyPolicy {
+    fn default() -> Self {
+        FlakyPolicy {
+            probe_repeats: default_probe_repeats(),
+            probe_seconds: default_probe_seconds(),
+            chronic: default_chronic(),
+            chronic_days: default_chronic_days(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VerifyStep {
     pub name: String,

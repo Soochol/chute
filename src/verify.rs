@@ -163,6 +163,61 @@ pub fn run(
     Ok(Outcome::Passed { flaky })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandEnd {
+    Passed,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+/// Runs `command` once in `dir` the way a step runs, in its own process group, with the same
+/// environment, the verification lock when the config asks for one, and the cancel flag. Its
+/// output goes to `log`, which must be in an existing folder.
+pub fn run_command(
+    config: &Config,
+    store: &RepoStore,
+    dir: &Path,
+    log: &Path,
+    command: &str,
+    timeout: Duration,
+    opts: &Options,
+) -> Result<CommandEnd> {
+    if opts.cancel.is_cancelled() {
+        return Ok(CommandEnd::Cancelled);
+    }
+    let _lock = if config.serialize {
+        match acquire_lock(store, &opts.cancel)? {
+            Lock::Held(file) => Some(file),
+            Lock::Cancelled => return Ok(CommandEnd::Cancelled),
+        }
+    } else {
+        None
+    };
+    if let Some(cache) = &opts.cache_dir {
+        fs::create_dir_all(cache).with_context(|| format!("만들지 못했다: {}", cache.display()))?;
+    }
+    let ctx = Ctx {
+        dir,
+        log_dir: dir,
+        run_id: run_id(),
+        opts,
+    };
+    let step = VerifyStep {
+        name: "command".to_owned(),
+        run: command.to_owned(),
+        timeout,
+        failed: None,
+        probe: None,
+    };
+    Ok(match ctx.attempt(&step, log)? {
+        End::Passed => CommandEnd::Passed,
+        End::Failed(Cause::TimedOut) => CommandEnd::TimedOut,
+        End::Failed(_) => CommandEnd::Failed,
+        End::Cancelled => CommandEnd::Cancelled,
+    })
+}
+
 pub fn log_path(log_dir: &Path, step: &str, attempt: u32) -> PathBuf {
     log_dir.join(format!("{step}.{attempt}.log"))
 }

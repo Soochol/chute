@@ -41,6 +41,10 @@ impl Lab {
     }
 
     pub fn build(verify_body: &str, top: &str, timeout_s: u64) -> Lab {
+        Lab::build_with_step(verify_body, top, timeout_s, "")
+    }
+
+    pub fn build_with_step(verify_body: &str, top: &str, timeout_s: u64, step_extra: &str) -> Lab {
         let sb = Sandbox::new();
         let repo = TestRepo::new(&sb, "acme/widget");
         let log = sb.root().join("verified.log");
@@ -103,8 +107,9 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         );
         sb.script("gh", &gh);
 
+        let step_extra = step_extra.replace("@ROOT@", &sb.root().to_string_lossy());
         let config = format!(
-            "{top}\n[[verify]]\nname = \"check\"\nrun = \"sh {}\"\ntimeout = {timeout_s}\nfailed = 'FAILED (\\S+)'\n",
+            "{top}\n[[verify]]\nname = \"check\"\nrun = \"sh {}\"\ntimeout = {timeout_s}\nfailed = 'FAILED (\\S+)'\n{step_extra}\n",
             script.display()
         );
         repo.commit_file("chute.toml", &config, "chore: chute 설정");

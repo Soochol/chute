@@ -358,7 +358,7 @@ fn resumed_by(by: ResumedBy) -> &'static str {
     }
 }
 
-fn probe_evidence(evidence: ProbeEvidence) -> &'static str {
+pub(super) fn probe_evidence(evidence: ProbeEvidence) -> &'static str {
     match evidence {
         ProbeEvidence::Base => "기준 트리에서도 흔들림",
         ProbeEvidence::Made => "흔들림을 재현함",
