@@ -1539,3 +1539,34 @@ fn the_hidden_submitter_argument_keeps_quotes_spaces_and_korean_when_given_strai
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     assert_eq!(state_of(p.hub()).queue[0].submitter, Some(submitter));
 }
+
+#[test]
+fn a_submit_from_another_pc_without_an_agent_flag_looks_the_terminal_up_once_for_agent_and_submitter()
+ {
+    let p = pair();
+    both_see_pr(&p, &p.local_head);
+
+    let out = p
+        .pc()
+        .sb
+        .command(BIN)
+        .current_dir(p.pc().repo.path())
+        .env("HC_TERMINAL_ID", "t1rs")
+        .args(["submit", "12"])
+        .output()
+        .unwrap();
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    let lookups = p
+        .pc()
+        .sb
+        .fake("hc")
+        .calls()
+        .into_iter()
+        .filter(|c| c.first().is_some_and(|v| v == "get"))
+        .count();
+    assert_eq!(lookups, 1);
+    let queued = state_of(p.hub()).queue.remove(0);
+    assert!(queued.submitter.is_some());
+    assert_eq!(queued.submitter, queued.agent);
+}

@@ -437,9 +437,15 @@ fn bare(terminal: &TerminalId) -> &str {
 /// hc may reuse an address, so `created_ms` is part of a terminal's identity.
 pub fn same_terminal(a: &Agent, b: &Agent, local: Option<&MachineId>) -> bool {
     let machine = |agent: &Agent| agent.machine.clone().or_else(|| local.cloned());
-    machine(a) == machine(b)
-        && bare(&a.terminal) == bare(&b.terminal)
-        && a.created_ms == b.created_ms
+    let (ma, mb) = (machine(a), machine(b));
+    let address = |agent: &Agent| {
+        if ma.is_none() && mb.is_none() {
+            agent.terminal.0.clone()
+        } else {
+            bare(&agent.terminal).to_owned()
+        }
+    };
+    ma == mb && address(a) == address(b) && a.created_ms == b.created_ms
 }
 
 pub struct Notifier<'a> {
@@ -849,6 +855,8 @@ mod tests {
         ));
         assert!(same_terminal(&base, &agent("t1", 100, None), Some(&local)));
         assert!(!same_terminal(&base, &agent("t1", 100, None), None));
+        let (a, b) = (agent("pcA/t9", 100, None), agent("pcB/t9", 100, None));
+        assert!(!same_terminal(&a, &b, None));
     }
 
     struct Rig {

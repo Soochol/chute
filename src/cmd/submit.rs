@@ -150,7 +150,11 @@ fn submit_through_hub(
     check_open_and_ready(&pr, info)?;
     let this_pc = machine::core(&ctx.ext)?.id;
     let agent = identify_agent(ctx, dir, args.agent.as_deref(), || Some(this_pc.clone()));
-    let submitter = identify_submitter(ctx, dir, || Some(this_pc));
+    let submitter = if args.agent.as_deref().is_none_or(str::is_empty) {
+        agent.clone()
+    } else {
+        identify_submitter(ctx, dir, || Some(this_pc))
+    };
     let head = match &args.head {
         Some(head) => head.clone(),
         None => local_head(&ctx.ext, dir)?,
