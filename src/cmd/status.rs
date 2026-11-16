@@ -1,14 +1,17 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone};
 
 use super::Ctx;
 use crate::config::{self, Config};
-use crate::hub;
+use crate::hub::{self, Route};
+use crate::machine::Machines;
 use crate::model::{
-    Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, ItemView, RecentBatch,
-    RepoInfo, RepoView, SchemaV1, StatusView, Today, Warning, WarningKind,
+    Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemView,
+    MachineId, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, Warning,
+    WarningKind,
 };
 use crate::queue;
 
@@ -23,18 +26,24 @@ pub struct Args {
 }
 
 const RECENT_BATCHES: usize = 10;
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     let now = Local::now();
     let views = if args.all {
-        ctx.home
-            .repos()?
-            .iter()
-            .map(|info| view(ctx, info, &now))
-            .collect::<Result<Vec<_>>>()?
+        let repos = ctx.home.repos()?;
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = repos
+                .iter()
+                .map(|info| scope.spawn(|| view_from_hub(ctx, info, &now)))
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().expect("status thread panicked"))
+                .collect::<Result<Vec<_>>>()
+        })?
     } else {
         let (info, _) = ctx.registered_repo()?;
-        vec![view(ctx, &info, &now)?]
+        vec![view_from_hub(ctx, &info, &now)?]
     };
     if args.json {
         let text = if args.all {
@@ -50,6 +59,221 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
         print!("{}", text.join("\n"));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn view_from_hub(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusView> {
+    if ctx.forwarded() {
+        return view(ctx, info, now);
+    }
+    match hub::elsewhere(&ctx.home, &ctx.ext, &info.slug) {
+        Ok(None) => view(ctx, info, now),
+        Ok(Some(_)) => Ok(from_remote_hub(ctx, info, now)),
+        Err(e) => {
+            let hub = HubView {
+                local: false,
+                machine_id: ctx.home.repo(&info.slug).hub().ok().flatten(),
+                host: None,
+                machine: None,
+                repo_path: None,
+                reachable: false,
+                error: None,
+            };
+            Ok(hub_down(ctx, info, hub, format!("{e:#}"), now))
+        }
+    }
+}
+
+fn from_remote_hub(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> StatusView {
+    let seen = match hub::view(&ctx.home, &ctx.ext, &info.slug, info.path.clone()) {
+        Ok(seen) => seen,
+        Err(e) => {
+            let hub = HubView {
+                local: false,
+                machine_id: None,
+                host: None,
+                machine: None,
+                repo_path: None,
+                reachable: false,
+                error: None,
+            };
+            return hub_down(ctx, info, hub, format!("{e:#}"), now);
+        }
+    };
+    if !seen.view.reachable {
+        let reason = seen.view.error.clone().unwrap_or_default();
+        return hub_down(ctx, info, seen.view, reason, now);
+    }
+    match ask_hub(ctx, info) {
+        Ok(received) => rebase(ctx, info, received, now),
+        Err(reason) => {
+            let hub = hub::view(&ctx.home, &ctx.ext, &info.slug, info.path.clone())
+                .map_or(seen.view, |now_seen| now_seen.view);
+            hub_down(ctx, info, hub, reason, now)
+        }
+    }
+}
+
+fn ask_hub(ctx: &Ctx, info: &RepoInfo) -> Result<StatusView, String> {
+    let route = hub::route(&ctx.home, &ctx.ext, &info.slug).map_err(|e| format!("{e:#}"))?;
+    if route == Route::Local {
+        return Err("허브 설정이 바뀌어 이 PC가 허브가 됐다. 다시 실행한다".to_owned());
+    }
+    let answer = hub::forward(
+        &ctx.home,
+        &ctx.ext,
+        &info.slug,
+        &route,
+        &["status", "--json"],
+        FORWARD_TIMEOUT,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    if answer.code != 0 {
+        let stderr = String::from_utf8_lossy(&answer.stderr);
+        return Err(format!(
+            "허브가 종료 코드 {}로 끝났다: {}",
+            answer.code,
+            stderr.trim()
+        ));
+    }
+    if answer.truncated {
+        return Err("허브의 상태 출력이 너무 커서 뒤가 잘렸다".to_owned());
+    }
+    serde_json::from_slice(&answer.stdout)
+        .map_err(|e| format!("허브가 보낸 상태를 읽지 못했다: {e}"))
+}
+
+fn rebase(ctx: &Ctx, info: &RepoInfo, mut v: StatusView, now: &DateTime<Local>) -> StatusView {
+    let store = ctx.home.repo(&info.slug);
+    let seen = match hub::view(&ctx.home, &ctx.ext, &info.slug, info.path.clone()) {
+        Ok(seen) => seen,
+        Err(e) => return hub_down(ctx, info, v.hub, format!("{e:#}"), now),
+    };
+    let hub_path = std::mem::replace(&mut v.repo.path, info.path.clone());
+    v.repo.state_dir = store.dir().to_owned();
+    v.hub = HubView {
+        local: false,
+        machine_id: seen.view.machine_id.clone(),
+        host: v.hub.host.take().or(seen.view.host.clone()),
+        machine: seen.view.machine.clone(),
+        repo_path: Some(hub_path),
+        reachable: true,
+        error: None,
+    };
+    if let Some(note) = seen.note {
+        v.warnings.push(hub_warning(note, now));
+    }
+    if let Some(machines) = &seen.machines {
+        let hub_id = seen.view.machine_id.as_ref();
+        if let Some(hub_id) = hub_id {
+            v.daemon.terminal = v
+                .daemon
+                .terminal
+                .take()
+                .map(|t| machines.address(hub_id, &bare(&t)));
+        }
+        for item in &mut v.queue {
+            item.agent = item.agent.take().map(|a| rebase_agent(machines, hub_id, a));
+        }
+    }
+    v
+}
+
+fn bare(terminal: &TerminalId) -> TerminalId {
+    TerminalId(
+        terminal
+            .0
+            .rsplit('/')
+            .next()
+            .unwrap_or(&terminal.0)
+            .to_owned(),
+    )
+}
+
+fn rebase_agent(machines: &Machines, hub: Option<&MachineId>, agent: AgentView) -> AgentView {
+    let Some(id) = agent.machine_id.clone().or(hub.cloned()) else {
+        return agent;
+    };
+    let agent = AgentView {
+        machine_id: Some(id.clone()),
+        ..agent
+    };
+    if id == machines.local().id {
+        return AgentView {
+            terminal: bare(&agent.terminal),
+            host: Some(machines.local().name.clone()),
+            machine: None,
+            ..agent
+        };
+    }
+    match machines.by_id(&id) {
+        Some(m) => AgentView {
+            terminal: machines.address(&id, &bare(&agent.terminal)),
+            host: m.host.clone().or(agent.host),
+            machine: Some(m.name.clone()),
+            ..agent
+        },
+        None => AgentView {
+            machine: None,
+            ..agent
+        },
+    }
+}
+
+fn hub_warning(message: String, now: &DateTime<Local>) -> Warning {
+    Warning {
+        kind: WarningKind::Hub,
+        message,
+        pr: None,
+        at_ms: EpochMs(now.timestamp_millis().max(0) as u64),
+    }
+}
+
+fn hub_down(
+    ctx: &Ctx,
+    info: &RepoInfo,
+    mut hub: HubView,
+    reason: String,
+    now: &DateTime<Local>,
+) -> StatusView {
+    let name = hub
+        .machine
+        .clone()
+        .or(hub.machine_id.as_ref().map(|id| id.to_string()))
+        .unwrap_or_else(|| "?".to_owned());
+    let message = if reason.starts_with("허브") {
+        reason
+    } else {
+        format!("허브 `{name}`에 닿지 않는다: {reason}")
+    };
+    hub.reachable = false;
+    hub.repo_path = None;
+    hub.error = Some(message.clone());
+    let approval = match Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch) {
+        Ok(Some(c)) => c.approval,
+        _ => Approval::default(),
+    };
+    StatusView {
+        schema: SchemaV1,
+        repo: RepoView {
+            slug: info.slug.clone(),
+            path: info.path.clone(),
+            default_branch: info.default_branch.clone(),
+            state_dir: ctx.home.repo(&info.slug).dir().to_owned(),
+        },
+        hub,
+        approval,
+        daemon: DaemonView {
+            running: false,
+            terminal: None,
+            pid: None,
+        },
+        blocked: None,
+        batch: None,
+        queue: Vec::new(),
+        today: Today::default(),
+        recent: Vec::new(),
+        warnings: vec![hub_warning(message, now)],
+    }
 }
 
 pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusView> {
@@ -225,6 +449,20 @@ fn human(v: &StatusView) -> String {
         "{} ({}) · {approval} · 데몬 {daemon}",
         v.repo.slug, v.repo.default_branch
     ));
+    if !v.hub.local {
+        let name = v.hub.machine.as_deref().unwrap_or("?");
+        let host = v
+            .hub
+            .host
+            .as_deref()
+            .map_or(String::new(), |h| format!(" ({h})"));
+        let reach = if v.hub.reachable {
+            ""
+        } else {
+            " · 닿지 않음"
+        };
+        line(format!("허브: {name}{host}{reach}"));
+    }
     if let Some(b) = &v.blocked {
         line(format!(
             "큐 멈춤: 기준 커밋 {}이 검증을 통과하지 못한다",
@@ -272,8 +510,94 @@ fn human(v: &StatusView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::{Core, Machine};
     use crate::model::{BatchId, BounceReason, PrNumber, Sha};
     use chrono::Utc;
+
+    fn id(s: &str) -> MachineId {
+        MachineId::try_from(s.to_owned()).unwrap()
+    }
+
+    fn viewer() -> Machines {
+        let known = |s: &str, name: &str| Machine {
+            id: id(s),
+            name: name.into(),
+            host: Some(format!("{name}-host")),
+            state: "connected".into(),
+        };
+        Machines::new(
+            Core {
+                id: id("pc"),
+                name: "pc-host".into(),
+            },
+            vec![known("hub", "main"), known("lap", "lappy")],
+        )
+    }
+
+    fn agent(terminal: &str, machine: &str) -> AgentView {
+        AgentView {
+            terminal: TerminalId(terminal.into()),
+            name: None,
+            alive: true,
+            machine_id: Some(id(machine)),
+            host: Some("from-hub".into()),
+            machine: Some("hub-name".into()),
+        }
+    }
+
+    #[test]
+    fn rebase_writes_agent_addresses_in_the_viewers_words() {
+        let m = viewer();
+        let show = |terminal: &str, machine: &str| {
+            let a = rebase_agent(&m, None, agent(terminal, machine));
+            (a.terminal.0, a.host, a.machine)
+        };
+        assert_eq!(
+            show("t7", "hub"),
+            (
+                "main/t7".into(),
+                Some("main-host".into()),
+                Some("main".into())
+            )
+        );
+        assert_eq!(
+            show("lap/t7", "lap"),
+            (
+                "lappy/t7".into(),
+                Some("lappy-host".into()),
+                Some("lappy".into())
+            )
+        );
+        assert_eq!(
+            show("hubside/t7", "pc"),
+            ("t7".into(), Some("pc-host".into()), None)
+        );
+        assert_eq!(
+            show("desk/t7", "zzz"),
+            ("desk/t7".into(), Some("from-hub".into()), None)
+        );
+    }
+
+    #[test]
+    fn an_agent_without_a_machine_lives_on_the_hub() {
+        let m = viewer();
+        let mut a = agent("t7", "hub");
+        a.machine_id = None;
+        let a = rebase_agent(&m, Some(&id("hub")), a);
+        assert_eq!(
+            (a.terminal.0, a.machine_id, a.machine),
+            ("main/t7".into(), Some(id("hub")), Some("main".into()))
+        );
+    }
+
+    #[test]
+    fn the_daemon_terminal_of_a_hub_elsewhere_gets_the_hubs_name() {
+        let m = viewer();
+        assert_eq!(
+            m.address(&id("hub"), &bare(&TerminalId("t1zz".into()))).0,
+            "main/t1zz"
+        );
+    }
 
     fn at(now: &DateTime<Utc>, minutes_ago: i64) -> EpochMs {
         EpochMs((now.timestamp_millis() - minutes_ago * 60_000) as u64)
