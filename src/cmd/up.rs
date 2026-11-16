@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -6,9 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use super::{Ctx, finish, run_on_hub};
-use crate::ext::Output;
+use crate::ext::{Ext, Output, Tool};
 use crate::model::{RepoInfo, TerminalId};
-use crate::store::RepoStore;
+use crate::store::{Home, RepoStore};
 
 const LAUNCH_MARKER: &str = "daemon-launched";
 const LAUNCH_GRACE: Duration = Duration::from_secs(15);
@@ -79,20 +80,21 @@ pub fn ensure_daemon(ctx: &Ctx, info: &RepoInfo, store: &RepoStore) -> Result<La
 /// `-2`, `-3` and so on.
 fn launch(ctx: &Ctx, info: &RepoInfo) -> Result<Output> {
     for attempt in 1..=NAME_TRIES {
-        let name = daemon_name(info, attempt);
-        let out = ctx.ext.hc([
+        let mut argv: Vec<String> = [
             "run",
             "--bg",
             "--json",
             "--no-parent",
             "--name",
-            &name,
+            &daemon_name(info, attempt),
             "--cwd",
             &info.path.to_string_lossy(),
             "--",
-            "chute",
-            "daemon",
-        ])?;
+        ]
+        .map(str::to_owned)
+        .into();
+        argv.extend(daemon_command(&ctx.home, &ctx.ext));
+        let out = ctx.ext.hc(argv)?;
         if out.success() {
             return Ok(out);
         }
@@ -105,6 +107,28 @@ fn launch(ctx: &Ctx, info: &RepoInfo) -> Result<Output> {
         }
     }
     unreachable!("the last attempt returns")
+}
+
+/// `hc run` terminals do not inherit the caller's environment.
+fn daemon_command(home: &Home, ext: &Ext) -> Vec<String> {
+    let absolute = |path: &Path| {
+        std::path::absolute(path)
+            .unwrap_or_else(|_| path.to_owned())
+            .display()
+            .to_string()
+    };
+    let mut command = vec![
+        "env".to_owned(),
+        format!("CHUTE_HOME={}", absolute(home.root())),
+    ];
+    for tool in Tool::ALL {
+        let program = ext.program(tool);
+        if program != Path::new(tool.name()) {
+            command.push(format!("{}={}", tool.env_var(), absolute(program)));
+        }
+    }
+    command.extend(["chute", "daemon"].map(str::to_owned));
+    command
 }
 
 fn is_name_taken(out: &Output) -> bool {
@@ -149,6 +173,24 @@ mod tests {
             remote_name: "origin".into(),
             default_branch: "main".to_owned(),
         }
+    }
+
+    #[test]
+    fn the_daemon_gets_absolute_paths_because_it_starts_in_the_repository() {
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| "bin/gh".into()));
+        let command = daemon_command(&Home::at("rel/home"), &ext);
+        let cwd = std::env::current_dir().unwrap();
+
+        assert_eq!(command[0], "env");
+        assert_eq!(
+            command[1],
+            format!("CHUTE_HOME={}", cwd.join("rel/home").display())
+        );
+        assert_eq!(
+            command[2],
+            format!("CHUTE_GH={}", cwd.join("bin/gh").display())
+        );
+        assert_eq!(command[3..], ["chute", "daemon"]);
     }
 
     #[test]

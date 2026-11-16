@@ -46,22 +46,19 @@ sc_setup() {
   guard_repo
   LT_NAME=$1
   W=$(mktemp -d "${TMPDIR:-/tmp}/chute-livetest.XXXXXX")
-  export CHUTE_HOME=$W/home LIVETEST_STATE=$W/marks
+  export CHUTE_HOME=$W/home LIVETEST_STATE=$W/home/marks
   mkdir -p "$W/bin" "$LIVETEST_STATE" "$CHUTE_HOME"
   ln -s "$LT_CHUTE" "$W/bin/chute"
-  # hc terminals do not inherit CHUTE_HOME, so the daemon that chute launches through
-  # `hc run -- chute daemon` would read the user's real state. The shim points it at ours.
+  # hc terminals do not inherit this shell's environment.
   cat > "$W/bin/hc" <<SHIM
 #!/usr/bin/env bash
 real=\$(PATH=\${PATH#$W/bin:} command -v hc)
 args=("\$@")
 if [[ \${args[0]:-} == run ]]; then
-  for i in "\${!args[@]}"; do
-    if [[ \${args[\$i]} == chute && \${args[\$((i+1))]:-} == daemon && \${args[\$((i-1))]:-} == -- ]]; then
-      args=("\${args[@]:0:\$i}" env CHUTE_HOME="$CHUTE_HOME" LIVETEST_STATE="$LIVETEST_STATE" "$LT_CHUTE" daemon)
-      break
-    fi
-  done
+  n=\${#args[@]}
+  if (( n >= 2 )) && [[ \${args[n-2]} == chute && \${args[n-1]} == daemon ]]; then
+    args[n-2]="$LT_CHUTE"
+  fi
 fi
 exec "\$real" "\${args[@]}"
 SHIM

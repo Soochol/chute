@@ -24,7 +24,7 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 ## 격리
 
 - 시나리오마다 임시 폴더 `/tmp/chute-livetest.*`를 만든다. 거기에 `CHUTE_HOME`(chute 상태), 샌드박스 clone, 시험 표식이 들어가고 끝나면 지운다. 사용자의 `~/.local/state/chute`와 다른 저장소의 데몬은 건드리지 않는다.
-- hc 터미널은 호출한 셸의 환경 변수를 물려받지 않는다. 그래서 chute가 `hc run -- chute daemon`으로 띄우는 데몬은 `CHUTE_HOME`을 잃고 사용자의 실제 상태 폴더를 읽는다. 시나리오가 `PATH` 맨 앞에 두는 `hc` 껍데기가 이 호출 하나만 `env CHUTE_HOME=… chute daemon`으로 바꿔 준다. 나머지 `hc` 호출은 그대로 실제 hc로 간다.
+- hc 터미널은 호출한 셸의 환경 변수를 물려받지 않는다. chute는 데몬을 `hc run -- env CHUTE_HOME=… chute daemon`으로 띄워 상태 폴더를 직접 넘긴다. 시나리오가 `PATH` 맨 앞에 두는 `hc` 껍데기는 이 호출에서 `chute`만 시험할 빌드로 바꾼다. `CHUTE_HOME`은 건드리지 않으므로 chute가 넘기지 못하면 데몬이 사용자의 실제 상태 폴더를 읽어 시나리오가 실패한다. 나머지 `hc` 호출은 그대로 실제 hc로 간다.
 - 알림을 받는 터미널(`agent`는 반송을 받는 작업자, `orch`는 submit한 터미널)은 `hc run`으로 띄운 `cat` 터미널이다. 알림이 도착했는지는 `hc read`로 본다. 오케스트레이터 터미널로는 아무것도 보내지 않는다.
 - 시나리오는 시작할 때와 끝날 때 샌드박스를 초기 상태로 되돌린다. main을 시드 커밋으로 강제 push하고, 열린 PR을 닫고, main 말고 모든 브랜치를 지운다.
 
@@ -36,7 +36,7 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 |---|---|
 | `ok` | 통과 |
 | `fail` | `FAIL <이름>`을 찍고 실패 |
-| `flaky` | 이 이름으로 처음 도는 때만 실패. 표식은 `$LIVETEST_STATE`에 둔다 |
+| `flaky` | 이 이름으로 처음 도는 때만 실패. 표식은 `$LIVETEST_STATE`(없으면 `$CHUTE_HOME/marks`)에 둔다 |
 | `hang` | 제한 시간을 넘겨 멈춘다 |
 | `slow:<n>` | n초 뒤 통과(batch가 도는 동안 끼어들 틈을 만든다) |
 | `excl:<태그>` | 혼자서는 통과하고 같은 태그가 둘이면 실패(조합 실패) |
@@ -64,8 +64,3 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 ## 시나리오 더하기
 
 `scenarios/NN-이름.sh`를 만들고 `lib.sh`를 읽어 들인다. `sc_setup`이 샌드박스와 터미널을 준비하고 종료 때 정리를 걸어 둔다. `mk_pr`, `submit`, `wait_for`, `check`, `ev_has`, `term_text`를 쓰고 `sc_done`으로 끝낸다. 단언이 하나라도 실패하면 종료 코드 1이다. chute의 결함이 나오면 시나리오에서 우회하지 않는다. 실패한 채로 두고 재현 방법을 보고서에 적는다.
-
-## 알려진 결함
-
-- `12-pr-closed`는 실패한다. chute는 batch를 시작할 때만 PR 상태를 읽는다. 검증 도중 PR을 닫아도 닫힌 PR의 내용이 main에 올라가고 `merged` 사건과 알림이 나간다. chute를 고치면 이 시나리오가 통과해야 한다.
-- `CHUTE_HOME`을 기본 위치가 아닌 곳으로 둔 사용자가 `chute up`이나 `chute submit`으로 데몬을 띄우면, hc 터미널이 `CHUTE_HOME`을 물려받지 못해 데몬이 다른 상태 폴더를 읽을 수 있다. 이 묶음은 `hc` 껍데기로 우회하므로 시나리오는 이것을 잡지 못한다.

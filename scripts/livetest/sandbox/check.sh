@@ -3,7 +3,6 @@
 #   ok            pass
 #   fail          print "FAIL <name>" and exit 1
 #   flaky         fail the first time this name runs, pass afterwards
-#                 (marker lives in $LIVETEST_STATE, outside the worktree)
 #   hang          sleep far past the step timeout
 #   slow:<n>      sleep n seconds, then pass
 #   excl:<tag>    pass alone; fail when two files carry the same tag (combination failure)
@@ -18,7 +17,7 @@ for f in cases/*; do
     ok) ;;
     fail) echo "FAIL $name"; status=1 ;;
     flaky)
-      mark="${LIVETEST_STATE:-/tmp}/flaky-$name"
+      mark="${LIVETEST_STATE:-${CHUTE_HOME:-/tmp}/marks}/flaky-$name"
       if [ -e "$mark" ]; then :; else
         mkdir -p "$(dirname "$mark")"; : > "$mark"
         echo "FAIL $name"; status=1

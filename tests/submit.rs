@@ -1035,7 +1035,7 @@ fn a_successful_submit_starts_the_daemon_with_hc_run_in_the_background_without_a
     for flag in ["--bg", "--no-parent"] {
         assert!(run.iter().any(|a| a == flag), "{flag}: {run:?}");
     }
-    assert_eq!(&run[run.len() - 3..], ["--", "chute", "daemon"]);
+    w.sb.assert_daemon_command(run);
 }
 
 #[test]

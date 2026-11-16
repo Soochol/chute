@@ -50,7 +50,7 @@ fn up_starts_the_daemon_in_the_background_without_a_parent_in_the_repository() {
         std::fs::canonicalize(value_of("--cwd")).unwrap(),
         std::fs::canonicalize(lab.repo.path()).unwrap()
     );
-    assert_eq!(&run[run.len() - 3..], ["--", "chute", "daemon"]);
+    lab.sb.assert_daemon_command(run);
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn up_on_another_pc_starts_the_daemon_on_the_hub_and_not_here() {
     for flag in ["--bg", "--no-parent"] {
         assert!(runs[0].iter().any(|x| x == flag), "{flag}: {:?}", runs[0]);
     }
-    assert_eq!(&runs[0][runs[0].len() - 3..], ["--", "chute", "daemon"]);
+    b.sb.assert_daemon_command(&runs[0]);
     assert!(a.sb.fake("hc").calls().iter().all(|c| c[0] != "run"));
 }
 
