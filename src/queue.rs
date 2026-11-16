@@ -529,10 +529,15 @@ pub fn take_batch(
 
 pub fn merged(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
     let item = take_out(state, pr, Action::Merge)?;
+    release_after(state, pr);
+    Ok(item)
+}
+
+/// Frees every item that waited for `pr`, which is now in the default branch.
+pub fn release_after(state: &mut State, pr: PrNumber) {
     for waiting in &mut state.queue {
         waiting.after.retain(|n| *n != pr);
     }
-    Ok(item)
 }
 
 pub fn closed(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {

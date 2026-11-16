@@ -204,6 +204,45 @@ impl Engine {
         Ok(at_ms)
     }
 
+    /// A PR that left the queue without merging through chute may still have been merged on
+    /// GitHub, which satisfies the items waiting for it. An unreadable state fails the pass.
+    fn release_merged_after(&self) -> Result<()> {
+        let state = self.store.load()?;
+        let gone: BTreeSet<PrNumber> = state
+            .queue
+            .iter()
+            .flat_map(|i| i.after.iter().copied())
+            .filter(|n| !state.queue.iter().any(|i| i.pr == *n))
+            .collect();
+        for n in gone {
+            if self.merged_on_github(n)? {
+                self.store.update(|s| {
+                    queue::release_after(s, n);
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merged_on_github(&self, pr: PrNumber) -> Result<bool> {
+        #[derive(serde::Deserialize)]
+        struct Found {
+            state: String,
+        }
+        let text = self
+            .ext
+            .gh(
+                &self.info.path,
+                ["pr", "view", &pr.0.to_string(), "--json", "state"],
+            )?
+            .ok()
+            .with_context(|| format!("{pr}의 상태를 gh로 읽지 못했다"))?;
+        let found: Found =
+            serde_json::from_str(&text).with_context(|| format!("{pr}의 gh 출력을 읽지 못했다"))?;
+        Ok(found.state == "MERGED")
+    }
+
     fn notifier(&self) -> Notifier<'_> {
         Notifier::new(&self.ext, &self.info, &self.store)
     }
@@ -506,6 +545,7 @@ impl Engine {
     }
 
     pub fn run_once(&self) -> Result<Pass> {
+        self.release_merged_after()?;
         self.prune_no_checks_warnings(None)?;
         let due_waiters = self.due_ci_waiters(&self.store.load()?);
         let waiting = |s: &crate::model::State| {

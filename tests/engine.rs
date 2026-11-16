@@ -2229,3 +2229,60 @@ fn thousands_of_flaked_tests_are_still_probed() {
     );
     assert_eq!(found[0].2, ProbeEvidence::Unresolved);
 }
+
+fn merge_by_hand(lab: &Lab, head: &chute::model::Sha) {
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "main", "origin/main"]);
+    lab.repo.git(&[
+        "merge",
+        "--no-ff",
+        "--quiet",
+        "-m",
+        "by hand",
+        head.as_str(),
+    ]);
+    lab.repo.git(&["push", "--quiet", "origin", "main"]);
+}
+
+#[test]
+fn waiting_a_pr_behind_one_merged_on_github_outside_chute_is_released() {
+    let lab = Lab::new("");
+    let head1 = lab.push_pr_branch(1, &[("a.txt", "a\n")]);
+    lab.queue_pr_by(1, &head1, Some(lab.agent()), None, Approval::Agent);
+    let head2 = lab.push_pr_branch(2, &[("b.txt", "b\n")]);
+    lab.queue_pr_by(2, &head2, Some(lab.agent()), None, Approval::Agent);
+    hold_behind(&lab, 2, 1);
+    lab.store
+        .update(|s| Ok(queue::drop_item(s, PrNumber(1))?))
+        .unwrap();
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Idle);
+    assert_eq!(lab.item(2).unwrap().after, prs(&[1]));
+
+    merge_by_hand(&lab, &head1);
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[2]));
+    assert!(lab.item(2).is_none());
+}
+
+#[test]
+fn waiting_a_pr_behind_one_whose_github_state_cannot_be_read_fails_the_pass_and_keeps_the_hold() {
+    let lab = Lab::new("");
+    let head2 = lab.push_pr_branch(2, &[("b.txt", "b\n")]);
+    lab.queue_pr_by(2, &head2, Some(lab.agent()), None, Approval::Agent);
+    lab.store
+        .update(|s| {
+            s.queue[0].after = prs(&[1]);
+            Ok(())
+        })
+        .unwrap();
+    lab.sb.script(
+        "gh",
+        "echo 'error connecting to api.github.com' >&2\nexit 1\n",
+    );
+
+    assert!(lab.engine().run_once().is_err());
+    assert_eq!(lab.item(2).unwrap().after, prs(&[1]));
+}
