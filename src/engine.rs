@@ -445,7 +445,14 @@ impl Engine {
                 .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
                 .map(|i| i.pr)
                 .collect();
-            let prs = queue::take_batch(s, config.max_batch, &due_waiters);
+            let prs = {
+                let due = if config.require_ci {
+                    &due_waiters
+                } else {
+                    &waiting_on_ci
+                };
+                queue::take_batch(s, config.max_batch, due)
+            };
             if !prs.is_empty() {
                 s.batch = Some(Batch {
                     id: id.clone(),

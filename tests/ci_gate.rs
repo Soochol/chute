@@ -672,3 +672,21 @@ fn a_run_that_removes_a_closed_ci_waiter_is_a_finished_batch_not_an_idle_pass() 
     assert!(lab.state().queue.is_empty());
     assert_eq!(lab.batch_ids().len(), 1);
 }
+
+#[test]
+fn turning_the_option_off_lets_a_recently_read_waiter_merge_in_queue_order() {
+    let lab = lab_requiring_ci();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.gh_checks(1, &[("build", "pending")]);
+    let engine = lab.engine_rechecking_ci_every(Duration::from_secs(3600));
+    assert_eq!(engine.run_once().unwrap(), Pass::Idle);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    let config = std::fs::read_to_string(lab.repo.path().join("chute.toml"))
+        .unwrap()
+        .replace("require_ci = true", "require_ci = false");
+    lab.main_commit(&[("chute.toml", &config)], "chore: require_ci 끔");
+
+    let summary = done(engine.run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2]));
+}
