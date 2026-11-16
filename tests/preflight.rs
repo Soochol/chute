@@ -9,7 +9,12 @@ use chute::model::{ItemState, PrNumber, Sha, State};
 use queue_kit::{World, item, stderr};
 use serde_json::Value;
 
+/// Most tests here want the check to run whatever the queue holds, so they ask for `always`.
 fn config(run: &str) -> String {
+    format!("preflight = \"always\"\n{}", config_without_policy(run))
+}
+
+fn config_without_policy(run: &str) -> String {
     format!(
         "approval = \"agent\"\n\n[[verify]]\nname = \"check\"\nrun = {run:?}\ntimeout = 60\nfailed = 'FAIL (\\S+)'\n"
     )
@@ -1288,7 +1293,7 @@ fn preflight_gc_failure_leaves_a_warning_and_the_next_clean_run_removes_it() {
 }
 
 fn paths_config(steps: &[(&str, &str, &str)]) -> String {
-    let mut text = String::from("approval = \"agent\"\n");
+    let mut text = String::from("preflight = \"always\"\napproval = \"agent\"\n");
     for (name, run, paths) in steps {
         text.push_str(&format!(
             "\n[[verify]]\nname = {name:?}\nrun = {run:?}\ntimeout = 60\npaths = {paths}\n"
@@ -1384,4 +1389,175 @@ fn moving_a_file_out_of_a_step_s_paths_still_runs_that_step() {
     let doc = json(&out);
     assert_eq!(doc["result"], "fail");
     assert_eq!(doc["skipped_steps"], serde_json::json!([]));
+}
+
+fn policy_world(policy: Option<&str>, run: &str) -> World {
+    let key = policy.map_or(String::new(), |p| format!("preflight = {p:?}\n"));
+    World::with_config(Some(format!("{key}{}", config_without_policy(run))))
+}
+
+fn ran_marker(dir: &tempfile::TempDir) -> (PathBuf, String) {
+    let mark = dir.path().join("ran");
+    let run = format!("touch {}", mark.display());
+    (mark, run)
+}
+
+/// Runs `chute preflight --json` while every preflight slot is held, so a run that took a slot
+/// would wait for it. Fails instead of hanging when it does.
+fn preflight_with_slots_held(w: &World) -> Output {
+    let _held = [1, 2].map(|k| hold_slot(w, chute::gitops::SlotName::Preflight(k)));
+    let mut command = w.sb.command(env!("CARGO_BIN_EXE_chute"));
+    let child = command
+        .current_dir(w.repo.path())
+        .args(["preflight", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output().unwrap());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(out) => out,
+        Err(_) => {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+            panic!("슬롯을 기다리며 멈췄다. 생략하는데 슬롯을 잡았다");
+        }
+    }
+}
+
+#[test]
+fn an_empty_queue_skips_by_default_without_taking_a_slot_or_running_the_check() {
+    let marks = tempfile::tempdir().unwrap();
+    let (mark, run) = ran_marker(&marks);
+    let w = policy_world(None, &run);
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let base = origin_main(&w);
+    let out = preflight_with_slots_held(&w);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "skipped");
+    assert_eq!(doc["skip_reason"], "no_queue");
+    assert_eq!(doc["head"], head);
+    assert_eq!(base.split_whitespace().next().unwrap(), doc["base"]);
+    assert_eq!(doc["with"], serde_json::json!([]));
+    assert!(!mark.exists(), "검증이 돌았다");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("기다린다"));
+}
+
+#[test]
+fn a_skip_prints_why_and_is_recorded_for_status() {
+    let w = policy_world(None, "true");
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let mut mine = item(12, ItemState::AwaitingApproval);
+    mine.branch = "feat/mine".into();
+    mine.head = Sha::try_from(head.clone()).unwrap();
+    w.seed(vec![mine]);
+    let out = preflight(&w, &[]);
+    assert_eq!(code(&out), 0);
+    let shown = text(&out);
+    assert!(
+        shown.starts_with("생략: 함께 합칠 PR이 큐에 없어"),
+        "{shown}"
+    );
+    assert!(shown.contains("batch가 병합 전에 검증한다"), "{shown}");
+    assert!(shown.contains(&head[..12]), "{shown}");
+    let record = &w.state().preflights["feat/mine"];
+    assert_eq!(record.head.as_str(), head);
+    assert!(record.base.is_some());
+    assert_eq!(w.entry(12).unwrap()["preflight"]["result"], "skipped");
+}
+
+#[test]
+fn a_waiting_pr_of_the_queue_makes_the_default_policy_check() {
+    let marks = tempfile::tempdir().unwrap();
+    let (mark, run) = ran_marker(&marks);
+    for state in [ItemState::Queued(None), ItemState::InBatch] {
+        let w = policy_world(Some("when_queued"), &run);
+        queue_pr(&w, 7, "a.txt", "a\n", state);
+        work_on(&w, "feat/mine", "mine.txt", "x\n");
+        let doc = json(&preflight(&w, &["--json"]));
+        assert_eq!(doc["result"], "pass");
+        assert_eq!(doc["with"], serde_json::json!([7]));
+        assert!(mark.exists(), "검증이 돌지 않았다");
+        fs::remove_file(&mark).unwrap();
+    }
+}
+
+#[test]
+fn only_my_own_queued_branch_still_counts_as_an_empty_queue() {
+    let w = policy_world(None, "true");
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let mut mine = item(12, ItemState::Queued(None));
+    mine.branch = "feat/mine".into();
+    mine.head = Sha::try_from(head).unwrap();
+    w.seed(vec![mine]);
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+}
+
+#[test]
+fn items_that_are_not_waiting_do_not_count_as_partners() {
+    let w = policy_world(None, "true");
+    queue_pr(&w, 7, "a.txt", "a\n", ItemState::AwaitingApproval);
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+}
+
+#[test]
+fn always_checks_even_with_an_empty_queue() {
+    let marks = tempfile::tempdir().unwrap();
+    let (mark, run) = ran_marker(&marks);
+    let w = policy_world(Some("always"), &run);
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "pass");
+    assert!(mark.exists(), "검증이 돌지 않았다");
+}
+
+#[test]
+fn never_skips_even_with_a_queued_pr_and_says_the_config_asked() {
+    let marks = tempfile::tempdir().unwrap();
+    let (mark, run) = ran_marker(&marks);
+    let w = policy_world(Some("never"), &run);
+    queue_pr(&w, 7, "a.txt", "a\n", ItemState::Queued(None));
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let out = preflight_with_slots_held(&w);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "skipped");
+    assert_eq!(doc["skip_reason"], "never");
+    assert_eq!(doc["head"], head);
+    assert!(doc["base"].is_string());
+    assert!(!mark.exists(), "검증이 돌았다");
+    let shown = text(&preflight(&w, &[]));
+    assert!(shown.contains("preflight가 \"never\""), "{shown}");
+}
+
+#[test]
+fn a_skip_still_refuses_uncommitted_changes() {
+    for policy in [None, Some("never")] {
+        let w = policy_world(policy, "true");
+        work_on(&w, "feat/mine", "mine.txt", "x\n");
+        w.repo.write("mine.txt", "changed\n");
+        let out = preflight(&w, &[]);
+        assert_eq!(code(&out), 2, "{policy:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("커밋"));
+        assert!(text(&out).is_empty());
+    }
+}
+
+#[test]
+fn a_skip_leaves_origin_the_worktree_and_the_queue_untouched() {
+    let w = policy_world(None, "true");
+    let head = work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let main_before = origin_main(&w);
+    let queue_before = w.state().queue;
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+    assert_eq!(origin_main(&w), main_before);
+    assert_eq!(w.state().queue, queue_before);
+    assert_eq!(w.repo.head(), head);
+    assert!(w.sb.fake("gh").calls().is_empty(), "gh가 불렸다");
 }

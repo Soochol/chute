@@ -7,7 +7,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::ext::Ext;
-use crate::model::{Approval, NonEmpty};
+use crate::model::{Approval, NonEmpty, PreflightPolicy};
 
 pub const FILE_NAME: &str = "chute.toml";
 pub const DEFAULT_BUDGET: u32 = 3;
@@ -24,6 +24,7 @@ pub struct Config {
     pub respawn: Vec<String>,
     pub require_head: bool,
     pub max_parallel: u32,
+    pub preflight: PreflightPolicy,
     pub env_check: Vec<String>,
     pub retention: Retention,
     pub cache: Cache,
@@ -103,6 +104,8 @@ struct RawConfig {
     require_head: bool,
     #[serde(default = "default_max_parallel")]
     max_parallel: u32,
+    #[serde(default)]
+    preflight: PreflightPolicy,
     #[serde(default)]
     env_check: Vec<String>,
     #[serde(default)]
@@ -327,6 +330,7 @@ impl Config {
             respawn: raw.respawn,
             require_head: raw.require_head,
             max_parallel: raw.max_parallel,
+            preflight: raw.preflight,
             env_check: raw.env_check,
             retention: Retention {
                 logs_days: raw.retention.logs_days,
@@ -410,6 +414,7 @@ serialize = false       # true면 검증을 한 번에 하나만 돈다
 require_ci = false      # true면 GitHub check가 통과한 PR만 batch에 넣는다
 require_head = false    # true면 --head 없는 submit을 거절한다
 max_parallel = 2        # 동시에 도는 preflight 수 상한(슬롯 수 상한)
+preflight = "when_queued"  # "when_queued"면 합칠 PR이 큐에 있을 때만 검사하고, "always"면 늘, "never"면 안 한다
 env_check = []          # 검증 전에 돌려 결과를 남길 명령. 예: ["cargo --version"]
 # 에이전트가 없을 때 띄울 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다.
 # 값을 넣으면 그 명령으로 새 에이전트를 띄운다.
@@ -461,6 +466,7 @@ mod tests {
         assert!(c.respawn.is_empty());
         assert!(!c.require_head);
         assert_eq!(c.max_parallel, 2);
+        assert_eq!(c.preflight, PreflightPolicy::WhenQueued);
         assert!(c.env_check.is_empty());
         assert_eq!(
             c.retention,
@@ -497,6 +503,7 @@ require_ci = true
 respawn = ["codex", "--no-daemon"]
 require_head = true
 max_parallel = 4
+preflight = "never"
 env_check = ["cargo --version", "git --version"]
 [retention]
 logs_days = 3
@@ -523,6 +530,7 @@ probe = "cargo test {tests} -- --exact"
         assert_eq!(c.respawn, ["codex", "--no-daemon"]);
         assert!(c.require_head);
         assert_eq!(c.max_parallel, 4);
+        assert_eq!(c.preflight, PreflightPolicy::Never);
         assert_eq!(c.env_check, ["cargo --version", "git --version"]);
         assert_eq!(
             c.retention,
@@ -691,6 +699,7 @@ probe = "cargo test {tests} -- --exact"
         for key in [
             "require_head",
             "max_parallel",
+            "preflight",
             "env_check",
             "respawn",
             "retention",
@@ -702,12 +711,27 @@ probe = "cargo test {tests} -- --exact"
         let minimal = Config::parse(MINIMAL).unwrap();
         let drafted = Config::parse(&text).unwrap();
         assert_eq!(drafted.max_parallel, minimal.max_parallel);
+        assert_eq!(drafted.preflight, minimal.preflight);
         assert_eq!(drafted.retention, minimal.retention);
         assert_eq!(drafted.flaky, minimal.flaky);
         assert_eq!(drafted.cache, minimal.cache);
         assert_eq!(drafted.env_check, minimal.env_check);
         assert_eq!(drafted.require_head, minimal.require_head);
         assert!(text.contains("# probe = "));
+    }
+
+    #[test]
+    fn the_preflight_key_takes_three_words_and_nothing_else() {
+        for (word, policy) in [
+            ("when_queued", PreflightPolicy::WhenQueued),
+            ("always", PreflightPolicy::Always),
+            ("never", PreflightPolicy::Never),
+        ] {
+            let text = format!("preflight = \"{word}\"\n{MINIMAL}");
+            assert_eq!(Config::parse(&text).unwrap().preflight, policy);
+        }
+        let err = Config::parse(&format!("preflight = \"sometimes\"\n{MINIMAL}")).unwrap_err();
+        assert!(format!("{err:#}").contains("sometimes"), "{err:#}");
     }
 
     #[test]

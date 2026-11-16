@@ -15,8 +15,8 @@ use crate::gc;
 use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
     Blocked, ConflictFile, EnvRecord, EpochMs, Failure, FailureKind, FailureShape, ItemState, Mode,
-    NonEmpty, Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView,
-    StepFailure, VerifyMode,
+    NonEmpty, Partner, PrNumber, PreflightPolicy, PreflightRecord, PreflightResult, RepoInfo, Sha,
+    StatusView, StepFailure, VerifyMode,
 };
 use crate::pc_limit::Wait;
 use crate::store::RepoStore;
@@ -51,7 +51,7 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
         print!("{}", render(&report));
     }
     Ok(match report.result {
-        PreflightResult::Pass => ExitCode::SUCCESS,
+        PreflightResult::Pass | PreflightResult::Skipped => ExitCode::SUCCESS,
         PreflightResult::Fail | PreflightResult::Conflict => ExitCode::from(REFUSED),
         PreflightResult::BaseBroken => ExitCode::from(BASE_BROKEN),
     })
@@ -73,8 +73,40 @@ struct Report {
     report_json: Option<PathBuf>,
     base_broken: Option<BrokenBase>,
     blocked: Option<Blocked>,
+    skip_reason: Option<SkipReason>,
     at_ms: EpochMs,
-    env: EnvRecord,
+    /// Absent when no slot was opened to record it.
+    env: Option<EnvRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SkipReason {
+    /// No other PR waits in the queue, so the batch runs the same checks.
+    NoQueue,
+    /// `chute.toml` says `preflight = "never"`.
+    Never,
+}
+
+impl SkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            SkipReason::NoQueue => {
+                "함께 합칠 PR이 큐에 없어 검사하지 않는다. batch가 병합 전에 검증한다"
+            }
+            SkipReason::Never => {
+                "chute.toml의 preflight가 \"never\"라 검사하지 않는다. batch가 병합 전에 검증한다"
+            }
+        }
+    }
+}
+
+fn skip_reason(policy: PreflightPolicy, others_queued: usize) -> Option<SkipReason> {
+    match policy {
+        PreflightPolicy::Always => None,
+        PreflightPolicy::Never => Some(SkipReason::Never),
+        PreflightPolicy::WhenQueued => (others_queued == 0).then_some(SkipReason::NoQueue),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +194,18 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     )
     .ok()
     .flatten();
+    // Without a readable config the full run below fetches the base and reports why.
+    let skip_why = last_fetched_config
+        .as_ref()
+        .and_then(|c| skip_reason(c.preflight, queued.len()));
+    if let Some(reason) = skip_why {
+        let base = remote_base(ctx, &info)?;
+        let report = Report::skipped(reason, &target, base, blocked, EpochMs::now());
+        if let Err(e) = record(ctx, &store, &target, &report) {
+            eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
+        }
+        return Ok(report);
+    }
     let max_parallel = last_fetched_config
         .as_ref()
         .map_or(DEFAULT_MAX_PARALLEL, |c| c.max_parallel);
@@ -262,6 +306,35 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         false,
     );
     Ok(report)
+}
+
+/// The default-branch tip on the remote, read without fetching into a slot.
+fn remote_base(ctx: &Ctx, info: &RepoInfo) -> Result<Sha> {
+    let branch = format!("refs/heads/{}", info.default_branch);
+    let listed = ctx
+        .ext
+        .git(
+            &info.path,
+            ["ls-remote", info.remote_name.as_str(), branch.as_str()],
+        )?
+        .ok()
+        .with_context(|| {
+            format!(
+                "{}/{}의 기준 커밋을 묻지 못했다",
+                info.remote_name, info.default_branch
+            )
+        })?;
+    let first = listed
+        .lines()
+        .find_map(|line| line.split_whitespace().next())
+        .ok_or_else(|| {
+            anyhow!(
+                "{}/{}의 기준 커밋을 찾지 못했다",
+                info.remote_name,
+                info.default_branch
+            )
+        })?;
+    Sha::try_from(first.to_owned()).map_err(|e| anyhow!(e))
 }
 
 struct Waiting {
@@ -707,8 +780,37 @@ impl Report {
             report_json: judged.written.as_ref().map(|written| written.json.clone()),
             base_broken: judged.base_broken.take(),
             blocked,
+            skip_reason: None,
             at_ms,
-            env,
+            env: Some(env),
+        }
+    }
+
+    fn skipped(
+        reason: SkipReason,
+        target: &Target,
+        base: Sha,
+        blocked: Option<Blocked>,
+        at_ms: EpochMs,
+    ) -> Report {
+        Report {
+            result: PreflightResult::Skipped,
+            head: target.head.clone(),
+            base,
+            with: Vec::new(),
+            skipped: Vec::new(),
+            skipped_steps: Vec::new(),
+            flaky: Vec::new(),
+            kind: None,
+            mode: None,
+            summary: None,
+            report: None,
+            report_json: None,
+            base_broken: None,
+            blocked,
+            skip_reason: Some(reason),
+            at_ms,
+            env: None,
         }
     }
 }
@@ -733,7 +835,7 @@ fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Res
             at_ms: report.at_ms,
             base: Some(report.base.clone()),
             with: report.with.clone(),
-            env: Some(report.env.clone()),
+            env: report.env.clone(),
         },
     };
     deliver(ctx, store, &entry)
@@ -792,6 +894,10 @@ fn render(report: &Report) -> String {
             .join(", ")
     };
     match (&report.summary, &report.base_broken) {
+        _ if report.skip_reason.is_some() => {
+            let reason = report.skip_reason.map_or("", SkipReason::label);
+            out.push_str(&format!("생략: {reason}\n"));
+        }
         (Some(summary), _) => out.push_str(&format!("{summary}\n")),
         (None, Some(broken)) => out.push_str(&format!(
             "기준이 깨졌다. 이 커밋 탓이 아니다: 기준 {}의 {} 단계가 실패한다. 이 HEAD는 판정하지 못했고 고칠 것도 없다. 기준을 고친 뒤 다시 실행한다\n검증 로그: {}\n",
@@ -832,9 +938,11 @@ fn render(report: &Report) -> String {
             "건너뛴 검증 단계 {step}: 건너뜀(바뀐 파일이 paths에 없다)\n"
         ));
     }
-    out.push_str(&format!("검사 환경: {}\n", env::machine_line(&report.env)));
-    for check in &report.env.checks {
-        out.push_str(&format!("  {}: {}\n", check.run, env::result_text(check)));
+    if let Some(env) = &report.env {
+        out.push_str(&format!("검사 환경: {}\n", env::machine_line(env)));
+        for check in &env.checks {
+            out.push_str(&format!("  {}: {}\n", check.run, env::result_text(check)));
+        }
     }
     for flaky in &report.flaky {
         let tests = if flaky.tests.is_empty() {
@@ -874,12 +982,13 @@ mod tests {
             report_json: None,
             base_broken: None,
             blocked: None,
+            skip_reason: None,
             at_ms: EpochMs(1),
-            env: EnvRecord {
+            env: Some(EnvRecord {
                 machine_id: None,
                 host: "pc".into(),
                 checks: Vec::new(),
-            },
+            }),
         }
     }
 
@@ -898,6 +1007,28 @@ mod tests {
         assert!(text.contains("기준 fedcba987654"));
         assert!(text.contains("#3, #4"));
         assert!(render(&passed(&[])).contains("함께 검증한 PR 없음"));
+    }
+
+    #[test]
+    fn the_policy_decides_from_the_number_of_other_queued_prs() {
+        use PreflightPolicy::{Always, Never, WhenQueued};
+        assert_eq!(skip_reason(WhenQueued, 0), Some(SkipReason::NoQueue));
+        assert_eq!(skip_reason(WhenQueued, 1), None);
+        assert_eq!(skip_reason(Always, 0), None);
+        assert_eq!(skip_reason(Never, 3), Some(SkipReason::Never));
+    }
+
+    #[test]
+    fn a_skip_says_why_and_keeps_head_and_base() {
+        let mut report = passed(&[]);
+        report.result = PreflightResult::Skipped;
+        report.skip_reason = Some(SkipReason::NoQueue);
+        report.env = None;
+        let text = render(&report);
+        assert!(text.starts_with("생략: 함께 합칠 PR이 큐에 없어"), "{text}");
+        assert!(text.contains("batch가 병합 전에 검증한다"));
+        assert!(text.contains("HEAD 0123456789ab · 기준 fedcba987654"));
+        assert!(!text.contains("검사 환경"));
     }
 
     #[test]

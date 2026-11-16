@@ -14,7 +14,7 @@ chute는 검증을 로컬에서 묶음(batch) 단위로 한 번에 돌린다. �
 
 ## 동작
 
-1. 에이전트가 PR을 올리기 전에 `chute preflight`로 기본 브랜치 + 큐 + 자기 HEAD를 합쳐 검증한다. 단독 실패가 나오면 기준 커밋만 따로 검증해 본다(큐가 이미 검증한 기준은 건너뛴다). 기준도 실패하면 "기준이 깨졌다. 이 커밋 탓이 아니다"로 보고하고 종료 코드 4로 끝난다. 이때 `--json`의 `result`는 `base_broken`이다.
+1. 에이전트가 PR을 올리기 전에 `chute preflight`로 기본 브랜치 + 큐 + 자기 HEAD를 합쳐 검증한다. 합칠 PR이 큐에 없으면 batch와 같은 검사를 한 번 더 하는 것뿐이라 기본으로 검사하지 않고 생략한다(`preflight` 키, 아래 표). 생략하면 종료 코드 0이고 `--json`의 `result`는 `skipped`이며 `head`와 `base`는 그대로 남는다. 단독 실패가 나오면 기준 커밋만 따로 검증해 본다(큐가 이미 검증한 기준은 건너뛴다). 기준도 실패하면 "기준이 깨졌다. 이 커밋 탓이 아니다"로 보고하고 종료 코드 4로 끝난다. 이때 `--json`의 `result`는 `base_broken`이다.
 2. PR을 올린 뒤 `chute submit`으로 큐에 넣는다. 그 순간의 PR HEAD가 기록된다.
 3. 데몬이 큐에서 PR을 (복구 PR, `--priority` PR, 나머지 순으로 각자 올린 순서대로) 최대 `max_batch`개 가져와 기본 브랜치 위에 합치고 `chute.toml`의 검증 단계를 돌린다.
 4. 통과하면 검증한 바로 그 트리를 기본 브랜치에 push한다. 실패하면 batch를 반으로 나눠 범인을 찾는다. 범인은 보고서와 함께 에이전트에게 돌아간다. 에이전트가 없으면 기본 설정에서는 띄우지 않고 사람 차례로 넘긴다. `respawn`에 명령을 넣었으면 그 명령으로 새로 띄운다.
@@ -268,6 +268,7 @@ serialize = false
 require_ci = false
 require_head = false
 max_parallel = 2
+preflight = "when_queued"
 env_check = []
 respawn = []
 # remote = "origin"
@@ -303,6 +304,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `require_ci` | `false` | `true`면 PR마다 등록된 HEAD의 GitHub check가 통과한 PR만 batch에 넣는다. 아래에 설명한다 |
 | `require_head` | `false` | `true`면 `--head` 없는 submit을 거절한다 |
 | `max_parallel` | `2` | 동시에 도는 preflight 수의 상한(슬롯 수의 상한). 1 이상 |
+| `preflight` | `"when_queued"` | `chute preflight`가 검사를 돌리는 때. `"when_queued"`는 합칠 PR(큐의 `queued`와 `in_batch` 가운데 자기 브랜치가 아닌 것)이 있을 때만 검사하고, `"always"`는 늘, `"never"`는 한 번도 검사하지 않는다. 생략하면 검사 슬롯을 잡지 않고 종료 코드 0으로 끝나며 `result`는 `skipped`, 이유는 `skip_reason`(`no_queue`, `never`)과 출력에 남는다. 커밋하지 않은 변경 거절, 저장소 등록 확인, 허브 확인은 생략할 때도 한다. 정책은 이 PC가 마지막으로 가져온 기본 브랜치의 `chute.toml`에서 읽는다. 읽지 못하면 생략하지 않는다 |
 | `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]`. 슬롯 폴더에서 `sh -c`로 하나씩 돌린다. 명령마다 30초 제한이 있고, 출력은 첫 줄 200자만 남긴다. 명령이 실패해도 검증은 그대로 돈다. 머신 이름과 hc 코어 id는 목록이 비어도 남는다. batch는 한 번, preflight는 실행마다 기록한다. 반송 보고서의 "검사 환경" 절은 같은 HEAD의 preflight와 다른 줄만 나란히 보인다 |
 | `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
 | `remote` | 없음 | chute가 관리하는 GitHub 저장소를 가리키는 git 원격의 이름. 없으면 chute가 정한다. 아래 "원격이 여러 개일 때"를 본다. `chute init`은 작업 폴더의 `chute.toml`에서 이 키를 읽는다 |

@@ -204,6 +204,17 @@ pub enum Approval {
     Human,
 }
 
+/// When `chute preflight` runs the checks. Whether it does is decided from the queue it reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightPolicy {
+    /// Check only when another PR waits in the queue to be merged with.
+    #[default]
+    WhenQueued,
+    Always,
+    Never,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub slug: Slug,
@@ -612,6 +623,8 @@ pub enum PreflightResult {
     Conflict,
     /// The base commit itself fails verification, so no commit can be judged on it.
     BaseBroken,
+    /// No check ran: the policy said the batch verifies this head anyway.
+    Skipped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
