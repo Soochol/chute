@@ -680,6 +680,10 @@ fn next_steps(
             "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",
             "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. 사람 차례로 넘어간다.",
         ),
+        Subject::Commit { .. } if require_head => (
+            "고쳐서 커밋한 뒤 `chute preflight`를 다시 실행한다. 통과하면 push하고 PR 번호와 새 HEAD를 보고한다. 이 저장소는 `require_head = true`라 submit하지 않는다.",
+            "못 풀겠으면 하던 일을 멈추고 사용자에게 이유를 알린다.",
+        ),
         Subject::Commit { .. } => (
             "고쳐서 커밋한 뒤 `chute preflight`를 다시 실행한다. 통과하면 push하고 `chute submit`을 실행한다.",
             "못 풀겠으면 하던 일을 멈추고 사용자에게 이유를 알린다.",

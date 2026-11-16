@@ -176,10 +176,12 @@ impl<'a> Repo<'a> {
     }
 
     fn requires_head(&self) -> bool {
-        self.default_branches
-            .first()
-            .and_then(|branch| Config::load_remote_branch(self.ext, &self.dir, branch).ok()?)
-            .is_some_and(|config| config.require_head)
+        self.default_branches.iter().any(|branch| {
+            Config::load_remote_branch(self.ext, &self.dir, branch)
+                .ok()
+                .flatten()
+                .is_some_and(|config| config.require_head)
+        })
     }
 
     fn hand_in(&self) -> &'static str {
@@ -814,6 +816,21 @@ mod tests {
                 assert_eq!(reason.contains("`chute submit`"), !reports, "{reason}");
             }
         }
+    }
+
+    #[test]
+    fn require_head_is_read_from_the_default_branch_even_when_origin_head_is_unset() {
+        let fx = Fixture::new(false);
+        fx.repo.git(&["branch", "-m", "master"]);
+        fx.repo.commit_file(
+            "chute.toml",
+            "require_head = true\n[[verify]]\nname = \"t\"\nrun = \"true\"\n",
+            "chore: 설정",
+        );
+        fx.repo.git(&["push", "--quiet", "origin", "master"]);
+        fx.repo.git(&["remote", "set-head", "origin", "-d"]);
+        let reason = fx.verdict("git push origin master").unwrap();
+        assert!(reason.contains("PR 번호와 HEAD를 보고한다"), "{reason}");
     }
 
     #[test]

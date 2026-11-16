@@ -1283,7 +1283,17 @@ fn require_head_repos_are_told_to_report_where_other_repos_are_told_to_submit() 
             lab.fb().deliver(&item, &notice);
         }
 
-        let mut texts = vec![read(&written.md)];
+        let commit_report = lab
+            .fb()
+            .write_report(
+                &Subject::Commit {
+                    commit: sha("abc1234def5678"),
+                },
+                &failure,
+                None,
+            )
+            .unwrap();
+        let mut texts = vec![read(&written.md), read(&commit_report.md)];
         let calls = lab.hc_calls();
         texts.extend(
             calls
@@ -1291,7 +1301,7 @@ fn require_head_repos_are_told_to_report_where_other_repos_are_told_to_submit() 
                 .filter(|c| c[0] == "send")
                 .map(|c| c[2].clone()),
         );
-        assert_eq!(texts.len(), 3, "{calls:?}");
+        assert_eq!(texts.len(), 4, "{calls:?}");
         for text in texts {
             assert_eq!(text.contains(REPORT), require_head, "{config}\n{text}");
             assert_eq!(
