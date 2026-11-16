@@ -52,6 +52,28 @@ impl Sandbox {
         self.dir.path()
     }
 
+    pub fn assert_daemon_command(&self, run: &[String]) {
+        let at = run
+            .iter()
+            .position(|a| a == "--")
+            .expect("no `--` in hc run");
+        let command = &run[at + 1..];
+        assert_eq!(command[0], "env", "{run:?}");
+        assert_eq!(
+            &command[command.len() - 2..],
+            ["chute", "daemon"],
+            "{run:?}"
+        );
+        let mut expected = vec![format!("CHUTE_HOME={}", self.chute_home().display())];
+        for (tool, var) in [("git", "CHUTE_GIT"), ("gh", "CHUTE_GH"), ("hc", "CHUTE_HC")] {
+            let path = self.root().join("bin").join(tool);
+            if path.exists() {
+                expected.push(format!("{var}={}", path.display()));
+            }
+        }
+        assert_eq!(command[1..command.len() - 2], expected[..], "{run:?}");
+    }
+
     pub fn chute_home(&self) -> PathBuf {
         self.root().join("chute-home")
     }
