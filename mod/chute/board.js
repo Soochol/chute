@@ -279,6 +279,7 @@ function batchOf(batch, members, now) {
       phase: b.phase == null ? null : named(PHASE, b.phase),
       step: str(b.step) || null,
       waitingMachine: b.waiting_machine === true,
+      reused: b.reused === "preflight" || b.reused === "batch" ? `${b.reused}의 통과 결과를 다시 씀` : null,
       round: Number.isFinite(b.round) && b.round > 0 ? `${b.round}번째 검증` : null,
       elapsed: Number.isFinite(b.started_ms) ? formatDuration(Math.max(0, (now - b.started_ms) / 1000)) : null,
     },

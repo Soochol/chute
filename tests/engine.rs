@@ -791,6 +791,7 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
             pushed: Vec::new(),
             verifications: 0,
             skipped: Vec::new(),
+            reused: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1095,6 +1096,7 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
             pushed: vec![landed],
             verifications: 3,
             skipped: Vec::new(),
+            reused: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1157,6 +1159,7 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
             pushed: Vec::new(),
             verifications: 0,
             skipped: Vec::new(),
+            reused: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1198,6 +1201,7 @@ fn batch_record(
         pushed: Vec::new(),
         verifications: 0,
         skipped: Vec::new(),
+        reused: Vec::new(),
         env: None,
     }
 }
@@ -1294,6 +1298,7 @@ fn a_finished_event_already_written_is_not_written_again() {
                 round: 1,
                 started_ms: chute::model::EpochMs::now(),
                 waiting_machine: false,
+                reused: None,
             });
             Ok(())
         })

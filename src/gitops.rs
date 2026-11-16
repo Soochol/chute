@@ -631,6 +631,12 @@ impl Slot {
         self.sha("HEAD")
     }
 
+    /// The tree SHA of `commit`: what two commits that hold the same files share.
+    pub fn tree_of(&self, commit: &Sha) -> Result<Sha> {
+        let out = self.run(&["rev-parse", "--verify", &format!("{commit}^{{tree}}")])?;
+        Sha::try_from(out.trim().to_owned()).map_err(|e| anyhow!(e))
+    }
+
     /// The files whose content differs between `base` and the slot's HEAD, as the `paths` of a
     /// verification step see them. Renames are listed as a delete and an add, so both the old and
     /// the new path count.

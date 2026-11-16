@@ -18,6 +18,7 @@ pub mod feedback;
 pub mod gc;
 pub mod gitops;
 pub mod queue;
+pub mod reuse;
 pub mod verify;
 
 #[cfg(test)]

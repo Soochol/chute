@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{Ctx, FORWARD_TIMEOUT, REFUSED, forward_to_hub};
-use crate::config::{Config, DEFAULT_MAX_PARALLEL};
+use crate::config::{Config, DEFAULT_MAX_PARALLEL, MAX_REUSE_HOURS};
 use crate::env::{self, EnvSection};
 use crate::feedback::{self, Feedback, Subject, Written};
 use crate::gc;
@@ -16,9 +16,10 @@ use crate::gitops::{Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
     Blocked, ConflictFile, EnvRecord, EpochMs, Failure, FailureKind, FailureShape, ItemState, Mode,
     NonEmpty, Partner, PrNumber, PreflightPolicy, PreflightRecord, PreflightResult, RepoInfo, Sha,
-    StatusView, StepFailure, VerifyMode,
+    StatusView, StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode,
 };
 use crate::pc_limit::Wait;
+use crate::reuse;
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
@@ -190,7 +191,7 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .and_then(|c| skip_reason(c.preflight, queued.len()));
     if let Some(reason) = skip_why {
         let report = Report::skipped(reason, &target, fetched_base, blocked, EpochMs::now());
-        if let Err(e) = record(ctx, &store, &target, &report) {
+        if let Err(e) = record(ctx, &store, &target, &report, None) {
             eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
         }
         return Ok(report);
@@ -279,8 +280,9 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         ItemResult::Merged { .. } | ItemResult::AlreadyMerged => run.verify(&merged.tip)?,
     };
 
+    let verified = passed_tree(ctx, &slot, &config, &merged.tip, &judged, &env, at);
     let report = Report::new(&mut judged, &target, &base, skipped, blocked, at, env);
-    if let Err(e) = record(ctx, &store, &target, &report) {
+    if let Err(e) = record(ctx, &store, &target, &report, verified) {
         eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
     }
     gc::auto(
@@ -293,6 +295,41 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         false,
     );
     Ok(report)
+}
+
+/// The tree this run verified, for batch to take over when it builds the same tree. A pass that
+/// needed a rerun is not kept: its flaky step stands for nothing.
+fn passed_tree(
+    ctx: &Ctx,
+    slot: &Slot,
+    config: &Config,
+    tip: &Sha,
+    judged: &Judged,
+    env: &EnvRecord,
+    at: EpochMs,
+) -> Option<VerifiedTree> {
+    if judged.result != PreflightResult::Pass || !judged.flaky.is_empty() || !config.reuse.enabled {
+        return None;
+    }
+    let key = slot.tree_of(tip).and_then(|tree| {
+        Ok(TreeKey {
+            tree,
+            config: reuse::fingerprint(&ctx.ext, slot.path(), config)?,
+            skipped: judged.skipped_steps.clone(),
+        })
+    });
+    match key {
+        Ok(key) => Some(VerifiedTree {
+            key,
+            at_ms: at,
+            by: VerifiedBy::Preflight,
+            env: Some(env.clone()),
+        }),
+        Err(e) => {
+            eprintln!("경고: 통과한 트리를 기록하지 못해 batch가 다시 검증한다: {e:#}");
+            None
+        }
+    }
 }
 
 struct Waiting {
@@ -777,9 +814,17 @@ impl Report {
 struct Recorded {
     branch: String,
     record: PreflightRecord,
+    #[serde(default)]
+    verified: Option<VerifiedTree>,
 }
 
-fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Result<()> {
+fn record(
+    ctx: &Ctx,
+    store: &RepoStore,
+    target: &Target,
+    report: &Report,
+    verified: Option<VerifiedTree>,
+) -> Result<()> {
     let Some(branch) = &target.branch else {
         eprintln!("경고: 브랜치가 아닌 HEAD라 결과를 상태에 기록하지 않는다");
         return Ok(());
@@ -795,6 +840,7 @@ fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Res
             with: report.with.clone(),
             env: report.env.clone(),
         },
+        verified,
     };
     deliver(ctx, store, &entry)
 }
@@ -829,6 +875,9 @@ fn write_record(store: &RepoStore, entry: &Recorded) -> Result<()> {
             state
                 .preflights
                 .insert(entry.branch.clone(), entry.record.clone());
+        }
+        if let Some(verified) = &entry.verified {
+            reuse::remember(state, verified.clone(), MAX_REUSE_HOURS, EpochMs::now());
         }
         Ok(())
     })

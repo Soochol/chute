@@ -569,6 +569,9 @@ pub struct Batch {
     /// True while verification waits for a free PC slot (`machine.toml`'s `max_verify`).
     #[serde(default)]
     pub waiting_machine: bool,
+    /// Which verification's pass the latest round took over instead of running again.
+    #[serde(default)]
+    pub reused: Option<VerifiedBy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,6 +674,40 @@ pub struct State {
     pub warnings: Vec<Warning>,
     #[serde(default)]
     pub base_doubt: Option<BaseDoubt>,
+    #[serde(default)]
+    pub verified_trees: Vec<VerifiedTree>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedBy {
+    Preflight,
+    Batch,
+}
+
+/// What a passed verification vouches for: the tree it ran on, the verify steps it ran, and the
+/// steps `paths` left out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeKey {
+    pub tree: Sha,
+    pub config: String,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedTree {
+    #[serde(flatten)]
+    pub key: TreeKey,
+    pub at_ms: EpochMs,
+    pub by: VerifiedBy,
+    pub env: Option<EnvRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reused {
+    pub tree: Sha,
+    pub by: VerifiedBy,
+    pub verified_ms: EpochMs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -715,6 +752,8 @@ pub struct BatchRecord {
     pub skipped: Vec<SkippedStep>,
     #[serde(default)]
     pub env: Option<EnvRecord>,
+    #[serde(default)]
+    pub reused: Vec<Reused>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,6 +847,12 @@ pub enum EventKind {
         base: Sha,
         by: ResumedBy,
         pr: Option<PrNumber>,
+    },
+    Reused {
+        batch: BatchId,
+        tree: Sha,
+        by: VerifiedBy,
+        verified_ms: EpochMs,
     },
     FlakyProbe {
         batch: BatchId,

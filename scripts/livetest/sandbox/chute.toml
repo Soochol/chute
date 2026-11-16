@@ -1,6 +1,7 @@
 approval = "agent"
 require_head = true
 respawn = []
+preflight = "always"
 
 [flaky]
 probe_repeats = 2

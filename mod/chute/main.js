@@ -382,6 +382,7 @@ function batchCard(batch, t) {
   const facts = [
     batch.waitingMachine ? "PC 자리를 기다리는 중" : batch.step,
     batch.round,
+    batch.reused,
     batch.elapsed && `경과 ${batch.elapsed}`,
   ].filter(Boolean);
   return v_flex()

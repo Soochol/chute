@@ -26,11 +26,33 @@ pub struct Config {
     pub max_parallel: u32,
     pub preflight: PreflightPolicy,
     pub env_check: Vec<String>,
+    pub reuse: Reuse,
     pub retention: Retention,
     pub cache: Cache,
     pub flaky: FlakyPolicy,
     pub verify: NonEmpty<VerifyStep>,
 }
+
+/// When a verification that passed on a tree may stand in for the batch's own run on that tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reuse {
+    pub enabled: bool,
+    pub hours: u32,
+    pub other_machines: bool,
+}
+
+impl Default for Reuse {
+    fn default() -> Self {
+        Reuse {
+            enabled: true,
+            hours: DEFAULT_REUSE_HOURS,
+            other_machines: false,
+        }
+    }
+}
+
+pub const DEFAULT_REUSE_HOURS: u32 = 24;
+pub const MAX_REUSE_HOURS: u32 = 7 * 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retention {
@@ -73,6 +95,20 @@ pub struct VerifyStep {
     pub paths: Option<NonEmpty<String>>,
 }
 
+impl Config {
+    /// The steps `paths` leaves out when the tree changes `changed` against its base.
+    pub fn skipped_steps(&self, changed: Option<&[String]>) -> Vec<String> {
+        let Some(changed) = changed else {
+            return Vec::new();
+        };
+        self.verify
+            .iter()
+            .filter(|step| !step.runs_for(changed))
+            .map(|step| step.name.clone())
+            .collect()
+    }
+}
+
 impl VerifyStep {
     pub fn runs_for(&self, changed: &[String]) -> bool {
         self.paths.as_ref().is_none_or(|paths| {
@@ -108,6 +144,12 @@ struct RawConfig {
     preflight: PreflightPolicy,
     #[serde(default)]
     env_check: Vec<String>,
+    #[serde(default = "default_true")]
+    reuse_verified: bool,
+    #[serde(default = "default_reuse_hours")]
+    reuse_hours: u32,
+    #[serde(default)]
+    reuse_other_machines: bool,
     #[serde(default)]
     retention: RawRetention,
     #[serde(default)]
@@ -179,6 +221,14 @@ struct RawStep {
     paths: Option<Vec<String>>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_reuse_hours() -> u32 {
+    DEFAULT_REUSE_HOURS
+}
+
 fn default_budget() -> u32 {
     DEFAULT_BUDGET
 }
@@ -233,6 +283,7 @@ impl Config {
         }
         let at_least_one = [
             ("max_parallel", raw.max_parallel),
+            ("reuse_hours", raw.reuse_hours),
             ("retention.logs_days", raw.retention.logs_days),
             ("retention.reports_days", raw.retention.reports_days),
             ("flaky.probe_repeats", raw.flaky.probe_repeats),
@@ -242,6 +293,9 @@ impl Config {
         ];
         if let Some((key, _)) = at_least_one.iter().find(|(_, value)| *value == 0) {
             bail!("chute.toml의 {key}는 1 이상이어야 한다");
+        }
+        if raw.reuse_hours > MAX_REUSE_HOURS {
+            bail!("chute.toml의 reuse_hours는 {MAX_REUSE_HOURS} 이하여야 한다");
         }
         if let Some(name) = &raw.remote
             && !is_remote_name(name)
@@ -332,6 +386,11 @@ impl Config {
             max_parallel: raw.max_parallel,
             preflight: raw.preflight,
             env_check: raw.env_check,
+            reuse: Reuse {
+                enabled: raw.reuse_verified,
+                hours: raw.reuse_hours,
+                other_machines: raw.reuse_other_machines,
+            },
             retention: Retention {
                 logs_days: raw.retention.logs_days,
                 reports_days: raw.retention.reports_days,
@@ -416,6 +475,9 @@ require_head = false    # true면 --head 없는 submit을 거절한다
 max_parallel = 2        # 동시에 도는 preflight 수 상한(슬롯 수 상한)
 preflight = "when_queued"  # "when_queued"면 합칠 PR이 큐에 있을 때만 검사하고, "always"면 늘, "never"면 안 한다
 env_check = []          # 검증 전에 돌려 결과를 남길 명령. 예: ["cargo --version"]
+reuse_verified = true   # true면 같은 트리에서 이미 통과한 검증 결과를 batch가 다시 쓴다
+reuse_hours = 24        # 통과 기록을 다시 쓸 수 있는 시간(시간 단위, 1 이상 168 이하)
+reuse_other_machines = false  # true면 다른 PC의 통과 기록도 env_check 결과가 같을 때 다시 쓴다
 # 에이전트가 없을 때 띄울 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다.
 # 값을 넣으면 그 명령으로 새 에이전트를 띄운다.
 # 주의: --dangerously-skip-permissions를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행한다.
@@ -468,6 +530,14 @@ mod tests {
         assert_eq!(c.max_parallel, 2);
         assert_eq!(c.preflight, PreflightPolicy::WhenQueued);
         assert!(c.env_check.is_empty());
+        assert_eq!(
+            c.reuse,
+            Reuse {
+                enabled: true,
+                hours: 24,
+                other_machines: false
+            }
+        );
         assert_eq!(
             c.retention,
             Retention {
@@ -718,6 +788,34 @@ probe = "cargo test {tests} -- --exact"
         assert_eq!(drafted.env_check, minimal.env_check);
         assert_eq!(drafted.require_head, minimal.require_head);
         assert!(text.contains("# probe = "));
+    }
+
+    #[test]
+    fn the_reuse_keys_are_read_and_the_hours_stay_between_one_and_a_week() {
+        let text = format!(
+            "reuse_verified = false\nreuse_hours = 168\nreuse_other_machines = true\n{MINIMAL}"
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap().reuse,
+            Reuse {
+                enabled: false,
+                hours: MAX_REUSE_HOURS,
+                other_machines: true
+            }
+        );
+        for hours in [0, 169] {
+            let err = Config::parse(&format!("reuse_hours = {hours}\n{MINIMAL}")).unwrap_err();
+            assert!(format!("{err:#}").contains("reuse_hours"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn skipped_steps_are_the_ones_paths_leaves_out() {
+        let text = "[[verify]]\nname = \"a\"\nrun = \"x\"\n[[verify]]\nname = \"b\"\nrun = \"y\"\npaths = [\"src/\"]\n";
+        let c = Config::parse(text).unwrap();
+        assert!(c.skipped_steps(None).is_empty());
+        assert_eq!(c.skipped_steps(Some(&["docs/x.md".to_owned()])), ["b"]);
+        assert!(c.skipped_steps(Some(&["src/x.rs".to_owned()])).is_empty());
     }
 
     #[test]

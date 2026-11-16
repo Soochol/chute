@@ -24,12 +24,13 @@ use crate::gitops::{
 use crate::model::{
     Agent, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs,
     Event, EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, ResumedBy, Sha, SkippedStep, State,
-    StepFailure, VerifyMode, Warning, WarningKind,
+    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, ResumedBy, Reused, Sha, SkippedStep, State,
+    StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
 use crate::queue;
+use crate::reuse;
 use crate::store::{Home, RepoStore};
 use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome};
 
@@ -655,6 +656,7 @@ impl Engine {
                     round: 0,
                     started_ms: EpochMs::now(),
                     waiting_machine: false,
+                    reused: None,
                 });
             }
             let items = prs
@@ -689,6 +691,7 @@ impl Engine {
                 verifications: 0,
                 env: None,
                 skipped: Vec::new(),
+                reused: Vec::new(),
             },
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
@@ -1397,7 +1400,7 @@ impl Run<'_> {
             if b.landing.is_empty() {
                 return self.land(&b);
             }
-            match self.verify(&b.tip, Scope::Changed)? {
+            match self.verify(&b.tip, Scope::Changed, !self.bisecting)? {
                 Verdict::Pass => {
                     if !self.all_still_fit(&b, &mut group)? {
                         continue;
@@ -1438,12 +1441,26 @@ impl Run<'_> {
         }
     }
 
-    fn verify(&mut self, tree: &Sha, scope: Scope) -> Result<Verdict> {
+    /// Runs the verify steps on `tree`, or takes over an earlier pass of the same tree when
+    /// `reusable`. Only the first build of a batch is reusable. A rerun after a failure, the
+    /// check of a PR alone and the check of a base each exist to see the tree again.
+    fn verify(&mut self, tree: &Sha, scope: Scope, reusable: bool) -> Result<Verdict> {
+        let changed = match scope {
+            Scope::Changed => Some(self.slot.changed_files(&self.start_base)?),
+            Scope::Whole => None,
+        };
+        let key = self.tree_key(tree, changed.as_deref())?;
+        if let (true, Some(key)) = (reusable, &key)
+            && self.reuse_pass(key)?
+        {
+            return Ok(Verdict::Pass);
+        }
         self.record.verifications += 1;
         let round = self.record.verifications;
         self.update_batch(|b| {
             b.round = round;
             b.step = None;
+            b.reused = None;
             b.phase = if b.phase == Phase::Building {
                 Phase::Verifying
             } else {
@@ -1471,10 +1488,6 @@ impl Run<'_> {
             .store
             .batch_dir(self.id())
             .join(format!("verify-{round}"));
-        let changed = match scope {
-            Scope::Changed => Some(self.slot.changed_files(&self.start_base)?),
-            Scope::Whole => None,
-        };
         let skipped = RefCell::new(Vec::new());
         let on_skip = |name: &str| skipped.borrow_mut().push(name.to_owned());
         let started = Instant::now();
@@ -1503,12 +1516,86 @@ impl Run<'_> {
         match outcome {
             Outcome::Passed { flaky } => {
                 self.clear_base_doubt()?;
+                let steady = flaky.is_empty();
                 self.record_flaky(flaky, tree)?;
+                if let (true, Some(key)) = (steady, key) {
+                    self.remember_pass(key)?;
+                }
                 Ok(Verdict::Pass)
             }
             Outcome::Failed(failed) => Ok(Verdict::Fail(failed)),
             Outcome::Cancelled => Err(Halt::Cancelled.into()),
         }
+    }
+
+    /// The key a pass on `commit` is kept and looked up by, or `None` when reuse is off.
+    fn tree_key(&self, commit: &Sha, changed: Option<&[String]>) -> Result<Option<TreeKey>> {
+        if !self.config.reuse.enabled {
+            return Ok(None);
+        }
+        Ok(Some(TreeKey {
+            tree: self.slot.tree_of(commit)?,
+            config: reuse::fingerprint(&self.engine.ext, &self.engine.info.path, &self.config)?,
+            skipped: self.config.skipped_steps(changed),
+        }))
+    }
+
+    /// Takes over the pass of an earlier verification of the same tree, if one still stands.
+    fn reuse_pass(&mut self, key: &TreeKey) -> Result<bool> {
+        let engine = self.engine;
+        let now = EpochMs::now();
+        let flaky_steps: Vec<String> = flaky::ledger(
+            &engine.store.history()?.events,
+            now,
+            &self.config.flaky,
+            self.config.flaky.chronic_days,
+        )
+        .into_iter()
+        .map(|entry| entry.key.step)
+        .collect();
+        let lookup = reuse::Lookup {
+            config: &self.config,
+            now,
+            here: self.record.env.as_ref(),
+            flaky_steps: &flaky_steps,
+        };
+        let state = engine.store.load()?;
+        let Some(found) = lookup.find(&state.verified_trees, key) else {
+            return Ok(false);
+        };
+        let reused = Reused {
+            tree: key.tree.clone(),
+            by: found.by,
+            verified_ms: found.at_ms,
+        };
+        engine.history(EventKind::Reused {
+            batch: self.id().clone(),
+            tree: reused.tree.clone(),
+            by: reused.by,
+            verified_ms: reused.verified_ms,
+        })?;
+        self.update_batch(|b| b.reused = Some(reused.by))?;
+        self.record.reused.push(reused);
+        self.save_record()?;
+        self.clear_base_doubt()?;
+        Ok(true)
+    }
+
+    fn remember_pass(&self, key: TreeKey) -> Result<()> {
+        let now = EpochMs::now();
+        let verified = VerifiedTree {
+            key,
+            at_ms: now,
+            by: VerifiedBy::Batch,
+            env: self.record.env.clone(),
+        };
+        self.engine
+            .store
+            .update(|s| {
+                reuse::remember(s, verified, self.config.reuse.hours, now);
+                Ok(())
+            })
+            .map(drop)
     }
 
     fn record_flaky(&mut self, flaky: Vec<FlakyStep>, tree: &Sha) -> Result<()> {
@@ -1671,13 +1758,15 @@ impl Run<'_> {
         let item = self.merge_item(pr);
         let result = self.slot.merge(base, &[item])?;
         match result.items.into_iter().next().map(|o| o.result) {
-            Some(ItemResult::Merged { .. }) => match self.verify(&result.tip, Scope::Changed)? {
-                Verdict::Pass => Ok(Alone::Pass),
-                Verdict::Fail(failed) => Ok(Alone::Fail {
-                    failed,
-                    tip: result.tip,
-                }),
-            },
+            Some(ItemResult::Merged { .. }) => {
+                match self.verify(&result.tip, Scope::Changed, false)? {
+                    Verdict::Pass => Ok(Alone::Pass),
+                    Verdict::Fail(failed) => Ok(Alone::Fail {
+                        failed,
+                        tip: result.tip,
+                    }),
+                }
+            }
             Some(ItemResult::AlreadyMerged) => Ok(Alone::Pass),
             Some(ItemResult::Conflict(_)) => Ok(Alone::Conflict),
             None => bail!("합치기 결과가 비어 있다"),
@@ -1690,7 +1779,7 @@ impl Run<'_> {
             return Ok(None);
         }
         self.slot.checkout(base)?;
-        match self.verify(base, Scope::Whole)? {
+        match self.verify(base, Scope::Whole, false)? {
             Verdict::Pass => {
                 engine.store.update(|s| {
                     if !s.verified_bases.contains(base) {
