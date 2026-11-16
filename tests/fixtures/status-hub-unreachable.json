@@ -40,5 +40,11 @@
       "pr": null,
       "at_ms": 1794724500000
     }
-  ]
+  ],
+  "post_verify": {
+    "last_green": null,
+    "run": null,
+    "red": null,
+    "last_started_ms": null
+  }
 }

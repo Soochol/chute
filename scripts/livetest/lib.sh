@@ -233,6 +233,45 @@ push_main() {
   git push -q origin lt-main-work:main >"$W/push.log" 2>&1 || die "main push 실패: $(cat "$W/push.log")"
 }
 
+# Turns on the check after the merge by committing a `[[post_verify]]` step and its script to
+# main. The script reads `post/*.txt` the way check.sh reads `cases/`: `ok`, `fail`, or `flaky`
+# (fails the first time its name runs).
+enable_post_verify() {
+  cat "$LT_DIR/sandbox/chute.toml" > "$W/chute-post.toml"
+  cat >> "$W/chute-post.toml" <<'TOML'
+
+[[post_verify]]
+name = "post"
+run = "sh post.sh"
+timeout = 30
+failed = 'FAIL (\S+)'
+TOML
+  cat > "$W/post.sh" <<'SH'
+#!/bin/sh
+set -u
+status=0
+for f in post/*; do
+  [ -f "$f" ] || continue
+  name=$(basename "$f" .txt)
+  case "$(cat "$f")" in
+    ok) ;;
+    fail) echo "FAIL $name"; status=1 ;;
+    flaky)
+      mark="${LIVETEST_STATE:-${CHUTE_HOME:-/tmp}/marks}/post-flaky-$name"
+      if [ ! -e "$mark" ]; then
+        mkdir -p "$(dirname "$mark")"; : > "$mark"
+        echo "FAIL $name"; status=1
+      fi ;;
+  esac
+done
+echo "post done status=$status"
+exit "$status"
+SH
+  push_main chute.toml=@"$W/chute-post.toml" post.sh=@"$W/post.sh"
+}
+
+post_green() { status_json | jq -r '.post_verify.last_green.commit // empty'; }
+
 submit() {
   local pr=$1; shift
   local head=${SUBMIT_HEAD:-$(pr_head "$pr")}

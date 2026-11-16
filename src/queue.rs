@@ -169,7 +169,7 @@ impl fmt::Display for TransitionError {
             ),
             TransitionError::RepairNotHalted(pr) => write!(
                 f,
-                "{pr}: 큐가 멈춰 있지 않아 복구 PR로 받지 않았다. 복구 PR은 기준 커밋이 깨져 큐가 멈췄을 때만 받는다. 일반 PR이면 `--repair` 없이 submit한다"
+                "{pr}: 큐가 멈춰 있지 않아 복구 PR로 받지 않았다. 복구 PR은 기준 커밋이 깨져 큐가 멈췄을 때나 머지 뒤 검사 실패로 PR을 잡아 둘 때만 받는다. 일반 PR이면 `--repair` 없이 submit한다"
             ),
             TransitionError::RepairTaken { pr, held, state } => write!(
                 f,
@@ -402,7 +402,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
 }
 
 fn check_repair(state: &State, pr: PrNumber) -> Result<(), TransitionError> {
-    if state.blocked.is_none() {
+    if state.blocked.is_none() && !state.post.holding() {
         return Err(TransitionError::RepairNotHalted(pr));
     }
     match state.queue.iter().find(|i| i.repair && i.pr != pr) {
@@ -563,6 +563,15 @@ pub fn take_batch(
     max_batch: u32,
     due_waiters: &BTreeSet<PrNumber>,
 ) -> Vec<PrNumber> {
+    take_batch_except(state, max_batch, due_waiters, &BTreeSet::new())
+}
+
+pub fn take_batch_except(
+    state: &mut State,
+    max_batch: u32,
+    due_waiters: &BTreeSet<PrNumber>,
+    skip: &BTreeSet<PrNumber>,
+) -> Vec<PrNumber> {
     let mut taken = Vec::new();
     let mut others = 0;
     let order = batch_order(&state.queue);
@@ -573,7 +582,7 @@ pub fn take_batch(
             };
             let is_waiting = item.state == ItemState::Queued(Some(QueuedReason::CiPending));
             let due = !is_waiting || due_waiters.contains(&item.pr);
-            let held = !item.after.is_empty();
+            let held = !item.after.is_empty() || skip.contains(&item.pr);
             if is_waiting != ci_pass || !due || held || (!ci_pass && others >= max_batch) {
                 continue;
             }
@@ -1767,6 +1776,45 @@ mod tests {
         );
         let taken = take_batch(&mut state, 2, &BTreeSet::new());
         assert_eq!(taken, [PrNumber(4), PrNumber(2)]);
+    }
+
+    #[test]
+    fn take_batch_except_leaves_the_skipped_prs_queued_and_still_fills_the_batch() {
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED), (4, QUEUED)]);
+        let skip: BTreeSet<PrNumber> = [PrNumber(1), PrNumber(3)].into();
+
+        let taken = take_batch_except(&mut state, 2, &BTreeSet::new(), &skip);
+
+        assert_eq!(prs(&taken), [2, 4]);
+        assert_eq!(state_of(&state, 1), QUEUED);
+        assert_eq!(state_of(&state, 3), QUEUED);
+    }
+
+    #[test]
+    fn a_repair_submission_is_taken_while_a_post_verify_failure_holds_prs() {
+        let mut state = State::default();
+        let err = submit(&mut state, repair_options(1)).unwrap_err();
+        assert!(matches!(err, TransitionError::RepairNotHalted(_)));
+
+        state.post.red = Some(crate::model::PostRed {
+            commit: sha("abc1234"),
+            step: "e2e".into(),
+            tests: Vec::new(),
+            log: "/log".into(),
+            report: None,
+            since_ms: EpochMs(1),
+            last_green: None,
+            culprit: None,
+            holding: false,
+        });
+        assert!(
+            submit(&mut state, repair_options(1)).is_err(),
+            "잡아 두지 않으면 받지 않는다"
+        );
+
+        state.post.red.as_mut().unwrap().holding = true;
+        submit(&mut state, repair_options(1)).unwrap();
+        assert!(state.queue[0].repair);
     }
 
     #[test]

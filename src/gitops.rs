@@ -34,6 +34,7 @@ pub enum SlotName {
     /// Numbered from 1.
     Preflight(u32),
     Revert,
+    Post,
 }
 
 impl SlotName {
@@ -43,6 +44,7 @@ impl SlotName {
         match text {
             "batch" => Some(SlotName::Batch),
             "revert" => Some(SlotName::Revert),
+            "post" => Some(SlotName::Post),
             _ => {
                 let k: u32 = text.strip_prefix("preflight-")?.parse().ok()?;
                 let slot = SlotName::Preflight(k);
@@ -58,6 +60,7 @@ impl fmt::Display for SlotName {
             SlotName::Batch => f.write_str("batch"),
             SlotName::Preflight(k) => write!(f, "preflight-{k}"),
             SlotName::Revert => f.write_str("revert"),
+            SlotName::Post => f.write_str("post"),
         }
     }
 }
@@ -660,6 +663,41 @@ impl Slot {
             .collect())
     }
 
+    pub fn first_parent_range(&self, from: &Sha, to: &Sha) -> Result<Vec<Sha>> {
+        let out = self
+            .git(&[
+                "rev-list",
+                "--first-parent",
+                "--reverse",
+                &format!("{from}..{to}"),
+            ])?
+            .ok()
+            .with_context(|| format!("{from}..{to}의 커밋을 읽지 못했다"))?;
+        out.lines()
+            .map(|line| Sha::try_from(line.trim().to_owned()).map_err(|e| anyhow!(e)))
+            .collect()
+    }
+
+    pub fn changed_since_fork(&self, base: &Sha, head: &Sha) -> Result<Vec<String>> {
+        let out = self
+            .git(&[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--no-ext-diff",
+                "--ignore-submodules=none",
+                "-z",
+                &format!("{base}...{head}"),
+            ])?
+            .ok()
+            .with_context(|| format!("{base}와 {head}의 바뀐 파일을 읽지 못했다"))?;
+        Ok(out
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Fetches the default branch and returns its tip. `<remote>/<branch>` is moved to the same
     /// commit.
     pub fn fetch_base(&self) -> Result<Sha> {
@@ -795,7 +833,7 @@ impl Slot {
         }
     }
 
-    fn is_ancestor(&self, commit: &Sha, of: &Sha) -> Result<bool> {
+    pub fn is_ancestor(&self, commit: &Sha, of: &Sha) -> Result<bool> {
         let out = self.git(&["merge-base", "--is-ancestor", commit.as_str(), of.as_str()])?;
         match out.code {
             Some(0) => Ok(true),

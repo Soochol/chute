@@ -20,6 +20,8 @@ chute는 검증을 로컬에서 묶음(batch) 단위로 한 번에 돌린다. �
 4. 통과하면 검증한 바로 그 트리를 기본 브랜치에 push한다. 실패하면 batch를 반으로 나눠 범인을 찾는다. 범인은 보고서와 함께 에이전트에게 돌아간다. 에이전트가 없으면 기본 설정에서는 띄우지 않고 사람 차례로 넘긴다. `respawn`에 명령을 넣었으면 그 명령으로 새로 띄운다.
 5. 머지에 성공하면 submit한 터미널에 결과 한 줄을 `hc send`로 보낸다. 작업자가 스스로 submit했으면 작업자가, 오케스트레이터가 submit했으면 오케스트레이터가 받는다. 받을 터미널이 없으면 기록만 남고 `chute events`로 따라잡는다. `chute status`나 현황판으로도 본다.
 
+batch가 기다리기에는 너무 느린 단계(예: e2e)는 `[[post_verify]]`에 둔다. 그 단계는 머지가 끝난 뒤 기본 브랜치의 tip에서 큐와 따로 돈다. 아래 "머지 뒤 검사"를 본다.
+
 orch 같은 오케스트레이터 아래에서 쓰는 법은 "오케스트레이터와 함께 쓰기"에 있다.
 
 ## 설치
@@ -116,6 +118,8 @@ orch 같은 오케스트레이터가 작업자 에이전트들을 부리면 머�
 | `reverted` | 되돌린 PR을 submit한 터미널 | 사람이 batch를 되돌렸다 |
 | `waiting` | `--after`로 잡힌 PR을 submit한 터미널 | 기다리는 PR이 머지되지 못했다 |
 | `flaky` | batch의 PR을 submit한 터미널 | 흔들림이 만들어졌거나 만성이다 |
+| `post_failed` | 처음 실패한 머지의 PR을 submit한 터미널과 그 작업자(같은 터미널이면 한 번) | 머지 뒤 검사가 기본 브랜치에서 실패했다. 아래 "머지 뒤 검사" |
+| `post_fixed` | `post_failed`를 받은 터미널 | 실패했던 머지 뒤 검사가 다시 통과했다 |
 
 알림은 사건이 기록된 뒤에 한 번만 보낸다. 데몬이 알림 도중 죽으면 한 번 빠질 수 있고, 같은 알림이 두 번 가는 것보다 낫다고 보았다. 빠진 알림은 `chute events`에서 `notified`의 `delivered`가 `sent`가 아닌 줄(사람용 출력에서는 `(놓친 알림)`)로 찾는다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄만 보낸 것이므로 갔다고 보고 표시를 붙이지 않는다. 알림을 못 보내도 큐 상태는 바뀌지 않는다.
 
@@ -123,7 +127,7 @@ orch 같은 오케스트레이터가 작업자 에이전트들을 부리면 머�
 
 기본 브랜치가 검증을 통과하지 못하면 큐가 멈춘다(`큐 멈춤`). 사람이 직접 push해서 풀지 않는다. 오케스트레이터가 에이전트에게 복구 PR을 만들게 하고 `chute submit <pr> --head <HEAD> --repair`로 넣는다.
 
-- 큐가 멈춰 있을 때만, 한 번에 하나만 받는다. `--after`와 함께 쓸 수 없다. `--head`와 승인 규칙은 일반 submit과 같고, `chute.toml`을 고치는 복구 PR은 사람 승인을 기다린다.
+- 큐가 멈춰 있을 때(또는 `post_verify_hold`가 머지 뒤 검사 실패로 PR을 잡아 두는 동안)만, 한 번에 하나만 받는다. `--after`와 함께 쓸 수 없다. `--head`와 승인 규칙은 일반 submit과 같고, `chute.toml`을 고치는 복구 PR은 사람 승인을 기다린다.
 - 데몬은 멈춘 채로도 복구 PR 하나만 지금 main 위에서 검증한다. 다른 PR과 묶지 않는다. 통과하면 push하고 멈춤을 풀고 `merged`와 `resumed`를 보낸다.
 - 실패하거나 충돌하면 보통 반송처럼 작업자에게 보고서가 가고 예산을 한 번 쓴다. 큐는 계속 멈춰 있다. 고친 HEAD로 다시 `--repair` submit을 하면 같은 항목이 들어간다.
 - 멈춘 사이 누가 main에 직접 push해 기준이 바뀌면 멈춤이 풀리고 복구 PR은 일반 PR처럼 batch를 고를 때 맨 앞에 선다.
@@ -273,6 +277,8 @@ env_check = []
 reuse_verified = true
 reuse_hours = 24
 reuse_other_machines = false
+post_verify_interval = 0
+post_verify_hold = false
 respawn = []
 # remote = "origin"
 
@@ -296,6 +302,12 @@ timeout = 3600
 failed = 'test (\S+) \.\.\. FAILED'
 # probe = "cargo test {tests} -- --exact"
 # paths = ["src/", "Cargo.toml"]
+
+# 머지 뒤에 기본 브랜치에서 돌릴 단계. 없으면 머지 뒤 검사는 꺼져 있다.
+# [[post_verify]]
+# name = "e2e"
+# run = "npm run e2e"
+# timeout = 1800
 ```
 
 | 키 | 기본값 | 뜻 |
@@ -312,6 +324,8 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `reuse_verified` | `true` | `true`면 batch가 합친 트리가 이미 통과한 트리와 같을 때 검증을 다시 하지 않고 그 통과를 쓴다. 트리 SHA(같은 기준, 같은 큐 구성, 같은 PR HEAD로 합친 결과), 검증 설정의 지문(`verify` 단계의 이름, `run`, `timeout`, `paths`), `paths`로 건너뛴 단계가 모두 같아야 같은 트리다. preflight와 batch가 통과하면 그 트리를 상태에 기록한다. 실패는 기록하지 않는다. 다시 돌아서 통과한 검증도 기록하지 않는다. 흔들림 장부(`chronic_days` 안의 `chute flaky` 목록)에 오른 단계를 도는 검증은 다시 쓰지 않는다. 다시 쓰면 `chute events`와 batch 기록에 `reused`로 어느 검증(`preflight`나 `batch`)의 결과인지 남고 `status --json`의 `batch.reused`에도 보인다. 검증 실패와 이분 탐색의 판정은 바뀌지 않는다 |
 | `reuse_hours` | `24` | 통과 기록을 다시 쓸 수 있는 시간(시간 단위). 지나면 환경이 바뀌었을 수 있어 다시 검증한다. 1 이상 168 이하 |
 | `reuse_other_machines` | `false` | 기본으로는 같은 머신에서 검증한 결과만 다시 쓴다. preflight는 작업자 PC에서, batch는 허브에서 도는 v2에서는 둘이 다른 머신이라 다시 쓰지 않는다. `true`면 `env_check`가 비어 있지 않고 두 머신의 `env_check` 결과(명령과 출력, 모두 성공)가 같을 때 다른 머신의 통과도 쓴다 |
+| `post_verify_interval` | `0` | 머지 뒤 검사를 시작하는 최소 간격(분). 앞 검사를 시작한 때부터 센다. 0이면 기본 브랜치가 움직인 뒤 지금 검사가 끝나는 대로 돈다. `[[post_verify]]` 단계가 없으면 0이어야 한다 |
+| `post_verify_hold` | `false` | `true`면 머지 뒤 검사가 실패한 동안 실패한 단계의 `paths`에 해당하는 PR을 batch에 넣지 않고 큐에 둔다. `paths`가 없는 단계가 실패하면 복구 PR을 뺀 모든 PR이다. 검사가 다시 통과하면 풀린다. `[[post_verify]]` 단계가 없으면 `false`여야 한다 |
 | `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
 | `remote` | 없음 | chute가 관리하는 GitHub 저장소를 가리키는 git 원격의 이름. 없으면 chute가 정한다. 아래 "원격이 여러 개일 때"를 본다. `chute init`은 작업 폴더의 `chute.toml`에서 이 키를 읽는다 |
 | `retention` (`[retention]`) | 아래 두 키 | 정리할 때 남기는 기간 |
@@ -331,6 +345,12 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `verify.probe` | 없음 | 선택. 흔들린 시험만 되풀이하는 명령. `{tests}` 자리가 있어야 하며 없으면 설정 오류다. 예: `cargo test {tests} -- --exact` |
 | `verify.failed` | 없음 | 선택. 실패한 시험 이름을 뽑는 정규식. 캡처 그룹이 있으면 그 값이, 없으면 일치한 글이 이름이다. 없으면 보고서에 로그의 끝부분이 들어간다 |
 | `verify.paths` | 없음 | 선택. 경로 접두어의 목록. 검증하는 트리가 기준과 다른 파일 가운데 하나라도 이 가운데 어느 것으로 시작하면 그 단계를 돌고, 아니면 건너뛴다. 없으면 늘 돈다. 빈 목록이나 빈 항목은 설정 오류다 |
+| `post_verify` (`[[post_verify]]`) | 없음 | 머지 뒤 검사의 단계. 모양은 `[[verify]]`와 같고 `probe`만 없다. 적은 순서대로 돈다. 아래 "머지 뒤 검사" |
+| `post_verify.name` | 필수 | 단계 이름. `[[verify]]`의 이름을 포함해 겹치면 안 된다(흔들림 장부가 단계를 이름으로만 구분한다). `/`를 담거나 `.`으로 시작하면 안 된다 |
+| `post_verify.run` | 필수 | 검사 worktree에서 `sh -c`로 실행하는 명령 |
+| `post_verify.timeout` | `3600` | 초. 넘기면 그 단계는 실패(`시간 초과`)다. 다시 돌려 보지 않는다 |
+| `post_verify.failed` | 없음 | 선택. `verify.failed`와 같다 |
+| `post_verify.paths` | 없음 | 선택. `verify.paths`와 같다. 기준은 마지막으로 통과한 커밋이고, 통과한 적이 없으면 모든 단계를 돈다 |
 
 ### 단계의 `paths`
 
@@ -344,7 +364,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 
 ### 설정 확인
 
-`chute config-check [--file <경로>] [--json]`은 작업 폴더(`--repo`를 주면 그 폴더, `--file`을 주면 그 파일)의 `chute.toml`을 읽어 검증 단계마다 이름, `paths`, 시간 제한을 보인다. 설정 오류가 있으면 이유를 내고 종료 코드 1로 끝난다. 저장소를 등록하지 않고 상태 폴더도 쓰지 않으며 등록되지 않은 저장소에서도 된다. chute는 기본 브랜치에 올라간 설정만 읽으므로 올리기 전에 확인하는 데 쓴다. `--json`은 `ok`, `file`, `error`, `verify`(`name`, `paths`, `timeout_s`)를 낸다.
+`chute config-check [--file <경로>] [--json]`은 작업 폴더(`--repo`를 주면 그 폴더, `--file`을 주면 그 파일)의 `chute.toml`을 읽어 검증 단계마다 이름, `paths`, 시간 제한을 보인다. 설정 오류가 있으면 이유를 내고 종료 코드 1로 끝난다. 저장소를 등록하지 않고 상태 폴더도 쓰지 않으며 등록되지 않은 저장소에서도 된다. chute는 기본 브랜치에 올라간 설정만 읽으므로 올리기 전에 확인하는 데 쓴다. `--json`은 `ok`, `file`, `error`, `verify`와 `post_verify`(`name`, `paths`, `timeout_s`)를 낸다. `[[post_verify]]` 단계는 "머지 뒤 검사 단계 N개" 아래에 따로 보인다.
 
 ### 원격이 여러 개일 때
 
@@ -385,7 +405,9 @@ batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을
 3. 검증 중인 batch: 기준, PR 목록, 단계, 회차.
 4. 대기: 승인 대기, 대기, `대기(CI 기다림)`. 항목에 `급함`(`--priority`), `복구`, `#N 뒤`(그 PR이 머지되길 기다림) 표시가 붙을 수 있다.
 5. 반송: 에이전트에게 돌려보낸 PR과 이유.
-6. 오늘의 숫자: 머지, 반송, flaky, batch 수, 머지까지 걸린 시간의 중앙값.
+6. 오늘의 숫자: 머지, 반송, flaky, batch 수, 머지까지 걸린 시간의 중앙값, 머지 뒤 검사가 마지막으로 통과한 커밋(검사가 도는 중이면 단계도).
+
+머지 뒤 검사가 실패했으면 `chute status`와 현황판의 1번(멈춤과 경고)에 실패한 단계, 처음 실패한 머지의 PR, 마지막 통과 커밋, 되돌리는 명령이 보인다.
 
 흔들린 시험(flaky)은 에이전트에게 보내지 않고 기록한다. 한 단계가 실패한 뒤 같은 트리에서 그 단계만 다시 돌려 통과하면 flaky로 보고 그 batch를 통과로 머지한다. 흔들리는 시험을 새로 만든 PR도 머지될 수 있다. 머지한 뒤 근거를 모은다. `[[verify]]`에 `probe`가 있으면 흔들린 시험만 되풀이해 기준 트리에서도 실패하는지(`base`), 흔들린 트리에서만 실패하는지(`made`)를 `history.jsonl`에 남기고 `made`면 그 batch PR을 submit한 터미널에 `flaky` 알림을 보낸다. 같은 시험이 `chronic_days`일 안에 `chronic`번 흔들리면 만성으로 경고를 올린다. `chute flaky`가 이 장부를 보인다. 되풀이는 다음 batch를 `probe_seconds`까지 늦춘다. `probe`가 없는 단계는 되풀이하지 않는다.
 
@@ -404,7 +426,7 @@ batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을
 
 ### 데몬 멈추기
 
-- `chute down`: 지금 도는 batch가 끝난 뒤 데몬이 멈춘다.
+- `chute down`: 지금 도는 batch가 끝난 뒤 데몬이 멈춘다. 도는 머지 뒤 검사는 기다리지 않고 취소한다. 다음에 데몬이 뜨면 그때의 tip을 처음부터 검사한다.
 - `chute down --now`: 돌던 검증을 취소하고 바로 멈춘다.
 - 다시 시작하려면 `chute up`.
 
@@ -418,6 +440,26 @@ batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을
 - **기준이 깨지면 큐가 멈춘다.** 단독 실패로 반송하기 전에, 그 기준 커밋이 검증을 통과한 적이 없으면 기준만 검증한다. 같은 기준 위에서 서로 다른 PR 둘이 연달아 단독 실패해도, 그 기준이 이미 통과한 적이 있어도 두 번째를 반송하기 전에 다시 검증한다. 기준도 실패하면 아무도 반송하지 않고 큐를 멈춘다(`큐 멈춤`). 기본 브랜치를 직접 push로 깨뜨렸거나 환경이 깨졌을 때 모든 에이전트가 틀린 반송을 받는 것을 막는다. 멈춘 큐는 복구 PR로 푼다("복구 PR").
 - 기본 브랜치를 향한 열린 PR만 받는다. draft나 다른 브랜치를 향한 PR은 submit이 거절한다.
 - push가 끝나면 `gh`로 PR이 Merged인지 본다. 아니면 현황판에 경고를 남긴다.
+
+## 머지 뒤 검사
+
+batch 검증은 PR을 묶어 머지하기 전에 돈다. 오래 걸리는 단계를 거기에 두면 큐 전체가 그 시간을 기다린다. `[[post_verify]]`에 둔 단계는 batch가 머지한 뒤에 기본 브랜치에서 돈다. batch는 `[[verify]]`의 빠른 단계만 돌려 머지한다. `[[post_verify]]`가 없으면 아무것도 달라지지 않는다.
+
+- **큐와 따로 돈다.** 데몬이 큐를 보는 일과 다른 스레드에서 기본 브랜치의 tip을 본다(10초마다 가져온다). tip이 마지막으로 통과한 커밋(last green)이나 마지막으로 실패한 커밋과 다르고 `post_verify_interval`이 지났으면 검사한다. 슬롯은 batch와 다른 `post`를 쓰고, PC 전체 검증 상한(`machine.toml`의 `max_verify`)을 batch, preflight와 함께 지킨다. 검사가 도는 동안 큐는 계속 머지한다. `serialize = true`의 잠금은 batch와 preflight의 검증만 묶고 머지 뒤 검사는 묶지 않는다(`max_verify`는 함께 지킨다). `[[post_verify]]`가 없는 저장소는 가져오지도 경고하지도 않고 지금과 똑같이 동작한다. 데몬은 batch, submit, 데몬 시작이 가져와 둔 기본 브랜치의 `chute.toml`에 `[[post_verify]]`가 있는지 먼저 보므로, 그 단계를 직접 push로 더했으면 한 번 `git fetch`하거나 데몬을 다시 띄워야 검사가 시작된다.
+- **tip만 검사한다.** 검사가 도는 동안 새 머지가 오면, 지금 검사가 끝난 뒤 그때의 tip을 한 번 검사한다. 사이 커밋을 하나씩 검사하지 않는다.
+- **`paths`는 마지막 통과 커밋과 비교한다.** 그 커밋과 검사하는 커밋이 다른 파일 가운데 `paths`에 맞는 것이 없으면 그 단계를 건너뛴다. 통과한 적이 없으면 모든 단계를 돈다.
+- **통과하면** 그 커밋이 last green이 된다. `chute status`, 현황판, `chute events`(`머지 뒤 검사 통과`)에 보이고 `status --json`의 `post_verify.last_green`에 있다.
+- **한 번만 실패하면 흔들림이다.** 실패한 단계는 batch와 같이 같은 커밋에서 그 단계만 한 번 더 돈다. 통과하면 흔들림으로 `flaky` 사건을 남기고 검사는 통과다. 사건의 batch 이름은 `post-<커밋 12자>`이고 `chute flaky` 장부에 오른다. 누구에게도 알리지 않는다. 시간 초과는 다시 돌리지 않는다.
+- **진짜 실패하면 범인 머지를 찾는다.** last green과 실패한 tip 사이에 기본 브랜치로 머지된 커밋(첫 부모만 따라간 머지 커밋)을 이분 탐색한다. 가운데 커밋마다 `[[post_verify]]` 단계를 처음부터 돌려, 처음 실패하는 머지를 찾는다. 이 탐색에서 한 번 실패했다 통과한 단계도 흔들림으로 장부에 남는다. 대략 log₂(머지 수)번을 더 돈다. 이 탐색도 큐를 막지 않는다. 찾은 커밋을 batch 기록(`batch.json`의 `merges`)에서 찾아 PR, batch, submit한 터미널, 작업자를 얻는다. last green이 없거나(처음 도는 검사) 기본 브랜치의 이력에서 빠졌으면 범인을 찾지 못한다. chute가 머지하지 않은 커밋이 처음 실패한 머지면 PR은 없다.
+- **알린다.** 범인 PR을 submit한 터미널과 작업자에게 `post_failed` 알림을 보낸다(같은 터미널이면 한 번). 범인 PR이 없으면 받을 곳이 없다. `chute events`에 `놓친 알림`으로 남는다.
+- **`post_failed` 줄의 형식.** `chute 결과 post_failed slug=<owner/name> at=<epoch ms> commit=<12자> step=<단계> [tests=<이름,이름>] [last_green=<12자>] [pr=<번호>] [batch=<id>] log=<로그 경로> [report=<보고서 경로>] <한국어 한 문장>`이다. `pr`와 `batch`는 범인을 찾았을 때만 있다.
+- **보고서.** `report.md`는 `reports/commit-<12자>/post/`에 있고 실패한 단계, 시험, 로그, 마지막 통과 커밋, 처음 실패한 머지, 되돌리는 명령을 적는다. 로그도 같은 폴더 아래에 있어 `reports_days` 뒤에 정리된다.
+- **같은 실패는 한 번만 알린다.** 실패가 남은 채 새 tip도 같은 단계의 같은 시험으로 실패하고 범인이 아직 기본 브랜치에 있으면, 범인을 다시 찾지도 다시 알리지도 않는다. 단계나 시험이 다르면 새 실패로 다시 찾는다. 범인을 찾는 중에 tip의 실패(같은 단계, tip이 실패한 시험을 모두 포함하는 실패)가 아닌 모양으로 실패하는 커밋은 판정에 쓰지 않고 이웃 커밋을 대신 돌린다. 다른 실패라 tip의 실패에 대해서는 아무것도 말해 주지 않기 때문이다. 이웃까지 모두 그렇게 실패하면 범인을 가리지 못하고 범인 없이 알린다. `failed`가 없는 단계는 시험 이름을 몰라 단계만 같으면 같은 실패로 보므로, 옛 실패가 남은 채 새로 깨지면 새 범인을 구별하지 못한다. 범인을 가리려면 단계에 `failed`를 둔다.
+- **되돌리는 일은 오케스트레이터가 정한다.** chute는 자동으로 되돌리지 않는다. 알림과 보고서가 `chute revert <batch>`를 안내할 뿐이다.
+- **고쳐지면 풀린다.** 실패가 남은 뒤 어느 tip이 통과하면 `post_fixed` 알림을 같은 터미널들에 보내고(`chute 결과 post_fixed slug=<owner/name> at=<epoch ms> commit=<12자> was=<12자> [pr=<번호>] <한국어 한 문장>`) `chute events`에 `머지 뒤 검사 풀림`이 남는다.
+- **선택: 고칠 때까지 PR을 잡아 둔다.** `post_verify_hold = true`면 실패가 남은 동안 batch가 실패한 단계의 `paths`에 해당하는 큐의 PR(그 PR이 기본 브랜치와 갈라진 뒤 바꾼 파일로 비교한다)을 가져가지 않는다. 다른 PR은 머지된다. 고치는 PR은 `chute submit --repair`로 넣으면 잡히지 않고 먼저 머지된다. 잡혀 있는 동안 데몬은 15초마다 본다. 실패가 풀리면 잡혔던 PR이 다시 batch에 들어간다. 기본은 끈다.
+- **상태 JSON.** `chute status --json`의 `post_verify`는 `last_green`(`commit`, `at_ms`), `run`(도는 검사: `tip`, `phase`는 `verifying`이나 `searching`, 지금 보는 `commit`, `step`, `started_ms`, `waiting_machine`), `red`(남은 실패: `commit`, `step`, `tests`, `log`, `report`, `since_ms`, `last_green`, `culprit`의 `commit`·`pr`·`batch`, `holding`), `last_started_ms`다. `run`은 검사가 PC 자리를 기다리면 `waiting_machine`이 `true`다.
+- **데몬이 멈추면** 도는 검사는 취소되고 기록은 남지 않는다. 다음에 데몬이 뜨면 그때의 tip을 처음부터 검사한다.
 
 ## 첫 가동 점검
 

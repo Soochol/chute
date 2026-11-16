@@ -160,6 +160,14 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null,"isDraft":%s,"baseRe
         })
     }
 
+    pub fn post(&self) -> chute::post::PostVerifier {
+        chute::post::PostVerifier::new(
+            Ext::from_vars(|k| self.sb.var(k)),
+            Home::at(self.sb.chute_home()),
+            self.info.clone(),
+        )
+    }
+
     fn hc_knows_the_agent(&self) {
         let hc = self.sb.fake("hc");
         hc.respond("get t1rs --json", Reply::file("tests/fixtures/hc/get.json"));

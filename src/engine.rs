@@ -88,6 +88,7 @@ impl Default for Timing {
 pub enum Pass {
     Idle,
     Blocked,
+    Held,
     Cancelled,
     Done(Summary),
 }
@@ -117,6 +118,7 @@ pub struct Engine {
     cancel: Cancel,
     timing: Timing,
     ci_looked: Mutex<BTreeMap<PrNumber, Instant>>,
+    pr_files: Mutex<BTreeMap<(PrNumber, Sha), Vec<String>>>,
 }
 
 impl Engine {
@@ -133,6 +135,7 @@ impl Engine {
             cancel: Cancel::new(),
             timing: Timing::default(),
             ci_looked: Mutex::new(BTreeMap::new()),
+            pr_files: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -622,6 +625,7 @@ impl Engine {
         }
         let config = self.load_config()?;
         self.prune_no_checks_warnings(Some(config.require_ci))?;
+        let held = self.held_by_post_verify(&slot, &base, &config)?;
         let id = self.new_batch_id();
         let (taken, was_waiting_on_ci, queue_position): (
             Vec<QueueItem>,
@@ -643,7 +647,7 @@ impl Engine {
                 if repairing {
                     queue::take_repair(s, due)
                 } else {
-                    queue::take_batch(s, config.max_batch, due)
+                    queue::take_batch_except(s, config.max_batch, due, &held)
                 }
             };
             if !prs.is_empty() {
@@ -671,7 +675,13 @@ impl Engine {
             Ok((items, waiting_on_ci, position))
         })?;
         if taken.is_empty() {
-            return Ok(if repairing { Pass::Blocked } else { Pass::Idle });
+            return Ok(if repairing {
+                Pass::Blocked
+            } else if !held.is_empty() {
+                Pass::Held
+            } else {
+                Pass::Idle
+            });
         }
         let mut run = Run {
             engine: self,
@@ -729,6 +739,64 @@ impl Engine {
                 Err(e) => Err(e),
             },
         }
+    }
+
+    fn held_by_post_verify(
+        &self,
+        slot: &Slot,
+        base: &Sha,
+        config: &Config,
+    ) -> Result<BTreeSet<PrNumber>> {
+        let state = self.store.load()?;
+        let (Some(post), Some(red)) = (&config.post, &state.post.red) else {
+            return Ok(BTreeSet::new());
+        };
+        let Some(step) = post.steps.iter().find(|s| s.name == red.step) else {
+            return Ok(BTreeSet::new());
+        };
+        if !post.hold || !red.holding {
+            return Ok(BTreeSet::new());
+        }
+        let mut held = BTreeSet::new();
+        for item in state
+            .queue
+            .iter()
+            .filter(|i| matches!(i.state, ItemState::Queued(_)) && !i.repair)
+        {
+            match self.files_of(slot, base, item) {
+                Ok(files) if step.runs_for(&files) => {
+                    held.insert(item.pr);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "경고: {}의 바뀐 파일을 읽지 못해 잡아 두지 않는다: {e:#}",
+                    item.pr
+                ),
+            }
+        }
+        Ok(held)
+    }
+
+    fn files_of(&self, slot: &Slot, base: &Sha, item: &QueueItem) -> Result<Vec<String>> {
+        let key = (item.pr, item.head.clone());
+        if let Some(files) = self
+            .pr_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(files.clone());
+        }
+        let head = match slot.fetch_pr_head(item.pr, &item.head)? {
+            PrHead::Unchanged => item.head.clone(),
+            PrHead::Changed { actual } => actual,
+        };
+        let files = slot.changed_since_fork(base, &head)?;
+        self.pr_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, files.clone());
+        Ok(files)
     }
 
     fn new_batch_id(&self) -> BatchId {
@@ -2111,7 +2179,7 @@ fn step_failure(failed: &Failed, mode: VerifyMode, tree: &Sha) -> Failure {
     }
 }
 
-fn reap_orphans(slot: &Path) -> Result<()> {
+pub(crate) fn reap_orphans(slot: &Path) -> Result<()> {
     let Ok(slot) = fs::canonicalize(slot) else {
         return Ok(());
     };

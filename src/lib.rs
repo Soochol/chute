@@ -9,6 +9,7 @@ pub mod machine;
 pub mod model;
 pub mod notify;
 pub mod pc_limit;
+pub mod post;
 pub mod repo;
 pub mod store;
 

@@ -61,6 +61,10 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 | `12-pr-closed` | batch 도중 닫힌 PR은 머지되지 않고 나머지는 머지 |
 | `13-main-broken` | 깨진 main에서 큐가 멈추고 `--repair`로 풀림 |
 | `14-tree-reuse` | preflight를 통과한 트리를 batch가 다시 검증하지 않고(`reused`), main이 움직여 트리가 달라지면 다시 검증 |
+| `15-post-failed` | 머지 뒤 검사가 main에서 실패하면 마지막 통과 커밋과 tip 사이를 이분 탐색해 처음 실패한 머지의 PR을 찾아 작업자와 submit한 터미널에 `post_failed`를 보내고, 고치는 PR이 머지돼 통과하면 `post_fixed`를 보낸다 |
+| `16-post-flaky` | 머지 뒤 검사 단계가 한 번 실패하고 다시 돌려 통과하면 main이 통과(last green)로 오르고 `chute flaky` 장부에 남으며 아무에게도 알리지 않음 |
+
+머지 뒤 검사를 보는 시나리오는 `enable_post_verify`(`lib.sh`)를 부른다. 이 함수는 `[[post_verify]]` 단계 `post`(`sh post.sh`)와 그 스크립트를 main에 커밋한다. `post.sh`는 `post/` 아래 파일마다 내용(`ok`, `fail`, `flaky`)으로 결과를 정한다. 샌드박스 시드의 `chute.toml`에는 `[[post_verify]]`가 없어서 다른 시나리오는 머지 뒤 검사 없이 돈다.
 
 ## 시나리오 더하기
 

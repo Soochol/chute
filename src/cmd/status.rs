@@ -10,8 +10,8 @@ use crate::hub::{self, Route};
 use crate::machine::Machines;
 use crate::model::{
     Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemView,
-    MachineId, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today,
-    VerifiedBy, Warning, WarningKind,
+    MachineId, PostPhase, PostState, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView,
+    TerminalId, Today, VerifiedBy, Warning, WarningKind,
 };
 use crate::queue;
 
@@ -282,6 +282,7 @@ fn hub_down(
         today: Today::default(),
         recent: Vec::new(),
         warnings: vec![hub_warning(message, now)],
+        post_verify: PostState::default(),
     }
 }
 
@@ -382,6 +383,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
         today,
         recent,
         warnings,
+        post_verify: state.post.clone(),
     })
 }
 
@@ -437,7 +439,10 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
             | EventKind::Notified { .. }
             | EventKind::Resumed { .. }
             | EventKind::FlakyProbe { .. }
-            | EventKind::Reused { .. } => {}
+            | EventKind::Reused { .. }
+            | EventKind::PostGreen { .. }
+            | EventKind::PostFailed { .. }
+            | EventKind::PostFixed { .. } => {}
         }
     }
     leads.sort_unstable();
@@ -449,6 +454,55 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
     recent.reverse();
     recent.truncate(RECENT_BATCHES);
     (today, recent)
+}
+
+fn post_lines(post: &PostState) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(run) = &post.run {
+        let what = match run.phase {
+            PostPhase::Verifying => "검사 중",
+            PostPhase::Searching => "범인을 찾는 중",
+        };
+        let waiting = if run.waiting_machine {
+            " · PC 자리를 기다리는 중"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "머지 뒤 검사 {what}: 기본 브랜치 {} · 확인하는 커밋 {} · 단계 {}{waiting}",
+            run.tip.short(),
+            run.commit.short(),
+            run.step.as_deref().unwrap_or("-")
+        ));
+    }
+    if let Some(red) = &post.red {
+        let culprit = red.culprit.as_ref().map_or(String::new(), |c| {
+            let who =
+                c.pr.map_or(format!("범인 커밋 {}", c.commit.short()), |pr| {
+                    format!("범인 {pr}")
+                });
+            let revert = c.batch.as_ref().map_or(String::new(), |b| {
+                format!(" · 되돌리려면 chute revert {}", b.0)
+            });
+            format!(" · {who}{revert}")
+        });
+        let green = red
+            .last_green
+            .as_ref()
+            .map_or(String::new(), |g| format!(" · 마지막 통과 {}", g.short()));
+        lines.push(format!(
+            "머지 뒤 검사 실패: 커밋 {} · 단계 {}{green}{culprit}",
+            red.commit.short(),
+            red.step
+        ));
+    }
+    if let Some(green) = &post.last_green {
+        lines.push(format!(
+            "머지 뒤 검사 마지막 통과: {}",
+            green.commit.short()
+        ));
+    }
+    lines
 }
 
 fn human(v: &StatusView) -> String {
@@ -510,6 +564,9 @@ fn human(v: &StatusView) -> String {
             b.round,
             prs.join(" ")
         ));
+    }
+    for text in post_lines(&v.post_verify) {
+        line(text);
     }
     if v.queue.is_empty() {
         line("큐가 비어 있다".to_owned());

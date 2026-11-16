@@ -88,6 +88,21 @@ pub enum Line {
         made: bool,
         chronic: bool,
     },
+    PostFailed {
+        commit: Sha,
+        step: String,
+        tests: Vec<String>,
+        last_green: Option<Sha>,
+        pr: Option<PrNumber>,
+        batch: Option<BatchId>,
+        log: PathBuf,
+        report: Option<PathBuf>,
+    },
+    PostFixed {
+        commit: Sha,
+        was: Sha,
+        pr: Option<PrNumber>,
+    },
 }
 
 pub fn mode_of(failure: &Failure) -> (Option<Mode>, Vec<PrNumber>) {
@@ -113,6 +128,8 @@ impl Line {
             Line::Reverted { .. } => NotifyKind::Reverted,
             Line::Waiting { .. } => NotifyKind::Waiting,
             Line::Flaky { .. } => NotifyKind::Flaky,
+            Line::PostFailed { .. } => NotifyKind::PostFailed,
+            Line::PostFixed { .. } => NotifyKind::PostFixed,
         }
     }
 
@@ -122,7 +139,9 @@ impl Line {
             | Line::Bounced { pr, .. }
             | Line::Human { pr, .. }
             | Line::Waiting { pr, .. } => Some(*pr),
-            Line::Resumed { pr, .. } => *pr,
+            Line::Resumed { pr, .. } | Line::PostFailed { pr, .. } | Line::PostFixed { pr, .. } => {
+                *pr
+            }
             Line::Reverted { prs, .. } | Line::Flaky { prs, .. } => match prs.as_slice() {
                 [only] => Some(*only),
                 _ => None,
@@ -328,6 +347,51 @@ impl Line {
                     format!("단계 {step}의 시험이 흔들렸다.")
                 }
             }
+            Line::PostFailed {
+                commit,
+                step,
+                tests,
+                last_green,
+                pr,
+                batch,
+                log,
+                report,
+            } => {
+                keys.sha("commit", commit);
+                keys.text("step", step);
+                if !tests.is_empty() {
+                    keys.texts("tests", tests);
+                }
+                if let Some(green) = last_green {
+                    keys.sha("last_green", green);
+                }
+                if let Some(pr) = pr {
+                    keys.put("pr", pr.0);
+                }
+                if let Some(batch) = batch {
+                    keys.text("batch", &batch.0);
+                }
+                keys.path("log", log);
+                if let Some(report) = report {
+                    keys.path("report", report);
+                }
+                let culprit = match (pr, batch) {
+                    (Some(pr), Some(batch)) => format!(
+                        " 여기서 처음 실패한 머지는 PR {}(batch {})다. 되돌리려면 오케스트레이터가 chute revert {}를 정한다. chute는 자동으로 되돌리지 않는다.",
+                        pr.0, batch.0, batch.0
+                    ),
+                    _ => " 처음 실패한 머지를 가리지 못했다.".to_owned(),
+                };
+                format!("머지 뒤 검사 단계 {step}가 기본 브랜치에서 실패했다.{culprit}")
+            }
+            Line::PostFixed { commit, was, pr } => {
+                keys.sha("commit", commit);
+                keys.sha("was", was);
+                if let Some(pr) = pr {
+                    keys.put("pr", pr.0);
+                }
+                "머지 뒤 검사가 다시 통과해 실패가 풀렸다.".to_owned()
+            }
         }
     }
 }
@@ -342,6 +406,8 @@ fn kind_word(kind: NotifyKind) -> &'static str {
         NotifyKind::Reverted => "reverted",
         NotifyKind::Waiting => "waiting",
         NotifyKind::Flaky => "flaky",
+        NotifyKind::PostFailed => "post_failed",
+        NotifyKind::PostFixed => "post_fixed",
     }
 }
 
@@ -720,6 +786,21 @@ mod tests {
                 made: true,
                 chronic: true,
             },
+            Line::PostFailed {
+                commit: sha("1a2b3c4d5e6f7a8b"),
+                step: "e2e".into(),
+                tests: vec!["login".into()],
+                last_green: Some(sha("9f8e7d6a5b4c3d2e")),
+                pr: Some(pr(12)),
+                batch: Some(BatchId("b20261117-091500".into())),
+                log: "/state/reports/commit-1a2b3c4d5e6f/post/verify/e2e.1.log".into(),
+                report: Some("/state/reports/commit-1a2b3c4d5e6f/post/report.md".into()),
+            },
+            Line::PostFixed {
+                commit: sha("aaaaaaaaaaaaaaaa"),
+                was: sha("1a2b3c4d5e6f7a8b"),
+                pr: Some(pr(12)),
+            },
         ]
     }
 
@@ -736,8 +817,8 @@ mod tests {
     }
 
     #[test]
-    fn the_eight_kinds_of_line_carry_the_planned_keys_in_the_allowed_characters() {
-        let planned: [(&str, &[&str]); 8] = [
+    fn the_ten_kinds_of_line_carry_the_planned_keys_in_the_allowed_characters() {
+        let planned: [(&str, &[&str]); 10] = [
             (
                 "merged",
                 &["slug", "at", "pr", "head", "batch", "commit", "repair"],
@@ -782,6 +863,22 @@ mod tests {
                     "slug", "at", "batch", "prs", "step", "tests", "evidence", "chronic",
                 ],
             ),
+            (
+                "post_failed",
+                &[
+                    "slug",
+                    "at",
+                    "commit",
+                    "step",
+                    "tests",
+                    "last_green",
+                    "pr",
+                    "batch",
+                    "log",
+                    "report",
+                ],
+            ),
+            ("post_fixed", &["slug", "at", "commit", "was", "pr"]),
         ];
         for (line, (kind, keys)) in all_lines().iter().zip(planned) {
             let text = line.render(&slug(), EpochMs(1763270000123), false);

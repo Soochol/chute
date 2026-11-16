@@ -35,6 +35,11 @@ impl Sha {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The first 12 characters, enough to name a commit in a line of text.
+    pub fn short(&self) -> &str {
+        &self.0[..self.0.len().min(12)]
+    }
 }
 
 impl TryFrom<String> for Sha {
@@ -653,6 +658,8 @@ pub enum WarningKind {
     Hub,
     FlakyChronic,
     Gc,
+    /// The check after the merge could not run.
+    Post,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,6 +682,82 @@ pub struct State {
     pub base_doubt: Option<BaseDoubt>,
     #[serde(default)]
     pub verified_trees: Vec<VerifiedTree>,
+    #[serde(default)]
+    pub post: PostState,
+}
+
+/// What the check after the merge knows. It runs beside the queue, so the queue's own fields
+/// never depend on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostState {
+    /// The last default-branch commit the post-merge steps passed on.
+    pub last_green: Option<GreenMark>,
+    /// The check that is running now.
+    pub run: Option<PostRun>,
+    /// The failure not yet fixed: the check failed and no later run has passed.
+    pub red: Option<PostRed>,
+    /// When the latest run began. `post_verify_interval` counts from it.
+    pub last_started_ms: Option<EpochMs>,
+}
+
+impl PostState {
+    /// Whether queued PRs that touch the failed step's paths wait for a fix.
+    pub fn holding(&self) -> bool {
+        self.red.as_ref().is_some_and(|red| red.holding)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GreenMark {
+    pub commit: Sha,
+    pub at_ms: EpochMs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostPhase {
+    Verifying,
+    /// Looking for the merge that broke it among the commits since the last green one.
+    Searching,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostRun {
+    /// The default-branch tip this run is about.
+    pub tip: Sha,
+    pub phase: PostPhase,
+    /// The commit being checked now: the tip, or a commit of the search.
+    pub commit: Sha,
+    pub step: Option<String>,
+    pub started_ms: EpochMs,
+    /// True while the run waits for a free PC slot (`machine.toml`'s `max_verify`).
+    #[serde(default)]
+    pub waiting_machine: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostRed {
+    /// The tip that failed.
+    pub commit: Sha,
+    pub step: String,
+    pub tests: Vec<String>,
+    pub log: PathBuf,
+    pub report: Option<PathBuf>,
+    pub since_ms: EpochMs,
+    pub last_green: Option<Sha>,
+    pub culprit: Option<Culprit>,
+    /// `post_verify_hold` was on when the failure was recorded.
+    #[serde(default)]
+    pub holding: bool,
+}
+
+/// The first commit of the default branch the steps fail on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Culprit {
+    pub commit: Sha,
+    /// `None` for a commit chute did not merge.
+    pub pr: Option<PrNumber>,
+    pub batch: Option<BatchId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -859,6 +942,23 @@ pub enum EventKind {
         runs: u32,
         failures: u32,
     },
+    PostGreen {
+        commit: Sha,
+        previous: Option<Sha>,
+        seconds: u64,
+    },
+    PostFailed {
+        commit: Sha,
+        step: String,
+        tests: Vec<String>,
+        last_green: Option<Sha>,
+        culprit: Option<Culprit>,
+    },
+    PostFixed {
+        commit: Sha,
+        was: Sha,
+        pr: Option<PrNumber>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,6 +972,8 @@ pub enum NotifyKind {
     Reverted,
     Waiting,
     Flaky,
+    PostFailed,
+    PostFixed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,6 +1039,9 @@ pub struct StatusView {
     pub today: Today,
     pub recent: Vec<RecentBatch>,
     pub warnings: Vec<Warning>,
+    /// Absent from the output of a chute older than the check after the merge.
+    #[serde(default)]
+    pub post_verify: PostState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
