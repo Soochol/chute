@@ -890,13 +890,18 @@ impl Run<'_> {
 
     fn ensure_env(&mut self) -> Result<()> {
         if self.record.env.is_none() {
-            self.record.env = Some(env::record(
+            self.slot.checkout(&self.start_base)?;
+            let env = env::record(
                 &self.engine.ext,
                 self.slot.path(),
                 &self.engine.store.batch_dir(self.id()).join("env"),
                 &self.config.env_check,
                 &self.engine.cancel,
-            ));
+            );
+            if self.engine.cancel.is_cancelled() {
+                return Ok(());
+            }
+            self.record.env = Some(env);
             self.save_record()?;
         }
         Ok(())

@@ -160,6 +160,7 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
             )
         })?;
 
+    slot.checkout(&base)?;
     let at = EpochMs::now();
     let log_dir = log_dir(&store, &target.head, at)?;
     let env = env::record(

@@ -107,7 +107,18 @@ fn read_head(log: &Path) -> Option<String> {
 
 fn is_unsafe(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
 }
 
 fn clean(line: &str) -> String {
@@ -317,6 +328,12 @@ mod tests {
             CHECK_TIMEOUT,
         );
         assert_eq!(env.checks[0].output, "evil x");
+        let env = env_of(
+            &f,
+            &["printf 'a\\330\\234b\\363\\240\\201\\201c\\n'"],
+            CHECK_TIMEOUT,
+        );
+        assert_eq!(env.checks[0].output, "a b c");
     }
 
     #[test]

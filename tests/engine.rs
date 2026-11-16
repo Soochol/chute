@@ -1402,6 +1402,27 @@ mod env_ci {
     use super::*;
 
     #[test]
+    fn the_batch_env_is_recorded_in_a_slot_set_to_the_base() {
+        let lab = Lab::build("", "env_check = [\"git rev-parse HEAD\"]", 60);
+        lab.open_pr(1, &[("f1", "x")]);
+        done(lab.engine().run_once().unwrap());
+        lab.main_commit(&[("moved.txt", "x\n")], "feat: main moved");
+        lab.open_pr(2, &[("f2", "x")]);
+        let base = lab.origin_main();
+
+        let summary = done(lab.engine().run_once().unwrap());
+
+        let env = lab
+            .store
+            .read_batch(&summary.batch)
+            .unwrap()
+            .unwrap()
+            .env
+            .unwrap();
+        assert_eq!(env.checks[0].output, base.trim());
+    }
+
+    #[test]
     fn a_ci_failure_report_carries_the_batch_env_too() {
         let lab = Lab::build(
             "",
