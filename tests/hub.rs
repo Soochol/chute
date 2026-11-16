@@ -724,7 +724,8 @@ fn take_refuses_while_this_pcs_own_queue_holds_other_items() {
     let out = take(b, "a");
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("다른 항목"), "{}", stderr(&out));
-    assert_eq!(state_of(b), mine);
+    let as_state = |v: Value| serde_json::from_value::<chute::model::State>(v).unwrap();
+    assert_eq!(as_state(state_of(b)), as_state(mine));
     assert!(history_of(b).is_empty());
     assert_eq!(hub_of(a), Some(id(b)), "옛 허브는 이미 얼어 있다");
 }
