@@ -207,6 +207,13 @@ test("batch shows members, phase, step, round and elapsed time", () => {
   assert.equal(batch.step, "test");
   assert.equal(batch.round, "1번째 검증");
   assert.equal(batch.elapsed, "5분 12초");
+  assert.equal(batch.waitingMachine, false);
+});
+
+test("batch shows that it waits for a free slot on this PC", () => {
+  const data = { ...fixture, batch: { ...fixture.batch, waiting_machine: true } };
+  const [batch] = section(only([data]), "batch").items;
+  assert.equal(batch.waitingMachine, true);
 });
 
 test("an in_batch item with no batch record is still shown", () => {
@@ -754,7 +761,7 @@ test("random malformed status never breaks the board", () => {
     maybe(o, "approval", () => or(() => pick(["agent", "human"])));
     maybe(o, "daemon", () => or(() => ({ running: or(() => rnd() < 0.5) })));
     maybe(o, "blocked", () => or(() => pick([null, { reason: or(() => "base_broken"), base: or(() => "0a1"), since_ms: or(() => 1794724080000), step: or(() => "test"), log: or(() => "/l"), pushed_by_chute: or(() => rnd() < 0.5), rechecked: or(() => rnd() < 0.5) }])));
-    maybe(o, "batch", () => or(() => pick([null, { prs: or(() => Array.from({ length: Math.floor(rnd() * 4) }, () => or(() => pick([1, 2, 3, 5, 12])))), phase: or(() => "verifying"), step: or(() => "test"), round: or(() => 1), started_ms: or(() => 1794724200000) }])));
+    maybe(o, "batch", () => or(() => pick([null, { prs: or(() => Array.from({ length: Math.floor(rnd() * 4) }, () => or(() => pick([1, 2, 3, 5, 12])))), phase: or(() => "verifying"), step: or(() => "test"), round: or(() => 1), started_ms: or(() => 1794724200000), waiting_machine: or(() => rnd() < 0.5) }])));
     maybe(o, "queue", () => or(() => Array.from({ length: Math.floor(rnd() * 6) }, () => or(queueItem, 0.1)), 0.1));
     maybe(o, "today", () => or(() => ({ merged: or(() => 1), bounced: or(() => 0), flaky: or(() => 0), batches: or(() => 1), median_lead_s: or(() => 60), verify_s: or(() => 5) })));
     maybe(o, "warnings", () => or(() => Array.from({ length: Math.floor(rnd() * 3) }, () => or(() => ({ kind: or(() => pick(["config", "flaky_chronic", "gc"])), message: or(() => "m") })))));

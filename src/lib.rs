@@ -8,6 +8,7 @@ pub mod hub;
 pub mod machine;
 pub mod model;
 pub mod notify;
+pub mod pc_limit;
 pub mod repo;
 pub mod store;
 

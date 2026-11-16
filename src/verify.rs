@@ -17,6 +17,7 @@ use nix::unistd::Pid;
 
 use crate::config::{Config, VerifyStep};
 use crate::model::{EpochMs, NonEmpty};
+use crate::pc_limit::{self, Wait};
 use crate::store::RepoStore;
 
 const LOCK_FILE: &str = "verify.lock";
@@ -56,6 +57,8 @@ pub struct Options<'a> {
     pub cache_dir: Option<PathBuf>,
     /// Called with the step's name as each step starts.
     pub on_step: Option<&'a dyn Fn(&str)>,
+    /// Called when the run starts and stops waiting for a free PC slot.
+    pub on_machine_wait: Option<&'a dyn Fn(Wait)>,
 }
 
 impl Default for Options<'_> {
@@ -66,6 +69,7 @@ impl Default for Options<'_> {
             kill_grace: Duration::from_secs(5),
             cache_dir: None,
             on_step: None,
+            on_machine_wait: None,
         }
     }
 }
@@ -139,6 +143,10 @@ pub fn run(
     } else {
         None
     };
+    let _slot = match pc_limit::acquire(store.home_dir(), &opts.cancel, opts.on_machine_wait)? {
+        pc_limit::Slot::Held(file) => file,
+        pc_limit::Slot::Cancelled => return Ok(Outcome::Cancelled),
+    };
     let ctx = Ctx {
         dir,
         log_dir,
@@ -193,6 +201,10 @@ pub fn run_probe(
         }
     } else {
         None
+    };
+    let _slot = match pc_limit::acquire(store.home_dir(), &opts.cancel, opts.on_machine_wait)? {
+        pc_limit::Slot::Held(file) => file,
+        pc_limit::Slot::Cancelled => return Ok(CommandEnd::Cancelled),
     };
     if let Some(cache) = &opts.cache_dir {
         fs::create_dir_all(cache).with_context(|| format!("만들지 못했다: {}", cache.display()))?;

@@ -341,6 +341,15 @@ chute는 `origin`이라는 이름을 고정해 쓰지 않는다. 관리하는 �
 
 **`CHUTE_HOME`.** 상태는 `$CHUTE_HOME`(없으면 `$XDG_STATE_HOME/chute`, 그것도 없으면 `~/.local/state/chute`) 아래에 저장소마다 폴더를 두고 쌓인다. `CHUTE_HOME`을 바꿔 쓴다면 주의한다. `chute up`이 `hc`로 띄운 데몬 터미널이 `CHUTE_HOME`을 물려받지 못하면 다른 상태 폴더를 보고 에이전트의 submit을 못 본다. 데몬이 도는 터미널과 에이전트의 셸이 같은 `CHUTE_HOME`을 갖는지 확인한다. `chute status`가 보이는 큐가 에이전트가 본 것과 다르면 이것을 의심한다.
 
+**PC 전체 검증 상한 (`machine.toml`).** 저장소마다 데몬과 preflight가 따로 돌기 때문에 저장소 여럿의 검증이 한꺼번에 겹치면 PC가 버티지 못한다. 이 PC에서 동시에 도는 검증 수는 `$CHUTE_HOME/machine.toml`의 `max_verify`(1 이상, 파일이 없으면 3)로 제한한다. 이 파일은 PC의 것이라 `chute.toml`에 둘 수 없고 저장소 clone에도 없다. 다른 PC는 그 PC의 `machine.toml`을 따르며 허브로 넘기는 것이 없다.
+
+```toml
+# $CHUTE_HOME/machine.toml (선택)
+max_verify = 3
+```
+
+batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을 띄우기 전에 `$CHUTE_HOME/machine/verify-<k>.lock` 가운데 빈 것 하나를 잡고 끝나면 놓는다. 모두 잡혀 있으면 자리가 날 때까지 기다린다. `serialize = true`인 저장소는 저장소의 `verify.lock`을 먼저 잡고 PC 자리를 나중에 잡는다. preflight는 기다리기 시작할 때 stderr에 `이 PC에서 검증 N개가 돌고 있어 기다린다`를 한 번 쓴다. 데몬의 batch는 `chute status`에 `PC 자리를 기다리는 중`으로 보이고 `--json`의 `batch.waiting_machine`이 `true`가 된다. 모르는 키나 0 같은 틀린 값은 그 파일 경로를 적은 오류다. 이 상한은 chute의 검증만 센다. chute 밖에서 도는 프로세스는 세지 않는다.
+
 ## 사람이 하는 일
 
 ### 현황판 읽기

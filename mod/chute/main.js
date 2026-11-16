@@ -379,7 +379,11 @@ function alertRow(item, t) {
 }
 
 function batchCard(batch, t) {
-  const facts = [batch.step, batch.round, batch.elapsed && `경과 ${batch.elapsed}`].filter(Boolean);
+  const facts = [
+    batch.waitingMachine ? "PC 자리를 기다리는 중" : batch.step,
+    batch.round,
+    batch.elapsed && `경과 ${batch.elapsed}`,
+  ].filter(Boolean);
   return v_flex()
     .gap(5)
     .p(9)

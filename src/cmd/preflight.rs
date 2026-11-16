@@ -17,6 +17,7 @@ use crate::model::{
     NonEmpty, Partner, PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView,
     StepFailure, VerifyMode,
 };
+use crate::pc_limit::Wait;
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
@@ -575,9 +576,15 @@ impl Run<'_> {
 
     fn run_steps(&self, log_dir: &Path) -> Result<Outcome> {
         let on_step = |name: &str| eprintln!("검증 단계: {name}");
+        let on_machine_wait = |wait: Wait| {
+            if let Wait::Begin { running } = wait {
+                eprintln!("이 PC에서 검증 {running}개가 돌고 있어 기다린다");
+            }
+        };
         let options = Options {
             cache_dir: Some(self.gitops.cache_dir()),
             on_step: Some(&on_step),
+            on_machine_wait: Some(&on_machine_wait),
             ..Options::default()
         };
         verify::run(self.config, self.store, self.slot.path(), log_dir, &options)

@@ -491,8 +491,13 @@ fn human(v: &StatusView) -> String {
     }
     if let Some(b) = &v.batch {
         let prs: Vec<String> = b.prs.iter().map(|p| p.to_string()).collect();
+        let waiting = if b.waiting_machine {
+            " · PC 자리를 기다리는 중"
+        } else {
+            ""
+        };
         line(format!(
-            "batch {} {:?} {} · {}회차 · {}",
+            "batch {} {:?} {} · {}회차 · {}{waiting}",
             b.id.0,
             b.phase,
             b.step.as_deref().unwrap_or("-"),
@@ -708,6 +713,19 @@ mod tests {
         let (today, _) = summarize(&events, &now);
         assert_eq!(today.median_lead_s, Some(250));
         assert_eq!(today.flaky, 1);
+    }
+
+    #[test]
+    fn a_batch_waiting_for_a_pc_slot_says_so_in_the_text_and_the_json() {
+        let fixture = include_str!("../../tests/fixtures/status-full.json");
+        let mut view: StatusView = serde_json::from_str(fixture).unwrap();
+        let batch = view.batch.as_mut().unwrap();
+        assert!(!batch.waiting_machine);
+        assert!(!human(&view).contains("PC 자리를 기다리는 중"));
+        view.batch.as_mut().unwrap().waiting_machine = true;
+        assert!(human(&view).contains("PC 자리를 기다리는 중"));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["batch"]["waiting_machine"], true);
     }
 
     #[test]
