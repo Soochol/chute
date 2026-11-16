@@ -7,7 +7,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -16,6 +19,8 @@ use crate::model::{CommitRef, ConflictFile, NonEmpty, PrNumber, RepoInfo, Sha};
 use crate::store::Home;
 
 const TRACKING_ATTEMPTS: u32 = 3;
+
+const SLOT_POLL: Duration = Duration::from_millis(200);
 
 pub const FAILED_REF_PREFIX: &str = "refs/chute/failed/";
 
@@ -29,6 +34,22 @@ pub enum SlotName {
     /// Numbered from 1.
     Preflight(u32),
     Revert,
+}
+
+impl SlotName {
+    /// The inverse of `Display`: a slot folder's name to its slot. `None` for anything else,
+    /// so `preflight-0` and `preflight-01` are not slots.
+    pub fn parse(text: &str) -> Option<SlotName> {
+        match text {
+            "batch" => Some(SlotName::Batch),
+            "revert" => Some(SlotName::Revert),
+            _ => {
+                let k: u32 = text.strip_prefix("preflight-")?.parse().ok()?;
+                let slot = SlotName::Preflight(k);
+                (k >= 1 && slot.to_string() == text).then_some(slot)
+            }
+        }
+    }
 }
 
 impl fmt::Display for SlotName {
@@ -124,6 +145,7 @@ pub struct Gitops {
     slots_dir: PathBuf,
     owner: String,
     default_branch: String,
+    cache_seed: Vec<String>,
 }
 
 impl Gitops {
@@ -135,7 +157,25 @@ impl Gitops {
             slots_dir: std::path::absolute(&slots_dir).unwrap_or(slots_dir),
             owner: info.slug.owner().to_owned(),
             default_branch: info.default_branch.clone(),
+            cache_seed: Vec::new(),
         }
+    }
+
+    /// Paths, relative to a slot, that a new or rebuilt slot copies from the slot used last.
+    pub fn with_cache_seed(mut self, seed: Vec<String>) -> Gitops {
+        self.cache_seed = seed;
+        self
+    }
+
+    /// One folder per repository for tools that many slots may write at once. Created when a
+    /// verification starts.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.slots_dir.join("cache")
+    }
+
+    /// Whether nobody holds the slot right now. The answer can be stale when it is read.
+    pub fn slot_is_free(&self, name: SlotName) -> Result<bool> {
+        Ok(self.lock_slot(name)?.is_some())
     }
 
     /// `None` when another holder has the slot. The lock file sits beside the worktree:
@@ -163,14 +203,22 @@ impl Gitops {
         }
     }
 
-    /// The first preflight slot nobody holds. When all are held, the next number is new.
-    pub fn lock_preflight_slot(&self) -> Result<SlotLock> {
-        for k in 1..=u32::MAX {
-            if let Some(lock) = self.lock_slot(SlotName::Preflight(k))? {
-                return Ok(lock);
+    /// The first of slots `1..=max_parallel` nobody holds. When all are held, waits for one and
+    /// says so once on stderr.
+    pub fn lock_preflight_slot(&self, max_parallel: u32) -> Result<SlotLock> {
+        let mut told = false;
+        loop {
+            for k in 1..=max_parallel {
+                if let Some(lock) = self.lock_slot(SlotName::Preflight(k))? {
+                    return Ok(lock);
+                }
             }
+            if !told {
+                eprintln!("다른 preflight {max_parallel}개가 돌고 있어 기다린다");
+                told = true;
+            }
+            thread::sleep(SLOT_POLL);
         }
-        bail!("preflight 슬롯을 잡지 못했다")
     }
 
     /// Overwrites an existing ref.
@@ -196,7 +244,7 @@ impl Gitops {
         Ok(())
     }
 
-    fn slot_path(&self, name: SlotName) -> PathBuf {
+    pub fn slot_path(&self, name: SlotName) -> PathBuf {
         self.slots_dir.join(name.to_string())
     }
 
@@ -210,6 +258,12 @@ impl Gitops {
     fn rebuild_worktree(&self, name: SlotName) -> Result<()> {
         let path = self.slot_path(name);
         remove_tree(&path).with_context(|| format!("지우지 못했다: {}", path.display()))?;
+        self.add_worktree(&path)?;
+        self.seed_cache(name);
+        Ok(())
+    }
+
+    fn add_worktree(&self, path: &Path) -> Result<()> {
         // `worktree add` rewrites `.git/worktrees`, and two of them racing there can fail.
         let _admin = self.lock_worktree_admin()?;
         // Without a commit-ish git starts at the user's HEAD, which an unborn branch lacks.
@@ -238,6 +292,97 @@ impl Gitops {
             .git(&self.repo, args)?
             .ok()
             .with_context(|| format!("슬롯을 만들지 못했다: {}", path.display()))?;
+        Ok(())
+    }
+
+    fn seed_cache(&self, name: SlotName) {
+        if self.cache_seed.is_empty() {
+            return;
+        }
+        let Some(from) = self.last_used_slot(name) else {
+            return;
+        };
+        let to = self.slot_path(name);
+        for rel in &self.cache_seed {
+            if let Err(e) = self.copy_seed(&from, &to, rel) {
+                eprintln!(
+                    "경고: 캐시 {rel}를 {}에서 복사하지 못했다: {e:#}",
+                    from.display()
+                );
+            }
+        }
+    }
+
+    fn last_used_slot(&self, except: SlotName) -> Option<PathBuf> {
+        let mut found: Vec<(SystemTime, PathBuf)> = fs::read_dir(&self.slots_dir)
+            .ok()?
+            .filter_map(|entry| {
+                let file_name = entry.ok()?.file_name();
+                let slot = SlotName::parse(file_name.to_str()?)?;
+                let path = self.slot_path(slot);
+                if slot == except || !path.join(".git").is_file() {
+                    return None;
+                }
+                let used = fs::metadata(self.slots_dir.join(format!("{slot}.lock")))
+                    .ok()?
+                    .modified()
+                    .ok()?;
+                Some((used, path))
+            })
+            .collect();
+        found.sort();
+        found.pop().map(|(_, path)| path)
+    }
+
+    fn copy_seed(&self, from: &Path, to: &Path, rel: &str) -> Result<()> {
+        let rel = Path::new(rel);
+        if rel.as_os_str().is_empty()
+            || !rel.components().all(|c| matches!(c, Component::Normal(_)))
+        {
+            bail!("슬롯 안의 상대 경로가 아니다");
+        }
+        let source = from.join(rel);
+        let Ok(canonical) = fs::canonicalize(&source) else {
+            return Ok(());
+        };
+        if !canonical.starts_with(fs::canonicalize(from)?) {
+            bail!("슬롯 밖을 가리킨다");
+        }
+        let ignored = self
+            .ext
+            .git(
+                from,
+                [
+                    OsStr::new("check-ignore"),
+                    OsStr::new("-q"),
+                    OsStr::new("--"),
+                    rel.as_os_str(),
+                ],
+            )?
+            .success();
+        if !ignored {
+            bail!("git이 무시하는 경로가 아니다");
+        }
+        let target = to.join(rel);
+        if fs::symlink_metadata(&target).is_ok() {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+            if !fs::canonicalize(parent)?.starts_with(fs::canonicalize(to)?) {
+                bail!("슬롯 밖으로 복사하게 된다");
+            }
+        }
+        let copied = Command::new("cp")
+            .args(["-a", "--reflink=auto", "--"])
+            .arg(&source)
+            .arg(&target)
+            .output()
+            .context("cp를 실행하지 못했다")?;
+        if !copied.status.success() {
+            let _ = remove_tree(&target);
+            bail!("{}", String::from_utf8_lossy(&copied.stderr).trim());
+        }
         Ok(())
     }
 
@@ -319,6 +464,10 @@ pub struct SlotLock {
 }
 
 impl SlotLock {
+    fn mark_used(&self) {
+        let _ = self._file.set_modified(SystemTime::now());
+    }
+
     pub fn name(&self) -> SlotName {
         self.name
     }
@@ -327,6 +476,7 @@ impl SlotLock {
     /// last user left; `Slot::checkout` and `Slot::merge` set it.
     pub fn open(self) -> Result<Slot> {
         self.git.ensure_worktree(self.name)?;
+        self.mark_used();
         let path = self.git.slot_path(self.name);
         Ok(Slot { path, lock: self })
     }
@@ -1181,6 +1331,121 @@ mod tests {
         assert_eq!(w.in_slot(&slot, &["status", "--porcelain"]), "");
     }
 
+    fn used_slot(w: &World, name: SlotName, files: &[(&str, &str)]) -> Slot {
+        let slot = w.slot(name);
+        let base = slot.fetch_base().unwrap();
+        slot.checkout(&base).unwrap();
+        for (path, content) in files {
+            let full = slot.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, content).unwrap();
+        }
+        slot
+    }
+
+    fn open_seeded(w: &World, seed: &[&str], name: SlotName) -> Slot {
+        let git = w
+            .gitops
+            .clone()
+            .with_cache_seed(seed.iter().map(|s| (*s).to_owned()).collect());
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(lock) = git.lock_slot(name).unwrap() {
+                return lock.open().unwrap();
+            }
+            assert!(Instant::now() < until, "슬롯 {name}을 잡지 못했다");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn seed_gives_a_new_slot_the_ignored_target_of_the_slot_used_last() {
+        let w = World::new();
+        let _older = used_slot(&w, SlotName::Preflight(1), &[("target/old.bin", "old")]);
+        thread::sleep(Duration::from_millis(20));
+        let _newer = used_slot(&w, SlotName::Preflight(2), &[("target/new.bin", "new")]);
+
+        let fresh = open_seeded(&w, &["target"], SlotName::Preflight(3));
+
+        let target = fresh.path().join("target");
+        assert_eq!(fs::read_to_string(target.join("new.bin")).unwrap(), "new");
+        assert!(!target.join("old.bin").exists());
+    }
+
+    #[test]
+    fn seed_reaches_a_slot_that_is_rebuilt() {
+        let w = World::new();
+        let _donor = used_slot(&w, SlotName::Preflight(1), &[("target/a.bin", "a")]);
+        let slot = open_seeded(&w, &["target"], SlotName::Preflight(2));
+        let base = slot.fetch_base().unwrap();
+        slot.checkout(&base).unwrap();
+        fs::remove_dir_all(slot.path().join("target")).unwrap();
+        let pointer = fs::read_to_string(slot.path().join(".git")).unwrap();
+        let gitdir = pointer.trim().strip_prefix("gitdir: ").unwrap().to_owned();
+        fs::write(Path::new(&gitdir).join("index"), "corrupt").unwrap();
+
+        slot.checkout(&base).unwrap();
+
+        assert!(slot.path().join("target/a.bin").exists());
+    }
+
+    #[test]
+    fn seed_does_not_touch_a_slot_that_already_exists() {
+        let w = World::new();
+        let _donor = used_slot(&w, SlotName::Preflight(1), &[("target/a.bin", "a")]);
+        drop(w.slot(SlotName::Preflight(2)));
+
+        let again = open_seeded(&w, &["target"], SlotName::Preflight(2));
+
+        assert!(!again.path().join("target").exists());
+    }
+
+    #[test]
+    fn seed_skips_tracked_paths_and_paths_outside_the_slot() {
+        let w = World::new();
+        let donor = used_slot(&w, SlotName::Preflight(1), &[("target/a.bin", "a")]);
+        let outside = w.sb.root().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, donor.path().join("target/escape")).unwrap();
+        let outside_path = outside.to_string_lossy().into_owned();
+
+        let fresh = open_seeded(
+            &w,
+            &[
+                "shared.txt",
+                "docs",
+                "../outside",
+                outside_path.as_str(),
+                "target/escape",
+                "",
+            ],
+            SlotName::Preflight(2),
+        );
+
+        for kept_out in ["shared.txt", "docs", "target"] {
+            assert!(!fresh.path().join(kept_out).exists(), "{kept_out}");
+        }
+        assert_eq!(fs::read_to_string(outside.join("secret")).unwrap(), "s");
+    }
+
+    #[test]
+    fn seed_failure_only_warns_and_the_slot_still_opens() {
+        let w = World::new();
+        let donor = used_slot(&w, SlotName::Preflight(1), &[("target/locked.bin", "x")]);
+        let locked = donor.path().join("target/locked.bin");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            return; // root reads anything, so cp cannot fail here
+        }
+
+        let fresh = open_seeded(&w, &["target", "cache"], SlotName::Preflight(2));
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(fresh.path().join(".git").is_file());
+        assert!(!fresh.path().join("target/locked.bin").exists());
+    }
+
     #[test]
     fn a_deleted_or_unlinked_slot_folder_is_rebuilt_without_stale_registrations() {
         let w = World::new();
@@ -1460,8 +1725,8 @@ mod tests {
     #[test]
     fn preflight_slots_are_separate_worktrees() {
         let w = World::new();
-        let first = w.gitops.lock_preflight_slot().unwrap();
-        let second = w.gitops.lock_preflight_slot().unwrap();
+        let first = w.gitops.lock_preflight_slot(2).unwrap();
+        let second = w.gitops.lock_preflight_slot(2).unwrap();
         assert_eq!(first.name(), SlotName::Preflight(1));
         assert_eq!(second.name(), SlotName::Preflight(2));
         let (first, second) = (first.open().unwrap(), second.open().unwrap());
@@ -1760,7 +2025,7 @@ mod tests {
         let ext = Ext::from_vars(|_| None);
         let info = repo::discover(&ext, Path::new(&repo)).unwrap();
         let gitops = Gitops::new(&ext, &Home::from_env().unwrap(), &info);
-        let slot = gitops.lock_preflight_slot().unwrap().open().unwrap();
+        let slot = gitops.lock_preflight_slot(2).unwrap().open().unwrap();
         let base = slot.fetch_base().unwrap();
         let head = sha(&head.to_string_lossy());
         slot.merge(&base, &[MergeItem::Local { head }]).unwrap();
