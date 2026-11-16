@@ -180,7 +180,7 @@ enum StepEnd {
     Cancelled,
 }
 
-enum End {
+pub enum End {
     Passed,
     Failed(Cause),
     Cancelled,
@@ -235,60 +235,84 @@ impl Ctx<'_> {
             .process_group(0)
             .spawn()
             .with_context(|| format!("검증 단계 {:?}를 띄우지 못했다", step.name))?;
-        let end = self.wait(&mut child, step);
+        let end = wait(&mut child, &step.name, step.timeout, &self.opts.cancel);
         terminate(&child, self.opts.kill_grace);
         end
     }
+}
 
-    fn wait(&self, child: &mut Child, step: &VerifyStep) -> Result<End> {
-        let leader = Pid::from_raw(child.id() as i32);
-        // WNOWAIT leaves the exited leader unreaped so that its pid, which `terminate` signals as a
-        // group id, cannot be reused before the SIGTERM.
-        let exited = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-        let deadline = Instant::now().checked_add(step.timeout);
-        let mut pause = Duration::from_millis(1);
-        loop {
-            match waitid(Id::Pid(leader), exited) {
-                Ok(WaitStatus::StillAlive) => {}
-                Ok(WaitStatus::Exited(_, 0)) => return Ok(End::Passed),
-                Ok(WaitStatus::Exited(_, code)) => return Ok(End::Failed(Cause::Exited(code))),
-                Ok(WaitStatus::Signaled(_, signal, _)) => {
-                    return Ok(End::Failed(Cause::Signaled(signal as i32)));
-                }
-                Ok(other) => bail!(
-                    "검증 단계 {:?}가 예상하지 못한 상태로 끝났다: {other:?}",
-                    step.name
-                ),
-                Err(Errno::EINVAL) => {
-                    // nix cannot name a real-time signal, so std reads the status instead.
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            return Ok(End::Failed(Cause::Signaled(
-                                status.signal().unwrap_or_default(),
-                            )));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            return Err(e).with_context(|| {
-                                format!("검증 단계 {:?}의 끝을 보지 못했다", step.name)
-                            });
-                        }
+pub fn run_command(
+    dir: &Path,
+    run: &str,
+    log: &Path,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<End> {
+    let out = create_fresh_log(log)?;
+    let err = out
+        .try_clone()
+        .with_context(|| format!("로그 파일을 복제하지 못했다: {}", log.display()))?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(run)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("명령 {run:?}을 띄우지 못했다"))?;
+    let end = wait(&mut child, run, timeout, cancel);
+    terminate(&child, Duration::from_secs(1));
+    end
+}
+
+fn wait(child: &mut Child, name: &str, timeout: Duration, cancel: &Cancel) -> Result<End> {
+    let leader = Pid::from_raw(child.id() as i32);
+    // WNOWAIT leaves the exited leader unreaped so that its pid, which `terminate` signals as a
+    // group id, cannot be reused before the SIGTERM.
+    let exited = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    let deadline = Instant::now().checked_add(timeout);
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match waitid(Id::Pid(leader), exited) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(WaitStatus::Exited(_, 0)) => return Ok(End::Passed),
+            Ok(WaitStatus::Exited(_, code)) => return Ok(End::Failed(Cause::Exited(code))),
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
+                return Ok(End::Failed(Cause::Signaled(signal as i32)));
+            }
+            Ok(other) => bail!(
+                "검증 단계 {:?}가 예상하지 못한 상태로 끝났다: {other:?}",
+                name
+            ),
+            Err(Errno::EINVAL) => {
+                // nix cannot name a real-time signal, so std reads the status instead.
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        return Ok(End::Failed(Cause::Signaled(
+                            status.signal().unwrap_or_default(),
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("검증 단계 {:?}의 끝을 보지 못했다", name));
                     }
                 }
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("검증 단계 {:?}의 끝을 보지 못했다", step.name));
-                }
             }
-            if self.opts.cancel.is_cancelled() {
-                return Ok(End::Cancelled);
+            Err(e) => {
+                return Err(e).with_context(|| format!("검증 단계 {:?}의 끝을 보지 못했다", name));
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(End::Failed(Cause::TimedOut));
-            }
-            thread::sleep(pause);
-            pause = (pause * 2).min(MAX_STEP_POLL);
         }
+        if cancel.is_cancelled() {
+            return Ok(End::Cancelled);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(End::Failed(Cause::TimedOut));
+        }
+        thread::sleep(pause);
+        pause = (pause * 2).min(MAX_STEP_POLL);
     }
 }
 

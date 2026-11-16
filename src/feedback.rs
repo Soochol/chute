@@ -11,6 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::env::{self, EnvSection};
 use crate::ext::{Ext, Output};
 use crate::gitops::FAILED_REF_PREFIX;
 use crate::hub::{ForwardErrorKind, exec_on_input};
@@ -122,6 +123,8 @@ pub struct ReportDoc {
     pub failure: Failure,
     pub step: Option<StepReport>,
     pub next: Vec<String>,
+    #[serde(default)]
+    pub env: Option<EnvSection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +190,17 @@ impl Feedback<'_> {
         failure: &Failure,
         failed_ref: Option<&str>,
     ) -> Result<Written> {
-        self.write_report_at(subject, failure, failed_ref, Placement::Here)
+        self.write_report_with_env(subject, failure, failed_ref, None)
+    }
+
+    pub fn write_report_with_env(
+        &self,
+        subject: &Subject,
+        failure: &Failure,
+        failed_ref: Option<&str>,
+        env: Option<EnvSection>,
+    ) -> Result<Written> {
+        self.write_report_at(subject, failure, failed_ref, env, Placement::Here)
     }
 
     fn write_report_at(
@@ -195,6 +208,7 @@ impl Feedback<'_> {
         subject: &Subject,
         failure: &Failure,
         failed_ref: Option<&str>,
+        env: Option<EnvSection>,
         placement: Placement<'_>,
     ) -> Result<Written> {
         let cause = Cause::of(failure)?;
@@ -217,6 +231,7 @@ impl Feedback<'_> {
                 next: next_steps(subject, &cause, &self.repo.default_branch),
                 step,
                 failure: failure.clone(),
+                env,
             };
             let mut text = serde_json::to_string_pretty(&doc)?;
             text.push('\n');
@@ -718,6 +733,10 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
         (Cause::Ci(checks), _) => render_ci(&mut out, checks),
     }
 
+    if let Some(section) = &doc.env {
+        render_env(&mut out, section);
+    }
+
     out.push("## 다음에 할 일".to_owned());
     out.push(String::new());
     for (i, step) in doc.next.iter().enumerate() {
@@ -725,6 +744,50 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
     }
     out.push(String::new());
     out.join("\n")
+}
+
+fn render_env(out: &mut Vec<String>, section: &EnvSection) {
+    out.push("## 검사 환경".to_owned());
+    out.push(String::new());
+    let hub = &section.env;
+    out.push(format!("- 머신: {}", code_span(&env::machine_line(hub))));
+    for check in &hub.checks {
+        out.push(format!(
+            "- {}: {}",
+            code_span(&check.run),
+            code_span(&env::result_text(check))
+        ));
+    }
+    match &section.preflight {
+        None => {}
+        Some(preflight) => {
+            let rows = env::differences(preflight, hub);
+            out.push(String::new());
+            if rows.is_empty() {
+                out.push("preflight와 같은 환경이다.".to_owned());
+            } else {
+                out.push(
+                    "같은 HEAD의 preflight와 다른 줄만 나란히 둔다. 없는 쪽은 그 명령을 돌리지 않았다.".to_owned(),
+                );
+                out.push(String::new());
+                out.push("| 항목 | preflight를 돌린 PC | 허브 |".to_owned());
+                out.push("| --- | --- | --- |".to_owned());
+                let cell = |text: &Option<String>| match text {
+                    Some(text) => code_span(text).replace('|', "\\|"),
+                    None => "(없음)".to_owned(),
+                };
+                for row in &rows {
+                    out.push(format!(
+                        "| {} | {} | {} |",
+                        code_span(&row.what).replace('|', "\\|"),
+                        cell(&row.preflight),
+                        cell(&row.hub)
+                    ));
+                }
+            }
+        }
+    }
+    out.push(String::new());
 }
 
 fn beside_report(path: &Path) -> &'static str {
@@ -1184,7 +1247,7 @@ impl Feedback<'_> {
     /// brings the failed tree in, and runs the v1 delivery here. The caller has fetched origin.
     pub fn receive(&self, parcel: &Parcel) -> Result<Delivery> {
         let item = &parcel.item;
-        let (failure, failed_ref, rebuild) = match &parcel.notice {
+        let (failure, failed_ref, rebuild, section) = match &parcel.notice {
             ParcelNotice::HeadChanged {
                 registered,
                 current,
@@ -1201,7 +1264,8 @@ impl Feedback<'_> {
                 failure,
                 failed_ref,
                 rebuild,
-            } => (failure, failed_ref, rebuild),
+                env: section,
+            } => (failure, failed_ref, rebuild, section),
         };
         let subject = Subject::from(item);
         let dir = self.report_dir(&subject);
@@ -1226,6 +1290,7 @@ impl Feedback<'_> {
             &subject,
             failure,
             imported.as_deref(),
+            section.as_deref().cloned(),
             Placement::Delivered {
                 rebuild: rebuild.as_ref(),
             },

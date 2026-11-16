@@ -577,7 +577,8 @@ pub struct BaseDoubt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvRecord {
-    pub machine_id: MachineId,
+    #[serde(default)]
+    pub machine_id: Option<MachineId>,
     pub host: String,
     pub checks: Vec<EnvCheck>,
 }
@@ -1196,7 +1197,7 @@ mod tests {
     #[test]
     fn an_env_record_round_trips_on_batch_and_preflight_records() {
         let env = EnvRecord {
-            machine_id: MachineId::try_from("9a0c".to_owned()).unwrap(),
+            machine_id: Some(MachineId::try_from("9a0c".to_owned()).unwrap()),
             host: "laptop-host".into(),
             checks: vec![
                 EnvCheck {

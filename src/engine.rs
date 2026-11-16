@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::ci::{self, Verdict as CiVerdict};
 use crate::config::Config;
+use crate::env::{self, EnvSection};
 use crate::ext::Ext;
 use crate::feedback::{Delivery, Feedback, Notice, Subject};
 use crate::gitops::{
@@ -763,6 +764,9 @@ impl Run<'_> {
         let mut by_queue = taken.to_vec();
         by_queue.sort_by_key(|i| self.queue_position[&i.pr]);
         let group = self.admit(&by_queue)?;
+        if !group.is_empty() {
+            self.ensure_env()?;
+        }
         self.solve(group)?;
         self.recheck_conflicts()
     }
@@ -1019,12 +1023,49 @@ impl Run<'_> {
         Ok(())
     }
 
+    fn ensure_env(&mut self) -> Result<()> {
+        if self.record.env.is_none() {
+            self.slot.checkout(&self.start_base)?;
+            let env = env::record(
+                &self.engine.ext,
+                self.slot.path(),
+                &self.engine.store.batch_dir(self.id()).join("env"),
+                &self.config.env_check,
+                &self.engine.cancel,
+            );
+            if self.engine.cancel.is_cancelled() {
+                return Ok(());
+            }
+            self.record.env = Some(env);
+            self.save_record()?;
+        }
+        Ok(())
+    }
+
+    fn env_section(&mut self, item: &QueueItem) -> Result<Option<EnvSection>> {
+        self.ensure_env()?;
+        let Some(env) = self.record.env.clone() else {
+            return Ok(None);
+        };
+        let state = self.engine.store.load()?;
+        let preflight = state
+            .preflights
+            .get(&item.branch)
+            .filter(|p| p.head == item.head)
+            .and_then(|p| p.env.clone());
+        Ok(Some(EnvSection { env, preflight }))
+    }
+
     fn bounce(&mut self, pr: PrNumber, failure: Failure, failed_ref: Option<&str>) -> Result<()> {
         let engine = self.engine;
         let item = self.items[&pr].clone();
-        let written = self
-            .feedback()
-            .write_report(&Subject::from(&item), &failure, failed_ref)?;
+        let section = self.env_section(&item)?;
+        let written = self.feedback().write_report_with_env(
+            &Subject::from(&item),
+            &failure,
+            failed_ref,
+            section,
+        )?;
         let budget = self.config.budget;
         let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
         let (to, unreachable, delivery) = if item.attempts < budget {
