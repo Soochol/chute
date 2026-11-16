@@ -37,6 +37,8 @@ pub enum Command {
     Submit(cmd::submit::Args),
     /// PR을 포기하고 사람 차례로 넘긴다
     Giveup(cmd::giveup::Args),
+    /// chute.toml을 읽어 검증 단계와 설정 오류를 보인다. 등록하거나 상태 폴더를 쓰지 않는다
+    ConfigCheck(cmd::config_check::Args),
     /// 큐, batch, 사람 차례, 오늘의 숫자를 보인다
     Status(cmd::status::Args),
     /// 승인을 기다리는 PR을 큐에 넣는다
@@ -125,6 +127,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Preflight(args) => cmd::preflight::run(args, ctx),
         Command::Submit(args) => cmd::submit::run(args, ctx),
         Command::Giveup(args) => cmd::giveup::run(args, ctx),
+        Command::ConfigCheck(args) => cmd::config_check::run(args, ctx),
         Command::Status(args) => cmd::status::run(args, ctx),
         Command::Approve(args) => cmd::approve::run(args, ctx),
         Command::Retry(args) => cmd::retry::run(args, ctx),

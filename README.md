@@ -291,6 +291,7 @@ run = "cargo test"
 timeout = 3600
 failed = 'test (\S+) \.\.\. FAILED'
 # probe = "cargo test {tests} -- --exact"
+# paths = ["src/", "Cargo.toml"]
 ```
 
 | 키 | 기본값 | 뜻 |
@@ -321,6 +322,21 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `verify.timeout` | `3600` | 초. 넘기면 그 단계는 실패(`시간 초과`)다. 시간 초과는 다시 돌려 보지 않는다 |
 | `verify.probe` | 없음 | 선택. 흔들린 시험만 되풀이하는 명령. `{tests}` 자리가 있어야 하며 없으면 설정 오류다. 예: `cargo test {tests} -- --exact` |
 | `verify.failed` | 없음 | 선택. 실패한 시험 이름을 뽑는 정규식. 캡처 그룹이 있으면 그 값이, 없으면 일치한 글이 이름이다. 없으면 보고서에 로그의 끝부분이 들어간다 |
+| `verify.paths` | 없음 | 선택. 경로 접두어의 목록. 검증하는 트리가 기준과 다른 파일 가운데 하나라도 이 가운데 어느 것으로 시작하면 그 단계를 돌고, 아니면 건너뛴다. 없으면 늘 돈다. 빈 목록이나 빈 항목은 설정 오류다 |
+
+### 단계의 `paths`
+
+`paths`가 있는 단계는 바뀐 파일이 맞을 때만 돈다. 비교는 문자열 접두어다(`"web/"`는 `web/app.js`에 맞고 `docs/web/x`에는 맞지 않는다). 이름이 바뀐 파일은 옛 경로와 새 경로를 모두 센다. 기준은 다음과 같다.
+
+- batch는 그 batch를 만든 기본 브랜치 커밋과 검증하는 트리를 비교한다. 나눠 다시 검증하는 batch도 같은 커밋을 기준으로 한다.
+- preflight는 그 preflight가 합친 기본 브랜치 커밋과 비교한다. 큐의 PR이 바꾼 파일도 들어가므로 batch보다 덜 건너뛴다.
+- 기준 검증, 기준 재검증, revert 검증은 `paths`를 무시하고 모든 단계를 돈다. 기준이 깨졌는지 보는 검사에서 단계를 건너뛰면 깨진 기준을 놓친다.
+
+건너뛴 단계는 batch 기록(`batch.json`의 `skipped`: 검증 회차와 단계 이름)과 preflight 결과에 남는다. `chute preflight`는 "건너뜀(바뀐 파일이 paths에 없다)"을 단계 이름과 함께 보이고 `--json`에는 `skipped_steps`가 있다. 건너뛴 트리도 기준으로 검증한 것으로 센다. `paths`를 잘못 적으면 그 단계가 필요한 PR에서도 건너뛰니 설정을 올리기 전에 `chute config-check`로 본다.
+
+### 설정 확인
+
+`chute config-check [--file <경로>] [--json]`은 작업 폴더(`--repo`를 주면 그 폴더, `--file`을 주면 그 파일)의 `chute.toml`을 읽어 검증 단계마다 이름, `paths`, 시간 제한을 보인다. 설정 오류가 있으면 이유를 내고 종료 코드 1로 끝난다. 저장소를 등록하지 않고 상태 폴더도 쓰지 않으며 등록되지 않은 저장소에서도 된다. chute는 기본 브랜치에 올라간 설정만 읽으므로 올리기 전에 확인하는 데 쓴다. `--json`은 `ok`, `file`, `error`, `verify`(`name`, `paths`, `timeout_s`)를 낸다.
 
 ### 원격이 여러 개일 때
 

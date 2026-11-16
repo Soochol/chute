@@ -68,6 +68,18 @@ pub struct VerifyStep {
     pub timeout: Duration,
     pub failed: Option<Regex>,
     pub probe: Option<String>,
+    /// The step runs only when a changed file starts with one of these. `None` means always.
+    pub paths: Option<NonEmpty<String>>,
+}
+
+impl VerifyStep {
+    pub fn runs_for(&self, changed: &[String]) -> bool {
+        self.paths.as_ref().is_none_or(|paths| {
+            changed
+                .iter()
+                .any(|file| paths.iter().any(|prefix| file.starts_with(prefix.as_str())))
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -161,6 +173,7 @@ struct RawStep {
     timeout: u64,
     failed: Option<String>,
     probe: Option<String>,
+    paths: Option<Vec<String>>,
 }
 
 fn default_budget() -> u32 {
@@ -279,12 +292,27 @@ impl Config {
                     step.name
                 );
             }
+            let paths = step
+                .paths
+                .map(|paths| {
+                    if paths.iter().any(|path| path.trim().is_empty()) {
+                        bail!("verify 단계 {:?}의 paths에 빈 항목이 있다", step.name);
+                    }
+                    NonEmpty::new(paths).ok_or_else(|| {
+                        anyhow!(
+                            "verify 단계 {:?}의 paths가 비어 있다. 늘 돌리려면 paths 키를 지운다",
+                            step.name
+                        )
+                    })
+                })
+                .transpose()?;
             steps.push(VerifyStep {
                 name: step.name,
                 run: step.run,
                 timeout: Duration::from_secs(step.timeout),
                 failed,
                 probe: step.probe,
+                paths,
             });
         }
         let verify = NonEmpty::new(steps)
@@ -410,6 +438,7 @@ run = {run}
 timeout = 3600          # 초
 # failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
 # probe = "cargo test {{tests}} -- --exact"   # 흔들린 시험만 되풀이하는 명령. {{tests}} 자리가 필요하다
+# paths = ["src/", "Cargo.toml"]   # 바뀐 파일이 이 접두어로 시작할 때만 이 단계를 돈다. 비우면 안 된다
 "#
     )
 }
@@ -531,6 +560,34 @@ probe = "cargo test {tests} -- --exact"
     fn rejects_missing_or_empty_verify() {
         assert!(Config::parse("budget = 3\n").is_err());
         assert!(Config::parse("verify = []\n").is_err());
+    }
+
+    fn with_paths(paths: &str) -> String {
+        format!("{MINIMAL}paths = {paths}\n")
+    }
+
+    #[test]
+    fn a_step_without_paths_always_runs_and_one_with_paths_runs_on_a_prefix_match() {
+        let always = Config::parse(MINIMAL).unwrap();
+        assert!(always.verify[0].paths.is_none());
+        assert!(always.verify[0].runs_for(&[]));
+
+        let c = Config::parse(&with_paths(r#"["web/", "Cargo.toml"]"#)).unwrap();
+        let step = &c.verify[0];
+        let files = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        assert!(step.runs_for(&files(&["docs/a.md", "web/app.js"])));
+        assert!(step.runs_for(&files(&["Cargo.toml"])));
+        assert!(step.runs_for(&files(&["Cargo.toml.bak"])), "접두어 비교다");
+        assert!(!step.runs_for(&files(&["docs/web/app.js", "src/web/x", "cargo.toml"])));
+        assert!(!step.runs_for(&[]));
+    }
+
+    #[test]
+    fn rejects_empty_or_blank_paths() {
+        for paths in ["[]", r#"[""]"#, r#"["web/", " "]"#] {
+            let e = Config::parse(&with_paths(paths)).unwrap_err().to_string();
+            assert!(e.contains("paths"), "{paths}: {e}");
+        }
     }
 
     #[test]

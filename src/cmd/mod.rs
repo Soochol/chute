@@ -1,5 +1,6 @@
 pub mod approve;
 pub mod batches;
+pub mod config_check;
 pub mod daemon;
 pub mod deliver;
 pub mod down;

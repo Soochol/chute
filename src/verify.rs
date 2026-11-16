@@ -56,6 +56,11 @@ pub struct Options<'a> {
     pub cache_dir: Option<PathBuf>,
     /// Called with the step's name as each step starts.
     pub on_step: Option<&'a dyn Fn(&str)>,
+    /// The files the verified tree changes against its base. A step with `paths` runs only when
+    /// one of them starts with a path. `None` runs every step.
+    pub changed: Option<&'a [String]>,
+    /// Called with the step's name for each step left out because of `paths`.
+    pub on_skip: Option<&'a dyn Fn(&str)>,
 }
 
 impl Default for Options<'_> {
@@ -66,6 +71,8 @@ impl Default for Options<'_> {
             kill_grace: Duration::from_secs(5),
             cache_dir: None,
             on_step: None,
+            changed: None,
+            on_skip: None,
         }
     }
 }
@@ -150,6 +157,12 @@ pub fn run(
         if opts.cancel.is_cancelled() {
             return Ok(Outcome::Cancelled);
         }
+        if opts.changed.is_some_and(|changed| !step.runs_for(changed)) {
+            if let Some(on_skip) = opts.on_skip {
+                on_skip(&step.name);
+            }
+            continue;
+        }
         if let Some(on_step) = opts.on_step {
             on_step(&step.name);
         }
@@ -209,6 +222,7 @@ pub fn run_probe(
         timeout,
         failed: None,
         probe: None,
+        paths: None,
     };
     Ok(match ctx.attempt(&step, log)? {
         End::Passed => CommandEnd::Passed,

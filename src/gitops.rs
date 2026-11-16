@@ -594,6 +594,29 @@ impl Slot {
         self.sha("HEAD")
     }
 
+    /// The files whose content differs between `base` and the slot's HEAD, as the `paths` of a
+    /// verification step see them. Renames are listed as a delete and an add, so both the old and
+    /// the new path count.
+    pub fn changed_files(&self, base: &Sha) -> Result<Vec<String>> {
+        let out = self
+            .git(&[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--no-ext-diff",
+                "-z",
+                base.as_str(),
+                "HEAD",
+            ])?
+            .ok()
+            .with_context(|| format!("{base}와 HEAD의 바뀐 파일을 읽지 못했다"))?;
+        Ok(out
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Fetches the default branch and returns its tip. `<remote>/<branch>` is moved to the same
     /// commit.
     pub fn fetch_base(&self) -> Result<Sha> {

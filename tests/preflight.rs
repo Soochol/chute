@@ -1229,3 +1229,102 @@ fn preflight_gc_failure_leaves_a_warning_and_the_next_clean_run_removes_it() {
     assert_eq!(code(&preflight(&w, &[])), 0);
     assert!(w.state().warnings.is_empty());
 }
+
+fn paths_config(steps: &[(&str, &str, &str)]) -> String {
+    let mut text = String::from("approval = \"agent\"\n");
+    for (name, run, paths) in steps {
+        text.push_str(&format!(
+            "\n[[verify]]\nname = {name:?}\nrun = {run:?}\ntimeout = 60\npaths = {paths}\n"
+        ));
+    }
+    text
+}
+
+#[test]
+fn a_step_whose_paths_match_no_changed_file_is_skipped_and_named() {
+    let w = World::with_config(Some(paths_config(&[
+        ("web", "exit 1", r#"["web/"]"#),
+        ("lib", "exit 1", r#"["lib/", "Cargo.toml"]"#),
+    ])));
+    work_on(&w, "feat/docs", "docs/note.txt", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "pass");
+    assert_eq!(doc["skipped_steps"], serde_json::json!(["web", "lib"]));
+    let plain = text(&preflight(&w, &[]));
+    assert!(
+        plain.contains("건너뛴 검증 단계 web: 건너뜀(바뀐 파일이 paths에 없다)"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn a_step_runs_when_a_changed_file_starts_with_one_of_its_paths() {
+    let w = World::with_config(Some(paths_config(&[
+        ("lib", "true", r#"["Cargo.toml", "lib/"]"#),
+        ("web", "test ! -f web/app.js", r#"["web/"]"#),
+    ])));
+    work_on(&w, "feat/web", "web/app.js", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "fail");
+    assert_eq!(doc["mode"], "solo");
+    assert_eq!(doc["skipped_steps"], serde_json::json!(["lib"]));
+    assert!(read(&doc["report"]).contains("web"));
+}
+
+#[test]
+fn a_step_without_paths_always_runs() {
+    let w = World::with_config(Some(format!(
+        "{}\n[[verify]]\nname = \"always\"\nrun = \"test ! -f docs/note.txt\"\n",
+        paths_config(&[("web", "true", r#"["web/"]"#)])
+    )));
+    work_on(&w, "feat/docs", "docs/note.txt", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(json(&out)["skipped_steps"], serde_json::json!(["web"]));
+}
+
+#[test]
+fn the_base_check_runs_every_step_whatever_paths_say() {
+    let w = World::with_config(Some(paths_config(&[
+        ("web", "test ! -f bad.txt", r#"["web/"]"#),
+        ("lib", "test ! -f lib/bad.txt", r#"["lib/"]"#),
+    ])));
+    let base = break_main(&w);
+    work_on(&w, "feat/lib", "lib/bad.txt", "x\n");
+    let out = preflight(&w, &["--json"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "base_broken");
+    assert_eq!(doc["base"], base);
+    assert_eq!(doc["base_broken"]["step"], "web");
+    assert_eq!(doc["skipped_steps"], serde_json::json!(["web"]));
+}
+
+#[test]
+fn moving_a_file_out_of_a_step_s_paths_still_runs_that_step() {
+    let w = World::with_config(Some(paths_config(&[(
+        "web",
+        "test ! -f docs/old.js",
+        r#"["web/"]"#,
+    )])));
+    w.repo
+        .commit_file("web/old.js", "same content\n", "feat: web 파일");
+    w.repo.git(&["push", "--quiet", "origin", "main"]);
+    w.repo
+        .git(&["checkout", "--quiet", "-b", "feat/move", "origin/main"]);
+    fs::create_dir_all(w.repo.path().join("docs")).unwrap();
+    w.repo.git(&["mv", "web/old.js", "docs/old.js"]);
+    w.repo
+        .git(&["commit", "--quiet", "-m", "feat: 파일을 옮긴다"]);
+
+    let out = preflight(&w, &["--json"]);
+
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["result"], "fail");
+    assert_eq!(doc["skipped_steps"], serde_json::json!([]));
+}

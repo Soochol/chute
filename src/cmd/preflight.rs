@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -62,6 +63,7 @@ struct Report {
     base: Sha,
     with: Vec<PrNumber>,
     skipped: Vec<Skipped>,
+    skipped_steps: Vec<String>,
     flaky: Vec<FlakyReport>,
     kind: Option<FailureKind>,
     mode: Option<Mode>,
@@ -128,6 +130,7 @@ struct Judged {
     result: PreflightResult,
     with: Vec<PrNumber>,
     flaky: Vec<FlakyStep>,
+    skipped_steps: Vec<String>,
     written: Option<Written>,
     base_broken: Option<BrokenBase>,
 }
@@ -433,6 +436,7 @@ impl Run<'_> {
             result: PreflightResult::Conflict,
             with,
             flaky: Vec::new(),
+            skipped_steps: Vec::new(),
             written: Some(written),
             base_broken: None,
         })
@@ -457,12 +461,14 @@ impl Run<'_> {
 
     fn verify(&self, tip: &Sha) -> Result<Judged> {
         let with = self.with();
-        let failed = match self.run_steps(&self.log_dir.join("with-queue"))? {
+        let (outcome, skipped_steps) = self.run_steps(&self.log_dir.join("with-queue"), true)?;
+        let failed = match outcome {
             Outcome::Passed { flaky } => {
                 return Ok(Judged {
                     result: PreflightResult::Pass,
                     with,
                     flaky,
+                    skipped_steps,
                     written: None,
                     base_broken: None,
                 });
@@ -499,6 +505,7 @@ impl Run<'_> {
                 result: PreflightResult::BaseBroken,
                 with,
                 flaky: Vec::new(),
+                skipped_steps,
                 written: None,
                 base_broken: Some(broken),
             });
@@ -508,6 +515,7 @@ impl Run<'_> {
             result: PreflightResult::Fail,
             with,
             flaky: Vec::new(),
+            skipped_steps,
             written: Some(written),
             base_broken: None,
         })
@@ -518,7 +526,7 @@ impl Run<'_> {
             return Ok(None);
         }
         self.slot.checkout(self.base)?;
-        match self.run_steps(&self.log_dir.join("base"))? {
+        match self.run_steps(&self.log_dir.join("base"), false)?.0 {
             Outcome::Passed { .. } => Ok(None),
             Outcome::Failed(failed) => Ok(Some(BrokenBase {
                 step: failed.step,
@@ -538,7 +546,7 @@ impl Run<'_> {
         if let Some(ItemResult::Conflict(files)) = solo.items.first().map(|item| &item.result) {
             return Ok(Alone::Conflicts(files.clone()));
         }
-        match self.run_steps(&self.log_dir.join("solo"))? {
+        match self.run_steps(&self.log_dir.join("solo"), true)?.0 {
             Outcome::Passed { .. } => Ok(Alone::Passes),
             Outcome::Failed(failed) => Ok(Alone::Fails(failed, solo.tip)),
             Outcome::Cancelled => bail!("검증이 취소됐다"),
@@ -573,15 +581,32 @@ impl Run<'_> {
             .write_report_with_env(&self.subject(), failure, failed_ref, Some(section))
     }
 
-    fn run_steps(&self, log_dir: &Path) -> Result<Outcome> {
+    /// Runs the steps on the slot's HEAD. With `only_changed`, a step whose `paths` match none
+    /// of the files HEAD changes against the preflight's base is left out and named in the
+    /// second value. The base itself is verified with every step.
+    fn run_steps(&self, log_dir: &Path, only_changed: bool) -> Result<(Outcome, Vec<String>)> {
+        let changed = if only_changed {
+            Some(self.slot.changed_files(self.base)?)
+        } else {
+            None
+        };
+        let skipped = RefCell::new(Vec::new());
         let on_step = |name: &str| eprintln!("검증 단계: {name}");
+        let on_skip = |name: &str| {
+            eprintln!("건너뛴 검증 단계: {name} (바뀐 파일이 paths에 없다)");
+            skipped.borrow_mut().push(name.to_owned());
+        };
         let options = Options {
             cache_dir: Some(self.gitops.cache_dir()),
             on_step: Some(&on_step),
+            changed: changed.as_deref(),
+            on_skip: Some(&on_skip),
             ..Options::default()
         };
-        verify::run(self.config, self.store, self.slot.path(), log_dir, &options)
-            .with_context(|| format!("검증을 돌리지 못했다 (저장소 {})", self.info.slug))
+        let outcome = verify::run(self.config, self.store, self.slot.path(), log_dir, &options)
+            .with_context(|| format!("검증을 돌리지 못했다 (저장소 {})", self.info.slug))?;
+        drop(options);
+        Ok((outcome, skipped.into_inner()))
     }
 }
 
@@ -648,6 +673,7 @@ impl Report {
             base: base.clone(),
             with: judged.with.clone(),
             skipped,
+            skipped_steps: std::mem::take(&mut judged.skipped_steps),
             flaky: judged
                 .flaky
                 .iter()
@@ -786,6 +812,11 @@ fn render(report: &Report) -> String {
             skipped.why.label()
         ));
     }
+    for step in &report.skipped_steps {
+        out.push_str(&format!(
+            "건너뛴 검증 단계 {step}: 건너뜀(바뀐 파일이 paths에 없다)\n"
+        ));
+    }
     out.push_str(&format!("검사 환경: {}\n", env::machine_line(&report.env)));
     for check in &report.env.checks {
         out.push_str(&format!("  {}: {}\n", check.run, env::result_text(check)));
@@ -819,6 +850,7 @@ mod tests {
             base: sha("fedcba9876543210fedcba9876543210fedcba98"),
             with: with.iter().map(|n| PrNumber(*n)).collect(),
             skipped: Vec::new(),
+            skipped_steps: Vec::new(),
             flaky: Vec::new(),
             kind: None,
             mode: None,
