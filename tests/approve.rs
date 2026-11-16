@@ -1,3 +1,4 @@
+mod forward_kit;
 mod queue_kit;
 mod support;
 
@@ -141,4 +142,65 @@ fn approve_with_the_current_head_or_a_prefix_of_it_approves() {
 
     assert_eq!(w.entry(12).unwrap()["state"], "queued");
     assert_eq!(w.entry(13).unwrap()["state"], "queued");
+}
+
+#[test]
+fn approve_on_another_pc_changes_the_hub_queue_only_and_reads_like_the_hub() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::AwaitingApproval)]);
+    let a_before = forward_kit::state_file(a);
+
+    let out = a.chute(forward_kit::BIN, &["approve", "12"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(forward_kit::out(&out), "승인했다: #12. 큐에 들어갔다\n");
+    assert_eq!(
+        forward_kit::state(b).queue[0].state,
+        ItemState::Queued(None)
+    );
+    assert_eq!(forward_kit::state_file(a), a_before);
+}
+
+#[test]
+fn approve_on_another_pc_passes_head_and_the_hubs_refusal_comes_back_unchanged() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::AwaitingApproval)]);
+
+    let args = ["approve", "12", "--head", "def5678"];
+    let remote = a.chute(forward_kit::BIN, &args);
+    let direct = b.chute(forward_kit::BIN, &args);
+
+    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
+    assert_eq!(remote.status.code(), direct.status.code());
+    assert_eq!(remote.stderr, direct.stderr);
+    assert!(stderr(&remote).contains("승인하려던 HEAD def5678"));
+    assert_eq!(
+        forward_kit::state(b).queue[0].state,
+        ItemState::AwaitingApproval
+    );
+
+    let ok = a.chute(forward_kit::BIN, &["approve", "12", "--head=abc1"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
+}
+
+#[test]
+fn approve_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
+    let net = forward_kit::net();
+    forward_kit::assert_unreachable_hub(&net, &["approve", "12"]);
+    forward_kit::assert_not_hub_answer(&net, &["approve", "12"]);
+}
+
+#[test]
+fn a_head_that_starts_with_a_hyphen_is_refused_by_the_hub_not_by_the_parser() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(b, vec![item(12, ItemState::AwaitingApproval)]);
+
+    let remote = a.chute(forward_kit::BIN, &["approve", "12", "--head=-abc"]);
+    let direct = b.chute(forward_kit::BIN, &["approve", "12", "--head=-abc"]);
+
+    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
+    assert_eq!(remote.stderr, direct.stderr);
 }

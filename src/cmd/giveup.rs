@@ -3,7 +3,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::{Ctx, Refusal, finish};
+use super::{Ctx, Refusal, finish, run_on_hub};
+use crate::hub::{Route, route};
 use crate::model::{EpochMs, Event, EventKind, PrNumber};
 use crate::queue;
 
@@ -17,14 +18,35 @@ pub struct Args {
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    if let Err(e) = reason_of(&args) {
+        return finish(Err(e));
+    }
+    if !ctx.forwarded() && route(&ctx.home, &ctx.ext, &ctx.slug()?)? != Route::Local {
+        let pr = match args.pr {
+            Some(pr) => pr,
+            None => current_pr(ctx)?,
+        }
+        .0
+        .to_string();
+        let reason = format!("--reason={}", args.reason);
+        let forwarded = ["giveup", pr.as_str(), reason.as_str()];
+        if let Some(code) = run_on_hub(ctx, &forwarded)? {
+            return Ok(code);
+        }
+    }
     finish(giveup(&args, ctx))
 }
 
-fn giveup(args: &Args, ctx: &Ctx) -> Result<()> {
+fn reason_of(args: &Args) -> Result<&str> {
     let reason = args.reason.trim();
     if reason.is_empty() {
         return Err(Refusal("--reason에 포기하는 이유를 적어야 한다".into()).into());
     }
+    Ok(reason)
+}
+
+fn giveup(args: &Args, ctx: &Ctx) -> Result<()> {
+    let reason = reason_of(args)?;
     let (_, store) = ctx.registered_repo()?;
     let pr = match args.pr {
         Some(pr) => pr,

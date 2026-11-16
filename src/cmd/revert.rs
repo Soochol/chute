@@ -3,10 +3,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::batches::{self, Loaded, short};
-use super::{Ctx, Refusal, finish};
+use super::{CANNOT_RUN, Ctx, FORWARD_TIMEOUT, Refusal, finish, forward_to_hub};
 use crate::config::Config;
 use crate::engine::VERIFIED_BASES_KEPT;
 use crate::gitops::{Gitops, PushOutcome, Slot, SlotName};
+use crate::hub::{Route, route};
 use crate::model::{
     BatchId, EpochMs, Event, EventKind, MergeRef, PrNumber, RepoInfo, RevertRecord, RevertedPr, Sha,
 };
@@ -25,7 +26,52 @@ pub struct Args {
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    if let Route::Remote { name, .. } = route(&ctx.home, &ctx.ext, &ctx.slug()?)? {
+        let command = hub_command(ctx, &name, &args);
+        eprintln!(
+            "chute: revert는 허브에서만 실행한다. 이 저장소의 허브는 `{name}`이다. \
+             검증까지 하면 시간이 오래 걸려 넘기지 않는다. 허브에서 실행하는 명령:\n  {command}"
+        );
+        return Ok(ExitCode::from(CANNOT_RUN));
+    }
     finish(revert(&args, ctx))
+}
+
+fn hub_command(ctx: &Ctx, hub: &str, args: &Args) -> String {
+    let path = hub_repo_path(ctx)
+        .map(|path| shell_word(&path))
+        .unwrap_or_else(|| "<허브의 저장소 경로>".to_owned());
+    let mut command = format!(
+        "hc run --on {hub} --cwd {path} chute revert {}",
+        shell_word(&args.batch)
+    );
+    if args.no_verify {
+        command.push_str(" --no-verify");
+    }
+    command
+}
+
+fn hub_repo_path(ctx: &Ctx) -> Option<String> {
+    let answer = forward_to_hub(ctx, &["status", "--json"], FORWARD_TIMEOUT)
+        .ok()
+        .flatten()?;
+    if answer.code != 0 {
+        return None;
+    }
+    let status: serde_json::Value = serde_json::from_slice(&answer.stdout).ok()?;
+    Some(status["repo"]["path"].as_str()?.to_owned())
+}
+
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-:@+=,".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 fn refuse<T>(message: impl Into<String>) -> Result<T> {

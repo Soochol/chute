@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::daemon::{Stop, request_stop};
-use super::{Ctx, finish};
+use super::{Ctx, FORWARD_TIMEOUT, finish, forward_to_hub, relay};
 
 const WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(100);
@@ -18,6 +18,13 @@ pub struct Args {
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    let mut forwarded = vec!["down"];
+    if args.now {
+        forwarded.push("--now");
+    }
+    if let Some(answer) = forward_to_hub(ctx, &forwarded, FORWARD_TIMEOUT + WAIT)? {
+        return Ok(relay(&answer));
+    }
     finish(down(&args, ctx))
 }
 

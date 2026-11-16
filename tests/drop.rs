@@ -1,3 +1,4 @@
+mod forward_kit;
 mod queue_kit;
 mod support;
 
@@ -78,4 +79,46 @@ fn a_corrupt_state_file_stops_drop_with_exit_code_2_and_is_left_alone() {
     let out = w.chute(w.repo.path(), &["drop", "12"]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(std::fs::read_to_string(w.state_file()).unwrap(), garbage);
+}
+
+#[test]
+fn drop_on_another_pc_removes_the_item_from_the_hub_queue_only() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    forward_kit::seed(
+        b,
+        vec![
+            item(12, ItemState::Queued(None)),
+            item(13, ItemState::Queued(None)),
+        ],
+    );
+    let a_before = forward_kit::state_file(a);
+
+    let out = a.chute(forward_kit::BIN, &["drop", "12"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(forward_kit::out(&out), "큐에서 뺐다: #12 (PR 12)\n");
+    let left: Vec<u64> = forward_kit::state(b).queue.iter().map(|i| i.pr.0).collect();
+    assert_eq!(left, [13]);
+    assert_eq!(forward_kit::state_file(a), a_before);
+}
+
+#[test]
+fn a_refused_drop_on_another_pc_has_the_hubs_exit_code_and_message() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+
+    let remote = a.chute(forward_kit::BIN, &["drop", "99"]);
+    let direct = b.chute(forward_kit::BIN, &["drop", "99"]);
+
+    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
+    assert_eq!(remote.status.code(), direct.status.code());
+    assert_eq!(remote.stderr, direct.stderr);
+}
+
+#[test]
+fn drop_on_another_pc_says_so_when_the_hub_is_down_or_this_is_not_the_hub() {
+    let net = forward_kit::net();
+    forward_kit::assert_unreachable_hub(&net, &["drop", "12"]);
+    forward_kit::assert_not_hub_answer(&net, &["drop", "12"]);
 }

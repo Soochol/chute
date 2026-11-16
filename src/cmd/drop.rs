@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use super::{Ctx, finish};
+use super::{Ctx, finish, run_on_hub};
 use crate::model::PrNumber;
 use crate::queue;
 
@@ -13,6 +13,10 @@ pub struct Args {
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    let pr = args.pr.0.to_string();
+    if let Some(code) = run_on_hub(ctx, &["drop", &pr])? {
+        return Ok(code);
+    }
     finish(drop_pr(&args, ctx))
 }
 

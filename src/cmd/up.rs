@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use super::{Ctx, finish};
+use super::{Ctx, finish, run_on_hub};
 use crate::ext::Output;
 use crate::model::{RepoInfo, TerminalId};
 use crate::store::RepoStore;
@@ -19,6 +19,9 @@ const NAME_TRIES: u32 = 5;
 pub struct Args {}
 
 pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    if let Some(code) = run_on_hub(ctx, &["up"])? {
+        return Ok(code);
+    }
     finish(up(ctx))
 }
 

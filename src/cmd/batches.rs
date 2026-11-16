@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone};
 use serde::Serialize;
 
-use super::Ctx;
+use super::{Ctx, run_on_hub};
 use crate::model::{BatchId, BatchRecord, EpochMs, EventKind, PrNumber, RevertRecord, Sha};
 use crate::store::RepoStore;
 
@@ -113,6 +113,14 @@ fn entries(all: &[Loaded], limit: usize) -> Vec<Entry> {
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    let limit = args.limit.to_string();
+    let mut forwarded = vec!["batches", "--limit", limit.as_str()];
+    if args.json {
+        forwarded.push("--json");
+    }
+    if let Some(code) = run_on_hub(ctx, &forwarded)? {
+        return Ok(code);
+    }
     let (_, store) = ctx.registered_repo()?;
     let entries = entries(&load_all(&store)?, args.limit);
     if args.json {

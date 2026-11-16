@@ -11,6 +11,7 @@ use nix::sys::signal::{SigHandler, Signal, signal};
 use super::Ctx;
 use crate::engine::{Engine, Pass};
 use crate::feedback;
+use crate::hub::{Route, route};
 use crate::model::{DaemonInfo, EpochMs, PrNumber, Warning, WarningKind};
 use crate::store::RepoStore;
 use crate::verify::Cancel;
@@ -70,6 +71,12 @@ impl Flags {
 }
 
 pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    if let Route::Remote { name, .. } = route(&ctx.home, &ctx.ext, &ctx.slug()?)? {
+        anyhow::bail!(
+            "데몬은 허브에서만 돈다. 이 저장소의 허브는 `{name}`이다. \
+             이 PC에서는 `chute up`으로 허브에 데몬을 띄운다"
+        );
+    }
     let (info, store) = ctx.registered_repo()?;
     let Some(_lock) = store.try_lock_daemon()? else {
         eprintln!("chute: {}의 데몬이 이미 돌고 있다", info.slug);

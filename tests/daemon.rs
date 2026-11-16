@@ -1,4 +1,5 @@
 mod engine_kit;
+mod forward_kit;
 mod support;
 
 use std::process::{Child, Command, Output, Stdio};
@@ -385,4 +386,19 @@ fn a_daemon_whose_state_write_failed_after_telling_the_agent_recovers_the_pr_by_
 
     ok(chute(&lab, &["down", "--now"]).output().unwrap());
     wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
+}
+
+#[test]
+fn daemon_on_a_pc_that_is_not_the_hub_is_refused_and_starts_nothing() {
+    let net = forward_kit::net();
+    let a = net.node("a");
+
+    let out = forward_kit::chute_within(a, &["daemon"], Duration::from_secs(20));
+
+    assert_eq!(out.status.code(), Some(2), "{}", forward_kit::err(&out));
+    let said = forward_kit::err(&out);
+    assert!(said.contains("데몬은 허브에서만 돈다"), "{said}");
+    assert!(said.contains("`b`"), "{said}");
+    assert!(!forward_kit::store(a).daemon_running().unwrap());
+    assert!(forward_kit::out(&out).is_empty());
 }
