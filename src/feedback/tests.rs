@@ -1249,6 +1249,61 @@ fn the_line_sent_to_a_pane_has_nothing_a_shell_would_act_on() {
 }
 
 #[test]
+fn require_head_repos_are_told_to_report_where_other_repos_are_told_to_submit() {
+    const REPORT: &str = "PR 번호와 새 HEAD를 보고한다";
+    for (require_head, config) in [
+        (true, format!("require_head = true\n{CONFIG}")),
+        (false, format!("require_head = false\n{CONFIG}")),
+        (false, CONFIG.to_owned()),
+    ] {
+        let lab = Lab::with_config(&config);
+        let mut item = lab.item(12, "feat/a");
+        item.agent = Some(lab.recorded_agent(lab.repo.path()));
+        lab.hc()
+            .respond("get t1rs*", terminal("t1rs", "live", RECORDED_MS))
+            .respond("send t1rs *", Reply::ok("{}"));
+        let failure = Failure::Conflict {
+            files: one(ConflictFile {
+                path: "a.txt".into(),
+                main_commits: vec![],
+            }),
+        };
+        let written = lab
+            .fb()
+            .write_report(&Subject::from(&item), &failure, None)
+            .unwrap();
+        let (registered, current) = (sha("abc1234def5678"), sha("0123456789abcdef"));
+        for notice in [
+            Notice::Bounced(&written),
+            Notice::HeadChanged {
+                registered: &registered,
+                current: &current,
+            },
+        ] {
+            lab.fb().deliver(&item, &notice);
+        }
+
+        let mut texts = vec![read(&written.md)];
+        let calls = lab.hc_calls();
+        texts.extend(
+            calls
+                .iter()
+                .filter(|c| c[0] == "send")
+                .map(|c| c[2].clone()),
+        );
+        assert_eq!(texts.len(), 3, "{calls:?}");
+        for text in texts {
+            assert_eq!(text.contains(REPORT), require_head, "{config}\n{text}");
+            assert_eq!(
+                text.contains("chute submit"),
+                !require_head,
+                "{config}\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_started_agent_is_recorded_from_the_run_result_without_asking_hc_again() {
     let lab = Lab::new();
     lab.repo.pr_branch("feat/a", "a.txt", "a\n");

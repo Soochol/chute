@@ -12,8 +12,17 @@ pub const REQUIRE_HEAD_NOTICE: &str =
     "이 저장소에서는 submit하지 말고 PR과 HEAD를 보고한다 (`require_head = true`)";
 
 pub fn run(ctx: &Ctx) -> Result<ExitCode> {
+    print(&text_for(ctx))
+}
+
+/// The manual without the line that needs the state folder, for when no folder can be named.
+pub fn run_without_state() -> Result<ExitCode> {
+    print(MANUAL)
+}
+
+fn print(text: &str) -> Result<ExitCode> {
     let mut out = std::io::stdout().lock();
-    out.write_all(text_for(ctx).as_bytes())
+    out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
         .context("설명서를 출력하지 못했다")?;
     Ok(ExitCode::SUCCESS)

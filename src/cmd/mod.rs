@@ -144,7 +144,10 @@ pub fn relay(answer: &Forwarded) -> ExitCode {
     let _ = std::io::stdout().write_all(&answer.stdout);
     let _ = std::io::stderr().write_all(&answer.stderr);
     if answer.truncated {
-        eprintln!("경고: 허브의 출력이 너무 커서 뒤가 잘렸다");
+        eprintln!(
+            "chute: 허브의 출력이 너무 커서 뒤가 잘렸다. 결과를 끝까지 알 수 없어 실행할 수 없음으로 끝낸다. 명령이 기록됐는지는 `chute status`로 확인한다"
+        );
+        return ExitCode::from(CANNOT_RUN);
     }
     ExitCode::from(u8::try_from(answer.code).unwrap_or(CANNOT_RUN))
 }

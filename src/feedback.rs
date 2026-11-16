@@ -228,7 +228,12 @@ impl Feedback<'_> {
                 at_ms: EpochMs::now(),
                 subject: subject.clone(),
                 summary: summarize(&cause),
-                next: next_steps(subject, &cause, &self.repo.default_branch),
+                next: next_steps(
+                    subject,
+                    &cause,
+                    &self.repo.default_branch,
+                    self.config.require_head,
+                ),
                 step,
                 failure: failure.clone(),
                 env,
@@ -658,10 +663,19 @@ fn summarize(cause: &Cause) -> String {
     }
 }
 
-fn next_steps(subject: &Subject, cause: &Cause, default_branch: &str) -> Vec<String> {
+fn next_steps(
+    subject: &Subject,
+    cause: &Cause,
+    default_branch: &str,
+    require_head: bool,
+) -> Vec<String> {
     let this = subject.this();
     let merge = format!("`git fetch origin`, `git merge origin/{default_branch}` 순서로 실행해");
     let (fix, give_up) = match subject {
+        Subject::Pr { .. } if require_head => (
+            "고쳐서 커밋하고 push한 뒤 PR 번호와 새 HEAD를 보고한다. 이 저장소는 `require_head = true`라 submit하지 않는다.",
+            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. 사람 차례로 넘어간다.",
+        ),
         Subject::Pr { .. } => (
             "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",
             "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. 사람 차례로 넘어간다.",
@@ -980,7 +994,7 @@ pub enum Notice<'a> {
 }
 
 impl Notice<'_> {
-    fn line(&self, item: &QueueItem) -> String {
+    fn line(&self, item: &QueueItem, require_head: bool) -> String {
         let label = format!("PR {}", item.pr);
         match self {
             Notice::Bounced(written) => {
@@ -1004,11 +1018,18 @@ impl Notice<'_> {
             Notice::HeadChanged {
                 registered,
                 current,
-            } => without_shell_syntax(&format!(
-                "chute 알림: {label}의 HEAD가 바뀌었다. 등록한 HEAD: {}, 지금 HEAD: {}. 머지는 등록한 HEAD만 한다. 고칠 것이 끝났으면 `chute submit`을 다시 실행한다.",
-                short(registered),
-                short(current)
-            )),
+            } => {
+                let again = if require_head {
+                    "고칠 것이 끝났으면 PR 번호와 새 HEAD를 보고한다."
+                } else {
+                    "고칠 것이 끝났으면 `chute submit`을 다시 실행한다."
+                };
+                without_shell_syntax(&format!(
+                    "chute 알림: {label}의 HEAD가 바뀌었다. 등록한 HEAD: {}, 지금 HEAD: {}. 머지는 등록한 HEAD만 한다. {again}",
+                    short(registered),
+                    short(current)
+                ))
+            }
         }
     }
 }
@@ -1332,7 +1353,7 @@ impl Feedback<'_> {
     }
 
     fn deliver_here(&self, item: &QueueItem, notice: &Notice<'_>) -> Delivery {
-        let line = notice.line(item);
+        let line = notice.line(item, self.config.require_head);
         if let Some(agent) = &item.agent {
             match self.send(agent, &line) {
                 Attempt::Sent => {

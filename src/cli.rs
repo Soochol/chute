@@ -97,7 +97,12 @@ fn restore_sigpipe() {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let ctx = Ctx::from_env(cli.repo.clone())?.with_slug(cli.slug.clone());
+    let ctx = match Ctx::from_env(cli.repo.clone()) {
+        Ok(ctx) => ctx,
+        Err(_) if cli.skill && cli.command.is_none() => return cmd::skill::run_without_state(),
+        Err(e) => return Err(e),
+    };
+    let ctx = ctx.with_slug(cli.slug.clone());
     dispatch(cli, &ctx)
 }
 

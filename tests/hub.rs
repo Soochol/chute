@@ -2,7 +2,7 @@ mod support;
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{ExitCode, Output};
 use std::time::Duration;
 
 use chute::cmd::{Ctx, Refusal, forward_to_hub, run_on_hub};
@@ -448,6 +448,21 @@ fn each_hc_failure_is_told_apart() {
     home_of(a).repo(&slug()).set_hub(nobody).unwrap();
     let err = run_on_hub(&ctx(a), &["status"]).unwrap_err();
     assert_eq!(kind(&err), ForwardErrorKind::UnknownMachine);
+}
+
+#[test]
+fn a_relayed_answer_that_was_cut_short_ends_as_cannot_run_and_says_so() {
+    let net = net(&["a", "b"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    point_at(a, b);
+
+    let whole = run_on_hub(&ctx(a), &["status"]).unwrap().unwrap();
+    assert_eq!(format!("{whole:?}"), format!("{:?}", ExitCode::SUCCESS));
+
+    a.truncate_exec_output();
+    let cut = run_on_hub(&ctx(a), &["status"]).unwrap().unwrap();
+    assert_eq!(format!("{cut:?}"), format!("{:?}", ExitCode::from(2)));
 }
 
 #[test]

@@ -7,6 +7,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use super::Ctx;
+use crate::config::Config;
 use crate::ext::Ext;
 
 /// Claude Code reads exit code 2 from a PreToolUse hook as "block the tool call and show stderr
@@ -174,6 +175,24 @@ impl<'a> Repo<'a> {
             .then(|| tracked.split_once('/').map(|(_, branch)| branch.to_owned()))?
     }
 
+    /// Same source as `submit`: `chute.toml` on the remote default branch. An unreadable
+    /// config counts as off, so the block message stays the usual one.
+    fn requires_head(&self) -> bool {
+        self.default_branches
+            .first()
+            .and_then(|branch| Config::load_remote_branch(self.ext, &self.dir, branch).ok()?)
+            .is_some_and(|config| config.require_head)
+    }
+
+    /// What to do once the work is on the PR branch.
+    fn hand_in(&self) -> &'static str {
+        if self.requires_head() {
+            "PR 번호와 HEAD를 보고한다(이 저장소는 `require_head = true`라 submit하지 않는다)"
+        } else {
+            "`chute submit`으로 큐에 넣는다"
+        }
+    }
+
     fn is_default(&self, branch: &str) -> bool {
         self.default_branches.iter().any(|d| d == branch)
     }
@@ -205,17 +224,18 @@ fn default_branches(ext: &Ext, dir: &Path) -> Vec<String> {
 impl Kind {
     fn verdict(&self, repo: &Repo) -> Option<String> {
         match self {
-            Kind::PrMerge => Some(
+            Kind::PrMerge => Some(format!(
                 "chute: 이 저장소는 chute가 머지한다. `gh pr merge`는 쓰지 않는다. \
-                 PR을 올린 뒤 `chute preflight`로 검증하고 `chute submit`으로 큐에 넣는다. \
-                 절차는 `chute --skill`에 있다."
-                    .to_owned(),
-            ),
+                 PR을 올린 뒤 `chute preflight`로 검증하고 {}. \
+                 절차는 `chute --skill`에 있다.",
+                repo.hand_in()
+            )),
             Kind::Push(push) => push.hits_default_branch(repo).map(|branch| {
                 format!(
                     "chute: 기본 브랜치({branch})로 직접 push하지 않는다. \
-                     PR 브랜치에 push하고 `chute preflight`로 검증한 뒤 `chute submit`으로 큐에 넣는다. \
-                     절차는 `chute --skill`에 있다."
+                     PR 브랜치에 push하고 `chute preflight`로 검증한 뒤 {}. \
+                     절차는 `chute --skill`에 있다.",
+                    repo.hand_in()
                 )
             }),
         }
@@ -771,6 +791,31 @@ mod tests {
             let reason = reason.unwrap_or_else(|| panic!("막히지 않았다: {command}"));
             assert!(reason.contains("chute preflight"), "{reason}");
             assert!(reason.contains("chute submit"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_require_head_repository_is_told_to_report_instead_of_to_submit() {
+        for (config, reports) in [
+            ("require_head = true\n", true),
+            ("require_head = false\n", false),
+            ("", false),
+            ("require_head = true\nnot toml [", false),
+        ] {
+            let config = format!("{config}[[verify]]\nname = \"t\"\nrun = \"true\"\n");
+            let fx = Fixture::new(false);
+            fx.repo.commit_file("chute.toml", &config, "chore: 설정");
+            fx.repo.git(&["push", "--quiet", "origin", "main"]);
+            for command in ["git push origin main", "gh pr merge 12"] {
+                let reason = fx.verdict(command).unwrap();
+                assert!(reason.contains("chute preflight"), "{reason}");
+                assert_eq!(
+                    reason.contains("PR 번호와 HEAD를 보고한다"),
+                    reports,
+                    "{reason}"
+                );
+                assert_eq!(reason.contains("`chute submit`"), !reports, "{reason}");
+            }
         }
     }
 
