@@ -344,11 +344,11 @@ chute는 `origin`이라는 이름을 고정해 쓰지 않는다. 관리하는 �
 
 1. `chute.toml`의 `remote = "<이름>"`이 있으면 그 원격을 쓴다.
 2. 없으면 이미 `chute init`으로 등록한 저장소의 URL과 맞는 원격이 하나뿐일 때 그 원격을 쓴다. 등록한 것이 아직 없으면 원격이 하나뿐일 때 그 원격을 쓴다.
-3. 맞는 원격이 없거나 둘 이상이면 오류로 멈춘다. 오류가 `git remote -v`로 확인하고 `remote` 키를 적으라고 안내한다.
+3. 맞는 원격이 여럿이어도 주소가 모두 같으면(ssh와 https 형태, `.git` 유무 차이는 같은 주소다) `origin`을, 없으면 이름순 첫째를 쓰고 `chute init`이 한 줄로 알린다. 주소가 서로 다른 원격이 둘 이상이거나 맞는 원격이 없으면 오류로 멈춘다. 오류가 `git remote -v`로 확인하고 `remote` 키를 적으라고 안내한다.
 
 예를 들어 fork를 `origin`으로 두고 GitHub 저장소를 `upstream`으로 둔 clone은 `chute.toml`에 `remote = "upstream"`을 적고 `chute init`을 실행한다. 그 뒤로 `chute submit`, batch 머지, 설정 읽기, 기본 브랜치 push는 모두 `upstream`으로 간다. `chute init`은 고른 원격의 이름을 등록 정보(`repo.json`의 `remote_name`)에 적는다. `remote` 키를 바꿨으면 `chute init`을 다시 실행해 등록을 고친다. `remote_name`이 없는 옛 등록은 `origin`으로 본다.
 
-`remote` 키는 작업 폴더의 `chute.toml`에서 읽는다. 기본 브랜치에도 올려 두면 다른 clone에서도 같은 원격을 고른다. 허브가 다른 PC일 때 그 PC의 원격 이름은 그 PC의 등록 정보를 따른다.
+`remote` 키는 작업 폴더의 `chute.toml`에서 읽고, 없으면 원격의 기본 브랜치(`<원격>/main`, `<원격>/master`)에 올라간 `chute.toml`에서 읽는다. 기본 브랜치에도 올려 두면 다른 clone에서도 같은 원격을 고른다. 허브가 다른 PC일 때 그 PC의 원격 이름은 그 PC의 등록 정보를 따른다.
 
 
 **`respawn`의 기본값은 `[]`이다.** 반송을 받을 에이전트가 없거나 터미널이 끝났으면 chute는 에이전트를 띄우지 않고 그 PR을 사람 차례(`전달 실패`)로 올린다. 값을 넣으면 그 명령으로 새 에이전트를 띄운다. 실행 파일과 인자를 나눠 적는다(`respawn = ["claude"]`). **`--dangerously-skip-permissions`를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행하게 한다.** 무인으로 뜨는 에이전트가 권한 대화상자에서 멈추지 않게 하려는 선택이지만, 사용자가 직접 켜는 옵션으로만 둔다(`respawn = ["claude", "--dangerously-skip-permissions"]`). 새 에이전트는 PR 브랜치의 worktree에서 돈다. 원래 에이전트의 worktree가 남아 있으면 그곳이고, 없으면 `~/.herdr/worktrees/<저장소>/<브랜치>`에 만든다. 사용자의 chute 체크아웃이 그 PR 브랜치를 쥐고 있으면 새 에이전트가 그 폴더에서 돈다. 권한 확인을 건너뛰는 값을 넣었다면 그곳에서도 권한 확인 없이 실행된다.

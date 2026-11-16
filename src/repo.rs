@@ -32,7 +32,7 @@ fn known_repos(
 pub fn slug(ext: &Ext, dir: &Path, registered: &Registry) -> Result<Slug> {
     let tree = work_tree(ext, dir)?;
     let all = remotes(ext, dir)?;
-    let key = local_remote_key(&tree);
+    let key = remote_key(ext, dir, &tree, &all);
     let known = known_repos(&all, key.as_deref(), registered)?;
     Ok(managed(&all, key.as_deref(), &known)?.slug.clone())
 }
@@ -40,7 +40,7 @@ pub fn slug(ext: &Ext, dir: &Path, registered: &Registry) -> Result<Slug> {
 pub fn discover(ext: &Ext, dir: &Path, registered: &Registry) -> Result<RepoInfo> {
     let path = work_tree(ext, dir)?;
     let all = remotes(ext, dir)?;
-    let key = local_remote_key(&path);
+    let key = remote_key(ext, dir, &path, &all);
     let known = known_repos(&all, key.as_deref(), registered)?;
     let chosen = managed(&all, key.as_deref(), &known)?;
     let default_branch = default_branch(ext, &path, &chosen.name)?;
@@ -89,26 +89,106 @@ pub fn managed<'a>(
         .iter()
         .filter(|r| registered.iter().any(|info| info.slug.same_repo(&r.slug)))
         .collect();
-    match (known.as_slice(), remotes) {
-        ([one], _) => Ok(one),
-        ([], [one]) => Ok(one),
-        ([], []) => bail!("GitHub 저장소를 가리키는 git 원격이 없다. `git remote -v`로 확인한다"),
-        (candidates, all) => {
-            let candidates: Vec<&Remote> = if candidates.is_empty() {
-                all.iter().collect()
-            } else {
-                candidates.to_vec()
-            };
-            let named: Vec<String> = candidates
-                .iter()
-                .map(|r| format!("{} ({})", r.name, r.url))
-                .collect();
-            bail!(
-                "chute가 쓸 git 원격을 하나로 정하지 못했다: {}. `git remote -v`로 확인하고 chute.toml에 `remote = \"<이름>\"`을 적는다",
-                named.join(", ")
-            )
-        }
+    let candidates: Vec<&Remote> = if known.is_empty() {
+        remotes.iter().collect()
+    } else {
+        known
+    };
+    if candidates.is_empty() {
+        bail!("GitHub 저장소를 가리키는 git 원격이 없다. `git remote -v`로 확인한다");
     }
+    if let Some(chosen) = pick_among_same_url(&candidates) {
+        return Ok(chosen);
+    }
+    let named: Vec<String> = candidates
+        .iter()
+        .map(|r| format!("{} ({})", r.name, r.url))
+        .collect();
+    bail!(
+        "chute가 쓸 git 원격을 하나로 정하지 못했다: {}. `git remote -v`로 확인하고 chute.toml에 `remote = \"<이름>\"`을 적는다",
+        named.join(", ")
+    )
+}
+
+/// Remotes whose normalized URLs are all equal are one repository: `origin` wins, then the
+/// first name in order.
+fn pick_among_same_url<'a>(candidates: &[&'a Remote]) -> Option<&'a Remote> {
+    let first = normalize_url(&candidates.first()?.url);
+    if candidates.iter().any(|r| normalize_url(&r.url) != first) {
+        return None;
+    }
+    candidates
+        .iter()
+        .copied()
+        .min_by_key(|r| (r.name != "origin", r.name.as_str()))
+}
+
+/// The remotes that point at the same URL as `chosen`, `chosen` included, by name.
+pub fn same_url_peers<'a>(remotes: &'a [Remote], chosen: &Remote) -> Vec<&'a Remote> {
+    let url = normalize_url(&chosen.url);
+    let mut peers: Vec<&Remote> = remotes
+        .iter()
+        .filter(|r| normalize_url(&r.url) == url)
+        .collect();
+    peers.sort_by(|a, b| a.name.cmp(&b.name));
+    peers
+}
+
+/// Drops scheme, user, `.git`, trailing slashes and the scp-style colon, so ssh and https
+/// forms of one address compare equal. Host names are case-insensitive, local paths are not.
+fn normalize_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let without_scheme = match trimmed.split_once("://") {
+        Some((_, rest)) => rest.to_owned(),
+        None if !trimmed.starts_with('/') => trimmed.replacen(':', "/", 1),
+        None => trimmed.to_owned(),
+    };
+    let (authority, path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme.as_str(), ""));
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    if host.is_empty() {
+        format!("/{path}")
+    } else {
+        format!("{}/{path}", host.to_ascii_lowercase())
+    }
+}
+
+/// The `remote` key of the work tree's chute.toml. Without one there, a key committed on a
+/// remote's default branch counts, so a checkout that lags behind still resolves.
+fn remote_key(ext: &Ext, dir: &Path, tree: &Path, remotes: &[Remote]) -> Option<String> {
+    if let Some(key) = local_remote_key(tree) {
+        return Some(key);
+    }
+    if remotes.len() < 2 {
+        return None;
+    }
+    let mut ordered: Vec<&Remote> = remotes.iter().collect();
+    ordered.sort_by_key(|r| (r.name != "origin", r.name.as_str()));
+    ordered
+        .into_iter()
+        .find_map(|r| remote_branch_key(ext, dir, &r.name))
+}
+
+fn remote_branch_key(ext: &Ext, dir: &Path, remote: &str) -> Option<String> {
+    let head = ext
+        .git(
+            dir,
+            ["symbolic-ref", "-q", &format!("refs/remotes/{remote}/HEAD")],
+        )
+        .ok()
+        .filter(|out| out.success())
+        .map(|out| out.stdout_text().trim().to_owned());
+    let mut refs: Vec<String> = head.into_iter().collect();
+    refs.extend(["main", "master"].map(|b| format!("refs/remotes/{remote}/{b}")));
+    refs.iter().find_map(|r| {
+        let out = ext
+            .git(dir, ["show", &format!("{r}:{}", config::FILE_NAME)])
+            .ok()?;
+        out.success()
+            .then(|| config::remote_key(&out.stdout_text()))?
+    })
 }
 
 pub fn local_remote_key(tree: &Path) -> Option<String> {
@@ -316,12 +396,97 @@ mod tests {
         ];
         let known = [registered("acme/widget", "a")];
 
-        let err = managed(&all, None, &known).unwrap_err().to_string();
-        assert!(err.contains("a (") && err.contains("b ("), "{err}");
-        assert!(!err.contains("c ("), "{err}");
+        assert_eq!(managed(&all, None, &known).unwrap().name, "a");
         assert_eq!(managed(&all, Some("b"), &known).unwrap().name, "b");
+        let err = managed(&all, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("c ("), "{err}");
         assert_eq!(managed(&all[2..], None, &[]).unwrap().name, "c");
         assert!(managed(&[], None, &[]).is_err());
+    }
+
+    fn add_same_url_remote(repo: &TestRepo, name: &str) {
+        let url = repo.origin().to_string_lossy();
+        repo.git(&["remote", "add", name, &url]);
+    }
+
+    #[test]
+    fn remotes_with_one_url_pick_origin() {
+        let sb = Sandbox::new();
+        let repo = TestRepo::new(&sb, "acme/widget");
+        for name in ["aaa", "paseo-pr-109", "zzz"] {
+            add_same_url_remote(&repo, name);
+        }
+        let ext = Ext::from_vars(|k| sb.var(k));
+
+        let info = discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
+        assert_eq!(info.remote_name, "origin");
+        assert_eq!(
+            slug(&ext, repo.path(), &|| Ok(Vec::new())).unwrap(),
+            info.slug
+        );
+    }
+
+    #[test]
+    fn remotes_with_one_url_and_no_origin_pick_the_first_name() {
+        let sb = Sandbox::new();
+        let repo = TestRepo::new(&sb, "acme/widget");
+        repo.git(&["remote", "rename", "origin", "zeta"]);
+        for name in ["mid", "alpha"] {
+            add_same_url_remote(&repo, name);
+        }
+        let ext = Ext::from_vars(|k| sb.var(k));
+
+        let info = discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
+        assert_eq!(info.remote_name, "alpha");
+    }
+
+    #[test]
+    fn remotes_with_different_urls_are_still_refused_without_a_key() {
+        let sb = Sandbox::new();
+        let repo = TestRepo::new(&sb, "acme/widget");
+        add_remote_clone(&sb, &repo, "mirror", "acme/widget");
+        add_same_url_remote(&repo, "twin");
+        let ext = Ext::from_vars(|k| sb.var(k));
+
+        let err = format!(
+            "{:#}",
+            discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap_err()
+        );
+        for needed in ["origin", "mirror", "twin", "remote = "] {
+            assert!(err.contains(needed), "{needed}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_key_on_a_remote_default_branch_is_used_when_the_work_tree_has_no_config() {
+        let sb = Sandbox::new();
+        let repo = fork_and_upstream(&sb);
+        repo.commit_file("chute.toml", "remote = \"upstream\"\n", "chore: 설정");
+        repo.git(&["push", "--quiet", "upstream", "main"]);
+        repo.git(&["reset", "--quiet", "--hard", "HEAD~1"]);
+        assert!(!repo.path().join("chute.toml").exists());
+        let ext = Ext::from_vars(|k| sb.var(k));
+
+        let info = discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
+        assert_eq!(info.remote_name, "upstream");
+    }
+
+    #[test]
+    fn urls_that_differ_only_in_form_normalize_equal() {
+        let forms = [
+            "git@github.com:acme/widget.git",
+            "https://github.com/acme/widget",
+            "ssh://git@GitHub.com/acme/widget/",
+        ];
+        assert!(
+            forms
+                .iter()
+                .all(|u| normalize_url(u) == normalize_url(forms[0]))
+        );
+        assert_ne!(
+            normalize_url("https://github.com/acme/widget"),
+            normalize_url("https://github.com/me/widget")
+        );
     }
 
     #[test]
