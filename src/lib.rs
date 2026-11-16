@@ -3,6 +3,7 @@ pub mod cmd;
 pub mod config;
 pub mod env;
 pub mod ext;
+pub mod flaky;
 pub mod hub;
 pub mod machine;
 pub mod model;

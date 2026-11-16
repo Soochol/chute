@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use chute::engine::{Pass, Summary};
 use chute::model::{
-    Approval, BlockReason, BounceReason, EventKind, Failure, HumanReason, ItemState, PrNumber,
-    StatusView, VerifyMode,
+    Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, HumanReason, ItemState,
+    PrNumber, ProbeEvidence, StatusView, VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -1679,4 +1679,354 @@ fn notify_a_halt_reaches_every_submitting_terminal_once() {
     }
     assert_eq!(lab.lines_sent_to("t1rs").len(), 1);
     assert!(lab.bounced_events().is_empty());
+}
+
+const FLAKE_ONCE: &str =
+    "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; fail \"FAILED flaky_test\"; fi";
+
+fn probe_lab(top: &str, probe: &str) -> Lab {
+    Lab::build_with_step(FLAKE_ONCE, top, 60, probe)
+}
+
+fn probe_step(command: &str) -> String {
+    format!("probe = \"{command}\"")
+}
+
+fn flake_next(lab: &Lab) {
+    fs::write(lab.sb.root().join("flake-now"), "").unwrap();
+}
+
+fn probes(lab: &Lab) -> Vec<(String, Vec<String>, ProbeEvidence, u32, u32)> {
+    lab.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::FlakyProbe {
+                step,
+                tests,
+                evidence,
+                runs,
+                failures,
+                ..
+            } => Some((step, tests, evidence, runs, failures)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn flaky_lines(lab: &Lab, terminal: &str) -> Vec<String> {
+    lab.lines_sent_to(terminal)
+        .into_iter()
+        .filter(|l| l.starts_with("chute 결과 flaky "))
+        .collect()
+}
+
+fn open_pr_by_orchestrator(lab: &Lab, n: u64, files: &[(&str, &str)]) {
+    let head = lab.push_pr_branch(n, files);
+    lab.queue_pr_by(
+        n,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+}
+
+#[test]
+fn a_probe_that_fails_only_on_the_flaked_tree_says_made_and_tells_the_submitter() {
+    let lab = probe_lab(
+        "[flaky]\nprobe_repeats = 3\n",
+        &probe_step("echo {tests} >> '@ROOT@/probe-runs'; [ ! -e PROBE_FAILS ]"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("PROBE_FAILS", "x\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Made,
+            4,
+            1
+        )]
+    );
+    let told = flaky_lines(&lab, "t1orch");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(has_key(&told[0], "evidence=made"), "{}", told[0]);
+    assert!(has_key(&told[0], "step=check"), "{}", told[0]);
+    assert!(has_key(&told[0], "tests=flaky_test"), "{}", told[0]);
+    assert!(!told[0].contains("chronic="), "{}", told[0]);
+    assert!(flaky_lines(&lab, "t1rs").is_empty());
+    let runs = fs::read_to_string(lab.sb.root().join("probe-runs")).unwrap();
+    assert_eq!(runs.lines().collect::<Vec<_>>(), ["flaky_test"; 4]);
+    assert!(lab.state().warnings.is_empty());
+    lab.assert_every_pushed_commit_was_verified();
+}
+
+#[test]
+fn a_probe_that_fails_on_the_base_says_base_and_tells_nobody() {
+    let lab = probe_lab("", &probe_step(": {tests}; [ ! -e PROBE_FAILS ]"));
+    lab.main_commit(&[("PROBE_FAILS", "x\n")], "chore: broken on main");
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Base,
+            1,
+            1
+        )]
+    );
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+    assert!(
+        lab.hc_calls("send")
+            .iter()
+            .all(|c| !c[2].contains(" flaky "))
+    );
+}
+
+#[test]
+fn a_probe_that_never_fails_is_unresolved_after_all_its_repeats() {
+    let lab = probe_lab("[flaky]\nprobe_repeats = 2\n", &probe_step(": {tests}"));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Unresolved,
+            4,
+            0
+        )]
+    );
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn a_probe_running_past_probe_seconds_is_cut_and_unresolved() {
+    let lab = probe_lab(
+        "[flaky]\nprobe_seconds = 1\n",
+        &probe_step(": {tests}; sleep 20"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let started = Instant::now();
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Unresolved,
+            0,
+            0
+        )]
+    );
+}
+
+#[test]
+fn a_cancel_during_a_probe_cuts_it_and_leaves_it_unresolved() {
+    let lab = probe_lab(
+        "",
+        &probe_step(": {tests}; touch '@ROOT@/probing'; sleep 20"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+    let cancel = chute::verify::Cancel::new();
+    let watcher = {
+        let (cancel, marker) = (cancel.clone(), lab.sb.root().join("probing"));
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !marker.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.cancel();
+        })
+    };
+
+    let started = Instant::now();
+    let summary = done(lab.engine().with_cancel(cancel).run_once().unwrap());
+    watcher.join().unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Unresolved,
+            0,
+            0
+        )]
+    );
+}
+
+#[test]
+fn a_step_without_a_probe_is_not_probed() {
+    let lab = Lab::new(FLAKE_ONCE);
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(probes(&lab).is_empty());
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn a_flake_without_test_names_is_not_probed() {
+    let lab = Lab::build_with_step(
+        "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; fail \"boom\"; fi",
+        "",
+        60,
+        &probe_step(": {tests}"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(probes(&lab).is_empty());
+}
+
+fn flake_one_batch(lab: &Lab, n: u64) {
+    open_pr_by_orchestrator(lab, n, &[(&format!("f{n}.txt"), "x\n")]);
+    flake_next(lab);
+    assert_eq!(done(lab.engine().run_once().unwrap()).merged, prs(&[n]));
+}
+
+#[test]
+fn a_chronic_test_raises_one_warning_and_one_notice_a_day() {
+    let lab = Lab::build(FLAKE_ONCE, "[flaky]\nchronic = 3\n", 60);
+
+    flake_one_batch(&lab, 1);
+    flake_one_batch(&lab, 2);
+    assert!(lab.state().warnings.is_empty());
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+
+    flake_one_batch(&lab, 3);
+    let warnings = lab.state().warnings;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].kind, WarningKind::FlakyChronic);
+    assert!(warnings[0].message.contains("flaky_test"), "{warnings:?}");
+    let told = flaky_lines(&lab, "t1orch");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(has_key(&told[0], "chronic=yes"), "{}", told[0]);
+    assert!(!told[0].contains("evidence="), "{}", told[0]);
+    assert!(has_key(&told[0], "prs=3"), "{}", told[0]);
+
+    flake_one_batch(&lab, 4);
+    assert_eq!(lab.state().warnings.len(), 1);
+    assert_eq!(flaky_lines(&lab, "t1orch").len(), 1);
+    assert!(lab.state().warnings[0].message.contains("4번"));
+
+    lab.store
+        .update(|s| {
+            s.warnings[0].at_ms.0 -= 25 * 60 * 60 * 1000;
+            Ok(())
+        })
+        .unwrap();
+    flake_one_batch(&lab, 5);
+    assert_eq!(lab.state().warnings.len(), 1);
+    assert_eq!(flaky_lines(&lab, "t1orch").len(), 2);
+}
+
+#[test]
+fn a_chronic_warning_goes_when_the_count_falls_under_the_threshold() {
+    let lab = Lab::build(FLAKE_ONCE, "[flaky]\nchronic = 2\nchronic_days = 5\n", 60);
+    flake_one_batch(&lab, 1);
+    flake_one_batch(&lab, 2);
+    assert_eq!(lab.state().warnings.len(), 1);
+    let history = lab.store.history().unwrap().events;
+    let later = EpochMs(EpochMs::now().0 + 10 * 24 * 60 * 60 * 1000);
+
+    let due = chute::flaky::refresh_chronic(
+        &lab.store,
+        &history,
+        later,
+        &chute::config::FlakyPolicy {
+            chronic: 2,
+            chronic_days: 5,
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+
+    assert!(due.is_empty());
+    assert!(lab.state().warnings.is_empty());
+}
+
+#[test]
+fn a_flake_on_a_tip_that_was_never_pushed_is_not_probed() {
+    let verify = format!(
+        "m='@ROOT@/moved'\nif [ ! -e \"$m\" ]; then touch \"$m\"; (git clone -q '@ORIGIN@' '@ROOT@/mover' && cd '@ROOT@/mover' && echo x > moved.txt && git add moved.txt && git commit -qm 'chore: other push' && git push -q origin HEAD:main) || fail 'mover failed'; fi\n{FLAKE_ONCE}"
+    );
+    let lab = Lab::build_with_step(
+        &verify,
+        "",
+        60,
+        &probe_step("[ -e moved.txt ] || [ ! -e f1.txt ]; : {tests}"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("f1.txt", "x\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(
+        lab.origin_git(&["ls-tree", "-r", "--name-only", "main"])
+            .contains("moved.txt")
+    );
+    assert!(probes(&lab).is_empty(), "{:?}", probes(&lab));
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn thousands_of_flaked_tests_are_still_probed() {
+    let body = "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; i=0; while [ $i -lt 5000 ]; do echo \"FAILED some_long_test_name_$i\"; i=$((i+1)); done; fail \"FAILED last\"; fi";
+    let lab = Lab::build_with_step(body, "", 60, &probe_step(": {tests}"));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let found = probes(&lab);
+    assert_eq!(found.len(), 1);
+    assert!(
+        (1000..5001).contains(&found[0].1.len()),
+        "the event names only the tests the probe ran with: {}",
+        found[0].1.len()
+    );
+    assert_eq!(found[0].2, ProbeEvidence::Unresolved);
 }

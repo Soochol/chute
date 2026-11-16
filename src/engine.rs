@@ -16,13 +16,15 @@ use crate::config::Config;
 use crate::env::{self, EnvSection};
 use crate::ext::Ext;
 use crate::feedback::{Delivery, Feedback, Notice, Subject};
+use crate::flaky;
 use crate::gitops::{
     FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, PushOutcome, Slot, SlotLock, SlotName,
 };
 use crate::model::{
     Agent, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event,
     EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
+    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning,
+    WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, mode_of};
 use crate::queue;
@@ -606,6 +608,9 @@ impl Engine {
         let result = run.execute(&taken);
         let only_deferred = run.only_deferred();
         let wound = run.wind_down();
+        if wound.is_ok() && result.is_ok() {
+            run.settle_flaky();
+        }
         let summary = Summary {
             batch: id,
             merged: run.merged.clone(),
@@ -1528,6 +1533,107 @@ impl Run<'_> {
                     engine.store.update(|s| Ok(queue::requeue(s, pr)?))?;
                 }
                 None => bail!("합치기 결과가 비어 있다"),
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_flaky(&mut self) {
+        if let Err(e) = self.gather_flaky_evidence() {
+            eprintln!("경고: 흔들림의 근거를 모으지 못했다: {e:#}");
+        }
+    }
+
+    fn gather_flaky_evidence(&mut self) -> Result<()> {
+        let engine = self.engine;
+        let flaky = self.record.flaky.clone();
+        let chronic_warned = engine
+            .store
+            .load()?
+            .warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::FlakyChronic);
+        if flaky.is_empty() && !chronic_warned {
+            return Ok(());
+        }
+        let mut made: Vec<Option<Vec<String>>> = vec![None; flaky.len()];
+        for (n, entry) in flaky.iter().enumerate() {
+            let command = self
+                .config
+                .verify
+                .iter()
+                .find(|s| s.name == entry.step)
+                .and_then(|s| s.probe.as_deref());
+            let landed = self.record.pushed.contains(&entry.tree);
+            let Some(command) = command.filter(|_| landed && !entry.tests.is_empty()) else {
+                continue;
+            };
+            let found = match flaky::probe(&flaky::ProbeJob {
+                config: &self.config,
+                store: &engine.store,
+                slot: &self.slot,
+                batch: self.id(),
+                command,
+                step: &entry.step,
+                tests: &entry.tests,
+                base: &self.start_base,
+                flaked: &entry.tree,
+                cancel: &engine.cancel,
+                cache_dir: engine.gitops.cache_dir(),
+            }) {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!(
+                        "경고: 단계 {}의 흔들림을 되풀이하지 못했다: {e:#}",
+                        entry.step
+                    );
+                    continue;
+                }
+            };
+            engine.history(EventKind::FlakyProbe {
+                batch: self.id().clone(),
+                step: entry.step.clone(),
+                tests: found.tests.clone(),
+                evidence: found.evidence,
+                runs: found.runs,
+                failures: found.failures,
+            })?;
+            if found.evidence == ProbeEvidence::Made {
+                made[n] = Some(found.tests);
+            }
+        }
+        let touched: Vec<flaky::Key> = flaky
+            .iter()
+            .flat_map(|f| flaky::keys_of(&f.step, &f.tests))
+            .collect();
+        let mut due = flaky::refresh_chronic(
+            &engine.store,
+            &engine.store.history()?.events,
+            EpochMs::now(),
+            &self.config.flaky,
+            &touched,
+        )?;
+        let targets: Vec<(Option<&Agent>, PrNumber)> = self
+            .merged
+            .iter()
+            .filter_map(|pr| self.items.get(pr))
+            .map(|i| (i.submitter.as_ref(), i.pr))
+            .collect();
+        for (entry, made) in flaky.iter().zip(made) {
+            let keys = flaky::keys_of(&entry.step, &entry.tests);
+            let chronic = keys.iter().any(|k| due.contains(k));
+            due.retain(|k| !keys.contains(k));
+            if (made.is_some() || chronic) && !targets.is_empty() {
+                engine
+                    .notifier()
+                    .notify_each(&targets, EpochMs::now(), |prs| Line::Flaky {
+                        batch: self.id().clone(),
+                        prs: prs.to_vec(),
+                        step: entry.step.clone(),
+                        tests: made.clone().unwrap_or_else(|| entry.tests.clone()),
+                        made: made.is_some(),
+                        chronic,
+                    });
             }
         }
         Ok(())
