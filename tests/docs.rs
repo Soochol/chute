@@ -51,3 +51,12 @@ fn readme_gives_the_first_run_check_and_the_manual_open_command() {
     assert!(text.contains("자동 시험으로 확인되지 않았다"));
     assert!(text.contains(r#"herdr-app do tab.new '{"mod":"chute"}'"#));
 }
+
+#[test]
+fn readme_gives_the_plugin_install_lines_and_the_missing_binary_behavior() {
+    let text = readme();
+    assert!(text.contains("/plugin marketplace add Soochol/chute"));
+    assert!(text.contains("/plugin install chute@chute"));
+    assert!(text.contains("cargo install --git https://github.com/Soochol/chute"));
+    assert!(text.contains("`PATH`에 없으면 훅은 호출을 막지 않고 지나간다"));
+}

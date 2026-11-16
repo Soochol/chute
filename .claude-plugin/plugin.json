@@ -1,0 +1,8 @@
+{
+  "name": "chute",
+  "version": "0.1.0",
+  "description": "chute 머지 큐용 스킬과, 기본 브랜치 직접 push와 gh pr merge를 막는 훅",
+  "author": { "name": "Soochol" },
+  "repository": "https://github.com/Soochol/chute",
+  "keywords": ["merge-queue", "herdr", "pull-request"]
+}

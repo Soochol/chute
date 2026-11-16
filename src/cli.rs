@@ -51,8 +51,10 @@ pub enum Command {
     Batches(cmd::batches::Args),
     /// batch를 되돌린다
     Revert(cmd::revert::Args),
-    /// mod와 스킬 파일을 설치한다
+    /// mod와 Codex 스킬 파일을 설치한다
     Install(cmd::install::Args),
+    /// Claude Code PreToolUse 훅. 기본 브랜치로의 push와 `gh pr merge`를 막는다
+    Guard(cmd::guard::Args),
 }
 
 pub fn main() -> ExitCode {
@@ -106,6 +108,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Batches(args) => cmd::batches::run(args, ctx),
         Command::Revert(args) => cmd::revert::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),
+        Command::Guard(args) => cmd::guard::run(args, ctx),
     }
 }
 
