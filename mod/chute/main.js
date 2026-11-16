@@ -1,9 +1,9 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, props, run, theme, watchFolder } from "herdr";
-import { causeText, failureText, interpret } from "./board.js";
+import { causeText, failureText, interpret, pollInterval } from "./board.js";
 
-const FALLBACK_MS = 15000;
+const TICK_MS = 1000;
 const MIN_READ_GAP_MS = 1000;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -17,8 +17,16 @@ export default class Chute extends View {
     this.watching = new Set();
     this.busy = new Map();
     this.errors = new Map();
+    this.lastReadAt = 0;
     this.request(cx);
-    cx.timer.every(FALLBACK_MS, (cx) => this.request(cx));
+    cx.timer.every(TICK_MS, (cx) => this.tick(cx));
+  }
+
+  // A tick never queues a read behind a running one; it only starts one when the poll interval has passed.
+  tick(cx) {
+    if (this.reading) return;
+    const board = this.result ? interpret(this.result) : null;
+    if (Date.now() - this.lastReadAt >= pollInterval(board)) this.request(cx);
   }
 
   request(cx) {
@@ -27,6 +35,7 @@ export default class Chute extends View {
       return;
     }
     this.reading = true;
+    this.lastReadAt = Date.now();
     cx.spawn(async (cx) => {
       try {
         let result;
@@ -149,7 +158,22 @@ export default class Chute extends View {
           .gap(8)
           .items_center()
           .child(div().flex_1().min_w(0).truncate().font_semibold().child(repo.slug))
+          .child(chip(`허브 ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1))
           .when(Boolean(repo.approval), (el) => el.child(chip(repo.approval, t.muted))),
+      )
+      .when(!repo.hub.reachable, (el) =>
+        el.child(
+          v_flex()
+            .gap(4)
+            .p(9)
+            .rounded(8)
+            .border_1()
+            .border_color(t.ansi1)
+            .child(div().font_semibold().text_color(t.ansi1).child("허브에 닿지 않는다"))
+            .when(Boolean(repo.hub.error), (box) =>
+              box.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(repo.hub.error)),
+            ),
+        ),
       )
       .children(repo.sections.map((section) => this.sectionView(section, t)));
   }
@@ -308,7 +332,8 @@ function agentChip(agent, t, cardKey) {
         .text_size(12)
         .text_color(agent.alive ? t.foreground : t.dim)
         .child(agent.alive ? agent.label : `${agent.label} · 종료됨`),
-    );
+    )
+    .when(Boolean(agent.host), (el) => el.child(chip(agent.host, t.muted)));
   if (!agent.alive) return label;
   return label
     .id(`peek-${cardKey}-${agent.terminal}`)

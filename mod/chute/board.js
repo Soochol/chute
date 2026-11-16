@@ -102,16 +102,40 @@ const safeHeadOf = (item) => (typeof item.head === "string" && SAFE_HEAD.test(it
 export const actionArgs = (verb, pr, repoPath, head) =>
   verb === "approve" ? [verb, String(pr), "--head", head, "--repo", repoPath] : [verb, String(pr), "--repo", repoPath];
 
+// Herdr resolves `machine/t7` like any terminal address (herdr-app AGENTS.md: "use `machine/address`
+// for another machine"), so an agent on another machine is peeked like a local one.
 function agentOf(agent) {
   if (!isObject(agent) || !str(agent.terminal)) return null;
   const name = str(agent.name);
+  const remote = str(agent.machine) !== "" || agent.terminal.includes("/");
   return {
     terminal: agent.terminal,
     name: name || null,
     alive: agent.alive === true,
+    remote,
+    host: remote ? str(agent.host) || str(agent.machine) || null : null,
     label: name ? `${name} (${agent.terminal})` : agent.terminal,
   };
 }
+
+// A status without `hub` comes from a pre-hub chute: the hub is this PC.
+function hubOf(hub) {
+  const h = isObject(hub) ? hub : {};
+  const local = h.local !== false;
+  return {
+    local,
+    reachable: h.reachable !== false,
+    error: str(h.error),
+    label: local ? "이 PC" : str(h.host) || str(h.machine) || "알 수 없는 허브",
+  };
+}
+
+export const REMOTE_POLL_MS = 5000;
+export const LOCAL_POLL_MS = 15000;
+
+// watchFolder only sees this PC's folders, so a repo whose hub is elsewhere is polled faster.
+export const pollInterval = (board) =>
+  board?.kind === "board" && board.repos.some((repo) => !repo.hub.local) ? REMOTE_POLL_MS : LOCAL_POLL_MS;
 
 function failureOf(item) {
   const failure = item.last_failure;
@@ -243,6 +267,16 @@ const bySubmission = (a, b) => {
 function repoBoard(view, now) {
   const repo = isObject(view.repo) ? view.repo : {};
   const path = str(repo.path);
+  const hub = hubOf(view.hub);
+  if (!hub.reachable) {
+    return {
+      slug: str(repo.slug) || "(이름 없는 저장소)",
+      stateDir: str(repo.state_dir),
+      approval: null,
+      hub,
+      sections: [],
+    };
+  }
   const queue = list(view.queue)
     .filter(isObject)
     .map((item) => ({ ...item, pr: prOf(item.pr), state: rawText(item.state), state_reason: rawText(item.state_reason) }))
@@ -279,6 +313,7 @@ function repoBoard(view, now) {
     slug: str(repo.slug) || "(이름 없는 저장소)",
     stateDir: str(repo.state_dir),
     approval: named(APPROVAL, view.approval),
+    hub,
     sections: SECTION_ORDER.filter((id) => placed[id].length > 0).map((id) => ({
       id,
       title: SECTION_TITLE[id],
