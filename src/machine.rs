@@ -84,7 +84,7 @@ impl Machines {
 
     pub fn address(&self, machine: &MachineId, terminal: &TerminalId) -> TerminalId {
         match self.by_id(machine) {
-            Some(m) if *machine != self.local.id => {
+            Some(m) if *machine != self.local.id && !terminal.0.contains('/') => {
                 TerminalId(format!("{}/{}", m.name, terminal.0))
             }
             _ => terminal.clone(),
@@ -149,6 +149,8 @@ mod tests {
         assert_eq!(m.address(&id("bbb"), &t7).0, "desk/t7");
         assert_eq!(m.address(&id("ccc"), &t7).0, "lap/t7");
         assert_eq!(m.address(&id("zzz"), &t7).0, "t7");
+        let qualified = TerminalId("desk/t7".into());
+        assert_eq!(m.address(&id("bbb"), &qualified).0, "desk/t7");
     }
 
     #[test]
