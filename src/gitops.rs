@@ -163,43 +163,36 @@ impl Gitops {
         }
     }
 
-    /// Fetches the default branch and moves its tracking ref forward without opening a slot.
-    /// The tip is returned even when a lost race leaves the tracking ref for the next fetch.
+    /// Fetches the default branch and moves its tracking ref to it without opening a slot.
+    /// The tip comes from a private ref, so the caller's `FETCH_HEAD` and branches stay as they are.
     pub fn fetch_base_tip(&self) -> Result<Sha> {
         let branch = &self.default_branch;
         let tracking = format!("refs/remotes/{}/{branch}", self.remote);
-        let refspec = format!("refs/heads/{branch}");
-        let before = self.repo_git(&["rev-parse", "--verify", "--quiet", &tracking])?;
-        let before = before
-            .success()
-            .then(|| Sha::try_from(before.stdout_text().trim().to_owned()))
-            .transpose()
-            .map_err(|e| anyhow!(e))?;
-        self.repo_git(&[
+        let private = format!("refs/chute/base-{}", std::process::id());
+        let refspec = format!("+refs/heads/{branch}:{private}");
+        let fetched = self.repo_git(&[
             "fetch",
             "--quiet",
             "--no-tags",
+            "--no-write-fetch-head",
             "--refmap=",
             &self.remote,
             &refspec,
-        ])?
-        .ok()?;
-        let tip = self
-            .repo_git(&["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?
-            .ok()?;
-        let tip = Sha::try_from(tip.trim().to_owned()).map_err(|e| anyhow!(e))?;
-        let forward = match &before {
-            None => true,
-            Some(old) => {
-                let ancestry =
-                    self.repo_git(&["merge-base", "--is-ancestor", old.as_str(), tip.as_str()])?;
-                ancestry.code == Some(0)
-            }
+        ])?;
+        let tip = if fetched.success() {
+            self.repo_git(&["rev-parse", "--verify", &format!("{private}^{{commit}}")])
+        } else {
+            Ok(fetched)
         };
-        if forward {
-            let old = before.as_ref().map_or("", Sha::as_str);
-            self.repo_git(&["update-ref", &tracking, tip.as_str(), old])?;
-        }
+        let _ = self.repo_git(&["update-ref", "-d", &private]);
+        let tip = Sha::try_from(tip?.ok()?.trim().to_owned()).map_err(|e| anyhow!(e))?;
+        let before = self.repo_git(&["rev-parse", "--verify", "--quiet", &tracking])?;
+        let old = if before.success() {
+            before.stdout_text().trim().to_owned()
+        } else {
+            String::new()
+        };
+        self.repo_git(&["update-ref", &tracking, tip.as_str(), &old])?;
         Ok(tip)
     }
 

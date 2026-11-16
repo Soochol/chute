@@ -1658,3 +1658,60 @@ fn a_skip_replaces_the_record_of_an_older_head() {
     assert_eq!(record.head.as_str(), newer);
     assert_eq!(record.result, chute::model::PreflightResult::Skipped);
 }
+
+fn fetch_head_of(w: &World) -> String {
+    fs::read_to_string(w.repo.path().join(".git/FETCH_HEAD")).unwrap_or_default()
+}
+
+#[test]
+fn a_skip_leaves_the_fetch_head_of_the_user_and_the_refs_it_made_alone() {
+    let w = policy_world(None, "true");
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    w.repo
+        .git(&["push", "--quiet", "origin", "HEAD:refs/heads/feat/other"]);
+    w.repo.git(&["fetch", "--quiet", "origin", "feat/other"]);
+    let before = fetch_head_of(&w);
+    assert!(before.contains("feat/other"), "{before}");
+    assert_eq!(json(&preflight(&w, &["--json"]))["result"], "skipped");
+    assert_eq!(fetch_head_of(&w), before);
+    assert!(
+        w.repo
+            .git(&["for-each-ref", "refs/chute"])
+            .trim()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_skip_follows_a_default_branch_that_was_pushed_back() {
+    let marks = tempfile::tempdir().unwrap();
+    let (mark, run) = ran_marker(&marks);
+    let w = policy_world(Some("always"), &run);
+    work_on(&w, "feat/mine", "mine.txt", "x\n");
+    let good = w.repo.git(&["rev-parse", "origin/main"]).trim().to_owned();
+    w.repo
+        .git(&["checkout", "--quiet", "-B", "tmp", "origin/main"]);
+    w.repo.commit_file(
+        chute::config::FILE_NAME,
+        &format!("preflight = \"never\"\n{}", config(&run)),
+        "chore: 되돌릴 변경",
+    );
+    w.repo
+        .git(&["push", "--quiet", "origin", "tmp:refs/heads/main"]);
+    w.repo.git(&[
+        "push",
+        "--quiet",
+        "origin",
+        &format!("{good}:refs/heads/main"),
+        "--force",
+    ]);
+    let discarded = w.repo.git(&["rev-parse", "tmp"]).trim().to_owned();
+    w.repo.git(&["checkout", "--quiet", "feat/mine"]);
+    w.repo.git(&["branch", "--quiet", "-D", "tmp"]);
+    w.repo
+        .git(&["update-ref", "refs/remotes/origin/main", &discarded]);
+    let doc = json(&preflight(&w, &["--json"]));
+    assert_eq!(doc["result"], "pass", "{doc}");
+    assert_eq!(doc["base"], good);
+    assert!(mark.exists());
+}
