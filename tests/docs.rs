@@ -91,6 +91,9 @@ fn manual_and_readme_quote_only_messages_the_code_prints() {
         "명령이 기록됐는지 알 수 없다",
         "명령은 기록되지 않았다",
         "에 닿지 않는다(",
+        "로 명령을 넘기지 못했다",
+        "에서 chute를 실행하지 못했다",
+        "의 상태가 {}이다",
         "허브에 닿지 않아 큐를 알 수 없다",
         "revert는 허브에서만 실행한다",
         "데몬은 허브에서만 돈다",
@@ -101,7 +104,8 @@ fn manual_and_readme_quote_only_messages_the_code_prints() {
         "허브: 이 PC",
         "(연결됨)",
     ];
-    let docs = format!("{}{}", manual(), readme());
+    let manual = manual();
+    let readme = readme();
     for text in quoted {
         assert!(code.contains(text), "코드에 `{text}`가 없다");
     }
@@ -110,10 +114,12 @@ fn manual_and_readme_quote_only_messages_the_code_prints() {
         "명령이 기록됐는지 알 수 없다",
         "revert는 허브에서만 실행한다",
         "데몬은 허브에서만 돈다",
-        "그 머신의 로그인 환경 PATH에 chute가 있는지 확인한다",
+        "허브에 닿지 않아 큐를 알 수 없다",
     ] {
-        assert!(docs.contains(text), "설명서에 `{text}`가 없다");
+        assert!(manual.contains(text), "설명서에 `{text}`가 없다");
     }
+    assert!(readme.contains("그 머신의 로그인 환경 PATH에 chute가 있는지 확인한다"));
+    assert!(readme.contains("revert는 허브에서만 실행한다"));
 }
 
 #[test]
