@@ -72,8 +72,6 @@ pub struct TerminalId(pub String);
 #[serde(transparent)]
 pub struct BatchId(pub String);
 
-/// The permanent id of an hc core (`hc server status --json`, `core.id`). Machine names differ
-/// by who is looking; the id does not.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct MachineId(String);
@@ -107,7 +105,6 @@ impl fmt::Display for MachineId {
     }
 }
 
-/// `hub.json`: which machine holds the queue of one repository. The file is absent on the hub.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubConfig {
     pub machine_id: MachineId,
@@ -318,7 +315,6 @@ pub struct Agent {
     pub name: Option<String>,
     pub workdir: PathBuf,
     pub alive: bool,
-    /// The machine the terminal lives on. Absent in v1 files: the hub itself.
     #[serde(default)]
     pub machine: Option<MachineId>,
 }
@@ -757,15 +753,11 @@ pub struct RepoView {
     pub state_dir: PathBuf,
 }
 
-/// Where the queue of this repository lives, as seen from the PC that reads the status.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubView {
-    /// The PC that reads the status is the hub.
     pub local: bool,
-    /// `None` only when this PC's own id could not be read from hc.
     pub machine_id: Option<MachineId>,
     pub host: Option<String>,
-    /// The hc name this PC gives the hub. `None` for the hub itself.
     pub machine: Option<String>,
     pub repo_path: Option<PathBuf>,
     pub reachable: bool,
@@ -803,7 +795,6 @@ pub struct AgentView {
     pub alive: bool,
     pub machine_id: Option<MachineId>,
     pub host: Option<String>,
-    /// The hc name this PC gives the agent's machine. `None` for this PC or an unknown machine.
     pub machine: Option<String>,
 }
 

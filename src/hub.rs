@@ -9,14 +9,12 @@ use crate::machine::{self, Machines};
 use crate::model::{HubView, MachineId, Slug};
 use crate::store::Home;
 
-/// Where the commands of one repository run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
     Local,
     Remote { id: MachineId, name: String },
 }
 
-/// The answer of a forwarded call: what the hub wrote and how it ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Forwarded {
     pub code: i32,
@@ -32,7 +30,6 @@ pub enum ForwardErrorKind {
     Unreachable,
     NoChute,
     TimedOut,
-    /// The machines point at each other as hub, so no machine can answer.
     Misconfigured,
 }
 
@@ -49,8 +46,6 @@ impl ForwardError {
     }
 }
 
-/// The machine that holds the queue when it is not this PC. `None` means this PC is the hub:
-/// no `hub.json`, or one that names this PC.
 pub fn elsewhere(home: &Home, ext: &Ext, slug: &Slug) -> Result<Option<MachineId>> {
     let Some(id) = home.repo(slug).hub()? else {
         return Ok(None);
@@ -77,9 +72,6 @@ fn unknown_hub(id: &MachineId) -> String {
     )
 }
 
-/// Runs `chute --slug <slug> <args>` on the hub with `CHUTE_FORWARDED=1`. A hub that says it
-/// is not the hub names the machine that is; the answer is then asked there once, and
-/// `hub.json` is rewritten only after that machine took the call.
 pub fn forward(
     home: &Home,
     ext: &Ext,
@@ -149,6 +141,9 @@ fn not_hub(answer: &Forwarded) -> Option<MachineId> {
         .map(|b| b.not_hub.hub)
 }
 
+/// Exit code reported when a signal ended the program and hc gave none.
+const ENDED_BY_SIGNAL: i32 = 2;
+
 #[derive(Deserialize)]
 struct HcExec {
     code: Option<i32>,
@@ -172,8 +167,6 @@ struct HcError {
     message: String,
 }
 
-/// `hc exec --json --on <name>`. The program's own exit code, whatever it is, comes back as
-/// data; a failure of hc itself is a `ForwardError`.
 pub fn exec_on(
     ext: &Ext,
     name: &str,
@@ -230,8 +223,7 @@ pub fn exec_on(
         )
     };
     Ok(Forwarded {
-        // A signal ended it: no exit code, so the call counts as a failure to run.
-        code: exec.code.unwrap_or(2),
+        code: exec.code.unwrap_or(ENDED_BY_SIGNAL),
         stdout: base64_decode(&exec.stdout).ok_or_else(|| unreadable("stdout"))?,
         stderr: base64_decode(&exec.stderr).ok_or_else(|| unreadable("stderr"))?,
         truncated: exec.truncated,
@@ -288,8 +280,6 @@ fn hc_failure(name: &str, stderr: &str) -> ForwardError {
     }
 }
 
-/// What `chute hub` and `chute status` show about the hub, without asking the hub anything.
-/// `note` carries a problem that left a field unknown; the caller decides how to show it.
 pub struct Seen {
     pub view: HubView,
     pub machines: Option<Machines>,

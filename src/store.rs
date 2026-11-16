@@ -211,7 +211,6 @@ impl RepoStore {
         }
     }
 
-    /// The hub this PC sends its commands to. `None` means this PC is the hub.
     pub fn hub(&self) -> Result<Option<MachineId>> {
         Ok(read_json::<HubConfig>(&self.dir.join(HUB_FILE))?.map(|c| c.machine_id))
     }

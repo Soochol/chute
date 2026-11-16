@@ -4,7 +4,6 @@ use serde::Deserialize;
 use crate::ext::Ext;
 use crate::model::{Agent, AgentView, MachineId, TerminalId};
 
-/// This PC as hc knows it: `hc server status --json`, `core`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Core {
     pub id: MachineId,
@@ -56,7 +55,6 @@ pub fn list(ext: &Ext) -> Result<Vec<Machine>> {
     Ok(listing.machines)
 }
 
-/// The machines as one PC sees them: itself and the machines it has added.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machines {
     local: Core,
@@ -84,8 +82,6 @@ impl Machines {
         self.others.iter().find(|m| m.name == name)
     }
 
-    /// The terminal address to hand to hc on this PC: `t7` here, `name/t7` on a machine this
-    /// PC knows, and the address as recorded on a machine it does not know.
     pub fn address(&self, machine: &MachineId, terminal: &TerminalId) -> TerminalId {
         match self.by_id(machine) {
             Some(m) if *machine != self.local.id => {
@@ -95,8 +91,6 @@ impl Machines {
         }
     }
 
-    /// An agent as this PC shows it. An agent with no machine lives on `home`, the machine
-    /// the state belongs to.
     pub fn agent_view(&self, home: &MachineId, agent: &Agent) -> AgentView {
         let id = agent.machine.as_ref().unwrap_or(home);
         let (host, machine) = if *id == self.local.id {

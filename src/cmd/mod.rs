@@ -32,10 +32,8 @@ use crate::store::{Home, RepoStore};
 
 pub const CANNOT_RUN: u8 = 2;
 pub const REFUSED: u8 = 1;
-/// A forwarded call reached a PC that is not the hub.
 pub const NOT_HUB: u8 = 3;
 
-/// How long a command waits for the hub unless it says otherwise.
 pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Ctx {
@@ -83,7 +81,6 @@ impl Ctx {
         })
     }
 
-    /// Another PC sent this call to its hub. It must not be sent on.
     pub fn forwarded(&self) -> bool {
         self.forwarded
     }
@@ -100,7 +97,6 @@ impl Ctx {
         }
     }
 
-    /// `--slug` if given, else the repository of the current folder (or `--repo`).
     pub fn slug(&self) -> Result<Slug> {
         match &self.slug {
             Some(slug) => Ok(slug.clone()),
@@ -118,8 +114,6 @@ impl Ctx {
     }
 }
 
-/// For a forwarded call: answers exit code 3 and `{"not_hub": {"hub": "<id>"}}` when this PC
-/// is not the hub, so the sender can follow the hub to where it moved. `None` means go on.
 pub fn answer_not_hub(ctx: &Ctx) -> Result<Option<ExitCode>> {
     if !ctx.forwarded {
         return Ok(None);
@@ -131,8 +125,6 @@ pub fn answer_not_hub(ctx: &Ctx) -> Result<Option<ExitCode>> {
     Ok(Some(ExitCode::from(NOT_HUB)))
 }
 
-/// Sends `args` to the hub when it is another machine. `None` means this PC is the hub (or
-/// the call was itself forwarded): run the command here.
 pub fn forward_to_hub(ctx: &Ctx, args: &[&str], timeout: Duration) -> Result<Option<Forwarded>> {
     if ctx.forwarded {
         return Ok(None);
@@ -144,8 +136,6 @@ pub fn forward_to_hub(ctx: &Ctx, args: &[&str], timeout: Duration) -> Result<Opt
     }
 }
 
-/// Writes what the hub wrote and ends with its exit code, so the call looks the same as it
-/// would have on the hub.
 pub fn relay(answer: &Forwarded) -> ExitCode {
     let _ = std::io::stdout().write_all(&answer.stdout);
     let _ = std::io::stderr().write_all(&answer.stderr);
@@ -155,8 +145,6 @@ pub fn relay(answer: &Forwarded) -> ExitCode {
     ExitCode::from(u8::try_from(answer.code).unwrap_or(CANNOT_RUN))
 }
 
-/// The one-liner for a command that belongs to the hub:
-/// `if let Some(code) = run_on_hub(ctx, &["approve", "12"])? { return Ok(code); }`
 pub fn run_on_hub(ctx: &Ctx, args: &[&str]) -> Result<Option<ExitCode>> {
     Ok(forward_to_hub(ctx, args, FORWARD_TIMEOUT)?.map(|answer| relay(&answer)))
 }

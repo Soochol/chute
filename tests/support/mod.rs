@@ -8,7 +8,6 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-/// The hc core id a `Sandbox` answers to `hc server status`.
 pub const SANDBOX_MACHINE_ID: &str = "0000000000000000000000000000000a";
 
 pub struct Sandbox {
@@ -222,7 +221,6 @@ impl FakeTool {
         self
     }
 
-    /// Drops every rule, including the ones `Sandbox::new` gave `hc`.
     pub fn clear_rules(&self) -> &FakeTool {
         fs::write(self.dir.join("rules"), "").unwrap();
         self
@@ -285,7 +283,6 @@ impl TestRepo {
         repo
     }
 
-    /// Another machine's clone of the same origin.
     pub fn clone_of(sb: &Sandbox, other: &TestRepo) -> TestRepo {
         let work = sb
             .root()
@@ -364,16 +361,11 @@ impl TestRepo {
     }
 }
 
-/// Several machines, each a `Sandbox` of its own, over one origin. A machine's `hc` answers
-/// `server status` and `machine ls` from what `connect` gave it, and sends
-/// `exec --on <name> -- chute …` to the real `chute` binary under the named machine's
-/// environment. Rules for other `hc` calls go through the machine's `Sandbox::fake("hc")`.
 pub struct Net {
     pub nodes: Vec<Node>,
 }
 
 pub struct Node {
-    /// What the machine calls itself (its `hc` core name and `host`).
     pub name: String,
     pub id: String,
     pub sb: Sandbox,
@@ -442,8 +434,6 @@ fn shell_quote(text: &str) -> String {
 }
 
 impl Net {
-    /// `names` are the machines; the first creates the origin, the others clone it. Each
-    /// starts knowing no other machine. `chute` is the binary every machine runs.
     pub fn new(slug: &str, names: &[&str], chute: &str) -> Net {
         let mut nodes: Vec<Node> = Vec::new();
         for (i, name) in names.iter().enumerate() {
@@ -472,8 +462,6 @@ impl Net {
             .unwrap_or_else(|| panic!("{name}라는 머신이 없다"))
     }
 
-    /// `from` adds `to` under `alias`, connected. Another alias on another machine is how
-    /// two PCs end up calling one machine by different names.
     pub fn connect(&self, from: &str, to: &str, alias: &str) {
         self.node(from).add_peer(self.node(to), alias, "connected");
     }
@@ -488,8 +476,6 @@ impl Net {
         }
     }
 
-    /// Changes what `from`'s hc reports for the machine it calls `alias`:
-    /// `connected`, `needs_login`, `unreachable`, `connecting`.
     pub fn set_state(&self, from: &str, alias: &str, state: &str) {
         self.node(from).set_peer_state(alias, state);
     }
@@ -515,8 +501,6 @@ impl Node {
         self.sb.fake("hc").clear_rules();
     }
 
-    /// Writes the launcher `hc exec` runs for this machine: the sandbox environment and
-    /// `chute`, from the machine's home folder as a login shell would start it.
     pub fn set_chute(&self, chute: &str) {
         let mut body = String::from("#!/bin/sh\n");
         for (key, value) in self.sb.envs() {
@@ -572,7 +556,6 @@ impl Node {
         fs::write(self.peers_path(), lines.join("\n") + "\n").unwrap();
     }
 
-    /// Runs the real binary on this machine from its checkout.
     pub fn chute(&self, bin: &str, args: &[&str]) -> std::process::Output {
         self.sb
             .command(bin)

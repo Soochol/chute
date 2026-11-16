@@ -152,8 +152,6 @@ const QUEUED: &str = r#"{
   "batch": null, "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
 }"#;
 
-/// `a` runs `hub set <machine>` after `setup`. The call is refused with exit code 1, the
-/// message holds `reason`, and `a` keeps no `hub.json`.
 fn refused(case: &str, machine: &str, setup: impl Fn(&Net), reason: &str) {
     let net = Net::new(SLUG, &["a", "b", "c"], BIN);
     net.connect_all();
@@ -313,7 +311,6 @@ fn a_forwarded_call_to_a_pc_that_is_not_the_hub_answers_exit_3_and_names_the_hub
     );
     assert!(out.stderr.is_empty());
 
-    // The same call on the hub itself runs.
     let on_hub =
         a.sb.command(BIN)
             .env("CHUTE_FORWARDED", "1")
@@ -396,7 +393,6 @@ fn forwarding_to_a_disconnected_machine_fails_in_korean_and_is_not_a_refusal() {
     for part in ["허브 `b`에 닿지 않는다", "기록되지 않았다", "hc machine ls"] {
         assert!(text.contains(part), "{text}");
     }
-    // `finish` turns a `Refusal` into exit code 1; anything else ends the process with 2.
     assert!(err.downcast_ref::<Refusal>().is_none());
 
     net.set_state("a", "b", "needs_login");
