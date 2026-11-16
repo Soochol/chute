@@ -125,6 +125,7 @@ impl Lab {
             name: Some("impl-a".into()),
             workdir: workdir.to_owned(),
             alive: true,
+            machine: None,
         }
     }
 

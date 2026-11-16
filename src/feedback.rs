@@ -1163,6 +1163,7 @@ impl Feedback<'_> {
             name: Some(name),
             workdir: cwd,
             alive: true,
+            machine: None,
         }))
     }
 
@@ -1216,6 +1217,7 @@ impl Feedback<'_> {
             name: Some(name.to_owned()),
             workdir: cwd.to_owned(),
             alive: true,
+            machine: None,
         }))
     }
 

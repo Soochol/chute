@@ -5,6 +5,7 @@ pub mod down;
 pub mod drop;
 pub mod giveup;
 pub mod guard;
+pub mod hub;
 pub mod init;
 pub mod install;
 pub mod preflight;
@@ -15,25 +16,35 @@ pub mod status;
 pub mod submit;
 pub mod up;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::ext::Ext;
-use crate::model::RepoInfo;
+use crate::hub::{Forwarded, Route, elsewhere, forward, route};
+use crate::model::{RepoInfo, Slug};
 use crate::queue::TransitionError;
 use crate::repo;
 use crate::store::{Home, RepoStore};
 
 pub const CANNOT_RUN: u8 = 2;
 pub const REFUSED: u8 = 1;
+/// A forwarded call reached a PC that is not the hub.
+pub const NOT_HUB: u8 = 3;
+
+/// How long a command waits for the hub unless it says otherwise.
+pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Ctx {
     pub home: Home,
     pub ext: Ext,
     repo: Option<PathBuf>,
     terminal: Option<String>,
+    slug: Option<Slug>,
+    forwarded: bool,
 }
 
 impl Ctx {
@@ -43,7 +54,19 @@ impl Ctx {
             ext,
             repo,
             terminal: None,
+            slug: None,
+            forwarded: false,
         }
+    }
+
+    pub fn with_slug(mut self, slug: Option<Slug>) -> Ctx {
+        self.slug = slug;
+        self
+    }
+
+    pub fn with_forwarded(mut self, forwarded: bool) -> Ctx {
+        self.forwarded = forwarded;
+        self
     }
 
     pub fn from_env(repo: Option<PathBuf>) -> Result<Ctx> {
@@ -55,7 +78,14 @@ impl Ctx {
             ext: Ext::from_env(),
             repo,
             terminal,
+            slug: None,
+            forwarded: std::env::var("CHUTE_FORWARDED").is_ok_and(|v| v == "1"),
         })
+    }
+
+    /// Another PC sent this call to its hub. It must not be sent on.
+    pub fn forwarded(&self) -> bool {
+        self.forwarded
     }
 
     pub fn terminal(&self) -> Option<&str> {
@@ -70,14 +100,65 @@ impl Ctx {
         }
     }
 
+    /// `--slug` if given, else the repository of the current folder (or `--repo`).
+    pub fn slug(&self) -> Result<Slug> {
+        match &self.slug {
+            Some(slug) => Ok(slug.clone()),
+            None => repo::slug(&self.ext, &self.target_dir()?),
+        }
+    }
+
     pub fn registered_repo(&self) -> Result<(RepoInfo, RepoStore)> {
-        let slug = repo::slug(&self.ext, &self.target_dir()?)?;
+        let slug = self.slug()?;
         let store = self.home.repo(&slug);
         let info = store.info()?.ok_or_else(|| {
             anyhow!("chute에 등록되지 않은 저장소다: {slug}. 저장소에서 `chute init`을 실행한다")
         })?;
         Ok((info, store))
     }
+}
+
+/// For a forwarded call: answers exit code 3 and `{"not_hub": {"hub": "<id>"}}` when this PC
+/// is not the hub, so the sender can follow the hub to where it moved. `None` means go on.
+pub fn answer_not_hub(ctx: &Ctx) -> Result<Option<ExitCode>> {
+    if !ctx.forwarded {
+        return Ok(None);
+    }
+    let Some(hub) = elsewhere(&ctx.home, &ctx.ext, &ctx.slug()?)? else {
+        return Ok(None);
+    };
+    println!("{}", serde_json::json!({"not_hub": {"hub": hub}}));
+    Ok(Some(ExitCode::from(NOT_HUB)))
+}
+
+/// Sends `args` to the hub when it is another machine. `None` means this PC is the hub (or
+/// the call was itself forwarded): run the command here.
+pub fn forward_to_hub(ctx: &Ctx, args: &[&str], timeout: Duration) -> Result<Option<Forwarded>> {
+    if ctx.forwarded {
+        return Ok(None);
+    }
+    let slug = ctx.slug()?;
+    match route(&ctx.home, &ctx.ext, &slug)? {
+        Route::Local => Ok(None),
+        remote => forward(&ctx.home, &ctx.ext, &slug, &remote, args, timeout).map(Some),
+    }
+}
+
+/// Writes what the hub wrote and ends with its exit code, so the call looks the same as it
+/// would have on the hub.
+pub fn relay(answer: &Forwarded) -> ExitCode {
+    let _ = std::io::stdout().write_all(&answer.stdout);
+    let _ = std::io::stderr().write_all(&answer.stderr);
+    if answer.truncated {
+        eprintln!("경고: 허브의 출력이 너무 커서 뒤가 잘렸다");
+    }
+    ExitCode::from(u8::try_from(answer.code).unwrap_or(CANNOT_RUN))
+}
+
+/// The one-liner for a command that belongs to the hub:
+/// `if let Some(code) = run_on_hub(ctx, &["approve", "12"])? { return Ok(code); }`
+pub fn run_on_hub(ctx: &Ctx, args: &[&str]) -> Result<Option<ExitCode>> {
+    Ok(forward_to_hub(ctx, args, FORWARD_TIMEOUT)?.map(|answer| relay(&answer)))
 }
 
 #[derive(Debug, thiserror::Error)]

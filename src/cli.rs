@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::cmd::{self, Ctx};
+use crate::model::Slug;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -19,6 +20,9 @@ pub struct Cli {
     /// 대상 저장소의 경로. 없으면 지금 폴더
     #[arg(long, global = true, value_name = "경로")]
     pub repo: Option<PathBuf>,
+    /// 등록된 저장소를 owner/name으로 고른다. 허브로 넘긴 호출이 쓴다
+    #[arg(long, global = true, value_name = "owner/name", conflicts_with = "repo", value_parser = parse_slug)]
+    pub slug: Option<Slug>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -53,8 +57,14 @@ pub enum Command {
     Revert(cmd::revert::Args),
     /// mod와 Codex 스킬 파일을 설치한다
     Install(cmd::install::Args),
+    /// 이 저장소의 허브(대기열을 가진 머신)를 보거나 정한다
+    Hub(cmd::hub::Args),
     /// Claude Code PreToolUse 훅. 기본 브랜치로의 push와 `gh pr merge`를 막는다
     Guard(cmd::guard::Args),
+}
+
+fn parse_slug(text: &str) -> Result<Slug, String> {
+    Slug::try_from(text.to_owned())
 }
 
 pub fn main() -> ExitCode {
@@ -78,7 +88,7 @@ fn restore_sigpipe() {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let ctx = Ctx::from_env(cli.repo.clone())?;
+    let ctx = Ctx::from_env(cli.repo.clone())?.with_slug(cli.slug.clone());
     dispatch(cli, &ctx)
 }
 
@@ -93,6 +103,9 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Cli::command().print_help()?;
         return Ok(ExitCode::from(cmd::CANNOT_RUN));
     };
+    if let Some(code) = cmd::answer_not_hub(ctx)? {
+        return Ok(code);
+    }
     match command {
         Command::Init(args) => cmd::init::run(args, ctx),
         Command::Preflight(args) => cmd::preflight::run(args, ctx),
@@ -107,6 +120,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Daemon(args) => cmd::daemon::run(args, ctx),
         Command::Batches(args) => cmd::batches::run(args, ctx),
         Command::Revert(args) => cmd::revert::run(args, ctx),
+        Command::Hub(args) => cmd::hub::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),
         Command::Guard(args) => cmd::guard::run(args, ctx),
     }

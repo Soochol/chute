@@ -72,6 +72,47 @@ pub struct TerminalId(pub String);
 #[serde(transparent)]
 pub struct BatchId(pub String);
 
+/// The permanent id of an hc core (`hc server status --json`, `core.id`). Machine names differ
+/// by who is looking; the id does not.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct MachineId(String);
+
+impl MachineId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for MachineId {
+    type Error = String;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        if id.is_empty() || id.contains(|c: char| c.is_whitespace() || c.is_control() || c == '/') {
+            return Err(format!("머신 id가 올바르지 않다: {id:?}"));
+        }
+        Ok(MachineId(id))
+    }
+}
+
+impl From<MachineId> for String {
+    fn from(id: MachineId) -> String {
+        id.0
+    }
+}
+
+impl fmt::Display for MachineId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `hub.json`: which machine holds the queue of one repository. The file is absent on the hub.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubConfig {
+    pub machine_id: MachineId,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EpochMs(pub u64);
@@ -277,6 +318,9 @@ pub struct Agent {
     pub name: Option<String>,
     pub workdir: PathBuf,
     pub alive: bool,
+    /// The machine the terminal lives on. Absent in v1 files: the hub itself.
+    #[serde(default)]
+    pub machine: Option<MachineId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +587,7 @@ pub enum WarningKind {
     Config,
     History,
     Engine,
+    Hub,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -693,6 +738,7 @@ impl From<SchemaV1> for u32 {
 pub struct StatusView {
     pub schema: SchemaV1,
     pub repo: RepoView,
+    pub hub: HubView,
     pub approval: Approval,
     pub daemon: DaemonView,
     pub blocked: Option<Blocked>,
@@ -709,6 +755,21 @@ pub struct RepoView {
     pub path: PathBuf,
     pub default_branch: String,
     pub state_dir: PathBuf,
+}
+
+/// Where the queue of this repository lives, as seen from the PC that reads the status.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubView {
+    /// The PC that reads the status is the hub.
+    pub local: bool,
+    /// `None` only when this PC's own id could not be read from hc.
+    pub machine_id: Option<MachineId>,
+    pub host: Option<String>,
+    /// The hc name this PC gives the hub. `None` for the hub itself.
+    pub machine: Option<String>,
+    pub repo_path: Option<PathBuf>,
+    pub reachable: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,6 +801,10 @@ pub struct AgentView {
     pub terminal: TerminalId,
     pub name: Option<String>,
     pub alive: bool,
+    pub machine_id: Option<MachineId>,
+    pub host: Option<String>,
+    /// The hc name this PC gives the agent's machine. `None` for this PC or an unknown machine.
+    pub machine: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,18 +841,19 @@ pub struct RecentBatch {
 }
 
 impl ItemView {
-    pub fn new(item: &QueueItem, budget: u32, preflight: Option<&PreflightRecord>) -> ItemView {
+    pub fn new(
+        item: &QueueItem,
+        budget: u32,
+        preflight: Option<&PreflightRecord>,
+        agent: Option<AgentView>,
+    ) -> ItemView {
         ItemView {
             pr: item.pr,
             title: item.title.clone(),
             branch: item.branch.clone(),
             head: item.head.clone(),
             state: item.state,
-            agent: item.agent.as_ref().map(|a| AgentView {
-                terminal: a.terminal.clone(),
-                name: a.name.clone(),
-                alive: a.alive,
-            }),
+            agent,
             attempts: item.attempts,
             budget,
             submitted_ms: item.submitted_ms,
@@ -811,12 +877,68 @@ mod tests {
     use serde_json::{Value, json};
 
     const FIXTURE: &str = include_str!("../tests/fixtures/status-full.json");
+    const UNREACHABLE: &str = include_str!("../tests/fixtures/status-hub-unreachable.json");
 
     #[test]
-    fn status_fixture_round_trips() {
-        let original: Value = serde_json::from_str(FIXTURE).unwrap();
-        let view: StatusView = serde_json::from_value(original.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&view).unwrap(), original);
+    fn status_fixtures_round_trip() {
+        for fixture in [FIXTURE, UNREACHABLE] {
+            let original: Value = serde_json::from_str(fixture).unwrap();
+            let view: StatusView = serde_json::from_value(original.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&view).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn status_fixture_has_a_remote_hub_and_agents_on_three_kinds_of_machine() {
+        let view: StatusView = serde_json::from_str(FIXTURE).unwrap();
+        assert!(!view.hub.local && view.hub.reachable && view.hub.error.is_none());
+        assert_eq!(view.hub.machine.as_deref(), Some("desk"));
+        let agents: Vec<&AgentView> = view.queue.iter().filter_map(|i| i.agent.as_ref()).collect();
+        assert!(agents.iter().any(|a| a.machine.as_deref() == Some("desk")));
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.machine.is_none() && a.host.is_some())
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.machine.is_none() && a.host.is_none())
+        );
+        assert!(agents.iter().all(|a| a.machine_id.is_some()));
+    }
+
+    #[test]
+    fn status_fixture_of_an_unreachable_hub_has_no_queue_and_says_why() {
+        let view: StatusView = serde_json::from_str(UNREACHABLE).unwrap();
+        assert!(!view.hub.reachable && !view.hub.local);
+        assert!(view.hub.error.is_some());
+        assert!(view.queue.is_empty() && !view.daemon.running);
+        assert!(view.warnings.iter().any(|w| w.kind == WarningKind::Hub));
+    }
+
+    #[test]
+    fn a_v1_agent_without_a_machine_is_read_and_kept_without_one() {
+        let v1 = json!({"terminal": "t1rs", "created_ms": 5, "name": "impl-a",
+                        "workdir": "/w/cfg", "alive": false});
+        let agent: Agent = serde_json::from_value(v1).unwrap();
+        assert_eq!(agent.machine, None);
+        let id = MachineId::try_from("9a0c".to_owned()).unwrap();
+        let again: Agent = serde_json::from_value(
+            serde_json::to_value(Agent {
+                machine: Some(id.clone()),
+                ..agent
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again.machine, Some(id));
+    }
+
+    #[test]
+    fn a_blank_machine_id_is_refused_when_read() {
+        assert!(serde_json::from_value::<HubConfig>(json!({"machine_id": ""})).is_err());
+        assert!(serde_json::from_value::<HubConfig>(json!({"machine_id": "a/b"})).is_err());
     }
 
     #[test]

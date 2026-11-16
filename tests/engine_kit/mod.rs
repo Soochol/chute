@@ -157,6 +157,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             name: Some("impl-a".into()),
             workdir: self.sb.root().join("w"),
             alive: true,
+            machine: None,
         }
     }
 

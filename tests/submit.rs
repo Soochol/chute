@@ -127,7 +127,8 @@ fn submit_json_reports_pr_head_state_and_place_and_status_shows_the_agent() {
     assert_eq!(entry["state"], "queued");
     assert_eq!(
         entry["agent"],
-        json!({"terminal": "t1rs", "name": "impl-a", "alive": true})
+        json!({"terminal": "t1rs", "name": "impl-a", "alive": true,
+               "machine_id": support::SANDBOX_MACHINE_ID, "host": "sandbox-pc", "machine": null})
     );
 }
 
@@ -163,6 +164,7 @@ fn trust_mode_queues_the_pr_and_records_its_head_and_agent() {
             name: Some("impl-a".into()),
             workdir: "/w/impl-a".into(),
             alive: true,
+            machine: None,
         })
     );
     assert_eq!((item.attempts, item.touches_config), (0, false));

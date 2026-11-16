@@ -1024,6 +1024,7 @@ mod tests {
             name: Some(terminal.into()),
             workdir: "/w".into(),
             alive: true,
+            machine: None,
         }
     }
 

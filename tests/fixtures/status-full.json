@@ -6,10 +6,19 @@
     "default_branch": "main",
     "state_dir": "/home/dev/.local/state/chute/repos/Soochol__chute"
   },
+  "hub": {
+    "local": false,
+    "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+    "host": "desk-host",
+    "machine": "desk",
+    "repo_path": "/home/hub/code/chute",
+    "reachable": true,
+    "error": null
+  },
   "approval": "agent",
   "daemon": {
     "running": true,
-    "terminal": "t1zz",
+    "terminal": "desk/t1zz",
     "pid": 4242
   },
   "blocked": {
@@ -40,7 +49,10 @@
       "agent": {
         "terminal": "t1rp",
         "name": "impl-h",
-        "alive": true
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
       },
       "attempts": 3,
       "budget": 3,
@@ -62,9 +74,12 @@
       "state": "needs_human",
       "state_reason": "unreachable",
       "agent": {
-        "terminal": "t1rq",
+        "terminal": "desk/t1rq",
         "name": "impl-i",
-        "alive": false
+        "alive": false,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 1,
       "budget": 3,
@@ -108,7 +123,10 @@
       "agent": {
         "terminal": "t1rv",
         "name": "impl-d",
-        "alive": true
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
       },
       "attempts": 2,
       "budget": 3,
@@ -133,9 +151,12 @@
       "state": "bounced",
       "state_reason": "conflict",
       "agent": {
-        "terminal": "t1ru",
+        "terminal": "desk/t1ru",
         "name": "impl-c",
-        "alive": true
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 1,
       "budget": 3,
@@ -157,9 +178,12 @@
       "state": "bounced",
       "state_reason": "timeout",
       "agent": {
-        "terminal": "t1rw",
+        "terminal": "desk/t1rw",
         "name": "impl-e",
-        "alive": true
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 1,
       "budget": 3,
@@ -181,9 +205,12 @@
       "state": "bounced",
       "state_reason": "ci",
       "agent": {
-        "terminal": "t1ry",
+        "terminal": "desk/t1ry",
         "name": "impl-g",
-        "alive": true
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 1,
       "budget": 3,
@@ -205,9 +232,12 @@
       "state": "bounced",
       "state_reason": "head_changed",
       "agent": {
-        "terminal": "t1rx",
+        "terminal": "t5",
         "name": "impl-f",
-        "alive": true
+        "alive": true,
+        "machine_id": "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+        "host": null,
+        "machine": null
       },
       "attempts": 0,
       "budget": 3,
@@ -224,9 +254,12 @@
       "state": "in_batch",
       "state_reason": null,
       "agent": {
-        "terminal": "t1rs",
+        "terminal": "desk/t1rs",
         "name": "impl-a",
-        "alive": true
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 1,
       "budget": 3,
@@ -251,9 +284,12 @@
       "state": "in_batch",
       "state_reason": null,
       "agent": {
-        "terminal": "t1rt",
+        "terminal": "desk/t1rt",
         "name": "impl-b",
-        "alive": true
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 0,
       "budget": 3,
@@ -270,9 +306,12 @@
       "state": "queued",
       "state_reason": "ci_pending",
       "agent": {
-        "terminal": "t1s2",
+        "terminal": "desk/t1s2",
         "name": "impl-ci",
-        "alive": true
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
       },
       "attempts": 0,
       "budget": 3,
@@ -309,7 +348,10 @@
       "agent": {
         "terminal": "t1s4",
         "name": "impl-config",
-        "alive": true
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
       },
       "attempts": 0,
       "budget": 3,

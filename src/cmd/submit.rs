@@ -262,6 +262,7 @@ fn lookup_agent(ctx: &Ctx, address: &str, fallback_dir: &Path) -> Result<Agent> 
         name: terminal.name.filter(|n| !n.is_empty()),
         workdir,
         alive: true,
+        machine: None,
     })
 }
 
