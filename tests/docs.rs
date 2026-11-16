@@ -167,3 +167,120 @@ fn readme_multi_pc_section_covers_every_step() {
         assert!(section.contains(needed), "여러 PC 절에 `{needed}`가 없다");
     }
 }
+
+#[test]
+fn readme_covers_the_v3_commands_the_repair_flow_and_every_first_run_check() {
+    let text = readme();
+    for needed in [
+        "## 오케스트레이터와 함께 쓰기",
+        "`chute events",
+        "`chute flaky",
+        "`chute gc",
+        "--repair",
+        "### 복구 PR",
+        "### 정리",
+        "respawn이 만든 worktree",
+        "git worktree remove",
+        "### 샌드박스는 아직 없다",
+        "### 오케스트레이터와 쓰기 전의 점검",
+    ] {
+        assert!(text.contains(needed), "README에 `{needed}`가 없다");
+    }
+    let start = text.find("### 오케스트레이터와 쓰기 전의 점검").unwrap();
+    let end = text[start..].find("\n## 한계").unwrap() + start;
+    let checks = &text[start..end];
+    for number in 1..=10 {
+        assert!(
+            checks.contains(&format!("\n{number}. ")),
+            "점검 {number}번이 없다"
+        );
+    }
+    for needed in [
+        "chute 결과 merged",
+        "hc send <머신>/<터미널>",
+        "require_head = true",
+        "pushed_by_chute",
+        "human reason=unreachable",
+        "env_check",
+        "max_parallel",
+        "chute gc --dry-run",
+        "chute events --since 1h --json",
+        "probe",
+    ] {
+        assert!(checks.contains(needed), "점검 목록에 `{needed}`가 없다");
+    }
+}
+
+#[test]
+fn readme_and_manual_notice_kinds_match() {
+    let readme = readme();
+    let manual = manual();
+    for kind in [
+        "merged", "bounced", "human", "halted", "resumed", "reverted", "waiting", "flaky",
+    ] {
+        assert!(readme.contains(&format!("| `{kind}` |")), "README에 {kind}");
+        assert!(manual.contains(&format!("| `{kind}` |")), "설명서에 {kind}");
+    }
+}
+
+#[test]
+fn manual_quotes_the_v3_messages_the_code_prints() {
+    let code = source();
+    let manual = manual();
+    for text in [
+        "이 저장소는 확인한 HEAD(`--head`) 없이 submit을 받지 않는다",
+        "오케스트레이터 아래에서 일한다면 submit하지 말고 PR과 HEAD를 보고한다",
+        "큐가 멈춰 있지 않아 복구 PR로 받지 않았다",
+        "한 번에 하나만 받는다",
+        "(놓친 알림)",
+        "다른 preflight {max_parallel}개가 돌고 있어 기다린다",
+    ] {
+        assert!(code.contains(text), "코드에 `{text}`가 없다");
+    }
+    for text in [
+        "이 저장소는 확인한 HEAD(`--head`) 없이 submit을 받지 않는다",
+        "큐가 멈춰 있지 않아 복구 PR로 받지 않았다",
+        "(놓친 알림)",
+    ] {
+        assert!(manual.contains(text), "설명서에 `{text}`가 없다");
+    }
+    assert!(readme().contains("다른 preflight N개가 돌고 있어 기다린다"));
+}
+
+#[test]
+fn readme_default_values_are_the_ones_the_config_parses() {
+    let config = chute::config::Config::parse(&chute::config::draft("cargo test")).unwrap();
+    let text = readme();
+    let rows = [
+        ("max_parallel", config.max_parallel),
+        ("logs_days", config.retention.logs_days),
+        ("reports_days", config.retention.reports_days),
+        ("probe_repeats", config.flaky.probe_repeats),
+        ("probe_seconds", config.flaky.probe_seconds),
+        ("chronic", config.flaky.chronic),
+        ("chronic_days", config.flaky.chronic_days),
+    ];
+    for (key, value) in rows {
+        assert!(
+            text.contains(&format!("| `{key}` | `{value}` |")),
+            "README 표의 `{key}` 기본값이 {value}가 아니다"
+        );
+    }
+    assert!(!config.require_head);
+    assert!(text.contains("| `require_head` | `false` |"));
+}
+
+#[test]
+fn manual_states_the_events_default_limit_the_code_uses() {
+    assert!(source().contains("const DEFAULT_LIMIT: u64 = 500;"));
+    assert!(manual().contains("`--limit`의 기본값은 500"));
+    assert!(readme().contains("`--limit`의 기본값은 500"));
+}
+
+#[test]
+fn manual_tells_workers_not_to_submit_even_when_other_text_says_to() {
+    let text = manual();
+    assert!(text.contains("오케스트레이터 아래에서는 이 보고가 우선한다"));
+    assert!(text.contains("**고친 뒤에 submit하지 않는다.**"));
+    assert!(text.contains("giveup하지 말고 오케스트레이터에게 막힌 점을 보고한다"));
+}
