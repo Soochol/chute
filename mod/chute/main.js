@@ -397,11 +397,19 @@ function batchCard(batch, t) {
     .when(facts.length > 0, (el) => el.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(facts.join(" · "))))
     .children(
       batch.prs.map((entry) =>
-        h_flex()
-          .gap(6)
-          .items_start()
-          .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
-          .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title)),
+        v_flex()
+          .gap(3)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_start()
+              .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
+              .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title)),
+          )
+          .when(entry.marks.length > 0, (el) =>
+            el.child(h_flex().gap(5).flex_wrap().children(entry.marks.map((mark) => chip(mark.text, tone(mark.tone, t))))),
+          )
+          .when(Boolean(entry.submitter), (el) => el.child(submitterLine(entry.submitter, t))),
       ),
     );
 }

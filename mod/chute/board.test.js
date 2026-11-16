@@ -200,8 +200,8 @@ test("waiting items are numbered in submission order", () => {
 test("batch shows members, phase, step, round and elapsed time", () => {
   const [batch] = section(only([fixture]), "batch").items;
   assert.deepEqual(batch.prs, [
-    { pr: 12, title: "큐 상태 전이 추가" },
-    { pr: 13, title: "검증 실행기" },
+    { pr: 12, title: "큐 상태 전이 추가", marks: [], submitter: null },
+    { pr: 13, title: "검증 실행기", marks: [], submitter: null },
   ]);
   assert.equal(batch.phase, "검증 중");
   assert.equal(batch.step, "test");
@@ -657,8 +657,8 @@ test("failure text prefers stderr, then stdout, then the exit code", () => {
 test("batch members come from the batch record even when the queue lacks them", () => {
   const data = { ...clone(fixture), queue: [] };
   assert.deepEqual(section(only(data), "batch").items[0].prs, [
-    { pr: 12, title: "" },
-    { pr: 13, title: "" },
+    { pr: 12, title: "", marks: [], submitter: null },
+    { pr: 13, title: "", marks: [], submitter: null },
   ]);
 });
 
@@ -1111,4 +1111,26 @@ test("v3: malformed v3 fields do not break the board", () => {
   const [alert] = section(only(data), "alerts").items;
   assert.equal(alert.log, null);
   assert.deepEqual(alert.facts, ["복구 PR #22 검증 대기"]);
+});
+
+test("v3: members of a running batch keep their marks and submitter", () => {
+  const repair = itemOf(22);
+  repair.state = "in_batch";
+  const data = { ...clone(fixture), queue: [repair], batch: { ...clone(fixture.batch), prs: [22] } };
+  const [entry] = section(only(data), "batch").items[0].prs;
+  assert.deepEqual(entry.marks.map((m) => m.text), ["복구"]);
+  assert.equal(entry.submitter.text, "submit orch (t1s0)");
+});
+
+test("v3: priority is a warning color and repair an error color", () => {
+  const both = itemOf(22);
+  both.priority = true;
+  const { marks } = waitingItem(withQueue(both), 22);
+  assert.deepEqual(marks.map((m) => [m.text, m.tone]), [["급함", "warn"], ["복구", "error"]]);
+});
+
+test("v3: a PR listed twice in after is shown once", () => {
+  const item = itemOf(24);
+  item.after = [12, 12, 22];
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(item), 24)), ["#12, #22 뒤"]);
 });

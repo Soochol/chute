@@ -121,7 +121,7 @@ function marksOf(item) {
   const marks = [];
   if (item.priority === true) marks.push({ kind: "priority", text: "급함", tone: "warn" });
   if (item.repair === true) marks.push({ kind: "repair", text: "복구", tone: "error" });
-  const after = list(item.after).filter((pr) => Number.isSafeInteger(pr) && pr > 0);
+  const after = [...new Set(list(item.after).filter((pr) => Number.isSafeInteger(pr) && pr > 0))];
   if (after.length > 0) marks.push({ kind: "after", text: `${after.map((pr) => `#${pr}`).join(", ")} 뒤`, tone: "muted" });
   return marks;
 }
@@ -261,9 +261,15 @@ function batchOf(batch, members, now) {
   const b = isObject(batch) ? batch : {};
   const unlisted = new Map();
   for (const item of members) unlisted.set(item.pr, [...(unlisted.get(item.pr) ?? []), item]);
-  const prs = list(b.prs).map((pr) => ({ pr: prOf(pr), title: str(unlisted.get(pr)?.shift()?.title) }));
+  const entryOf = (pr, item) => ({
+    pr,
+    title: str(item?.title),
+    marks: item ? marksOf(item) : [],
+    submitter: item ? submitterOf(item) : null,
+  });
+  const prs = list(b.prs).map((pr) => entryOf(prOf(pr), unlisted.get(pr)?.shift()));
   for (const rest of unlisted.values()) {
-    for (const item of rest) prs.push({ pr: item.pr, title: str(item.title) });
+    for (const item of rest) prs.push(entryOf(item.pr, item));
   }
   return [
     {
