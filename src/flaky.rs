@@ -313,7 +313,7 @@ fn repeat(
         else {
             break;
         };
-        match verify::run_command(
+        match verify::run_probe(
             job.config,
             job.store,
             job.slot.path(),

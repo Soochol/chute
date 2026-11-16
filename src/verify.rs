@@ -174,7 +174,7 @@ pub enum CommandEnd {
 /// Runs `command` once in `dir` the way a step runs, in its own process group, with the same
 /// environment, the verification lock when the config asks for one, and the cancel flag. Its
 /// output goes to `log`, which must be in an existing folder.
-pub fn run_command(
+pub fn run_probe(
     config: &Config,
     store: &RepoStore,
     dir: &Path,
