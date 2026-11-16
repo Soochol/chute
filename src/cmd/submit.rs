@@ -35,7 +35,6 @@ pub struct Args {
     /// 결과를 JSON으로 출력한다
     #[arg(long)]
     pub json: bool,
-    /// Set by a PC that filled in `--head` itself, so the hub still sees a submit without one.
     #[arg(long, hide = true)]
     pub relayed_no_head: bool,
     #[arg(long, hide = true, value_name = "JSON", value_parser = parse_relayed)]
@@ -253,8 +252,6 @@ fn record_submitted(
     }
 }
 
-/// Keeps the PRs this one must wait for: those in the queue. A PR that is not queued but
-/// already merged on GitHub needs no waiting and is left out; any other is refused.
 fn resolve_after(
     ctx: &Ctx,
     dir: &Path,

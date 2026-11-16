@@ -533,7 +533,6 @@ impl<'a> Notifier<'a> {
         }
     }
 
-    /// Tells the submitter of each item held behind `held` that it keeps waiting, and why.
     pub fn notify_waiters(&self, held: PrNumber, why: WaitingWhy, at: EpochMs) {
         let state = match self.store.load() {
             Ok(state) => state,

@@ -267,7 +267,6 @@ pub struct Submission {
     pub touches_config: bool,
     pub approval: Approval,
     pub priority: bool,
-    /// PRs that must merge first. The caller has already dropped the ones that merged.
     pub after: Vec<PrNumber>,
     pub now: EpochMs,
 }
@@ -370,8 +369,6 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     })
 }
 
-/// Drops duplicates and PRs that left the queue meanwhile (they merged, or the caller
-/// would have refused them), and refuses a PR waiting for itself or for a PR that waits for it.
 fn checked_after(
     state: &State,
     pr: PrNumber,
@@ -395,7 +392,6 @@ fn checked_after(
     Ok(kept)
 }
 
-/// Whether `pr` waits for `target`, directly or through the PRs it waits for.
 fn waits_for(queue: &[QueueItem], pr: PrNumber, target: PrNumber) -> bool {
     let mut seen = vec![pr];
     let mut todo = vec![pr];
@@ -474,8 +470,6 @@ pub fn unreachable(state: &mut State, pr: PrNumber) -> Result<(), TransitionErro
     move_to(state, pr, Action::Escalate(HumanReason::Unreachable)).map(|_| ())
 }
 
-/// The order in which waiting items are considered for a batch. Every rule that puts one
-/// item ahead of another lives here; items of the same rank keep the order they were queued.
 pub fn batch_order(queue: &[QueueItem]) -> Vec<PrNumber> {
     let mut order: Vec<&QueueItem> = queue.iter().collect();
     order.sort_by_key(|item| !item.priority);

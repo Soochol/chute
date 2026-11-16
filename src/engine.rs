@@ -987,7 +987,6 @@ impl Run<'_> {
         Ok((to, unreachable, delivery))
     }
 
-    /// Returns when the PR's latest event happened, for the notices that follow it.
     fn note_unreachable(&self, pr: PrNumber, why: Option<String>, at: EpochMs) -> Result<EpochMs> {
         let Some(detail) = why else { return Ok(at) };
         let at = self.engine.history_at(EventKind::NeedsHuman {
@@ -1000,7 +999,6 @@ impl Run<'_> {
         Ok(at)
     }
 
-    /// Tells whoever waits behind `pr` that it was sent back or handed to a human.
     fn tell_waiters(&self, pr: PrNumber, at: EpochMs) {
         let why = match self
             .engine
