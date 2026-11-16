@@ -576,3 +576,435 @@ fn status_still_works_when_hc_cannot_say_who_this_pc_is() {
             .contains("머신 id를 읽지 못했다")
     );
 }
+
+fn item_json(pr: u32, state: &str, reason: Value, agent: Value) -> Value {
+    serde_json::json!({
+        "pr": pr, "title": format!("pr {pr}"), "branch": format!("feat/{pr}"),
+        "head": "abc1234", "state": state, "state_reason": reason, "agent": agent,
+        "attempts": 0, "submitted_ms": 10 + u64::from(pr), "touches_config": false,
+        "last_failure": null
+    })
+}
+
+fn agent_json(machine: Option<&str>) -> Value {
+    let mut agent = serde_json::json!({
+        "terminal": "t7", "created_ms": 5, "name": "w", "workdir": "/w", "alive": true
+    });
+    if let Some(id) = machine {
+        agent["machine"] = Value::from(id);
+    }
+    agent
+}
+
+fn seed(node: &Node, state: Value) {
+    let state = serde_json::from_value(state).unwrap();
+    home_of(node)
+        .repo(&slug())
+        .update(|s| {
+            *s = state;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn state_of(node: &Node) -> Value {
+    serde_json::to_value(home_of(node).repo(&slug()).load().unwrap()).unwrap()
+}
+
+fn history_of(node: &Node) -> Vec<chute::model::Event> {
+    home_of(node).repo(&slug()).history().unwrap().events
+}
+
+fn events(n: u64) -> Vec<chute::model::Event> {
+    use chute::model::{BatchId, EpochMs, Event, EventKind, PrNumber, Sha};
+    (1..=n)
+        .map(|i| Event {
+            at_ms: EpochMs(i),
+            kind: EventKind::Merged {
+                pr: PrNumber(i),
+                batch: BatchId("b0".to_owned()),
+                commit: Sha::try_from("abc1234".to_owned()).unwrap(),
+                submitted_ms: EpochMs(1),
+            },
+        })
+        .collect()
+}
+
+fn three_items(c: &Node) -> Value {
+    serde_json::json!({
+        "queue": [
+            item_json(1, "queued", Value::Null, agent_json(Some(&c.id))),
+            item_json(2, "needs_human", Value::from("gave_up"), agent_json(Some(&c.id))),
+            item_json(3, "queued", Value::Null, agent_json(None)),
+        ],
+        "batch": null, "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
+    })
+}
+
+fn old_hub_with_items(net: &Net) -> Value {
+    let (a, c) = (net.node("a"), net.node("c"));
+    seed(a, three_items(c));
+    let state = state_of(a);
+    let store = home_of(a).repo(&slug());
+    for event in events(2) {
+        store.append_history(&event).unwrap();
+    }
+    state
+}
+
+fn take(b: &Node, from: &str) -> Output {
+    b.chute(BIN, &["hub", "take", from])
+}
+
+fn with_a_filled_in(mut state: Value, a: &Node) -> Value {
+    for item in state["queue"].as_array_mut().unwrap() {
+        if item["agent"]["machine"].is_null() {
+            item["agent"]["machine"] = Value::from(a.id.clone());
+        }
+    }
+    state
+}
+
+#[test]
+fn take_moves_the_queue_and_the_history_and_makes_this_pc_the_hub() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let state = old_hub_with_items(&net);
+
+    let out = take(b, "a");
+    let said = ok(&out);
+    assert!(
+        said.contains("보고서와 검증 로그는 옮기지 않는다"),
+        "{said}"
+    );
+
+    assert_eq!(state_of(b), with_a_filled_in(state.clone(), a));
+    assert_eq!(state_of(b)["queue"][2]["agent"]["machine"], a.id);
+    assert_eq!(state_of(a), state, "얼어 있는 옛 허브의 큐는 그대로다");
+    assert_eq!(hub_of(a), Some(id(b)));
+    assert!(!hub_json(b).exists());
+    assert_eq!(history_of(b), events(2));
+    assert_eq!(json(&ok(&b.chute(BIN, &["hub", "--json"])))["local"], true);
+}
+
+#[test]
+fn take_refuses_while_the_old_hubs_daemon_runs_and_changes_nothing() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    old_hub_with_items(&net);
+    let _daemon = home_of(a)
+        .repo(&slug())
+        .try_lock_daemon()
+        .unwrap()
+        .expect("데몬 잠금");
+
+    let out = take(b, "a");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("chute down"), "{}", stderr(&out));
+    assert!(!hub_json(a).exists());
+    assert!(!hub_json(b).exists());
+    assert_eq!(state_of(b)["queue"], serde_json::json!([]));
+    assert!(history_of(b).is_empty());
+}
+
+#[test]
+fn take_refuses_while_this_pcs_own_queue_holds_other_items() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    old_hub_with_items(&net);
+    let mine = serde_json::json!({
+        "queue": [item_json(9, "queued", Value::Null, Value::Null)],
+        "batch": null, "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    seed(b, mine.clone());
+
+    let out = take(b, "a");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("다른 항목"), "{}", stderr(&out));
+    assert_eq!(state_of(b), mine);
+    assert!(history_of(b).is_empty());
+    assert_eq!(hub_of(a), Some(id(b)), "옛 허브는 이미 얼어 있다");
+}
+
+#[test]
+fn take_refuses_a_machine_that_is_unknown_or_not_connected() {
+    let net = net(&["a", "b"]);
+    net.connect_all();
+    let b = net.node("b");
+    let out = take(b, "nosuch");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("hc가 머신 `nosuch`을 모른다"));
+    net.set_state("b", "a", "unreachable");
+    let out = take(b, "a");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("연결돼 있지 않다(상태: unreachable)"));
+}
+
+#[test]
+fn hidden_release_and_export_guard_themselves() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    old_hub_with_items(&net);
+
+    let out = a.chute(BIN, &["hub", "export"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("아직 허브다"), "{}", stderr(&out));
+
+    ok(&a.chute(BIN, &["hub", "release", "--to", &b.id]));
+    ok(&a.chute(BIN, &["hub", "release", "--to", &b.id]));
+    let other = format!("{:032x}", 0xff);
+    let out = a.chute(BIN, &["hub", "release", "--to", &other]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("허브가 아니다"), "{}", stderr(&out));
+    assert_eq!(hub_of(a), Some(id(b)));
+    a.chute(BIN, &["hub", "set", "--local"]);
+    let me = a.chute(BIN, &["hub", "release", "--to", &a.id]);
+    assert_eq!(me.status.code(), Some(1), "{}", stderr(&me));
+    let ghost = a.chute(BIN, &["hub", "release", "--to", &other]);
+    assert_eq!(ghost.status.code(), Some(1), "{}", stderr(&ghost));
+    assert!(stderr(&ghost).contains("hc가 모른다"), "{}", stderr(&ghost));
+    assert!(!hub_json(a).exists());
+    ok(&a.chute(BIN, &["hub", "release", "--to", &b.id]));
+    let exported = json(&ok(&a.chute(BIN, &["hub", "export"])));
+    assert_eq!(exported["state"]["queue"].as_array().unwrap().len(), 3);
+}
+
+fn end_state(b: &Node, a: &Node) -> (Value, Vec<chute::model::Event>, Option<MachineId>, bool) {
+    (state_of(b), history_of(b), hub_of(a), hub_json(b).exists())
+}
+
+#[test]
+fn take_run_again_after_any_step_ends_in_the_same_state() {
+    let reference = {
+        let net = net(&["a", "b", "c"]);
+        net.connect_all();
+        old_hub_with_items(&net);
+        ok(&take(net.node("b"), "a"));
+        end_state(net.node("b"), net.node("a"))
+    };
+    assert_eq!(reference.0["queue"].as_array().unwrap().len(), 3);
+
+    type Stop = fn(&Net);
+    let stops: [(&str, Stop); 4] = [
+        ("1단계 뒤", |net| {
+            let (a, b) = (net.node("a"), net.node("b"));
+            ok(&a.chute(BIN, &["hub", "release", "--to", &b.id]));
+        }),
+        ("2단계 뒤", |net| {
+            let (a, b) = (net.node("a"), net.node("b"));
+            ok(&a.chute(BIN, &["hub", "release", "--to", &b.id]));
+            ok(&a.chute(BIN, &["hub", "export"]));
+        }),
+        (
+            "3단계 도중(상태만 쓰고 기록은 한 줄만)",
+            |net| {
+                let (a, b) = (net.node("a"), net.node("b"));
+                ok(&a.chute(BIN, &["hub", "release", "--to", &b.id]));
+                let store = home_of(b).repo(&slug());
+                let exported = json(&ok(&a.chute(BIN, &["hub", "export"])));
+                seed(b, exported["state"].clone());
+                store.append_history(&events(2)[0]).unwrap();
+                point_at(b, a);
+            },
+        ),
+        ("4단계 앞(모두 쓰고 hub.json만 남음)", |net| {
+            let (a, b) = (net.node("a"), net.node("b"));
+            ok(&take(b, "a"));
+            point_at(b, a);
+        }),
+    ];
+    for (when, stop) in stops {
+        let net = net(&["a", "b", "c"]);
+        net.connect_all();
+        old_hub_with_items(&net);
+        stop(&net);
+        ok(&take(net.node("b"), "a"));
+        assert_eq!(end_state(net.node("b"), net.node("a")), reference, "{when}");
+        ok(&take(net.node("b"), "a"));
+        assert_eq!(
+            end_state(net.node("b"), net.node("a")),
+            reference,
+            "{when}, 한 번 더"
+        );
+    }
+}
+
+#[test]
+fn a_pc_that_knew_the_old_hub_follows_it_to_the_new_one() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b, c) = (net.node("a"), net.node("b"), net.node("c"));
+    seed(
+        a,
+        serde_json::json!({
+            "queue": [item_json(4, "awaiting_approval", Value::Null, Value::Null)],
+            "batch": null, "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
+        }),
+    );
+    point_at(c, a);
+    ok(&take(b, "a"));
+
+    let answer = forward(c, &remote(a), &["approve", "4"]).unwrap();
+    assert_eq!(
+        answer.code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&answer.stderr)
+    );
+
+    assert_eq!(state_of(b)["queue"][0]["state"], "queued");
+    assert_eq!(state_of(a)["queue"][0]["state"], "awaiting_approval");
+    assert_eq!(hub_of(c), Some(id(b)));
+}
+
+#[test]
+fn an_in_batch_item_taken_over_goes_back_to_the_queue_when_the_new_hubs_daemon_recovers() {
+    let net = net(&["a", "b"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    seed(
+        a,
+        serde_json::json!({
+        "queue": [item_json(5, "in_batch", Value::Null, agent_json(Some(&b.id)))],
+        "batch": {"id": "b1", "base": "abc1234", "prs": [5], "phase": "verifying",
+                  "step": null, "round": 1, "started_ms": 1},
+        "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
+        }),
+    );
+    let mut state = state_of(a);
+    ok(&take(b, "a"));
+    assert_eq!(state_of(b), state, "가져온 그대로다");
+
+    let store = home_of(b).repo(&slug());
+    let info = store.info().unwrap().unwrap();
+    let worktrees = b.sb.root().join("worktrees");
+    chute::engine::Engine::new(ext_of(b), home_of(b), info, worktrees)
+        .recover()
+        .unwrap();
+
+    state["queue"][0]["state"] = Value::from("queued");
+    state["batch"] = Value::Null;
+    let after = state_of(b);
+    assert_eq!(after["queue"][0]["state"], "queued", "{after}");
+    assert_eq!(after["batch"], Value::Null, "{after}");
+    assert_eq!(after["queue"][0]["pr"], 5);
+}
+
+#[test]
+fn take_run_again_after_the_new_hub_has_worked_changes_nothing_of_its_own() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let b = net.node("b");
+    old_hub_with_items(&net);
+    ok(&take(b, "a"));
+
+    let store = home_of(b).repo(&slug());
+    let extra = events(3).pop().unwrap();
+    store.append_history(&extra).unwrap();
+    store
+        .update(|s| {
+            s.verified_bases
+                .push(chute::model::Sha::try_from("def5678".to_owned()).unwrap());
+            Ok(())
+        })
+        .unwrap();
+    let (state, history) = (state_of(b), history_of(b));
+
+    ok(&take(b, "a"));
+
+    assert_eq!(state_of(b), state);
+    assert_eq!(history_of(b), history);
+    assert_eq!(history.len(), 3);
+}
+
+#[test]
+fn take_run_again_after_the_new_hubs_queue_drained_does_not_bring_it_back() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    old_hub_with_items(&net);
+    ok(&take(b, "a"));
+    seed(
+        b,
+        serde_json::json!({
+            "queue": [], "batch": null, "blocked": null,
+            "verified_bases": [], "preflights": {}, "warnings": []
+        }),
+    );
+
+    ok(&take(b, "a"));
+
+    assert_eq!(state_of(b)["queue"], serde_json::json!([]));
+    assert_eq!(history_of(b), events(2));
+    assert_eq!(hub_of(a), Some(id(b)));
+}
+
+#[test]
+fn take_run_again_with_an_empty_history_does_not_bring_back_drained_items() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    seed(a, three_items(net.node("c")));
+    ok(&take(b, "a"));
+    seed(
+        b,
+        serde_json::json!({
+            "queue": [], "batch": null, "blocked": null,
+            "verified_bases": [], "preflights": {}, "warnings": []
+        }),
+    );
+
+    ok(&take(b, "a"));
+
+    assert_eq!(state_of(b)["queue"], serde_json::json!([]));
+}
+
+#[test]
+fn taking_the_hub_back_refuses_instead_of_overwriting_the_work_done_meanwhile() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    old_hub_with_items(&net);
+    ok(&take(b, "a"));
+    home_of(b)
+        .repo(&slug())
+        .update(|s| {
+            let mut extra = s.queue[0].clone();
+            extra.pr = chute::model::PrNumber(7);
+            s.queue.push(extra);
+            Ok(())
+        })
+        .unwrap();
+    let (frozen_a, worked_b) = (state_of(a), state_of(b));
+
+    let out = take(a, "b");
+
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("다른 항목"), "{}", stderr(&out));
+    assert_eq!(state_of(a), frozen_a);
+    assert_eq!(state_of(b), worked_b);
+}
+
+#[test]
+fn take_run_again_refuses_when_the_old_hub_has_become_a_hub_again() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    old_hub_with_items(&net);
+    ok(&take(b, "a"));
+    ok(&a.chute(BIN, &["hub", "set", "--local"]));
+
+    let out = take(b, "a");
+
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("다시 스스로를 허브로 안다"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(hub_of(a), None);
+}

@@ -5,9 +5,12 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::{Ctx, Refusal, finish};
+use super::{Ctx, FORWARD_TIMEOUT, Refusal, finish, relay};
 use crate::config::{self, Config};
-use crate::model::{Agent, EpochMs, ItemState, PrNumber, RepoInfo, Sha, TerminalId};
+use crate::ext::Ext;
+use crate::hub::{self, Forwarded, Route};
+use crate::machine;
+use crate::model::{Agent, EpochMs, ItemState, MachineId, PrNumber, RepoInfo, Sha, TerminalId};
 use crate::queue::{self, Change, Submission};
 
 #[derive(clap::Args, Debug)]
@@ -17,22 +20,70 @@ pub struct Args {
     /// 반송을 받을 hc 터미널 주소. 없으면 HC_TERMINAL_ID
     #[arg(long, value_name = "주소")]
     pub agent: Option<String>,
+    /// 확인한 커밋. GitHub의 PR HEAD가 이 값과 다르면 거절한다. 7자 이상의 짧은 SHA도 된다
+    #[arg(long, value_name = "SHA", value_parser = parse_head)]
+    pub head: Option<Sha>,
     /// 결과를 JSON으로 출력한다
     #[arg(long)]
     pub json: bool,
+    #[arg(long, hide = true, value_name = "JSON", value_parser = parse_relayed)]
+    pub relayed_agent: Option<Relayed>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Relayed(Option<Agent>);
+
+fn parse_relayed(text: &str) -> Result<Relayed, String> {
+    serde_json::from_str(text)
+        .map(Relayed)
+        .map_err(|e| format!("에이전트 JSON을 읽지 못했다: {e}"))
+}
+
+const MIN_HEAD_LEN: usize = 7;
+
+fn parse_head(text: &str) -> Result<Sha, String> {
+    let sha = Sha::try_from(text.to_ascii_lowercase())?;
+    if sha.as_str().len() < MIN_HEAD_LEN {
+        return Err(format!(
+            "커밋 SHA는 {MIN_HEAD_LEN}자 이상이어야 한다: {text}"
+        ));
+    }
+    Ok(sha)
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
-    finish(submit(&args, ctx))
+    match submit(&args, ctx) {
+        Ok(None) => Ok(ExitCode::SUCCESS),
+        Ok(Some(answer)) => Ok(relay(&answer)),
+        Err(e) => finish(Err(e)),
+    }
 }
 
-fn submit(args: &Args, ctx: &Ctx) -> Result<()> {
+fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
     let dir = ctx.target_dir()?;
     let (info, store) = ctx.registered_repo()?;
+    if !ctx.forwarded() {
+        let route = hub::route(&ctx.home, &ctx.ext, &info.slug)?;
+        if let Route::Remote { .. } = route {
+            return submit_through_hub(args, ctx, &dir, &info, &route).map(Some);
+        }
+    }
     let config = load_default_branch_config(ctx, &info)?;
     let pr = read_pr(ctx, &dir, args.pr)?;
     check_open_and_ready(&pr, &info)?;
-    let agent = identify_agent(ctx, &dir, args.agent.as_deref());
+    if let Some(head) = &args.head {
+        check_head(&pr, head)?;
+    }
+    let this_pc = || this_machine(ctx);
+    let agent = match &args.relayed_agent {
+        Some(Relayed(agent)) => {
+            if let Some(agent) = agent {
+                check_agent_machine(&ctx.ext, agent, this_pc().as_ref())?;
+            }
+            agent.clone()
+        }
+        None => identify_agent(ctx, &dir, args.agent.as_deref(), this_pc),
+    };
 
     let config_edit = pr.config_edit();
     if config_edit == ConfigEdit::Unknown {
@@ -69,7 +120,94 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<()> {
     } else {
         print!("{}", render(&report, config_edit == ConfigEdit::Yes));
     }
-    Ok(())
+    Ok(None)
+}
+
+fn submit_through_hub(
+    args: &Args,
+    ctx: &Ctx,
+    dir: &Path,
+    info: &RepoInfo,
+    route: &Route,
+) -> Result<Forwarded> {
+    let pr = read_pr(ctx, dir, args.pr)?;
+    check_open_and_ready(&pr, info)?;
+    let this_pc = machine::core(&ctx.ext)?.id;
+    let agent = identify_agent(ctx, dir, args.agent.as_deref(), || Some(this_pc));
+    let head = match &args.head {
+        Some(head) => head.clone(),
+        None => local_head(&ctx.ext, dir)?,
+    };
+    let mut forwarded = vec![
+        "submit".to_owned(),
+        pr.number.0.to_string(),
+        "--head".to_owned(),
+        head.to_string(),
+        "--relayed-agent".to_owned(),
+        serde_json::to_string(&agent)?,
+    ];
+    if args.json {
+        forwarded.push("--json".to_owned());
+    }
+    let argv: Vec<&str> = forwarded.iter().map(String::as_str).collect();
+    hub::forward(
+        &ctx.home,
+        &ctx.ext,
+        &info.slug,
+        route,
+        &argv,
+        FORWARD_TIMEOUT,
+    )
+}
+
+fn this_machine(ctx: &Ctx) -> Option<MachineId> {
+    match machine::core(&ctx.ext) {
+        Ok(core) => Some(core.id),
+        Err(e) => {
+            eprintln!("경고: 이 PC의 머신 id를 읽지 못했다: {e:#}. 에이전트의 머신을 비워 둔다");
+            None
+        }
+    }
+}
+
+fn local_head(ext: &Ext, dir: &Path) -> Result<Sha> {
+    let text = ext
+        .git(dir, ["rev-parse", "HEAD"])?
+        .ok()
+        .context("이 PC의 HEAD를 읽지 못했다")?;
+    Sha::try_from(text.trim().to_owned()).map_err(anyhow::Error::msg)
+}
+
+fn check_head(pr: &Pr, expected: &Sha) -> Result<(), Refusal> {
+    if pr.head_ref_oid.as_str().starts_with(expected.as_str()) {
+        return Ok(());
+    }
+    Err(Refusal(format!(
+        "{}: GitHub의 PR HEAD는 {}인데 확인한 HEAD는 {expected}다. \
+         push하지 않은 커밋이 있거나 그사이 다른 커밋이 push됐다. 확인할 HEAD를 push한 뒤 다시 submit한다",
+        pr.number, pr.head_ref_oid
+    )))
+}
+
+fn check_agent_machine(
+    ext: &Ext,
+    agent: &Agent,
+    this_pc: Option<&MachineId>,
+) -> Result<(), Refusal> {
+    let Some(machine) = &agent.machine else {
+        return Ok(());
+    };
+    if Some(machine) == this_pc {
+        return Ok(());
+    }
+    let known = machine::list(ext).map_err(|e| Refusal(format!("{e:#}")))?;
+    if known.iter().any(|m| m.id == *machine) {
+        return Ok(());
+    }
+    Err(Refusal(format!(
+        "에이전트가 있는 머신({machine})을 이 허브가 모른다. 반송이 갈 길이 없어 받지 않는다. \
+         허브에서 `hc machine add`로 그 PC를 더한 뒤 다시 submit한다"
+    )))
 }
 
 #[derive(Serialize)]
@@ -207,7 +345,12 @@ fn check_open_and_ready(pr: &Pr, info: &RepoInfo) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn identify_agent(ctx: &Ctx, dir: &Path, flag: Option<&str>) -> Option<Agent> {
+fn identify_agent(
+    ctx: &Ctx,
+    dir: &Path,
+    flag: Option<&str>,
+    this_pc: impl FnOnce() -> Option<MachineId>,
+) -> Option<Agent> {
     let Some(address) = flag.filter(|a| !a.is_empty()).or(ctx.terminal()) else {
         eprintln!(
             "경고: 에이전트를 알 수 없다. --agent도 HC_TERMINAL_ID도 없다. 에이전트 없이 등록한다"
@@ -215,12 +358,33 @@ fn identify_agent(ctx: &Ctx, dir: &Path, flag: Option<&str>) -> Option<Agent> {
         return None;
     };
     match lookup_agent(ctx, address, dir) {
-        Ok(agent) => Some(agent),
+        Ok(agent) => {
+            let machine = machine_of(ctx, &agent.terminal, this_pc);
+            Some(Agent { machine, ..agent })
+        }
         Err(e) => {
             eprintln!("경고: 에이전트를 확인하지 못했다({address}): {e:#}. 에이전트 없이 등록한다");
             None
         }
     }
+}
+
+fn machine_of(
+    ctx: &Ctx,
+    terminal: &TerminalId,
+    this_pc: impl FnOnce() -> Option<MachineId>,
+) -> Option<MachineId> {
+    let Some((name, _)) = terminal.0.split_once('/') else {
+        return this_pc();
+    };
+    let found = machine::list(&ctx.ext)
+        .ok()
+        .and_then(|all| all.into_iter().find(|m| m.name == name))
+        .map(|m| m.id);
+    if found.is_none() {
+        eprintln!("경고: 터미널 주소의 머신 `{name}`을 hc가 모른다. 에이전트의 머신을 비워 둔다");
+    }
+    found
 }
 
 #[derive(Deserialize)]
