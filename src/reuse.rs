@@ -11,8 +11,6 @@ const MAX_KEPT: usize = 64;
 const HASH_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUR_MS: u64 = 60 * 60 * 1000;
 
-/// Names what `verify::run` would execute: each step's name, command, timeout and `paths`. What
-/// only shapes a report (`failed`, `probe`) is left out, so editing it keeps earlier passes valid.
 pub fn fingerprint(ext: &Ext, repo: &Path, config: &Config) -> Result<String> {
     let steps: Vec<_> = config
         .verify
@@ -42,9 +40,8 @@ pub fn fingerprint(ext: &Ext, repo: &Path, config: &Config) -> Result<String> {
     Ok(out.trim().to_owned())
 }
 
-/// Keeps `verified` for the next lookup. A record of the same key is replaced, records older than
-/// `keep_hours` go, and only the newest `MAX_KEPT` stay.
-pub fn remember(state: &mut State, verified: VerifiedTree, keep_hours: u32, now: EpochMs) {
+pub fn remember(state: &mut State, mut verified: VerifiedTree, keep_hours: u32, now: EpochMs) {
+    verified.at_ms = verified.at_ms.min(now);
     let oldest = now.0.saturating_sub(u64::from(keep_hours) * HOUR_MS);
     state
         .verified_trees
@@ -57,10 +54,7 @@ pub fn remember(state: &mut State, verified: VerifiedTree, keep_hours: u32, now:
 pub struct Lookup<'a> {
     pub config: &'a Config,
     pub now: EpochMs,
-    /// The machine that would verify. A tree recorded on another machine is not reused when this
-    /// is unknown.
     pub here: Option<&'a EnvRecord>,
-    /// Steps on the flaky ledger. A pass over any of them proves less than it seems to.
     pub flaky_steps: &'a [String],
 }
 
@@ -308,6 +302,15 @@ mod tests {
                 .find(&records, &without_lint)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_stamp_from_the_future_is_kept_as_now() {
+        let me = env("m1", "1");
+        let now = EpochMs(100 * HOUR_MS);
+        let mut state = State::default();
+        remember(&mut state, record(key(), 120 * HOUR_MS, me), 24, now);
+        assert_eq!(state.verified_trees[0].at_ms, now);
     }
 
     #[test]

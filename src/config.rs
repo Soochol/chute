@@ -33,7 +33,6 @@ pub struct Config {
     pub verify: NonEmpty<VerifyStep>,
 }
 
-/// When a verification that passed on a tree may stand in for the batch's own run on that tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reuse {
     pub enabled: bool,
@@ -96,7 +95,6 @@ pub struct VerifyStep {
 }
 
 impl Config {
-    /// The steps `paths` leaves out when the tree changes `changed` against its base.
     pub fn skipped_steps(&self, changed: Option<&[String]>) -> Vec<String> {
         let Some(changed) = changed else {
             return Vec::new();

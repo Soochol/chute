@@ -31,7 +31,6 @@ fn config_of(lab: &Lab) -> Config {
     Config::parse(&fs::read_to_string(lab.repo.path().join("chute.toml")).unwrap()).unwrap()
 }
 
-/// The tree a batch builds from `main` and `heads` merged in order.
 fn merged_tree(lab: &Lab, heads: &[&Sha]) -> Sha {
     let probe = lab.sb.root().join("tree-probe");
     let _ = fs::remove_dir_all(&probe);

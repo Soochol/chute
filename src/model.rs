@@ -569,7 +569,6 @@ pub struct Batch {
     /// True while verification waits for a free PC slot (`machine.toml`'s `max_verify`).
     #[serde(default)]
     pub waiting_machine: bool,
-    /// Which verification's pass the latest round took over instead of running again.
     #[serde(default)]
     pub reused: Option<VerifiedBy>,
 }
@@ -685,8 +684,6 @@ pub enum VerifiedBy {
     Batch,
 }
 
-/// What a passed verification vouches for: the tree it ran on, the verify steps it ran, and the
-/// steps `paths` left out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeKey {
     pub tree: Sha,

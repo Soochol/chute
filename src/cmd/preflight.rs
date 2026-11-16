@@ -297,8 +297,6 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     Ok(report)
 }
 
-/// The tree this run verified, for batch to take over when it builds the same tree. A pass that
-/// needed a rerun is not kept: its flaky step stands for nothing.
 fn passed_tree(
     ctx: &Ctx,
     slot: &Slot,

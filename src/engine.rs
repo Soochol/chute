@@ -1441,9 +1441,6 @@ impl Run<'_> {
         }
     }
 
-    /// Runs the verify steps on `tree`, or takes over an earlier pass of the same tree when
-    /// `reusable`. Only the first build of a batch is reusable. A rerun after a failure, the
-    /// check of a PR alone and the check of a base each exist to see the tree again.
     fn verify(&mut self, tree: &Sha, scope: Scope, reusable: bool) -> Result<Verdict> {
         let changed = match scope {
             Scope::Changed => Some(self.slot.changed_files(&self.start_base)?),
@@ -1528,7 +1525,6 @@ impl Run<'_> {
         }
     }
 
-    /// The key a pass on `commit` is kept and looked up by, or `None` when reuse is off.
     fn tree_key(&self, commit: &Sha, changed: Option<&[String]>) -> Result<Option<TreeKey>> {
         if !self.config.reuse.enabled {
             return Ok(None);
@@ -1540,7 +1536,6 @@ impl Run<'_> {
         }))
     }
 
-    /// Takes over the pass of an earlier verification of the same tree, if one still stands.
     fn reuse_pass(&mut self, key: &TreeKey) -> Result<bool> {
         let engine = self.engine;
         let now = EpochMs::now();
