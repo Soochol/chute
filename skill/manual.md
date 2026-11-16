@@ -18,6 +18,10 @@ chute는 이 저장소의 머지 큐다. 여러 에이전트가 PR을 동시에 
 6. 못 풀겠으면 `chute giveup --reason "<이유>"`를 실행하고 멈춘다. 사람 차례로 넘어간다.
 7. `chute.toml`의 검증 명령이나 시간 제한을 고쳐서 검증을 통과시키려 하지 않는다. 이 파일을 고치는 PR은 사람 승인을 기다린다.
 
+### 원격이 여러 개일 때
+
+이 설명서의 `origin`과 `origin/main`은 chute가 관리하는 GitHub 원격의 이름과 그 기본 브랜치다. git 원격이 여러 개인 저장소는 이름이 다를 수 있다. 예를 들어 fork가 `origin`이고 GitHub 저장소가 `upstream`이면 `upstream`이다. 어느 원격인지는 `chute.toml`의 `remote` 키와 chute 등록 정보가 정하고, 반송 보고서의 명령도 그 이름으로 나온다. 훅은 chute가 관리하는 원격의 기본 브랜치로 가는 push만 막는다. fork나 미러로 가는 push는 막지 않는다. chute가 원격을 하나로 정하지 못해 멈추면("chute가 쓸 git 원격을 하나로 정하지 못했다") 우회하지 말고 보고한다. `chute.toml`에 `remote`를 적는 것은 사용자가 정한다.
+
 PR은 기본 브랜치를 향한 열린 PR이어야 하고 draft가 아니어야 한다. 저장소가 chute에 등록돼 있지 않으면 `chute`가 "등록되지 않은 저장소"라고 알린다. 그때는 사용자에게 알린다.
 
 ## 명령
@@ -57,7 +61,7 @@ preflight를 통과해도 머지가 보장되지는 않는다. 최종 판정은 
 PR을 큐에 올린다. 작업자는 `--head`와 `--agent` 말고는 쓰지 않는다. `--priority`, `--after`, `--repair`는 오케스트레이터가 쓴다(아래 "오케스트레이터가 쓰는 것"). PR 번호가 없으면 지금 브랜치의 PR이다. 그 순간의 PR HEAD를 큐에 기록하고, **기록한 HEAD만 머지한다.** 그 뒤에 push하면 HEAD가 달라져 머지되지 않고 알림이 온다. 고칠 것이 끝났을 때 submit한다.
 
 - 종료 코드 `0`: 큐에 올렸다(또는 이미 올라 있다).
-- 종료 코드 `1`: 거절. 닫힌 PR, 이미 머지된 PR, draft, 기본 브랜치가 아닌 곳을 향한 PR, 지금 batch에서 검증 중인 PR, 사람 차례인 PR, `--head`와 PR HEAD가 다른 경우, `chute.toml`을 기본 브랜치(`origin/main`)에서 읽지 못한 경우, `require_head = true`인 저장소에서 `--head` 없이 submit한 경우, `--after`나 `--repair`의 조건을 어긴 경우다. 이유가 stderr에 나온다. `chute.toml`을 읽지 못했다는 이유면 `git fetch`를 먼저 실행하고 다시 한다.
+- 종료 코드 `1`: 거절. 닫힌 PR, 이미 머지된 PR, draft, 기본 브랜치가 아닌 곳을 향한 PR, 지금 batch에서 검증 중인 PR, 사람 차례인 PR, `--head`와 PR HEAD가 다른 경우, `chute.toml`을 기본 브랜치(`origin/main`. 원격 이름은 `chute.toml`의 `remote`나 등록 정보를 따른다)에서 읽지 못한 경우, `require_head = true`인 저장소에서 `--head` 없이 submit한 경우, `--after`나 `--repair`의 조건을 어긴 경우다. 이유가 stderr에 나온다. `chute.toml`을 읽지 못했다는 이유면 `git fetch`를 먼저 실행하고 다시 한다.
 - 종료 코드 `2`: 실행할 수 없다. PR을 찾지 못했거나(번호를 인자로 주거나 PR이 있는 브랜치에서 실행한다) 저장소가 등록되지 않은 경우다. 허브가 다른 PC일 때 허브에 닿지 않는 경우도 종료 코드 `2`다(아래 "허브가 다른 PC일 때").
 - `--head <SHA>`: 확인한 커밋. GitHub의 PR HEAD가 이 값과 다르면 거절한다(종료 코드 `1`). 7자 이상의 짧은 SHA도 된다. 허브가 다른 PC일 때는 이 PC의 HEAD가 자동으로 들어가므로 줄 필요가 없다(`require_head = true`인 저장소는 이 자동 값을 받지 않는다). 허브에서 직접 실행할 때 push한 커밋을 못 박으려면 쓴다.
 - `--agent <주소>`: 반송을 받을 `hc` 터미널 주소. 없으면 환경 변수 `HC_TERMINAL_ID`를 쓴다. Codex처럼 이전 터미널의 `HC_TERMINAL_ID`를 물려받을 수 있는 에이전트는 자기 주소를 `--agent`로 직접 준다.

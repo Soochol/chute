@@ -91,7 +91,7 @@ impl World {
     fn bounce(&self, item: &QueueItem) -> (Delivery, PathBuf) {
         let hub = self.hub();
         let ext = Ext::from_vars(|k| hub.sb.var(k));
-        let info = repo::discover(&ext, hub.repo.path()).unwrap();
+        let info = repo::discover(&ext, hub.repo.path(), &|| Ok(Vec::new())).unwrap();
         let store = Home::at(hub.sb.chute_home()).repo(&info.slug);
         let config = Config::parse(CONFIG).unwrap();
         let worktrees = hub.sb.root().join("hub-worktrees");
@@ -444,7 +444,7 @@ fn a_head_change_notice_goes_to_the_agents_machine_without_a_report() {
     let item = w.item(w.agent_on_desk());
     let hub = w.hub();
     let ext = Ext::from_vars(|k| hub.sb.var(k));
-    let info = repo::discover(&ext, hub.repo.path()).unwrap();
+    let info = repo::discover(&ext, hub.repo.path(), &|| Ok(Vec::new())).unwrap();
     let store = Home::at(hub.sb.chute_home()).repo(&info.slug);
     let config = Config::parse(CONFIG).unwrap();
     let worktrees = hub.sb.root().join("hub-worktrees");

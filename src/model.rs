@@ -166,6 +166,11 @@ impl Slug {
     pub fn dir_name(&self) -> String {
         format!("{}__{}", self.owner, self.name)
     }
+
+    /// GitHub compares owner and name without regard to case.
+    pub fn same_repo(&self, other: &Slug) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+    }
 }
 
 impl TryFrom<String> for Slug {
@@ -204,7 +209,13 @@ pub struct RepoInfo {
     pub slug: Slug,
     pub path: PathBuf,
     pub remote: String,
+    #[serde(default = "default_remote_name")]
+    pub remote_name: String,
     pub default_branch: String,
+}
+
+fn default_remote_name() -> String {
+    "origin".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

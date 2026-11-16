@@ -29,6 +29,7 @@ fn readme_names_every_chute_toml_key() {
     keys(&table, &mut found);
     found.insert("failed".to_owned());
     found.insert("probe".to_owned());
+    found.insert("remote".to_owned());
     let text = readme();
     for key in &found {
         let named = text.contains(&format!("`{key}`")) || text.contains(&format!("`verify.{key}`"));

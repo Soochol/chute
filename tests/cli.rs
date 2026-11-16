@@ -50,6 +50,87 @@ fn init_writes_a_readable_draft_and_registers() {
     assert!(!repo.path().join("AGENTS.md").exists());
 }
 
+fn fork_and_upstream(sb: &Sandbox) -> TestRepo {
+    let repo = TestRepo::new(sb, "acme/widget");
+    let fork = sb.root().join("remotes/me/widget.git");
+    let (fork_s, upstream) = (
+        fork.to_string_lossy().into_owned(),
+        repo.origin().to_string_lossy().into_owned(),
+    );
+    repo.git(&["clone", "--quiet", "--bare", &upstream, &fork_s]);
+    repo.git(&["remote", "rename", "origin", "upstream"]);
+    repo.git(&["remote", "add", "origin", &fork_s]);
+    repo.git(&["fetch", "--quiet", "origin"]);
+    repo
+}
+
+#[test]
+fn init_with_several_remotes_asks_for_the_remote_key_and_then_uses_it() {
+    let sb = Sandbox::new();
+    let repo = fork_and_upstream(&sb);
+
+    let refused = chute(&sb, repo.path(), &["init"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    for needed in ["upstream", "origin", "git remote -v", "remote = "] {
+        assert!(stderr.contains(needed), "{needed}: {stderr}");
+    }
+    assert!(!sb.chute_home().join("repos").exists());
+
+    repo.write(
+        "chute.toml",
+        &format!("remote = \"upstream\"\n{}", chute::config::draft("true")),
+    );
+    ok(chute(&sb, repo.path(), &["init"]));
+    let repo_json = sb.chute_home().join("repos/acme__widget/repo.json");
+    let info: Value = serde_json::from_str(&fs::read_to_string(repo_json).unwrap()).unwrap();
+    assert_eq!(info["slug"], "acme/widget");
+    assert_eq!(info["remote_name"], "upstream");
+    assert_eq!(info["default_branch"], "main");
+
+    repo.write("chute.toml", &chute::config::draft("true"));
+    let status: Value =
+        serde_json::from_str(&ok(chute(&sb, repo.path(), &["status", "--json"]))).unwrap();
+    assert_eq!(status["repo"]["slug"], "acme/widget");
+}
+
+#[test]
+fn an_unreadable_registration_of_another_repository_does_not_stop_a_single_remote_repository() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    repo.commit_file("chute.toml", &chute::config::draft("true"), "chore: 설정");
+    repo.git(&["push", "--quiet", "origin", "main"]);
+    ok(chute(&sb, repo.path(), &["init"]));
+    let broken = sb.chute_home().join("repos/zzz__broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("repo.json"), "{").unwrap();
+
+    let status: Value =
+        serde_json::from_str(&ok(chute(&sb, repo.path(), &["status", "--json"]))).unwrap();
+    assert_eq!(status["repo"]["slug"], "acme/widget");
+}
+
+#[test]
+fn a_repository_registered_before_remote_name_existed_still_uses_origin() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    repo.commit_file("chute.toml", &chute::config::draft("true"), "chore: 설정");
+    repo.git(&["push", "--quiet", "origin", "main"]);
+    ok(chute(&sb, repo.path(), &["init"]));
+    let repo_json = sb.chute_home().join("repos/acme__widget/repo.json");
+    let mut info: Value = serde_json::from_str(&fs::read_to_string(&repo_json).unwrap()).unwrap();
+    info.as_object_mut().unwrap().remove("remote_name");
+    fs::write(&repo_json, info.to_string()).unwrap();
+
+    let status: Value =
+        serde_json::from_str(&ok(chute(&sb, repo.path(), &["status", "--json"]))).unwrap();
+    assert_eq!(status["repo"]["slug"], "acme/widget");
+    assert!(
+        status["warnings"].as_array().is_none_or(|w| w.is_empty()),
+        "{status}"
+    );
+}
+
 #[test]
 fn init_twice_gives_the_same_files() {
     let sb = Sandbox::new();
@@ -169,6 +250,7 @@ fn chute_git_selects_the_git_executable() {
         "worktree list --porcelain",
         support::Reply::ok("worktree /w/widget\nHEAD abc1234\nbranch refs/heads/main\n"),
     )
+    .respond("remote", support::Reply::ok("origin\n"))
     .respond(
         "remote get-url origin",
         support::Reply::ok("https://github.com/acme/widget.git\n"),
@@ -179,6 +261,7 @@ fn chute_git_selects_the_git_executable() {
         git.calls(),
         [
             vec!["worktree", "list", "--porcelain"],
+            vec!["remote"],
             vec!["remote", "get-url", "origin"]
         ]
     );

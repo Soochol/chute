@@ -252,7 +252,12 @@ fn hub_down(
     hub.reachable = false;
     hub.repo_path = None;
     hub.error = Some(message.clone());
-    let approval = match Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch) {
+    let approval = match Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    ) {
         Ok(Some(c)) => c.approval,
         _ => Approval::default(),
     };
@@ -284,14 +289,19 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
     let store = ctx.home.repo(&info.slug);
     let state = store.load()?;
     let mut warnings = state.warnings.clone();
-    let loaded = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch);
+    let loaded = Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    );
     let (approval, budget) = match loaded {
         Ok(Some(c)) => (c.approval, c.budget),
         failed => {
             let message = match failed {
                 Ok(_) => format!(
-                    "설정을 읽지 못했다: chute.toml이 origin/{}에 없다. 기본 브랜치에 올렸는지 확인하고 `git fetch`를 먼저 실행한다",
-                    info.default_branch
+                    "설정을 읽지 못했다: chute.toml이 {}/{}에 없다. 기본 브랜치에 올렸는지 확인하고 `git fetch`를 먼저 실행한다",
+                    info.remote_name, info.default_branch
                 ),
                 Err(e) => format!("{e:#}"),
             };

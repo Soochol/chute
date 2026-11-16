@@ -94,7 +94,7 @@ impl Swept {
 enum Doomed {
     Dir(PathBuf),
     Ref(String),
-    Slot(SlotLock),
+    Slot(Box<SlotLock>),
 }
 
 struct Planned {
@@ -241,7 +241,7 @@ fn plan_slots(site: &Site, rules: &Rules) -> Result<Vec<Planned>> {
                     target: path.display().to_string(),
                     bytes: tree_size(&path),
                 },
-                doomed: Doomed::Slot(lock),
+                doomed: Doomed::Slot(Box::new(lock)),
             }
         })
         .collect())
@@ -376,8 +376,12 @@ fn is_due(store: &RepoStore, now: EpochMs) -> bool {
 }
 
 fn rules_of(site: &Site) -> Result<Option<Rules>> {
-    let Some(config) =
-        Config::load_remote_branch(site.ext, &site.info.path, &site.info.default_branch)?
+    let Some(config) = Config::load_remote_branch(
+        site.ext,
+        &site.info.path,
+        &site.info.remote_name,
+        &site.info.default_branch,
+    )?
     else {
         return Ok(None);
     };
@@ -394,7 +398,7 @@ fn rules_of(site: &Site) -> Result<Option<Rules>> {
 
 /// Sweeps this PC. A real run notes its time and the outcome in the state: a failure leaves a
 /// `gc` warning, the next clean run removes it. `None` when there is no `chute.toml` on
-/// `origin/<default branch>` to take the rules from.
+/// `<remote>/<default branch>` to take the rules from.
 pub fn run(site: &Site, dry_run: bool, now: EpochMs) -> Result<Option<Swept>> {
     let outcome = rules_of(site).map(|rules| rules.map(|rules| sweep(site, &rules, now, dry_run)));
     if !dry_run {
@@ -490,6 +494,7 @@ mod tests {
                 slug: Slug::new("acme", "widget").unwrap(),
                 path: repo.path().to_path_buf(),
                 remote: "unused".into(),
+                remote_name: "origin".into(),
                 default_branch: "main".into(),
             };
             let store = home.repo(&info.slug);

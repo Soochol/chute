@@ -77,6 +77,54 @@ fn three_passing_prs_become_three_merge_commits_after_one_verification() {
     assert_eq!(lab.merged_prs(), [1, 2, 3]);
 }
 
+fn main_of(lab: &Lab, git_dir: &std::path::Path) -> String {
+    let mut git = lab.sb.command("git");
+    let out = git
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "main"]);
+    String::from_utf8(out.output().unwrap().stdout).unwrap()
+}
+
+#[test]
+fn a_batch_merges_into_the_remote_named_upstream_and_leaves_the_fork_alone() {
+    let mut lab = Lab::new("");
+    for n in 1..=2 {
+        lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
+    }
+    let fork = lab.sb.root().join("remotes/me/widget.git");
+    let fork_path = fork.to_string_lossy().into_owned();
+    let upstream = lab.repo.origin().to_string_lossy().into_owned();
+    lab.repo
+        .git(&["clone", "--quiet", "--bare", &upstream, &fork_path]);
+    let fork_before = main_of(&lab, &fork);
+    lab.repo.git(&["remote", "rename", "origin", "upstream"]);
+    lab.repo.git(&["remote", "add", "origin", &fork_path]);
+    lab.repo.git(&["fetch", "--quiet", "origin"]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    let config = fs::read_to_string(lab.repo.path().join("chute.toml")).unwrap();
+    lab.repo.commit_file(
+        "chute.toml",
+        &format!("remote = \"upstream\"\n{config}"),
+        "chore: remote 키",
+    );
+    lab.repo.git(&["push", "--quiet", "upstream", "main"]);
+    lab.info = chute::repo::discover(
+        &chute::ext::Ext::from_vars(|k| lab.sb.var(k)),
+        lab.repo.path(),
+        &|| Ok(Vec::new()),
+    )
+    .unwrap();
+    assert_eq!(lab.info.remote_name, "upstream");
+    lab.store.register(&lab.info).unwrap();
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2]));
+    assert_eq!(lab.merge_commits_on_main().len(), 2);
+    assert_eq!(main_of(&lab, &fork), fork_before, "fork의 main은 그대로다");
+}
+
 #[test]
 fn status_has_the_planned_shape_during_and_after_a_batch() {
     let lab = Lab::new("@STATUS@");

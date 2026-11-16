@@ -144,6 +144,7 @@ pub struct Gitops {
     repo: PathBuf,
     slots_dir: PathBuf,
     owner: String,
+    remote: String,
     default_branch: String,
     cache_seed: Vec<String>,
 }
@@ -156,6 +157,7 @@ impl Gitops {
             repo: info.path.clone(),
             slots_dir: std::path::absolute(&slots_dir).unwrap_or(slots_dir),
             owner: info.slug.owner().to_owned(),
+            remote: info.remote_name.clone(),
             default_branch: info.default_branch.clone(),
             cache_seed: Vec::new(),
         }
@@ -592,15 +594,16 @@ impl Slot {
         self.sha("HEAD")
     }
 
-    /// Fetches the default branch and returns its tip. `origin/<branch>` is moved to the same
+    /// Fetches the default branch and returns its tip. `<remote>/<branch>` is moved to the same
     /// commit.
     pub fn fetch_base(&self) -> Result<Sha> {
-        let branch = &self.lock.git.default_branch;
-        let tracking = format!("refs/remotes/origin/{branch}");
+        let git = &self.lock.git;
+        let branch = &git.default_branch;
+        let tracking = format!("refs/remotes/{}/{branch}", git.remote);
         let before = self.read_ref(&tracking)?;
         let tip = self
             .fetch(&format!("refs/heads/{branch}"))
-            .with_context(|| format!("origin/{branch}를 가져오지 못했다"))?;
+            .with_context(|| format!("{}/{branch}를 가져오지 못했다", git.remote))?;
         self.advance_tracking_ref(&tracking, before.as_ref(), &tip)?;
         Ok(tip)
     }
@@ -662,7 +665,7 @@ impl Slot {
     pub fn push(&self, commit: &Sha) -> Result<PushOutcome> {
         let git = &self.lock.git;
         let refspec = format!("{commit}:refs/heads/{}", git.default_branch);
-        let out = self.git(&["push", "origin", &refspec])?;
+        let out = self.git(&["push", &git.remote, &refspec])?;
         if out.success() {
             return Ok(PushOutcome::Pushed);
         }
@@ -790,7 +793,7 @@ impl Slot {
             "--quiet",
             "--no-tags",
             "--refmap=",
-            "origin",
+            &self.lock.git.remote,
             refspec,
         ])?;
         self.sha("FETCH_HEAD")
@@ -976,7 +979,7 @@ mod tests {
             repo.git(&["commit", "--quiet", "-m", "chore: 기준 파일"]);
             repo.git(&["push", "--quiet", "origin", "main"]);
             let ext = hermetic_ext(&sb);
-            let info = repo::discover(&ext, repo.path()).unwrap();
+            let info = repo::discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
             let gitops = Gitops::new(&ext, &Home::at(sb.chute_home()), &info);
             let peer = sb.root().join("peer");
             let origin = repo.origin().to_string_lossy().into_owned();
@@ -1823,7 +1826,7 @@ mod tests {
     #[test]
     fn a_relative_state_folder_still_puts_slots_outside_the_users_checkout() {
         let w = World::new();
-        let info = repo::discover(&hermetic_ext(&w.sb), w.repo.path()).unwrap();
+        let info = repo::discover(&hermetic_ext(&w.sb), w.repo.path(), &|| Ok(Vec::new())).unwrap();
 
         let gitops = Gitops::new(
             &Ext::from_vars(|_| None),
@@ -2221,7 +2224,7 @@ mod tests {
             return;
         };
         let ext = Ext::from_vars(|_| None);
-        let info = repo::discover(&ext, Path::new(&repo)).unwrap();
+        let info = repo::discover(&ext, Path::new(&repo), &|| Ok(Vec::new())).unwrap();
         let gitops = Gitops::new(&ext, &Home::from_env().unwrap(), &info);
         let slot = gitops.lock_preflight_slot(2).unwrap().open().unwrap();
         let base = slot.fetch_base().unwrap();
@@ -2376,6 +2379,7 @@ mod tests {
             slug: crate::model::Slug::new("acme", "widget").unwrap(),
             path: home.join("unused-checkout"),
             remote: "unused".into(),
+            remote_name: "origin".into(),
             default_branch: "main".into(),
         };
         Gitops::new(&Ext::from_vars(|_| None), &Home::at(home), &info)

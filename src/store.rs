@@ -631,6 +631,7 @@ mod tests {
                 slug: slug.clone(),
                 path: "/w/a".into(),
                 remote: "git@github.com:acme/a.git".into(),
+                remote_name: "origin".into(),
                 default_branch: "main".into(),
             })
             .unwrap();
@@ -654,6 +655,7 @@ mod tests {
                     slug: slug.clone(),
                     path: format!("/w/{name}").into(),
                     remote: format!("git@github.com:{slug}.git"),
+                    remote_name: "origin".into(),
                     default_branch: "main".into(),
                 })
                 .unwrap();

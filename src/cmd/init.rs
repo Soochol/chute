@@ -17,10 +17,15 @@ const FALLBACK_VERIFY: &str =
     "echo 'chute.toml의 [[verify]] run을 이 저장소의 검사 명령으로 바꾼다' >&2; exit 1";
 
 pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
-    let info = repo::discover(&ctx.ext, &ctx.target_dir()?)?;
+    let info = repo::discover(&ctx.ext, &ctx.target_dir()?, &|| ctx.home.repos())?;
 
     let config_path = info.path.join(config::FILE_NAME);
-    let on_remote = format!("origin/{}:{}", info.default_branch, config::FILE_NAME);
+    let on_remote = format!(
+        "{}/{}:{}",
+        info.remote_name,
+        info.default_branch,
+        config::FILE_NAME
+    );
     if config_path.exists() {
         println!(
             "설정 파일이 이미 있어 그대로 둔다: {}",
@@ -37,8 +42,8 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
             .with_context(|| format!("쓰지 못했다: {}", config_path.display()))?;
         println!("설정 초안을 썼다: {}", config_path.display());
         println!(
-            "chute는 origin/{}에 올라간 chute.toml만 읽는다. 검증 명령을 확인하고 커밋해 올린다.",
-            info.default_branch
+            "chute는 {}/{}에 올라간 chute.toml만 읽는다. 검증 명령을 확인하고 커밋해 올린다.",
+            info.remote_name, info.default_branch
         );
     }
 
@@ -55,6 +60,10 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
             "이미 등록돼 있다: {} (상태 폴더 {})",
             info.slug,
             store.dir().display()
+        ),
+        Some(old) if old.path == info.path => println!(
+            "등록한 원격을 바꿨다: {} (이전 {}, 지금 {})",
+            info.slug, old.remote_name, info.remote_name
         ),
         Some(old) => println!(
             "등록 경로를 바꿨다: {} (이전 {}, 지금 {})",

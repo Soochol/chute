@@ -46,6 +46,7 @@ mod slots {
             slug: Slug::new("acme", "widget").unwrap(),
             path: root.join("work"),
             remote: "unused".into(),
+            remote_name: "origin".into(),
             default_branch: "main".into(),
         };
         Gitops::new(&Ext::from_vars(|_| None), &Home::at(root), &info)

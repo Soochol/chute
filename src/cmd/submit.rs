@@ -411,10 +411,10 @@ fn render(report: &Report, touches_config: bool) -> String {
 
 fn load_default_branch_config(ctx: &Ctx, info: &RepoInfo) -> Result<Config> {
     let branch = &info.default_branch;
-    Config::load_remote_branch(&ctx.ext, &info.path, branch)?.ok_or_else(|| {
+    Config::load_remote_branch(&ctx.ext, &info.path, &info.remote_name, branch)?.ok_or_else(|| {
         Refusal(format!(
-            "{}: chute.toml을 origin/{branch}에서 읽지 못했다. 기본 브랜치에 올렸는지 확인하고 `git fetch`를 먼저 실행한다",
-            info.slug
+            "{}: chute.toml을 {}/{branch}에서 읽지 못했다. 기본 브랜치에 올렸는지 확인하고 `git fetch`를 먼저 실행한다",
+            info.slug, info.remote_name
         ))
         .into()
     })

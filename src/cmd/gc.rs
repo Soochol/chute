@@ -44,7 +44,8 @@ fn sweep(args: &Args, ctx: &Ctx) -> Result<Swept> {
     };
     gc::run(&site, args.dry_run, EpochMs::now())?.ok_or_else(|| {
         anyhow!(
-            "origin/{}에서 chute.toml을 읽지 못했다. 보관 기간을 알 수 없어 정리하지 않는다. 기본 브랜치에 올렸는지 확인한다",
+            "{}/{}에서 chute.toml을 읽지 못했다. 보관 기간을 알 수 없어 정리하지 않는다. 기본 브랜치에 올렸는지 확인한다",
+            info.remote_name,
             info.default_branch
         )
     })
@@ -133,7 +134,7 @@ mod tests {
             repo.git(&["push", "--quiet", "origin", "main"]);
             let ext = Ext::from_vars(|k| sb.var(k));
             let home = Home::at(sb.chute_home());
-            let info = crate::repo::discover(&ext, repo.path()).unwrap();
+            let info = crate::repo::discover(&ext, repo.path(), &|| Ok(Vec::new())).unwrap();
             home.repo(&info.slug).register(&info).unwrap();
             let ctx = Ctx::new(home, ext, Some(repo.path().to_path_buf()));
             World {

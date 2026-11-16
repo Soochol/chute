@@ -104,7 +104,7 @@ impl Ctx {
     pub fn slug(&self) -> Result<Slug> {
         match &self.slug {
             Some(slug) => Ok(slug.clone()),
-            None => repo::slug(&self.ext, &self.target_dir()?),
+            None => repo::slug(&self.ext, &self.target_dir()?, &|| self.home.repos()),
         }
     }
 

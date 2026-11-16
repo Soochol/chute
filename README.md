@@ -51,7 +51,8 @@ cargo install --git https://github.com/Soochol/chute
 - 스킬은 `skills/chute/SKILL.md`다. 에이전트에게 `chute --skill`의 설명서를 읽으라고 알린다. 이 파일이 스킬의 유일한 원본이고 `chute install`도 이 파일을 쓴다.
 - 훅은 Bash 호출 전에 `chute guard`를 실행한다. 대상 저장소의 루트에 `chute.toml`이 있을 때만 다음을 막고, `chute preflight`와 `chute submit`을 쓰라고 안내한다. `chute.toml`이 없는 저장소에서는 아무것도 막지 않는다.
   - `gh pr merge`와 PR 머지 API(`gh api .../pulls/<번호>/merge`)
-  - 기본 브랜치로 가는 `git push`. `git push origin main`, `git push origin HEAD:main`, `git push --all`, 기본 브랜치를 체크아웃한 상태의 맨 `git push` 같은 형태다. 맨 `git push`는 `push.default`와 upstream이 정하는 브랜치를 본다. 기본 브랜치는 원격의 `HEAD`(`refs/remotes/<원격>/HEAD`)가 가리키는 브랜치이고, 그것이 없으면 `main`과 `master`다. `origin/HEAD`가 없는 clone에서 기본 브랜치가 다른 이름이면 `git remote set-head origin -a`로 만든다.
+  - chute가 관리하는 저장소의 기본 브랜치로 가는 `git push`. `git push origin main`, `git push origin HEAD:main`, `git push --all`, 기본 브랜치를 체크아웃한 상태의 맨 `git push` 같은 형태다. 맨 `git push`는 `push.default`와 upstream이 정하는 브랜치를 본다. 기본 브랜치는 push 대상 원격의 `HEAD`(`refs/remotes/<원격>/HEAD`)가 가리키는 브랜치이고, 그것이 없으면 `main`과 `master`다. 그 원격에 `HEAD`가 없는 clone에서 기본 브랜치가 다른 이름이면 `git remote set-head <원격> -a`로 만든다.
+  - push 대상 원격은 git이 고르는 순서로 정한다. 명령에 적힌 원격(`--repo`도 같다), 브랜치의 `branch.<이름>.pushRemote`, `remote.pushDefault`, 브랜치의 upstream 원격, `origin` 순이다. 그 원격이 chute가 관리하는 저장소가 아니면(fork, 미러, 백업) 막지 않는다. 원격 URL의 `owner/name`이 chute가 관리하는 저장소와 같으면 관리하는 저장소로 본다. 어느 원격으로 가는지 알아내지 못하면 막고 이유를 보인다. 안내 문구의 `require_head`는 push 대상 원격의 기본 브랜치에 있는 `chute.toml`을 따른다.
   - PR 브랜치로의 push는 막지 않는다.
 - chute 데몬이 직접 하는 push는 Claude Code의 도구 호출이 아니므로 훅이 보지 않는다. 데몬이 머지하는 데는 영향이 없다.
 - 훅은 실수를 막는 장치이지 보안 경계가 아니다. 셸 별칭, 변수, 스크립트 안의 명령은 따라가지 않는다. 중괄호 확장, 함수 정의, 파이프나 `&` 뒤의 `cd`, 작은따옴표 안의 `$(...)`, 큰따옴표 안의 백틱도 따라가지 못한다.
@@ -64,7 +65,7 @@ cargo install --git https://github.com/Soochol/chute
 ## 처음 쓰기
 
 1. 대상 저장소에서 `chute init`을 실행한다. `chute.toml` 초안을 쓰고 저장소를 상태 폴더에 등록한다.
-2. `chute.toml`의 `[[verify]]`를 이 저장소의 검사 명령으로 고치고 커밋해 기본 브랜치에 올린다. chute는 `origin/<기본 브랜치>`에 올라간 `chute.toml`만 읽는다.
+2. `chute.toml`의 `[[verify]]`를 이 저장소의 검사 명령으로 고치고 커밋해 기본 브랜치에 올린다. chute는 `<원격>/<기본 브랜치>`(원격이 하나뿐이면 보통 `origin/<기본 브랜치>`)에 올라간 `chute.toml`만 읽는다. git 원격이 여러 개인 저장소는 아래 "원격이 여러 개일 때"를 본다.
 3. `chute install`을 실행한다. Codex 스킬 파일(`~/.codex/skills/chute/SKILL.md`)과 현황판 mod(`~/.config/herdr-app/mods/chute/`)를 쓴다. `~/.codex`가 없으면 스킬을 건너뛰고, Herdr 홈이 없으면 mod를 건너뛴다. `HERDR_APP_HOME`이 있으면 그 아래에 mod를 쓴다. 다시 실행해도 같은 결과이고, 무엇을 썼고 무엇이 그대로인지 출력한다. Claude Code의 스킬과 훅은 위의 plugin이 준다.
 4. 대상 저장소의 `AGENTS.md`(또는 에이전트 지침 파일)에 한 줄을 넣는다. `chute init`과 `chute install`이 출력하는 문장이다. chute는 지침 파일과 herdr 템플릿을 고치지 않는다.
    ```
@@ -269,6 +270,7 @@ require_head = false
 max_parallel = 2
 env_check = []
 respawn = []
+# remote = "origin"
 
 [retention]
 logs_days = 7
@@ -302,6 +304,7 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `max_parallel` | `2` | 동시에 도는 preflight 수의 상한(슬롯 수의 상한). 1 이상 |
 | `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]`. 슬롯 폴더에서 `sh -c`로 하나씩 돌린다. 명령마다 30초 제한이 있고, 출력은 첫 줄 200자만 남긴다. 명령이 실패해도 검증은 그대로 돈다. 머신 이름과 hc 코어 id는 목록이 비어도 남는다. batch는 한 번, preflight는 실행마다 기록한다. 반송 보고서의 "검사 환경" 절은 같은 HEAD의 preflight와 다른 줄만 나란히 보인다 |
 | `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
+| `remote` | 없음 | chute가 관리하는 GitHub 저장소를 가리키는 git 원격의 이름. 없으면 chute가 정한다. 아래 "원격이 여러 개일 때"를 본다. `chute init`은 작업 폴더의 `chute.toml`에서 이 키를 읽는다 |
 | `retention` (`[retention]`) | 아래 두 키 | 정리할 때 남기는 기간 |
 | `logs_days` | `7` | 검증 로그와 preflight 로그를 남기는 날수. 1 이상 |
 | `reports_days` | `30` | 반송 보고서, preflight 보고서, 실패 트리 참조를 남기는 날수. 1 이상 |
@@ -318,6 +321,19 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `verify.timeout` | `3600` | 초. 넘기면 그 단계는 실패(`시간 초과`)다. 시간 초과는 다시 돌려 보지 않는다 |
 | `verify.probe` | 없음 | 선택. 흔들린 시험만 되풀이하는 명령. `{tests}` 자리가 있어야 하며 없으면 설정 오류다. 예: `cargo test {tests} -- --exact` |
 | `verify.failed` | 없음 | 선택. 실패한 시험 이름을 뽑는 정규식. 캡처 그룹이 있으면 그 값이, 없으면 일치한 글이 이름이다. 없으면 보고서에 로그의 끝부분이 들어간다 |
+
+### 원격이 여러 개일 때
+
+chute는 `origin`이라는 이름을 고정해 쓰지 않는다. 관리하는 저장소는 GitHub URL의 `owner/name`으로 찾는다. ssh 주소, https 주소, `.git`이 붙은 주소와 안 붙은 주소는 같은 저장소다. 쓸 원격은 다음 순서로 정한다.
+
+1. `chute.toml`의 `remote = "<이름>"`이 있으면 그 원격을 쓴다.
+2. 없으면 이미 `chute init`으로 등록한 저장소의 URL과 맞는 원격이 하나뿐일 때 그 원격을 쓴다. 등록한 것이 아직 없으면 원격이 하나뿐일 때 그 원격을 쓴다.
+3. 맞는 원격이 없거나 둘 이상이면 오류로 멈춘다. 오류가 `git remote -v`로 확인하고 `remote` 키를 적으라고 안내한다.
+
+예를 들어 fork를 `origin`으로 두고 GitHub 저장소를 `upstream`으로 둔 clone은 `chute.toml`에 `remote = "upstream"`을 적고 `chute init`을 실행한다. 그 뒤로 `chute submit`, batch 머지, 설정 읽기, 기본 브랜치 push는 모두 `upstream`으로 간다. `chute init`은 고른 원격의 이름을 등록 정보(`repo.json`의 `remote_name`)에 적는다. `remote` 키를 바꿨으면 `chute init`을 다시 실행해 등록을 고친다. `remote_name`이 없는 옛 등록은 `origin`으로 본다.
+
+`remote` 키는 작업 폴더의 `chute.toml`에서 읽는다. 기본 브랜치에도 올려 두면 다른 clone에서도 같은 원격을 고른다. 허브가 다른 PC일 때 그 PC의 원격 이름은 그 PC의 등록 정보를 따른다.
+
 
 **`respawn`의 기본값은 `[]`이다.** 반송을 받을 에이전트가 없거나 터미널이 끝났으면 chute는 에이전트를 띄우지 않고 그 PR을 사람 차례(`전달 실패`)로 올린다. 값을 넣으면 그 명령으로 새 에이전트를 띄운다. 실행 파일과 인자를 나눠 적는다(`respawn = ["claude"]`). **`--dangerously-skip-permissions`를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행하게 한다.** 무인으로 뜨는 에이전트가 권한 대화상자에서 멈추지 않게 하려는 선택이지만, 사용자가 직접 켜는 옵션으로만 둔다(`respawn = ["claude", "--dangerously-skip-permissions"]`). 새 에이전트는 PR 브랜치의 worktree에서 돈다. 원래 에이전트의 worktree가 남아 있으면 그곳이고, 없으면 `~/.herdr/worktrees/<저장소>/<브랜치>`에 만든다. 사용자의 chute 체크아웃이 그 PR 브랜치를 쥐고 있으면 새 에이전트가 그 폴더에서 돈다. 권한 확인을 건너뛰는 값을 넣었다면 그곳에서도 권한 확인 없이 실행된다.
 

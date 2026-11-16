@@ -135,10 +135,14 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         .filter(|item| Some(item.branch.as_str()) != target.branch.as_deref())
         .collect();
 
-    let last_fetched_config =
-        Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)
-            .ok()
-            .flatten();
+    let last_fetched_config = Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    )
+    .ok()
+    .flatten();
     let max_parallel = last_fetched_config
         .as_ref()
         .map_or(DEFAULT_MAX_PARALLEL, |c| c.max_parallel);
@@ -148,13 +152,19 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     let gitops = Gitops::new(&ctx.ext, &ctx.home, &info).with_cache_seed(seed);
     let slot = gitops.lock_preflight_slot(max_parallel)?.open()?;
     let base = slot.fetch_base()?;
-    let config = Config::load_remote_branch(&ctx.ext, &info.path, &info.default_branch)?
-        .ok_or_else(|| {
-            anyhow!(
-                "origin/{}에서 chute.toml을 읽지 못했다. 기본 브랜치에 올렸는지 확인한다",
-                info.default_branch
-            )
-        })?;
+    let config = Config::load_remote_branch(
+        &ctx.ext,
+        &info.path,
+        &info.remote_name,
+        &info.default_branch,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "{}/{}에서 chute.toml을 읽지 못했다. 기본 브랜치에 올렸는지 확인한다",
+            info.remote_name,
+            info.default_branch
+        )
+    })?;
 
     slot.checkout(&base)?;
     let at = EpochMs::now();
