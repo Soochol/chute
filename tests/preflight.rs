@@ -641,3 +641,303 @@ fn untracked_files_count_even_when_git_is_set_to_hide_them() {
     assert_eq!(code(&out), 2);
     assert!(!mark.exists(), "검증이 돌았다");
 }
+
+mod remote {
+    use super::*;
+    use chute::model::{QueueItem, Slug};
+    use chute::store::Home;
+    use support::{Net, Node};
+
+    const BIN: &str = env!("CARGO_BIN_EXE_chute");
+
+    fn slug() -> Slug {
+        Slug::new("acme", "widget").unwrap()
+    }
+
+    fn hub_state(node: &Node) -> State {
+        Home::at(node.sb.chute_home()).repo(&slug()).load().unwrap()
+    }
+
+    fn mesh(run: &str) -> Net {
+        let net = Net::new("acme/widget", &["a", "b"], BIN);
+        for node in &net.nodes {
+            let out = node.chute(BIN, &["init"]);
+            let _ = fs::remove_file(node.repo.path().join("chute.toml"));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        net.connect_all();
+        let a = net.node("a");
+        a.repo
+            .commit_file("chute.toml", &config(run), "chore: chute 설정");
+        a.repo.git(&["push", "--quiet", "origin", "main"]);
+        let out = net.node("b").chute(BIN, &["hub", "set", "a"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        net
+    }
+
+    fn hub_queue(net: &Net, pr: u64, file: &str, content: &str, state: ItemState) -> String {
+        let a = net.node("a");
+        let branch = format!("feat/{pr}");
+        let head = a.repo.pr_branch(&branch, file, content);
+        a.repo.git(&[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("{head}:refs/pull/{pr}/head"),
+        ]);
+        let mut queued: QueueItem = queue_kit::item(pr, state);
+        queued.branch = branch;
+        queued.head = Sha::try_from(head.clone()).unwrap();
+        Home::at(a.sb.chute_home())
+            .repo(&slug())
+            .update(|s| {
+                s.queue.push(queued);
+                Ok(())
+            })
+            .unwrap();
+        head
+    }
+
+    fn work_on_b(net: &Net, branch: &str, file: &str, content: &str) -> String {
+        let b = net.node("b");
+        b.repo.git(&["fetch", "--quiet", "origin"]);
+        b.repo
+            .git(&["checkout", "--quiet", "-b", branch, "origin/main"]);
+        b.repo
+            .commit_file(file, content, &format!("feat: {branch}"))
+    }
+
+    fn run_b(net: &Net, args: &[&str]) -> Output {
+        let argv = [&["preflight"][..], args].concat();
+        net.node("b").chute(BIN, &argv)
+    }
+
+    fn stderr(out: &Output) -> String {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    #[test]
+    fn a_pc_that_is_not_the_hub_verifies_with_the_hubs_queue() {
+        let net = mesh("true");
+        hub_queue(&net, 7, "a.txt", "a\n", ItemState::Queued(None));
+        hub_queue(&net, 8, "b.txt", "b\n", ItemState::InBatch);
+        hub_queue(&net, 9, "c.txt", "c\n", ItemState::AwaitingApproval);
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+        assert!(hub_state(net.node("b")).queue.is_empty());
+
+        let out = run_b(&net, &[]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert!(
+            text(&out).contains("함께 검증한 PR #7, #8"),
+            "{}",
+            text(&out)
+        );
+        assert!(hub_state(net.node("b")).queue.is_empty());
+    }
+
+    #[test]
+    fn the_queue_of_the_hub_is_laid_over_the_head_before_the_check_runs() {
+        let net = mesh("test -f a.txt && test -f mine.txt");
+        hub_queue(&net, 7, "a.txt", "a\n", ItemState::Queued(None));
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+        let out = run_b(&net, &["--json"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(json(&out)["with"], serde_json::json!([7]));
+    }
+
+    #[test]
+    fn a_conflict_with_the_hubs_queue_is_reported_on_this_pc() {
+        let net = mesh("true");
+        hub_queue(&net, 7, "shared.txt", "theirs\n", ItemState::Queued(None));
+        work_on_b(&net, "feat/mine", "shared.txt", "mine\n");
+        let out = run_b(&net, &["--json"]);
+        assert_eq!(code(&out), 1, "{}", stderr(&out));
+        let doc = json(&out);
+        assert_eq!(doc["result"], "conflict");
+        let path = PathBuf::from(doc["report"].as_str().unwrap());
+        let here = net.node("b").sb.chute_home();
+        assert!(path.starts_with(&here), "{path:?} {here:?}");
+        let report = read(&doc["report"]);
+        assert!(report.contains("shared.txt"), "{report}");
+        assert!(report.contains("큐의 PR #7"), "{report}");
+    }
+
+    #[test]
+    fn a_passing_result_is_recorded_on_the_hub_and_shown_by_its_status() {
+        let net = mesh("true");
+        hub_queue(&net, 7, "a.txt", "a\n", ItemState::Queued(None));
+        hub_queue(&net, 2, "two.txt", "two\n", ItemState::AwaitingApproval);
+        let b = net.node("b");
+        b.repo.git(&["fetch", "--quiet", "origin"]);
+        b.repo
+            .git(&["checkout", "--quiet", "-b", "feat/2", "origin/feat/2"]);
+        let head = b.repo.commit_file("more.txt", "x\n", "feat: 더");
+
+        let out = run_b(&net, &[]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+        let hub = hub_state(net.node("a"));
+        let record = hub.preflights.get("feat/2").expect("허브에 기록됐다");
+        assert_eq!(record.result, chute::model::PreflightResult::Pass);
+        assert_eq!(record.head.as_str(), head);
+        assert_eq!(record.with, vec![PrNumber(7)]);
+        assert!(hub_state(net.node("b")).preflights.is_empty());
+
+        let status: Value =
+            serde_json::from_slice(&net.node("a").chute(BIN, &["status", "--json"]).stdout)
+                .unwrap();
+        let item = status["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["pr"] == 2)
+            .unwrap();
+        assert_eq!(item["preflight"]["result"], "pass");
+        assert_eq!(item["preflight"]["head"], head);
+    }
+
+    #[test]
+    fn a_hub_that_cannot_be_reached_stops_with_exit_2_and_uses_no_slot() {
+        let net = mesh("true");
+        hub_queue(&net, 7, "a.txt", "a\n", ItemState::Queued(None));
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+        net.set_state("b", "a", "unreachable");
+
+        let out = run_b(&net, &[]);
+        assert_eq!(code(&out), 2, "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("허브에 닿지 않아 큐를 알 수 없다"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(text(&out).is_empty(), "{}", text(&out));
+        let slots = Home::at(net.node("b").sb.chute_home()).slots_dir(&slug());
+        assert!(!slots.exists(), "{slots:?}");
+    }
+
+    #[test]
+    fn a_failed_recording_only_warns_and_keeps_the_result_and_exit_code() {
+        let peers = |net: &Net| net.node("b").sb.root().join("net").join("peers");
+        let cut = |net: &Net| format!("sed -i 's/connected/unreachable/' {}", peers(net).display());
+
+        let net = mesh("true");
+        let run = cut(&net);
+        net.node("a")
+            .repo
+            .commit_file("chute.toml", &config(&run), "chore: 검증 중 허브가 끊긴다");
+        net.node("a")
+            .repo
+            .git(&["push", "--quiet", "origin", "main"]);
+        hub_queue(&net, 7, "a.txt", "a\n", ItemState::Queued(None));
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+
+        let out = run_b(&net, &["--json"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(json(&out)["result"], "pass");
+        assert!(
+            stderr(&out).contains("경고: 결과를 상태에 기록하지 못했다"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(hub_state(net.node("a")).preflights.is_empty());
+    }
+
+    #[test]
+    fn a_failing_result_keeps_exit_code_1_when_the_recording_fails_too() {
+        let net = mesh("true");
+        let run = format!(
+            "sed -i 's/connected/unreachable/' {}; echo 'FAIL boom'; exit 1",
+            net.node("b").sb.root().join("net").join("peers").display()
+        );
+        net.node("a")
+            .repo
+            .commit_file("chute.toml", &config(&run), "chore: 검증이 실패한다");
+        net.node("a")
+            .repo
+            .git(&["push", "--quiet", "origin", "main"]);
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+        let out = run_b(&net, &[]);
+        assert_eq!(code(&out), 1, "{}", stderr(&out));
+        assert!(stderr(&out).contains("경고: 결과를 상태에 기록하지 못했다"));
+    }
+
+    #[test]
+    fn a_broken_base_on_the_hub_is_announced_and_reported_here() {
+        let net = mesh("true");
+        let base = net.node("a").repo.git(&["rev-parse", "origin/main"]);
+        Home::at(net.node("a").sb.chute_home())
+            .repo(&slug())
+            .update(|state| {
+                state.blocked = Some(chute::model::Blocked {
+                    reason: chute::model::BlockReason::BaseBroken,
+                    base: Sha::try_from(base.trim().to_owned()).unwrap(),
+                    since_ms: chute::model::EpochMs(1),
+                });
+                Ok(())
+            })
+            .unwrap();
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+        let out = run_b(&net, &["--json"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert!(stderr(&out).starts_with("경고: 저장소가 base_broken"));
+        assert_eq!(json(&out)["blocked"]["reason"], "base_broken");
+    }
+
+    #[test]
+    fn a_hub_that_refuses_the_record_leaves_a_warning_and_the_result() {
+        let net = mesh("true");
+        let hub_state = Home::at(net.node("a").sb.chute_home())
+            .repo(&slug())
+            .dir()
+            .join("state.json");
+        let run = format!("printf '{{' > {}", hub_state.display());
+        net.node("a").repo.commit_file(
+            "chute.toml",
+            &config(&run),
+            "chore: 검증 중 허브 상태가 깨진다",
+        );
+        net.node("a")
+            .repo
+            .git(&["push", "--quiet", "origin", "main"]);
+        work_on_b(&net, "feat/mine", "mine.txt", "x\n");
+        let out = run_b(&net, &["--json"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(json(&out)["result"], "pass");
+        assert!(
+            stderr(&out).contains("경고: 결과를 상태에 기록하지 못했다"),
+            "{}",
+            stderr(&out)
+        );
+    }
+
+    #[test]
+    fn the_hub_prunes_by_its_own_clock_not_the_senders() {
+        let net = mesh("true");
+        let now = chute::model::EpochMs::now().0;
+        let record = |head: &str, at: u64| {
+            serde_json::json!({
+                "branch": "old/keep",
+                "record": {"head": head, "result": "pass", "report": null, "at_ms": at}
+            })
+            .to_string()
+        };
+        let head = net.node("a").repo.head();
+        let sent = |text: &str| {
+            let out = net.node("b").chute(BIN, &["preflight", "--record", text]);
+            assert_eq!(code(&out), 0, "{}", stderr(&out));
+        };
+        sent(&record(&head, now - 1000));
+        let skewed = record(&head, now + 365 * 24 * 3600 * 1000).replace("old/keep", "feat/skew");
+        sent(&skewed);
+        let kept: Vec<String> = hub_state(net.node("a")).preflights.into_keys().collect();
+        assert_eq!(kept, ["feat/skew", "old/keep"]);
+    }
+}
