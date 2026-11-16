@@ -665,6 +665,7 @@ impl Run<'_> {
             self.slot.path(),
             &self.engine.store.batch_dir(self.id()).join("env"),
             &self.config.env_check,
+            &self.engine.cancel,
         ));
         self.save_record()?;
         let mut by_queue = taken.to_vec();

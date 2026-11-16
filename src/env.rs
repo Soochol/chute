@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::ext::Ext;
 use crate::machine;
 use crate::model::{EnvCheck, EnvRecord};
-use crate::verify::{self, End};
+use crate::verify::{self, Cancel, End};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_CHARS: usize = 200;
+const READ_BYTES: u64 = 16 * 1024;
+const LOG_LIMIT_BLOCKS: u32 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSection {
@@ -27,8 +30,14 @@ pub struct Difference {
     pub hub: Option<String>,
 }
 
-pub fn record(ext: &Ext, dir: &Path, log_dir: &Path, commands: &[String]) -> EnvRecord {
-    record_within(ext, dir, log_dir, commands, CHECK_TIMEOUT)
+pub fn record(
+    ext: &Ext,
+    dir: &Path,
+    log_dir: &Path,
+    commands: &[String],
+    cancel: &Cancel,
+) -> EnvRecord {
+    record_within(ext, dir, log_dir, commands, CHECK_TIMEOUT, cancel)
 }
 
 pub fn record_within(
@@ -37,6 +46,7 @@ pub fn record_within(
     log_dir: &Path,
     commands: &[String],
     timeout: Duration,
+    cancel: &Cancel,
 ) -> EnvRecord {
     let _ = fs::create_dir_all(log_dir);
     EnvRecord {
@@ -47,20 +57,17 @@ pub fn record_within(
         checks: commands
             .iter()
             .enumerate()
+            .take_while(|_| !cancel.is_cancelled())
             .map(|(n, run)| {
-                check(
-                    dir,
-                    run,
-                    &log_dir.join(format!("env-{}.log", n + 1)),
-                    timeout,
-                )
+                let log = log_dir.join(format!("env-{}.log", n + 1));
+                check(dir, run, &log, timeout, cancel)
             })
             .collect(),
     }
 }
 
-fn check(dir: &Path, run: &str, log: &Path, timeout: Duration) -> EnvCheck {
-    let (ok, note) = match verify::run_command(dir, run, log, timeout) {
+fn check(dir: &Path, run: &str, log: &Path, timeout: Duration, cancel: &Cancel) -> EnvCheck {
+    let (ok, note) = match verify::run_command(dir, &capped(run), log, timeout, cancel) {
         Ok(End::Passed) => (true, None),
         Ok(End::Failed(verify::Cause::TimedOut)) => (
             false,
@@ -69,10 +76,7 @@ fn check(dir: &Path, run: &str, log: &Path, timeout: Duration) -> EnvCheck {
         Ok(End::Failed(_) | End::Cancelled) => (false, None),
         Err(e) => (false, Some(format!("{e:#}"))),
     };
-    let first = fs::read(log)
-        .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .and_then(|text| text.lines().map(str::trim).find(|l| !l.is_empty()).map(cut));
+    let first = read_head(log).and_then(|text| text.lines().map(clean).find(|l| !l.is_empty()));
     let output = match (first, note) {
         (Some(line), Some(note)) => format!("{line} ({note})"),
         (Some(line), None) => line,
@@ -86,18 +90,36 @@ fn check(dir: &Path, run: &str, log: &Path, timeout: Duration) -> EnvCheck {
     }
 }
 
-fn cut(line: &str) -> String {
-    line.chars().take(OUTPUT_CHARS).collect()
+/// A command that prints without end stops at the file size limit instead of filling the disk.
+fn capped(run: &str) -> String {
+    format!("ulimit -f {LOG_LIMIT_BLOCKS} 2>/dev/null\n{run}")
+}
+
+fn read_head(log: &Path) -> Option<String> {
+    let mut bytes = Vec::new();
+    File::open(log)
+        .ok()?
+        .take(READ_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn clean(line: &str) -> String {
+    let plain: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    plain.trim().chars().take(OUTPUT_CHARS).collect()
 }
 
 pub fn differences(preflight: &EnvRecord, hub: &EnvRecord) -> Vec<Difference> {
     let mut rows = Vec::new();
-    let (before, now) = (machine_line(preflight), machine_line(hub));
-    if before != now {
+    if !same_machine(preflight, hub) {
         rows.push(Difference {
             what: "머신".to_owned(),
-            preflight: Some(before),
-            hub: Some(now),
+            preflight: Some(machine_line(preflight)),
+            hub: Some(machine_line(hub)),
         });
     }
     let mut runs: Vec<&str> = Vec::new();
@@ -117,6 +139,14 @@ pub fn differences(preflight: &EnvRecord, hub: &EnvRecord) -> Vec<Difference> {
         }
     }
     rows
+}
+
+fn same_machine(a: &EnvRecord, b: &EnvRecord) -> bool {
+    a.host == b.host
+        && match (&a.machine_id, &b.machine_id) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
 }
 
 pub fn machine_line(env: &EnvRecord) -> String {
@@ -168,7 +198,14 @@ mod tests {
     }
 
     fn env_of(f: &Fixture, list: &[&str], timeout: Duration) -> EnvRecord {
-        record_within(&f.ext, &f.dir, &f.logs, &commands(list), timeout)
+        record_within(
+            &f.ext,
+            &f.dir,
+            &f.logs,
+            &commands(list),
+            timeout,
+            &Cancel::new(),
+        )
     }
 
     #[test]
@@ -251,6 +288,51 @@ mod tests {
     }
 
     #[test]
+    fn an_endless_check_is_bounded_in_time_and_log_size() {
+        let f = fixture();
+        let started = Instant::now();
+        let env = env_of(&f, &["yes", "yes | tr -d '\\n'"], Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(env.checks.iter().all(|c| !c.ok));
+        assert!(env.checks[0].output.starts_with('y'));
+        for log in fs::read_dir(&f.logs).unwrap() {
+            assert!(log.unwrap().metadata().unwrap().len() <= 256 * 512 + 4096);
+        }
+    }
+
+    #[test]
+    fn control_characters_in_the_output_are_replaced() {
+        let f = fixture();
+        let env = env_of(&f, &["printf 'a\\rb\\033[31mred\\0z\\n'"], CHECK_TIMEOUT);
+        assert!(!env.checks[0].output.contains(|c: char| c.is_control()));
+        assert!(env.checks[0].output.starts_with("a b"));
+    }
+
+    #[test]
+    fn cancelling_ends_the_running_check_and_skips_the_rest() {
+        let f = fixture();
+        let cancel = Cancel::new();
+        let stopper = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stopper.cancel();
+        });
+        let started = Instant::now();
+        let env = record_within(
+            &f.ext,
+            &f.dir,
+            &f.logs,
+            &commands(&["sleep 20", "echo never"]),
+            CHECK_TIMEOUT,
+            &cancel,
+        );
+        thread.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(env.checks.len(), 1);
+        assert!(!env.checks[0].ok);
+    }
+
+    #[test]
     fn checks_run_in_the_given_folder() {
         let f = fixture();
         fs::write(f.dir.join("marker"), "here").unwrap();
@@ -289,5 +371,8 @@ mod tests {
         assert_eq!(rows[2].hub, None);
         assert_eq!(rows[3].preflight, None);
         assert!(differences(&hub, &hub).is_empty());
+        let mut named = hub.clone();
+        named.machine_id = Some(crate::model::MachineId::try_from("9a0c".to_owned()).unwrap());
+        assert!(differences(&named, &hub).is_empty());
     }
 }

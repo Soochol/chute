@@ -1356,6 +1356,7 @@ mod env {
             lab.repo.path(),
             &lab.sb.root().join("env-logs"),
             &[],
+            &chute::verify::Cancel::new(),
         );
         same.host = machine.host.clone();
         same.machine_id = machine.machine_id.clone();

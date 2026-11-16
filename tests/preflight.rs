@@ -376,7 +376,11 @@ fn queue_origin_main_and_the_worktree_are_untouched() {
         index_before
     );
     assert!(!w.repo.path().join("a.txt").exists());
-    assert!(w.sb.fake("hc").calls().is_empty(), "hc가 불렸다");
+    assert_eq!(
+        w.sb.fake("hc").calls(),
+        [["server", "status", "--json"]],
+        "hc는 이 PC의 코어 id를 묻는 데만 불려야 한다"
+    );
     assert!(w.sb.fake("gh").calls().is_empty(), "gh가 불렸다");
 }
 

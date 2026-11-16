@@ -150,6 +150,16 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
             )
         })?;
 
+    let at = EpochMs::now();
+    let log_dir = log_dir(&store, &target.head, at)?;
+    let env = env::record(
+        &ctx.ext,
+        slot.path(),
+        &log_dir.join("env"),
+        &config.env_check,
+        &verify::Cancel::new(),
+    );
+
     let mut skipped = Vec::new();
     let mut items = fetch_queue(&slot, &queued, &mut skipped);
     items.push(MergeItem::Local {
@@ -182,14 +192,6 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         config: &config,
         worktrees_root: &worktrees_root,
     };
-    let at = EpochMs::now();
-    let log_dir = log_dir(&store, &target.head, at)?;
-    let env = env::record(
-        &ctx.ext,
-        slot.path(),
-        &log_dir.join("env"),
-        &config.env_check,
-    );
     let run = Run {
         ctx,
         info: &info,

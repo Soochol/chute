@@ -230,7 +230,13 @@ impl Ctx<'_> {
     }
 }
 
-pub fn run_command(dir: &Path, run: &str, log: &Path, timeout: Duration) -> Result<End> {
+pub fn run_command(
+    dir: &Path,
+    run: &str,
+    log: &Path,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<End> {
     let out = create_fresh_log(log)?;
     let err = out
         .try_clone()
@@ -245,7 +251,7 @@ pub fn run_command(dir: &Path, run: &str, log: &Path, timeout: Duration) -> Resu
         .process_group(0)
         .spawn()
         .with_context(|| format!("명령 {run:?}을 띄우지 못했다"))?;
-    let end = wait(&mut child, run, timeout, &Cancel::new());
+    let end = wait(&mut child, run, timeout, cancel);
     terminate(&child, Duration::from_secs(1));
     end
 }
