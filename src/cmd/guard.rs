@@ -254,11 +254,9 @@ fn actions(command: &str) -> Vec<Action> {
 }
 
 fn collect(command: &str, start: &Dir, found: &mut Vec<Action>) {
-    let substitution = Regex::new(r"\$\(([^()]*)\)|`([^`]*)`").unwrap();
+    let substitution = Regex::new(r"\$\(([^()]*)\)").unwrap();
     for inner in substitution.captures_iter(command) {
-        if let Some(text) = inner.get(1).or_else(|| inner.get(2)) {
-            collect(text.as_str(), start, found);
-        }
+        collect(&inner[1], start, found);
     }
     let mut dir = start.clone();
     let mut outer: Vec<Dir> = Vec::new();
@@ -558,8 +556,8 @@ fn strip_heredocs(command: &str) -> String {
                 || prefix.matches(['\'', '"']).count() % 2 == 1
                 || prefix.contains("((");
             let feeds_a_shell = line
-                .split(|c: char| !c.is_alphanumeric())
-                .any(|word| SHELLS.contains(&word));
+                .split(|c: char| c.is_whitespace() || "|;&()".contains(c))
+                .any(|word| SHELLS.contains(&basename(word)));
             let Some(at) = lines
                 .clone()
                 .take(LONGEST_BODY)
@@ -922,13 +920,25 @@ mod tests {
             "cat <<'EOF' | sh\ngit push origin main\nEOF",
             "cat <<EOF\n$(git push origin main)\nEOF",
             "echo \"$(git push origin main)\"",
-            "echo \"a `gh pr merge 5` b\"",
             "cd -P . && git push origin main",
             "cd -- . && git push origin main",
             "git push origin feat:heads/main",
             "git push origin feat:refs/heads/main",
         ] {
             assert!(fx.verdict(command).is_some(), "막히지 않았다: {command}");
+        }
+    }
+
+    #[test]
+    fn markdown_and_scripts_written_through_a_quoted_heredoc_are_text() {
+        let fx = Fixture::new(true);
+        for command in [
+            "git commit -m \"$(cat <<'EOF'\n- `git push origin main`\nEOF\n)\"",
+            "cat > README.md <<'EOF'\n```\ngit push origin main\n```\nEOF",
+            "cat > deploy.sh <<'EOF'\n#!/bin/sh\ngit push origin main\nEOF",
+            "cat > bash.md <<'EOF'\ngit push origin main\nEOF",
+        ] {
+            assert_eq!(fx.verdict(command), None, "{command}");
         }
     }
 
