@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use chute::engine::{Pass, Summary};
 use chute::model::{
-    Approval, BlockReason, BounceReason, EventKind, Failure, HumanReason, ItemState, PrNumber,
-    StatusView, VerifyMode,
+    Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, HumanReason, ItemState,
+    PrNumber, ProbeEvidence, StatusView, VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -1246,6 +1246,203 @@ fn recovery_tells_history_about_a_bounce_the_record_has_and_the_history_lacks() 
     assert_eq!(chute_status(&lab)["today"]["bounced"], 1);
 }
 
+mod env {
+    use super::*;
+    use chute::model::{EnvCheck, EnvRecord, EpochMs, PreflightRecord, PreflightResult};
+
+    fn preflight_env(version: &str) -> EnvRecord {
+        EnvRecord {
+            machine_id: None,
+            host: "laptop".into(),
+            checks: vec![EnvCheck {
+                run: "echo hub-tool".into(),
+                output: version.into(),
+                ok: true,
+            }],
+        }
+    }
+
+    fn preflight_of(head: &chute::model::Sha, env: EnvRecord) -> PreflightRecord {
+        PreflightRecord {
+            head: head.clone(),
+            result: PreflightResult::Pass,
+            report: None,
+            at_ms: EpochMs(1),
+            base: None,
+            with: Vec::new(),
+            env: Some(env),
+        }
+    }
+
+    #[test]
+    fn a_batch_records_its_env_once_before_the_first_verification() {
+        let marks = tempfile::tempdir().unwrap();
+        let marker = marks.path().join("env-count");
+        let first = format!("echo run >> {}; echo hub-tool 1", marker.display());
+        let lab = Lab::build("", &format!("env_check = [{first:?}, \"exit 3\"]"), 60);
+        lab.open_pr(1, &[("f1", "x")]);
+        lab.open_pr(2, &[("f2", "x")]);
+
+        let summary = done(lab.engine().run_once().unwrap());
+
+        assert_eq!(summary.merged, prs(&[1, 2]));
+        let env = lab
+            .store
+            .read_batch(&summary.batch)
+            .unwrap()
+            .unwrap()
+            .env
+            .expect("batch 기록에 환경이 있다");
+        assert_eq!(
+            env.machine_id.as_ref().map(|id| id.as_str()),
+            Some(support::SANDBOX_MACHINE_ID)
+        );
+        let outputs: Vec<(&str, &str, bool)> = env
+            .checks
+            .iter()
+            .map(|c| (c.run.as_str(), c.output.as_str(), c.ok))
+            .collect();
+        assert_eq!(
+            outputs,
+            [(first.as_str(), "hub-tool 1", true), ("exit 3", "", false)]
+        );
+        assert_eq!(lab.verify_runs(), 1, "실패한 환경 명령이 검증을 막았다");
+        assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn a_bounce_report_shows_the_hub_env_beside_the_preflight_of_the_same_head() {
+        let lab = Lab::build(BAD, "env_check = [\"echo hub-tool 2\"]", 60);
+        lab.open_pr(1, &[("f1", "x")]);
+        let head = lab.open_pr(2, &[("f2", "x"), ("BAD", "")]);
+        lab.store
+            .update(|s| {
+                s.preflights.insert(
+                    "pr-2".into(),
+                    preflight_of(&head, preflight_env("hub-tool 1")),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(2).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(report.contains("## 검사 환경"), "{report}");
+        assert!(
+            report.contains("`echo hub-tool 2`: `hub-tool 2`"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| 항목 | preflight를 돌린 PC | 허브 |"),
+            "{report}"
+        );
+        assert!(report.contains("`laptop`"), "{report}");
+        let json = fs::read_to_string(failure.report.with_extension("json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["env"]["preflight"]["host"], "laptop");
+        assert_eq!(doc["env"]["env"]["checks"][0]["output"], "hub-tool 2");
+    }
+
+    #[test]
+    fn a_bounce_report_says_the_environment_is_the_same_when_the_preflight_matches() {
+        let lab = Lab::build(BAD, "env_check = [\"echo hub-tool 1\"]", 60);
+        let head = lab.open_pr(1, &[("f1", "x"), ("BAD", "")]);
+        let mut same = preflight_env("hub-tool 1");
+        same.checks[0].run = "echo hub-tool 1".into();
+        let machine = chute::env::record(
+            &chute::ext::Ext::from_vars(|k| lab.sb.var(k)),
+            lab.repo.path(),
+            &lab.sb.root().join("env-logs"),
+            &[],
+            &chute::verify::Cancel::new(),
+        );
+        same.host = machine.host.clone();
+        same.machine_id = machine.machine_id.clone();
+        lab.store
+            .update(|s| {
+                s.preflights
+                    .insert("pr-1".into(), preflight_of(&head, same));
+                Ok(())
+            })
+            .unwrap();
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(1).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(report.contains("preflight와 같은 환경이다."), "{report}");
+    }
+
+    #[test]
+    fn a_preflight_of_another_head_is_not_compared() {
+        let lab = Lab::build(BAD, "env_check = [\"echo hub-tool 2\"]", 60);
+        lab.open_pr(1, &[("f1", "x"), ("BAD", "")]);
+        let other = chute::model::Sha::try_from("a".repeat(40)).unwrap();
+        lab.store
+            .update(|s| {
+                s.preflights
+                    .insert("pr-1".into(), preflight_of(&other, preflight_env("old")));
+                Ok(())
+            })
+            .unwrap();
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(1).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(report.contains("## 검사 환경"), "{report}");
+        assert!(!report.contains("preflight를 돌린 PC"), "{report}");
+        assert!(!report.contains("같은 환경"), "{report}");
+    }
+}
+
+mod env_ci {
+    use super::*;
+
+    #[test]
+    fn the_batch_env_is_recorded_in_a_slot_set_to_the_base() {
+        let lab = Lab::build("", "env_check = [\"git rev-parse HEAD\"]", 60);
+        lab.open_pr(1, &[("f1", "x")]);
+        done(lab.engine().run_once().unwrap());
+        lab.main_commit(&[("moved.txt", "x\n")], "feat: main moved");
+        lab.open_pr(2, &[("f2", "x")]);
+        let base = lab.origin_main();
+
+        let summary = done(lab.engine().run_once().unwrap());
+
+        let env = lab
+            .store
+            .read_batch(&summary.batch)
+            .unwrap()
+            .unwrap()
+            .env
+            .unwrap();
+        assert_eq!(env.checks[0].output, base.trim());
+    }
+
+    #[test]
+    fn a_ci_failure_report_carries_the_batch_env_too() {
+        let lab = Lab::build(
+            "",
+            "require_ci = true\nenv_check = [\"echo hub-tool 1\"]",
+            60,
+        );
+        lab.open_pr(1, &[("f1", "x")]);
+        lab.gh_checks(1, &[("build", "fail")]);
+
+        done(lab.engine().run_once().unwrap());
+
+        let failure = lab.item(1).unwrap().last_failure.unwrap();
+        let report = fs::read_to_string(&failure.report).unwrap();
+        assert!(
+            report.contains("`echo hub-tool 1`: `hub-tool 1`"),
+            "{report}"
+        );
+    }
+}
+
 fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_owned).collect()
 }
@@ -1681,4 +1878,353 @@ fn waiting_a_pr_behind_one_that_merges_joins_the_next_batch_and_hears_nothing() 
 
     assert_eq!(second.merged, prs(&[2]));
     assert!(waiting_lines(&lab).is_empty());
+
+const FLAKE_ONCE: &str =
+    "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; fail \"FAILED flaky_test\"; fi";
+
+fn probe_lab(top: &str, probe: &str) -> Lab {
+    Lab::build_with_step(FLAKE_ONCE, top, 60, probe)
+}
+
+fn probe_step(command: &str) -> String {
+    format!("probe = \"{command}\"")
+}
+
+fn flake_next(lab: &Lab) {
+    fs::write(lab.sb.root().join("flake-now"), "").unwrap();
+}
+
+fn probes(lab: &Lab) -> Vec<(String, Vec<String>, ProbeEvidence, u32, u32)> {
+    lab.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::FlakyProbe {
+                step,
+                tests,
+                evidence,
+                runs,
+                failures,
+                ..
+            } => Some((step, tests, evidence, runs, failures)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn flaky_lines(lab: &Lab, terminal: &str) -> Vec<String> {
+    lab.lines_sent_to(terminal)
+        .into_iter()
+        .filter(|l| l.starts_with("chute 결과 flaky "))
+        .collect()
+}
+
+fn open_pr_by_orchestrator(lab: &Lab, n: u64, files: &[(&str, &str)]) {
+    let head = lab.push_pr_branch(n, files);
+    lab.queue_pr_by(
+        n,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+}
+
+#[test]
+fn a_probe_that_fails_only_on_the_flaked_tree_says_made_and_tells_the_submitter() {
+    let lab = probe_lab(
+        "[flaky]\nprobe_repeats = 3\n",
+        &probe_step("echo {tests} >> '@ROOT@/probe-runs'; [ ! -e PROBE_FAILS ]"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("PROBE_FAILS", "x\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Made,
+            4,
+            1
+        )]
+    );
+    let told = flaky_lines(&lab, "t1orch");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(has_key(&told[0], "evidence=made"), "{}", told[0]);
+    assert!(has_key(&told[0], "step=check"), "{}", told[0]);
+    assert!(has_key(&told[0], "tests=flaky_test"), "{}", told[0]);
+    assert!(!told[0].contains("chronic="), "{}", told[0]);
+    assert!(flaky_lines(&lab, "t1rs").is_empty());
+    let runs = fs::read_to_string(lab.sb.root().join("probe-runs")).unwrap();
+    assert_eq!(runs.lines().collect::<Vec<_>>(), ["flaky_test"; 4]);
+    assert!(lab.state().warnings.is_empty());
+    lab.assert_every_pushed_commit_was_verified();
+}
+
+#[test]
+fn a_probe_that_fails_on_the_base_says_base_and_tells_nobody() {
+    let lab = probe_lab("", &probe_step(": {tests}; [ ! -e PROBE_FAILS ]"));
+    lab.main_commit(&[("PROBE_FAILS", "x\n")], "chore: broken on main");
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Base,
+            1,
+            1
+        )]
+    );
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+    assert!(
+        lab.hc_calls("send")
+            .iter()
+            .all(|c| !c[2].contains(" flaky "))
+    );
+}
+
+#[test]
+fn a_probe_that_never_fails_is_unresolved_after_all_its_repeats() {
+    let lab = probe_lab("[flaky]\nprobe_repeats = 2\n", &probe_step(": {tests}"));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Unresolved,
+            4,
+            0
+        )]
+    );
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn a_probe_running_past_probe_seconds_is_cut_and_unresolved() {
+    let lab = probe_lab(
+        "[flaky]\nprobe_seconds = 1\n",
+        &probe_step(": {tests}; sleep 20"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let started = Instant::now();
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Unresolved,
+            0,
+            0
+        )]
+    );
+}
+
+#[test]
+fn a_cancel_during_a_probe_cuts_it_and_leaves_it_unresolved() {
+    let lab = probe_lab(
+        "",
+        &probe_step(": {tests}; touch '@ROOT@/probing'; sleep 20"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+    let cancel = chute::verify::Cancel::new();
+    let watcher = {
+        let (cancel, marker) = (cancel.clone(), lab.sb.root().join("probing"));
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !marker.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.cancel();
+        })
+    };
+
+    let started = Instant::now();
+    let summary = done(lab.engine().with_cancel(cancel).run_once().unwrap());
+    watcher.join().unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(
+        probes(&lab),
+        [(
+            "check".to_owned(),
+            vec!["flaky_test".to_owned()],
+            ProbeEvidence::Unresolved,
+            0,
+            0
+        )]
+    );
+}
+
+#[test]
+fn a_step_without_a_probe_is_not_probed() {
+    let lab = Lab::new(FLAKE_ONCE);
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(probes(&lab).is_empty());
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn a_flake_without_test_names_is_not_probed() {
+    let lab = Lab::build_with_step(
+        "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; fail \"boom\"; fi",
+        "",
+        60,
+        &probe_step(": {tests}"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(probes(&lab).is_empty());
+}
+
+fn flake_one_batch(lab: &Lab, n: u64) {
+    open_pr_by_orchestrator(lab, n, &[(&format!("f{n}.txt"), "x\n")]);
+    flake_next(lab);
+    assert_eq!(done(lab.engine().run_once().unwrap()).merged, prs(&[n]));
+}
+
+#[test]
+fn a_chronic_test_raises_one_warning_and_one_notice_a_day() {
+    let lab = Lab::build(FLAKE_ONCE, "[flaky]\nchronic = 3\n", 60);
+
+    flake_one_batch(&lab, 1);
+    flake_one_batch(&lab, 2);
+    assert!(lab.state().warnings.is_empty());
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+
+    flake_one_batch(&lab, 3);
+    let warnings = lab.state().warnings;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].kind, WarningKind::FlakyChronic);
+    assert!(warnings[0].message.contains("flaky_test"), "{warnings:?}");
+    let told = flaky_lines(&lab, "t1orch");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(has_key(&told[0], "chronic=yes"), "{}", told[0]);
+    assert!(!told[0].contains("evidence="), "{}", told[0]);
+    assert!(has_key(&told[0], "prs=3"), "{}", told[0]);
+
+    flake_one_batch(&lab, 4);
+    assert_eq!(lab.state().warnings.len(), 1);
+    assert_eq!(flaky_lines(&lab, "t1orch").len(), 1);
+    assert!(lab.state().warnings[0].message.contains("4번"));
+
+    lab.store
+        .update(|s| {
+            s.warnings[0].at_ms.0 -= 25 * 60 * 60 * 1000;
+            Ok(())
+        })
+        .unwrap();
+    flake_one_batch(&lab, 5);
+    assert_eq!(lab.state().warnings.len(), 1);
+    assert_eq!(flaky_lines(&lab, "t1orch").len(), 2);
+}
+
+#[test]
+fn a_chronic_warning_goes_when_the_count_falls_under_the_threshold() {
+    let lab = Lab::build(FLAKE_ONCE, "[flaky]\nchronic = 2\nchronic_days = 5\n", 60);
+    flake_one_batch(&lab, 1);
+    flake_one_batch(&lab, 2);
+    assert_eq!(lab.state().warnings.len(), 1);
+    let history = lab.store.history().unwrap().events;
+    let later = EpochMs(EpochMs::now().0 + 10 * 24 * 60 * 60 * 1000);
+
+    let due = chute::flaky::refresh_chronic(
+        &lab.store,
+        &history,
+        later,
+        &chute::config::FlakyPolicy {
+            chronic: 2,
+            chronic_days: 5,
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+
+    assert!(due.is_empty());
+    assert!(lab.state().warnings.is_empty());
+}
+
+#[test]
+fn a_flake_on_a_tip_that_was_never_pushed_is_not_probed() {
+    let verify = format!(
+        "m='@ROOT@/moved'\nif [ ! -e \"$m\" ]; then touch \"$m\"; (git clone -q '@ORIGIN@' '@ROOT@/mover' && cd '@ROOT@/mover' && echo x > moved.txt && git add moved.txt && git commit -qm 'chore: other push' && git push -q origin HEAD:main) || fail 'mover failed'; fi\n{FLAKE_ONCE}"
+    );
+    let lab = Lab::build_with_step(
+        &verify,
+        "",
+        60,
+        &probe_step("[ -e moved.txt ] || [ ! -e f1.txt ]; : {tests}"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("f1.txt", "x\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(
+        lab.origin_git(&["ls-tree", "-r", "--name-only", "main"])
+            .contains("moved.txt")
+    );
+    assert!(probes(&lab).is_empty(), "{:?}", probes(&lab));
+    assert!(flaky_lines(&lab, "t1orch").is_empty());
+}
+
+#[test]
+fn thousands_of_flaked_tests_are_still_probed() {
+    let body = "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; i=0; while [ $i -lt 5000 ]; do echo \"FAILED some_long_test_name_$i\"; i=$((i+1)); done; fail \"FAILED last\"; fi";
+    let lab = Lab::build_with_step(body, "", 60, &probe_step(": {tests}"));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+    flake_next(&lab);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let found = probes(&lab);
+    assert_eq!(found.len(), 1);
+    assert!(
+        (1000..5001).contains(&found[0].1.len()),
+        "the event names only the tests the probe ran with: {}",
+        found[0].1.len()
+    );
+    assert_eq!(found[0].2, ProbeEvidence::Unresolved);
 }

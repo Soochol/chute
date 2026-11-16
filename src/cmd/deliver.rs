@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use super::Ctx;
 use crate::config::Config;
 use crate::feedback::{self, Delivery, Feedback, PARCEL_LIMIT, Parcel};
+use crate::gc;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {}
@@ -44,7 +45,17 @@ pub fn deliver(ctx: &Ctx, input: &[u8]) -> Result<Delivery> {
         config: &config,
         worktrees_root: &worktrees_root,
     };
-    feedback.receive(&parcel)
+    let delivery = feedback.receive(&parcel)?;
+    gc::auto(
+        &gc::Site {
+            ext: &ctx.ext,
+            home: &ctx.home,
+            info: &info,
+            store: &store,
+        },
+        false,
+    );
+    Ok(delivery)
 }
 
 fn fetch_origin(ctx: &Ctx, repo: &Path) {

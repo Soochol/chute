@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,15 +13,18 @@ use serde::Deserialize;
 
 use crate::ci::{self, Verdict as CiVerdict};
 use crate::config::Config;
+use crate::env::{self, EnvSection};
 use crate::ext::Ext;
 use crate::feedback::{Delivery, Feedback, Notice, Subject};
+use crate::flaky;
 use crate::gitops::{
     FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, PushOutcome, Slot, SlotLock, SlotName,
 };
 use crate::model::{
     Agent, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event,
     EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
+    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning,
+    WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
 use crate::queue;
@@ -35,10 +38,36 @@ pub const VERIFIED_BASES_KEPT: usize = 100;
 const NO_CHECKS_WARNING_AFTER_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug)]
+pub enum Clock {
+    System,
+    Frozen(Arc<Mutex<Instant>>),
+}
+
+impl Clock {
+    pub fn frozen() -> Clock {
+        Clock::Frozen(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    pub fn advance(&self, by: Duration) {
+        if let Clock::Frozen(now) = self {
+            *now.lock().unwrap_or_else(|e| e.into_inner()) += by;
+        }
+    }
+
+    fn now(&self) -> Instant {
+        match self {
+            Clock::System => Instant::now(),
+            Clock::Frozen(now) => *now.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Timing {
     pub merged_check: Duration,
     pub merged_poll: Duration,
     pub ci_recheck: Duration,
+    pub clock: Clock,
 }
 
 impl Default for Timing {
@@ -47,6 +76,7 @@ impl Default for Timing {
             merged_check: Duration::from_secs(20),
             merged_poll: Duration::from_secs(1),
             ci_recheck: Duration::from_secs(30),
+            clock: Clock::System,
         }
     }
 }
@@ -438,9 +468,9 @@ impl Engine {
             .iter()
             .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
             .filter(|i| {
-                looked
-                    .get(&i.pr)
-                    .is_none_or(|at| at.elapsed() >= self.timing.ci_recheck)
+                looked.get(&i.pr).is_none_or(|at| {
+                    self.timing.clock.now().duration_since(*at) >= self.timing.ci_recheck
+                })
             })
             .map(|i| i.pr)
             .collect()
@@ -582,6 +612,9 @@ impl Engine {
         let result = run.execute(&taken);
         let only_deferred = run.only_deferred();
         let wound = run.wind_down();
+        if wound.is_ok() && result.is_ok() {
+            run.settle_flaky();
+        }
         let summary = Summary {
             batch: id,
             merged: run.merged.clone(),
@@ -740,6 +773,9 @@ impl Run<'_> {
         let mut by_queue = taken.to_vec();
         by_queue.sort_by_key(|i| self.queue_position[&i.pr]);
         let group = self.admit(&by_queue)?;
+        if !group.is_empty() {
+            self.ensure_env()?;
+        }
         self.solve(group)?;
         self.recheck_conflicts()
     }
@@ -791,7 +827,9 @@ impl Run<'_> {
         let verdict = ci::read(&engine.ext, &engine.info.path, pr)?;
         let mut looked = engine.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
         match verdict {
-            CiVerdict::Pending | CiVerdict::NoChecks => looked.insert(pr, Instant::now()),
+            CiVerdict::Pending | CiVerdict::NoChecks => {
+                looked.insert(pr, engine.timing.clock.now())
+            }
             CiVerdict::Passed | CiVerdict::Failed(_) => looked.remove(&pr),
         };
         drop(looked);
@@ -1013,12 +1051,49 @@ impl Run<'_> {
         self.engine.notifier().notify_waiters(pr, why, at);
     }
 
+    fn ensure_env(&mut self) -> Result<()> {
+        if self.record.env.is_none() {
+            self.slot.checkout(&self.start_base)?;
+            let env = env::record(
+                &self.engine.ext,
+                self.slot.path(),
+                &self.engine.store.batch_dir(self.id()).join("env"),
+                &self.config.env_check,
+                &self.engine.cancel,
+            );
+            if self.engine.cancel.is_cancelled() {
+                return Ok(());
+            }
+            self.record.env = Some(env);
+            self.save_record()?;
+        }
+        Ok(())
+    }
+
+    fn env_section(&mut self, item: &QueueItem) -> Result<Option<EnvSection>> {
+        self.ensure_env()?;
+        let Some(env) = self.record.env.clone() else {
+            return Ok(None);
+        };
+        let state = self.engine.store.load()?;
+        let preflight = state
+            .preflights
+            .get(&item.branch)
+            .filter(|p| p.head == item.head)
+            .and_then(|p| p.env.clone());
+        Ok(Some(EnvSection { env, preflight }))
+    }
+
     fn bounce(&mut self, pr: PrNumber, failure: Failure, failed_ref: Option<&str>) -> Result<()> {
         let engine = self.engine;
         let item = self.items[&pr].clone();
-        let written = self
-            .feedback()
-            .write_report(&Subject::from(&item), &failure, failed_ref)?;
+        let section = self.env_section(&item)?;
+        let written = self.feedback().write_report_with_env(
+            &Subject::from(&item),
+            &failure,
+            failed_ref,
+            section,
+        )?;
         let budget = self.config.budget;
         let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
         let (to, unreachable, delivery) = if item.attempts < budget {
@@ -1485,6 +1560,107 @@ impl Run<'_> {
                     engine.store.update(|s| Ok(queue::requeue(s, pr)?))?;
                 }
                 None => bail!("합치기 결과가 비어 있다"),
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_flaky(&mut self) {
+        if let Err(e) = self.gather_flaky_evidence() {
+            eprintln!("경고: 흔들림의 근거를 모으지 못했다: {e:#}");
+        }
+    }
+
+    fn gather_flaky_evidence(&mut self) -> Result<()> {
+        let engine = self.engine;
+        let flaky = self.record.flaky.clone();
+        let chronic_warned = engine
+            .store
+            .load()?
+            .warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::FlakyChronic);
+        if flaky.is_empty() && !chronic_warned {
+            return Ok(());
+        }
+        let mut made: Vec<Option<Vec<String>>> = vec![None; flaky.len()];
+        for (n, entry) in flaky.iter().enumerate() {
+            let command = self
+                .config
+                .verify
+                .iter()
+                .find(|s| s.name == entry.step)
+                .and_then(|s| s.probe.as_deref());
+            let landed = self.record.pushed.contains(&entry.tree);
+            let Some(command) = command.filter(|_| landed && !entry.tests.is_empty()) else {
+                continue;
+            };
+            let found = match flaky::probe(&flaky::ProbeJob {
+                config: &self.config,
+                store: &engine.store,
+                slot: &self.slot,
+                batch: self.id(),
+                command,
+                step: &entry.step,
+                tests: &entry.tests,
+                base: &self.start_base,
+                flaked: &entry.tree,
+                cancel: &engine.cancel,
+                cache_dir: engine.gitops.cache_dir(),
+            }) {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!(
+                        "경고: 단계 {}의 흔들림을 되풀이하지 못했다: {e:#}",
+                        entry.step
+                    );
+                    continue;
+                }
+            };
+            engine.history(EventKind::FlakyProbe {
+                batch: self.id().clone(),
+                step: entry.step.clone(),
+                tests: found.tests.clone(),
+                evidence: found.evidence,
+                runs: found.runs,
+                failures: found.failures,
+            })?;
+            if found.evidence == ProbeEvidence::Made {
+                made[n] = Some(found.tests);
+            }
+        }
+        let touched: Vec<flaky::Key> = flaky
+            .iter()
+            .flat_map(|f| flaky::keys_of(&f.step, &f.tests))
+            .collect();
+        let mut due = flaky::refresh_chronic(
+            &engine.store,
+            &engine.store.history()?.events,
+            EpochMs::now(),
+            &self.config.flaky,
+            &touched,
+        )?;
+        let targets: Vec<(Option<&Agent>, PrNumber)> = self
+            .merged
+            .iter()
+            .filter_map(|pr| self.items.get(pr))
+            .map(|i| (i.submitter.as_ref(), i.pr))
+            .collect();
+        for (entry, made) in flaky.iter().zip(made) {
+            let keys = flaky::keys_of(&entry.step, &entry.tests);
+            let chronic = keys.iter().any(|k| due.contains(k));
+            due.retain(|k| !keys.contains(k));
+            if (made.is_some() || chronic) && !targets.is_empty() {
+                engine
+                    .notifier()
+                    .notify_each(&targets, EpochMs::now(), |prs| Line::Flaky {
+                        batch: self.id().clone(),
+                        prs: prs.to_vec(),
+                        step: entry.step.clone(),
+                        tests: made.clone().unwrap_or_else(|| entry.tests.clone()),
+                        made: made.is_some(),
+                        chronic,
+                    });
             }
         }
         Ok(())

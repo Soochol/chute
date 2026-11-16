@@ -29,6 +29,7 @@ fn probe_in_threads(store: &Arc<RepoStore>) -> Vec<thread::JoinHandle<usize>> {
 
 mod slots {
     use std::collections::BTreeSet;
+    use std::fs;
     use std::path::Path;
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
@@ -138,6 +139,42 @@ mod slots {
         ] {
             assert_eq!(SlotName::parse(text), None, "{text}");
         }
+    }
+
+    #[test]
+    fn gc_offers_only_surplus_preflight_slots_nobody_holds_and_keeps_them_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = gitops(dir.path());
+        for name in [
+            SlotName::Preflight(1),
+            SlotName::Preflight(2),
+            SlotName::Preflight(3),
+            SlotName::Preflight(4),
+            SlotName::Preflight(5),
+            SlotName::Batch,
+        ] {
+            fs::create_dir_all(git.slot_path(name)).unwrap();
+        }
+        let held = git.lock_slot(SlotName::Preflight(4)).unwrap().unwrap();
+
+        let offered = git.lock_surplus_preflight_slots(2).unwrap();
+
+        let names: Vec<_> = offered.iter().map(|lock| lock.name()).collect();
+        assert_eq!(names, [SlotName::Preflight(3), SlotName::Preflight(5)]);
+        assert!(
+            git.lock_slot(SlotName::Preflight(3)).unwrap().is_none(),
+            "a preflight cannot take a slot gc is about to remove"
+        );
+        assert!(git.lock_slot(SlotName::Preflight(2)).unwrap().is_some());
+        drop(offered);
+        assert!(git.lock_slot(SlotName::Preflight(3)).unwrap().is_some());
+        drop(held);
+        let all = git.lock_surplus_preflight_slots(0).unwrap();
+        assert_eq!(all.len(), 5, "with no limit every slot folder is surplus");
+        assert!(
+            git.lock_surplus_preflight_slots(5).unwrap().is_empty(),
+            "slots at or under max_parallel stay"
+        );
     }
 
     #[test]

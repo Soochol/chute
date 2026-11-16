@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chute::engine::{Engine, Timing};
+use chute::engine::{Clock, Engine, Timing};
 use chute::ext::Ext;
 use chute::model::{
     Agent, Approval, Batch, BatchId, BounceReason, EpochMs, EventKind, ItemState, Phase, PrNumber,
@@ -41,6 +41,10 @@ impl Lab {
     }
 
     pub fn build(verify_body: &str, top: &str, timeout_s: u64) -> Lab {
+        Lab::build_with_step(verify_body, top, timeout_s, "")
+    }
+
+    pub fn build_with_step(verify_body: &str, top: &str, timeout_s: u64, step_extra: &str) -> Lab {
         let sb = Sandbox::new();
         let repo = TestRepo::new(&sb, "acme/widget");
         let log = sb.root().join("verified.log");
@@ -103,8 +107,9 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
         );
         sb.script("gh", &gh);
 
+        let step_extra = step_extra.replace("@ROOT@", &sb.root().to_string_lossy());
         let config = format!(
-            "{top}\n[[verify]]\nname = \"check\"\nrun = \"sh {}\"\ntimeout = {timeout_s}\nfailed = 'FAILED (\\S+)'\n",
+            "{top}\n[[verify]]\nname = \"check\"\nrun = \"sh {}\"\ntimeout = {timeout_s}\nfailed = 'FAILED (\\S+)'\n{step_extra}\n",
             script.display()
         );
         repo.commit_file("chute.toml", &config, "chore: chute 설정");
@@ -131,6 +136,10 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
     }
 
     pub fn engine_rechecking_ci_every(&self, ci_recheck: Duration) -> Engine {
+        self.engine_with_clock(ci_recheck, Clock::System)
+    }
+
+    pub fn engine_with_clock(&self, ci_recheck: Duration, clock: Clock) -> Engine {
         let ext = Ext::from_vars(|k| self.sb.var(k));
         Engine::new(
             ext,
@@ -142,6 +151,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null}}\n' "$state" "$head
             merged_check: Duration::ZERO,
             merged_poll: Duration::from_millis(10),
             ci_recheck,
+            clock,
         })
     }
 
