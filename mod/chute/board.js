@@ -117,7 +117,6 @@ function agentOf(agent) {
   };
 }
 
-// Queue-item facts added in v3: priority, repair, `after` and a submitter that differs from the worker.
 function marksOf(item) {
   const marks = [];
   if (item.priority === true) marks.push({ kind: "priority", text: "급함", tone: "warn" });
