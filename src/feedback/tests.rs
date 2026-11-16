@@ -3927,3 +3927,22 @@ fn an_agent_on_this_machine_is_delivered_even_when_the_machine_list_fails() {
     assert!(matches!(delivery, Delivery::Sent { .. }), "{delivery:?}");
     assert!(!verbs(&lab.hc_calls()).contains(&"machine"));
 }
+
+#[test]
+fn a_log_cut_after_reading_it_as_text_still_says_so() {
+    let lab = Lab::new();
+    let (head, tree) = lab.failed_tree(7, "x\n");
+    let log = lab.sb.root().join("raw.log");
+    fs::write(&log, [0xffu8; 900]).unwrap();
+    let failure = lab.failed_with_log(&tree, log);
+    let mut item = lab.item(7, "feat/a");
+    item.head = sha(&head);
+    let limits = Limits {
+        log: 1000,
+        ..Limits::default()
+    };
+
+    let parcel = lab.parcel_of(&item, &failure, &limits).unwrap();
+
+    assert!(text_of(&parcel.files[0]).starts_with("[chute: 로그가 길어"));
+}

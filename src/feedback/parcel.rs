@@ -347,9 +347,9 @@ fn log_end(path: &Path, limit: usize) -> String {
     match read() {
         Ok((bytes, len)) => {
             let cut = len - bytes.len() as u64;
-            let text = String::from_utf8_lossy(&bytes);
-            let text = tail_of(&text, limit);
-            let cut = cut + bytes.len().saturating_sub(text.len()) as u64;
+            let lossy = String::from_utf8_lossy(&bytes);
+            let text = tail_of(&lossy, limit);
+            let cut = cut + (lossy.len() - text.len()) as u64;
             if cut == 0 {
                 text.to_owned()
             } else {
@@ -377,9 +377,9 @@ fn diff_start(path: &Path, limit: usize) -> String {
     match read() {
         Ok((bytes, len)) => {
             let cut = len - bytes.len() as u64;
-            let text = String::from_utf8_lossy(&bytes);
-            let text = head_of(&text, limit);
-            let cut = cut + bytes.len().saturating_sub(text.len()) as u64;
+            let lossy = String::from_utf8_lossy(&bytes);
+            let text = head_of(&lossy, limit);
+            let cut = cut + (lossy.len() - text.len()) as u64;
             if cut == 0 {
                 text.to_owned()
             } else {
