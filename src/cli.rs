@@ -99,6 +99,9 @@ fn restore_sigpipe() {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    if let (false, Some(Command::ConfigCheck(args))) = (cli.skill, &cli.command) {
+        return cmd::config_check::run(args, cli.repo.as_deref());
+    }
     let ctx = match Ctx::from_env(cli.repo.clone()) {
         Ok(ctx) => ctx,
         Err(_) if cli.skill && cli.command.is_none() => return cmd::skill::run_without_state(),
@@ -127,7 +130,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Preflight(args) => cmd::preflight::run(args, ctx),
         Command::Submit(args) => cmd::submit::run(args, ctx),
         Command::Giveup(args) => cmd::giveup::run(args, ctx),
-        Command::ConfigCheck(args) => cmd::config_check::run(args, ctx),
+        Command::ConfigCheck(args) => cmd::config_check::run(&args, ctx.repo_arg()),
         Command::Status(args) => cmd::status::run(args, ctx),
         Command::Approve(args) => cmd::approve::run(args, ctx),
         Command::Retry(args) => cmd::retry::run(args, ctx),

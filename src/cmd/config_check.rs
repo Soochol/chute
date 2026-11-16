@@ -1,11 +1,11 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use super::{Ctx, REFUSED};
+use super::{REFUSED, target_dir_of};
 use crate::config::{self, Config};
 
 #[derive(clap::Args, Debug)]
@@ -33,11 +33,11 @@ struct Checked {
     verify: Vec<Step>,
 }
 
-pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
-    let file = match args.file {
-        Some(file) => std::path::absolute(&file)
+pub fn run(args: &Args, repo: Option<&Path>) -> Result<ExitCode> {
+    let file = match &args.file {
+        Some(file) => std::path::absolute(file)
             .with_context(|| format!("경로를 절대 경로로 바꾸지 못했다: {}", file.display()))?,
-        None => ctx.target_dir()?.join(config::FILE_NAME),
+        None => target_dir_of(repo)?.join(config::FILE_NAME),
     };
     let checked = check(file);
     if args.json {
@@ -107,8 +107,6 @@ fn render(checked: &Checked) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ext::Ext;
-    use crate::store::Home;
     use crate::testkit::Sandbox;
 
     const GOOD: &str = r#"
@@ -122,14 +120,6 @@ run = "true"
 timeout = 1800
 paths = ["web/", "Cargo.toml"]
 "#;
-
-    fn context(sb: &Sandbox, dir: &std::path::Path) -> Ctx {
-        Ctx::new(
-            Home::at(sb.chute_home()),
-            Ext::from_vars(|k| sb.var(k)),
-            Some(dir.to_path_buf()),
-        )
-    }
 
     fn write(sb: &Sandbox, text: &str) -> PathBuf {
         let dir = sb.root().join("work");
@@ -184,12 +174,12 @@ paths = ["web/", "Cargo.toml"]
     fn exit_code_follows_the_result_and_the_state_folder_stays_empty() {
         let sb = Sandbox::new();
         let file = write(&sb, GOOD);
-        let ctx = context(&sb, file.parent().unwrap());
+        let dir = file.parent().unwrap();
         let args = |file| Args { file, json: true };
-        let ok = run(args(None), &ctx).unwrap();
+        let ok = run(&args(None), Some(dir)).unwrap();
         assert_eq!(format!("{ok:?}"), format!("{:?}", ExitCode::SUCCESS));
         fs::write(&file, "[[verify]]\nname = \"a\"\nrun = \"\"\n").unwrap();
-        let bad = run(args(Some(file.clone())), &ctx).unwrap();
+        let bad = run(&args(Some(file.clone())), Some(dir)).unwrap();
         assert_eq!(format!("{bad:?}"), format!("{:?}", ExitCode::from(1)));
         assert_eq!(fs::read_dir(sb.chute_home()).unwrap().count(), 0);
     }
