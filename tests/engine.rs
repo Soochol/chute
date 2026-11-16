@@ -92,7 +92,6 @@ fn a_batch_merges_into_the_remote_named_upstream_and_leaves_the_fork_alone() {
     for n in 1..=2 {
         lab.open_pr(n, &[(&format!("f{n}.txt"), "x\n")]);
     }
-    // The managed repository moves to `upstream`; `origin` becomes a fork of it.
     let fork = lab.sb.root().join("remotes/me/widget.git");
     let fork_path = fork.to_string_lossy().into_owned();
     let upstream = lab.repo.origin().to_string_lossy().into_owned();

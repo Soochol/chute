@@ -6,7 +6,6 @@ use crate::config;
 use crate::ext::Ext;
 use crate::model::{RepoInfo, Slug};
 
-/// A git remote whose URL names an `owner/name` repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Remote {
     pub name: String,
@@ -14,8 +13,6 @@ pub struct Remote {
     pub slug: Slug,
 }
 
-/// The slug of the repository chute manages in `dir`. `registered` is what `chute init` has
-/// stored so far.
 pub fn slug(ext: &Ext, dir: &Path, registered: &[RepoInfo]) -> Result<Slug> {
     let tree = work_tree(ext, dir)?;
     let all = remotes(ext, dir)?;
@@ -40,7 +37,6 @@ pub fn discover(ext: &Ext, dir: &Path, registered: &[RepoInfo]) -> Result<RepoIn
     })
 }
 
-/// Every remote of the repository at `dir` whose URL names `owner/name`.
 pub fn remotes(ext: &Ext, dir: &Path) -> Result<Vec<Remote>> {
     let names = ext.git(dir, ["remote"])?.ok()?;
     let mut found = Vec::new();
@@ -61,9 +57,6 @@ pub fn remotes(ext: &Ext, dir: &Path) -> Result<Vec<Remote>> {
     Ok(found)
 }
 
-/// The remote chute manages, in this order: the one `chute.toml` names with `remote`; the only
-/// one whose repository is already registered; the only remote there is. Anything else is
-/// refused, because guessing would merge into the wrong repository.
 pub fn managed<'a>(
     remotes: &'a [Remote],
     key: Option<&str>,
@@ -102,7 +95,6 @@ pub fn managed<'a>(
     }
 }
 
-/// The `remote` key of the `chute.toml` checked out at `tree`, if there is one.
 pub fn local_remote_key(tree: &Path) -> Option<String> {
     let text = std::fs::read_to_string(tree.join(config::FILE_NAME)).ok()?;
     config::remote_key(&text)
@@ -193,7 +185,6 @@ mod tests {
         assert_eq!(Path::new(&info.remote), repo.origin());
     }
 
-    /// `origin` is a fork; the repository chute manages is `upstream`.
     fn fork_and_upstream(sb: &Sandbox) -> TestRepo {
         let repo = TestRepo::new(sb, "acme/widget");
         add_remote_clone(sb, &repo, "fork", "me/widget");

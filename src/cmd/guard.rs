@@ -102,7 +102,6 @@ enum Kind {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Push {
-    /// The remote the command names, as a remote name or a URL.
     remote: Option<String>,
     all_branches: bool,
     tags_only: bool,
@@ -141,14 +140,10 @@ struct Repo<'a> {
     ext: &'a Ext,
     dir: PathBuf,
     remotes: Vec<Remote>,
-    /// The remote chute manages. `None` when chute cannot tell which it is, and then every
-    /// remote is treated as managed.
     managed: Option<Remote>,
 }
 
-/// Where a push goes.
 struct Target {
-    /// The remote's name, when the command names a configured remote.
     name: Option<String>,
     slug: Slug,
 }
@@ -203,8 +198,6 @@ impl<'a> Repo<'a> {
             .then(|| tracked.split_once('/').map(|(_, branch)| branch.to_owned()))?
     }
 
-    /// The remote a push goes to, in git's own order: the one on the command line, the
-    /// branch's `pushRemote`, `remote.pushDefault`, the branch's upstream remote, and `origin`.
     fn push_remote(&self, push: &Push) -> Option<String> {
         if let Some(named) = &push.remote {
             return Some(named.clone());
@@ -248,7 +241,6 @@ impl<'a> Repo<'a> {
         self.managed.as_ref().is_none_or(|m| m.slug == target.slug)
     }
 
-    /// The branch `<remote>/HEAD` points at, or `main` and `master` when it is unset.
     fn default_branches(&self, remote: Option<&str>) -> Vec<String> {
         let head = remote.and_then(|name| {
             let out = self
@@ -268,7 +260,6 @@ impl<'a> Repo<'a> {
         head.map_or_else(|| vec!["main".to_owned(), "master".to_owned()], |b| vec![b])
     }
 
-    /// Whether the `chute.toml` on the default branch of any of `remotes` sets `require_head`.
     fn requires_head(&self, remotes: &[&str]) -> bool {
         remotes.iter().any(|remote| {
             self.default_branches(Some(remote)).iter().any(|branch| {
@@ -280,8 +271,6 @@ impl<'a> Repo<'a> {
         })
     }
 
-    /// `remote` is where the push goes. Without one, the managed remote's settings apply, or
-    /// every remote's when chute cannot tell which is managed.
     fn hand_in(&self, remote: Option<&str>) -> &'static str {
         let names: Vec<&str> = match (remote, &self.managed) {
             (Some(name), _) => vec![name],
@@ -832,7 +821,6 @@ mod tests {
     struct Fixture {
         sb: Sandbox,
         repo: TestRepo,
-        /// What `chute init` has registered, as the hook reads it.
         known: Vec<RepoInfo>,
     }
 
@@ -947,8 +935,6 @@ mod tests {
 
     const CONFIG: &str = "[[verify]]\nname = \"t\"\nrun = \"true\"\n";
 
-    /// `upstream` is the repository chute manages and `origin` is the user's fork. Both
-    /// default to `main`.
     fn forked(top: &str) -> Fixture {
         let fx = Fixture::new(false);
         let at = fx.sb.root().join("clones/me/widget.git");

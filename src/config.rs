@@ -365,8 +365,6 @@ fn is_remote_name(name: &str) -> bool {
         && !name.contains(|c: char| c.is_whitespace() || c.is_control() || c == '/')
 }
 
-/// The `remote` key alone, read without validating the rest of the file, so that a repository
-/// with several matching remotes can be told apart before any config can be loaded.
 pub fn remote_key(text: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(text).ok()?;
     let name = value.get("remote")?.as_str()?;

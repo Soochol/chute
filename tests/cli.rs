@@ -50,7 +50,6 @@ fn init_writes_a_readable_draft_and_registers() {
     assert!(!repo.path().join("AGENTS.md").exists());
 }
 
-/// `origin` is a fork and the repository chute manages is `upstream`.
 fn fork_and_upstream(sb: &Sandbox) -> TestRepo {
     let repo = TestRepo::new(sb, "acme/widget");
     let fork = sb.root().join("remotes/me/widget.git");
@@ -89,7 +88,6 @@ fn init_with_several_remotes_asks_for_the_remote_key_and_then_uses_it() {
     assert_eq!(info["remote_name"], "upstream");
     assert_eq!(info["default_branch"], "main");
 
-    // Once registered, later commands find the same remote without the key.
     repo.write("chute.toml", &chute::config::draft("true"));
     let status: Value =
         serde_json::from_str(&ok(chute(&sb, repo.path(), &["status", "--json"]))).unwrap();

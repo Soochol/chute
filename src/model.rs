@@ -204,8 +204,6 @@ pub struct RepoInfo {
     pub slug: Slug,
     pub path: PathBuf,
     pub remote: String,
-    /// Name of the git remote that holds `remote`. Repositories registered before this field
-    /// existed always used `origin`.
     #[serde(default = "default_remote_name")]
     pub remote_name: String,
     pub default_branch: String,
