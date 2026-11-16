@@ -1512,8 +1512,6 @@ impl Feedback<'_> {
         }))
     }
 
-    /// The remote that holds the PR branch: the one whose repository is the PR's head
-    /// repository. A fork checkout keeps the fork as `origin`, not the managed remote.
     fn pr_remote(&self, pr: PrNumber, cwd: &Path) -> Option<String> {
         #[derive(Deserialize)]
         struct Owner {

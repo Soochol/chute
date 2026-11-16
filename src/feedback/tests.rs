@@ -176,7 +176,6 @@ impl Lab {
         );
     }
 
-    /// `origin` is the fork `me/widget` and the managed repository is `upstream`.
     fn make_origin_a_fork(&mut self) {
         let fork = self.sb.root().join("clones/me/widget.git");
         let fork_s = fork.to_string_lossy().into_owned();
