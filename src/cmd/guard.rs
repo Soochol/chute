@@ -254,6 +254,12 @@ fn actions(command: &str) -> Vec<Action> {
 }
 
 fn collect(command: &str, start: &Dir, found: &mut Vec<Action>) {
+    let substitution = Regex::new(r"\$\(([^()]*)\)|`([^`]*)`").unwrap();
+    for inner in substitution.captures_iter(command) {
+        if let Some(text) = inner.get(1).or_else(|| inner.get(2)) {
+            collect(text.as_str(), start, found);
+        }
+    }
     let mut dir = start.clone();
     let mut outer: Vec<Dir> = Vec::new();
     for words in segments(command) {
@@ -274,9 +280,12 @@ fn collect(command: &str, start: &Dir, found: &mut Vec<Action>) {
         };
         match basename(program) {
             "cd" => {
-                dir = args
-                    .first()
-                    .map_or_else(|| start.clone(), |to| dir.then(to))
+                let target = args.iter().find(|a| *a == "-" || !a.starts_with('-'));
+                dir = match target.map(String::as_str) {
+                    Some("-") => dir,
+                    Some(to) => dir.then(to),
+                    None => start.clone(),
+                };
             }
             "sh" | "bash" | "zsh" | "dash" => {
                 if let Some(script) = args
@@ -441,7 +450,8 @@ fn parse_push<'a>(args: impl Iterator<Item = &'a str>) -> Push {
 fn destination(refspec: &str) -> Option<Destination> {
     let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
     let target = refspec.split_once(':').map_or(refspec, |(_, dst)| dst);
-    let target = target.strip_prefix("refs/heads/").unwrap_or(target);
+    let target = target.strip_prefix("refs/").unwrap_or(target);
+    let target = target.strip_prefix("heads/").unwrap_or(target);
     match target {
         "" => None,
         "HEAD" => Some(Destination::CurrentBranch),
@@ -526,6 +536,8 @@ fn segments(command: &str) -> Vec<Vec<String>> {
 }
 
 fn strip_heredocs(command: &str) -> String {
+    const LONGEST_BODY: usize = 2000;
+    const SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "eval", "source", "xargs"];
     let opener =
         Regex::new(r#"(?:^|[^<])<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#)
             .unwrap();
@@ -540,8 +552,27 @@ fn strip_heredocs(command: &str) -> String {
             else {
                 continue;
             };
-            let body: Vec<&str> = lines.clone().collect();
-            if let Some(at) = body.iter().position(|l| l.trim() == end) {
+            let whole = opened.get(0).unwrap();
+            let prefix = &line[..whole.start() + whole.as_str().find("<<").unwrap_or(0)];
+            let quoted_or_commented = line.trim_start().starts_with('#')
+                || prefix.matches(['\'', '"']).count() % 2 == 1
+                || prefix.contains("((");
+            let feeds_a_shell = line
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| SHELLS.contains(&word));
+            let Some(at) = lines
+                .clone()
+                .take(LONGEST_BODY)
+                .position(|l| l.trim() == end)
+            else {
+                continue;
+            };
+            let expands = opened.get(3).is_some()
+                && lines
+                    .clone()
+                    .take(at)
+                    .any(|l| l.contains("$(") || l.contains('`'));
+            if !quoted_or_commented && !feeds_a_shell && !expands {
                 lines.nth(at);
             }
         }
@@ -877,6 +908,37 @@ mod tests {
                 "막히지 않았다: {command}"
             );
         }
+    }
+
+    #[test]
+    fn heredocs_that_a_shell_runs_or_that_only_look_like_heredocs_are_scanned() {
+        let fx = Fixture::new(true);
+        for command in [
+            "echo '<<EOF'\ngit push origin main\nEOF",
+            "echo \"<<EOF\"\ngit push origin main\nEOF",
+            "# <<EOF\ngit push origin main\nEOF",
+            "x=$((1<<EOF))\ngit push origin main\nEOF",
+            "bash <<EOF\ngit push origin main\nEOF",
+            "cat <<'EOF' | sh\ngit push origin main\nEOF",
+            "cat <<EOF\n$(git push origin main)\nEOF",
+            "echo \"$(git push origin main)\"",
+            "echo \"a `gh pr merge 5` b\"",
+            "cd -P . && git push origin main",
+            "cd -- . && git push origin main",
+            "git push origin feat:heads/main",
+            "git push origin feat:refs/heads/main",
+        ] {
+            assert!(fx.verdict(command).is_some(), "막히지 않았다: {command}");
+        }
+    }
+
+    #[test]
+    fn a_command_with_thousands_of_heredoc_openers_finishes() {
+        let fx = Fixture::new(true);
+        let command = "cat <<E\n".repeat(5_000);
+        let started = std::time::Instant::now();
+        assert_eq!(fx.verdict(&command), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

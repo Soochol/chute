@@ -52,7 +52,7 @@ cargo install --git https://github.com/Soochol/chute
   - 기본 브랜치로 가는 `git push`. `git push origin main`, `git push origin HEAD:main`, `git push --all`, 기본 브랜치를 체크아웃한 상태의 맨 `git push` 같은 형태다. 맨 `git push`는 `push.default`와 upstream이 정하는 브랜치를 본다. 기본 브랜치는 원격의 `HEAD`(`refs/remotes/<원격>/HEAD`)가 가리키는 브랜치이고, 그것이 없으면 `main`과 `master`다. `origin/HEAD`가 없는 clone에서 기본 브랜치가 다른 이름이면 `git remote set-head origin -a`로 만든다.
   - PR 브랜치로의 push는 막지 않는다.
 - chute 데몬이 직접 하는 push는 Claude Code의 도구 호출이 아니므로 훅이 보지 않는다. 데몬이 머지하는 데는 영향이 없다.
-- 훅은 실수를 막는 장치이지 보안 경계가 아니다. 셸 별칭, 변수, 스크립트 안의 명령은 따라가지 않는다.
+- 훅은 실수를 막는 장치이지 보안 경계가 아니다. 셸 별칭, 변수, 스크립트 안의 명령은 따라가지 않는다. 중괄호 확장, 함수 정의, 파이프나 `&` 뒤의 `cd`, 작은따옴표 안의 `$(...)`도 정확히 따라가지 못한다.
 - `chute` 실행 파일이 `PATH`에 없으면 훅은 호출을 막지 않고 지나간다. `chute.toml`이 있는 저장소에서만 "실행 파일이 없어 막지 못한다"는 안내를 사용자에게 보인다. 훅이 입력을 읽거나 판정하지 못할 때도 호출을 막지 않고 이유만 보인다.
 
 ### `chute install`이 하는 일
