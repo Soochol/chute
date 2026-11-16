@@ -475,3 +475,22 @@ fn status_refuses_a_corrupt_state_file() {
     assert!(out.stdout.is_empty());
     assert_eq!(fs::read_to_string(&path).unwrap(), "{\"queue\": [");
 }
+
+#[test]
+fn init_with_remotes_of_one_url_uses_origin_and_says_so() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    let url = repo.origin().to_string_lossy().into_owned();
+    repo.git(&["remote", "add", "paseo-pr-109", &url]);
+    repo.commit_file("chute.toml", &chute::config::draft("true"), "chore: 설정");
+    repo.git(&["push", "--quiet", "origin", "main"]);
+
+    let out = ok(chute(&sb, repo.path(), &["init"]));
+    assert!(
+        out.contains("주소가 같은 원격이 2개(origin, paseo-pr-109) 있다. 쓰는 원격: origin"),
+        "{out}"
+    );
+    let repo_json = sb.chute_home().join("repos/acme__widget/repo.json");
+    let info: Value = serde_json::from_str(&fs::read_to_string(repo_json).unwrap()).unwrap();
+    assert_eq!(info["remote_name"], "origin");
+}
