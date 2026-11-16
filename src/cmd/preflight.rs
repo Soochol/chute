@@ -18,7 +18,6 @@ use crate::model::{
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
 
-/// How long `state.json` keeps a preflight record of a branch that is not in the queue.
 const RECORD_KEEP_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHOWN_PATHS: usize = 5;
 

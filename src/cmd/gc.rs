@@ -34,7 +34,6 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     })
 }
 
-/// Always this PC's own state folder and repository: nothing goes to the hub.
 fn sweep(args: &Args, ctx: &Ctx) -> Result<Swept> {
     let (info, store) = ctx.registered_repo()?;
     let site = Site {

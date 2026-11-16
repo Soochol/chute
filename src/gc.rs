@@ -30,7 +30,6 @@ const AUTO_EVERY_MS: u64 = 60 * 60 * 1000;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const BATCH_ID_LEN: usize = "b20261116-141025".len();
 
-/// Everything a sweep reads or changes on this PC.
 pub struct Site<'a> {
     pub ext: &'a Ext,
     pub home: &'a Home,
@@ -41,11 +40,8 @@ pub struct Site<'a> {
 pub struct Rules {
     pub retention: Retention,
     pub max_parallel: u32,
-    /// The PRs in the queue. `Some` only on the hub, the one machine that knows the queue.
     pub queue: Option<BTreeSet<PrNumber>>,
-    /// The batch that is running or waiting for recovery: its logs stay.
     pub batch: Option<BatchId>,
-    /// The log the halted queue points at: the folder holding it stays.
     pub blocked_log: Option<PathBuf>,
 }
 
@@ -78,7 +74,6 @@ impl Kind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Item {
     pub kind: Kind,
-    /// A folder, or a full ref name.
     pub target: String,
     pub bytes: u64,
 }
@@ -252,8 +247,6 @@ fn plan_slots(site: &Site, rules: &Rules) -> Result<Vec<Planned>> {
         .collect())
 }
 
-/// The folders directly under `root` of the given `kind` that `name_ok` accepts, are older
-/// than `cutoff`, and do not hold the log the halted queue points at.
 fn old_dirs(
     root: &Path,
     kind: Kind,
@@ -334,7 +327,6 @@ enum Made {
     Batch { pr: PrNumber, made: Option<EpochMs> },
 }
 
-/// A failed-tree ref's name: `preflight-<ms>-<tree>` or `pr<n>-<batch id>`.
 fn parse_ref(name: &str) -> Option<Made> {
     if let Some(made) = preflight_ref_made_at(name) {
         return Some(Made::Preflight(made));
@@ -352,8 +344,6 @@ pub fn preflight_ref_made_at(name: &str) -> Option<EpochMs> {
     at.parse().ok().map(EpochMs)
 }
 
-/// A batch id is the local time it started: `b20261116-141025`, with `-<n>` appended when
-/// two batches began in the same second.
 fn batch_made_at(batch: &str) -> Option<EpochMs> {
     let stamp = batch.get(..BATCH_ID_LEN)?;
     let naive = NaiveDateTime::parse_from_str(stamp, "b%Y%m%d-%H%M%S").ok()?;
@@ -385,8 +375,6 @@ fn is_due(store: &RepoStore, now: EpochMs) -> bool {
     last_run(store).is_none_or(|last| last.0 > now.0 || now.0 - last.0 >= AUTO_EVERY_MS)
 }
 
-/// The rules from `origin/<default branch>`'s `chute.toml` and this PC's state. `None` when
-/// that branch has no `chute.toml` yet.
 fn rules_of(site: &Site) -> Result<Option<Rules>> {
     let Some(config) =
         Config::load_remote_branch(site.ext, &site.info.path, &site.info.default_branch)?
@@ -538,7 +526,6 @@ mod tests {
             }
         }
 
-        /// A folder with one file, last touched `days` ago.
         fn dir(&self, relative: &str, days: u64) -> PathBuf {
             let dir = self.store.dir().join(relative);
             fs::create_dir_all(&dir).unwrap();
