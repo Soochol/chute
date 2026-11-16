@@ -6,16 +6,16 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::{Ctx, REFUSED};
+use super::{Ctx, FORWARD_TIMEOUT, REFUSED, forward_to_hub};
 use crate::config::Config;
 use crate::ext::Ext;
 use crate::feedback::{self, Feedback, Subject, Written};
 use crate::gitops::{FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, Slot};
 use crate::model::{
     Blocked, ConflictFile, EpochMs, Failure, FailureKind, ItemState, Mode, NonEmpty, Partner,
-    PrNumber, PreflightRecord, PreflightResult, QueueItem, RepoInfo, Sha, StepFailure, VerifyMode,
+    PrNumber, PreflightRecord, PreflightResult, RepoInfo, Sha, StatusView, StepFailure, VerifyMode,
 };
 use crate::store::RepoStore;
 use crate::verify::{self, Cause, Detail, FlakyStep, Options, Outcome};
@@ -30,9 +30,19 @@ pub struct Args {
     /// 결과를 JSON으로 출력한다
     #[arg(long)]
     pub json: bool,
+    /// 다른 PC의 preflight가 결과를 넘길 때 쓴다. 검증하지 않고 이 결과만 기록한다
+    #[arg(long, hide = true, value_name = "JSON", conflicts_with = "json")]
+    pub record: Option<String>,
 }
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
+    if let Some(text) = &args.record {
+        let entry: Recorded =
+            serde_json::from_str(text).context("넘겨받은 preflight 결과를 읽지 못했다")?;
+        let (_, store) = ctx.registered_repo()?;
+        deliver(ctx, &store, &entry)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let report = preflight(ctx)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -117,14 +127,12 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
     let dir = ctx.target_dir()?;
     let (info, store) = ctx.registered_repo()?;
     let target = read_target(ctx, &dir)?;
-    let state = store.load()?;
-    if let Some(blocked) = &state.blocked {
+    let Queue { waiting, blocked } = read_queue(ctx, &store)?;
+    if let Some(blocked) = &blocked {
         eprintln!("{}", blocked_notice(blocked));
     }
-    let queued: Vec<&QueueItem> = state
-        .queue
+    let queued: Vec<&Waiting> = waiting
         .iter()
-        .filter(|item| matches!(item.state, ItemState::Queued(_) | ItemState::InBatch))
         .filter(|item| Some(item.branch.as_str()) != target.branch.as_deref())
         .collect();
 
@@ -191,12 +199,71 @@ fn preflight(ctx: &Ctx) -> Result<Report> {
         ItemResult::Merged { .. } | ItemResult::AlreadyMerged => run.verify(&merged.tip)?,
     };
 
-    let report = Report::new(&judged, &target, &base, skipped, state.blocked, at);
-    if let Err(e) = record(&store, &target, &report) {
+    let report = Report::new(&judged, &target, &base, skipped, blocked, at);
+    if let Err(e) = record(ctx, &store, &target, &report) {
         eprintln!("경고: 결과를 상태에 기록하지 못했다: {e:#}");
     }
     prune(&ctx.ext, &info, &store, &gitops);
     Ok(report)
+}
+
+struct Waiting {
+    pr: PrNumber,
+    branch: String,
+    title: String,
+    head: Sha,
+}
+
+struct Queue {
+    waiting: Vec<Waiting>,
+    blocked: Option<Blocked>,
+}
+
+fn read_queue(ctx: &Ctx, store: &RepoStore) -> Result<Queue> {
+    let answer = forward_to_hub(ctx, &["status", "--json"], FORWARD_TIMEOUT)
+        .context("허브에 닿지 않아 큐를 알 수 없다. 큐 없이 검증하면 batch의 결과와 달라질 수 있어 검증하지 않는다")?;
+    let Some(answer) = answer else {
+        let state = store.load()?;
+        let waiting = state
+            .queue
+            .iter()
+            .filter(|item| matches!(item.state, ItemState::Queued(_) | ItemState::InBatch))
+            .map(|item| Waiting {
+                pr: item.pr,
+                branch: item.branch.clone(),
+                title: item.title.clone(),
+                head: item.head.clone(),
+            })
+            .collect();
+        return Ok(Queue {
+            waiting,
+            blocked: state.blocked,
+        });
+    };
+    if answer.code != 0 || answer.truncated {
+        bail!(
+            "허브가 큐를 알려 주지 않아 검증하지 않는다 (종료 코드 {}): {}",
+            answer.code,
+            String::from_utf8_lossy(&answer.stderr).trim()
+        );
+    }
+    let view: StatusView = serde_json::from_slice(&answer.stdout)
+        .context("허브의 상태를 읽지 못해 큐를 알 수 없다. 검증하지 않는다")?;
+    let waiting = view
+        .queue
+        .into_iter()
+        .filter(|item| matches!(item.state, ItemState::Queued(_) | ItemState::InBatch))
+        .map(|item| Waiting {
+            pr: item.pr,
+            branch: item.branch,
+            title: item.title,
+            head: item.head,
+        })
+        .collect();
+    Ok(Queue {
+        waiting,
+        blocked: view.blocked,
+    })
 }
 
 fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
@@ -245,7 +312,7 @@ fn read_target(ctx: &Ctx, dir: &Path) -> Result<Target> {
     Ok(Target { head, branch })
 }
 
-fn fetch_queue(slot: &Slot, queued: &[&QueueItem], skipped: &mut Vec<Skipped>) -> Vec<MergeItem> {
+fn fetch_queue(slot: &Slot, queued: &[&Waiting], skipped: &mut Vec<Skipped>) -> Vec<MergeItem> {
     let mut items = Vec::new();
     for item in queued {
         match slot.fetch_pr_head(item.pr, &item.head) {
@@ -513,28 +580,54 @@ impl Report {
     }
 }
 
-fn record(store: &RepoStore, target: &Target, report: &Report) -> Result<()> {
+#[derive(Debug, Serialize, Deserialize)]
+struct Recorded {
+    branch: String,
+    record: PreflightRecord,
+}
+
+fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Result<()> {
     let Some(branch) = &target.branch else {
         eprintln!("경고: 브랜치가 아닌 HEAD라 결과를 상태에 기록하지 않는다");
         return Ok(());
     };
-    let cutoff = report.at_ms.0.saturating_sub(KEEP_FOR.as_millis() as u64);
+    let entry = Recorded {
+        branch: branch.clone(),
+        record: PreflightRecord {
+            head: report.head.clone(),
+            result: report.result,
+            report: report.report.clone(),
+            at_ms: report.at_ms,
+            base: Some(report.base.clone()),
+            with: report.with.clone(),
+        },
+    };
+    deliver(ctx, store, &entry)
+}
+
+fn deliver(ctx: &Ctx, store: &RepoStore, entry: &Recorded) -> Result<()> {
+    let text = serde_json::to_string(entry)?;
+    match forward_to_hub(ctx, &["preflight", "--record", &text], FORWARD_TIMEOUT)? {
+        None => write_record(store, entry),
+        Some(answer) if answer.code == 0 => Ok(()),
+        Some(answer) => bail!(
+            "허브가 결과를 받지 않았다 (종료 코드 {}): {}",
+            answer.code,
+            String::from_utf8_lossy(&answer.stderr).trim()
+        ),
+    }
+}
+
+fn write_record(store: &RepoStore, entry: &Recorded) -> Result<()> {
+    let cutoff = EpochMs::now().0.saturating_sub(KEEP_FOR.as_millis() as u64);
     store.update(|state| {
         let queued: Vec<String> = state.queue.iter().map(|i| i.branch.clone()).collect();
         state
             .preflights
             .retain(|name, old| old.at_ms.0 >= cutoff || queued.contains(name));
-        state.preflights.insert(
-            branch.clone(),
-            PreflightRecord {
-                head: report.head.clone(),
-                result: report.result,
-                report: report.report.clone(),
-                at_ms: report.at_ms,
-                base: Some(report.base.clone()),
-                with: report.with.clone(),
-            },
-        );
+        state
+            .preflights
+            .insert(entry.branch.clone(), entry.record.clone());
         Ok(())
     })
 }

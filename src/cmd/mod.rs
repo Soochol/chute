@@ -1,6 +1,7 @@
 pub mod approve;
 pub mod batches;
 pub mod daemon;
+pub mod deliver;
 pub mod down;
 pub mod drop;
 pub mod giveup;

@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
@@ -12,11 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::ext::{Ext, Output};
 use crate::gitops::FAILED_REF_PREFIX;
+use crate::hub::{ForwardErrorKind, exec_on_input};
+use crate::machine::{self, Machine};
 use crate::model::{
     Agent, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner, PrNumber,
     QueueItem, RepoInfo, Sha, StepFailure, TerminalId, VerifyMode,
 };
 use crate::store::RepoStore;
+
+mod parcel;
+
+pub use parcel::{Limits, PARCEL_LIMIT, Parcel};
+use parcel::{ParcelNotice, Rebuild};
 
 const HC_NOT_FOUND: i32 = 3;
 const HC_BLOCKED: i32 = 9;
@@ -35,6 +43,7 @@ const SHELLS: [&str; 9] = [
 ];
 const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
+const REMOTE_DELIVER_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub fn worktrees_root(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
     var("HOME")
@@ -178,10 +187,20 @@ impl Feedback<'_> {
         failure: &Failure,
         failed_ref: Option<&str>,
     ) -> Result<Written> {
+        self.write_report_at(subject, failure, failed_ref, Placement::Here)
+    }
+
+    fn write_report_at(
+        &self,
+        subject: &Subject,
+        failure: &Failure,
+        failed_ref: Option<&str>,
+        placement: Placement<'_>,
+    ) -> Result<Written> {
         let cause = Cause::of(failure)?;
         let step = match &cause {
             Cause::Step { step, timed_out } => {
-                Some(self.step_report(subject, step, failed_ref, *timed_out)?)
+                Some(self.step_report(subject, step, failed_ref, *timed_out, placement)?)
             }
             Cause::Conflict(_) | Cause::Ci(_) => None,
         };
@@ -242,13 +261,7 @@ impl Feedback<'_> {
     }
 
     fn failed_ref_at(&self, name: &str, tree: &Sha) -> Result<String> {
-        let plain = !name.is_empty()
-            && !name.starts_with('-')
-            && !name.contains("..")
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b));
-        if !plain {
+        if !plain_ref_name(name) {
             bail!("실패한 트리 참조 이름이 아니다: {name:?}");
         }
         let full = if name.starts_with("refs/") {
@@ -286,6 +299,7 @@ impl Feedback<'_> {
         step: &StepFailure,
         failed_ref: Option<&str>,
         timed_out: bool,
+        placement: Placement<'_>,
     ) -> Result<StepReport> {
         let configured = self
             .config
@@ -315,18 +329,54 @@ impl Feedback<'_> {
         } else {
             String::new()
         };
+        let run = format!(
+            "CHUTE_RUN_ID=repro_{run_id}_$$_$(date +%s) {limit}sh -c {}",
+            shell_word(&configured.run)
+        );
+        let git = format!("git -c core.hooksPath=/dev/null -C {repo}");
+        let at_tree = format!(
+            "{git} worktree add --detach {dir} {} && (cd {dir} && {run})",
+            step.tree
+        );
+        let repro = match (placement, &failed_ref) {
+            (Placement::Here, _) | (Placement::Delivered { .. }, Some(_)) => vec![at_tree],
+            (
+                Placement::Delivered {
+                    rebuild: Some(rebuild),
+                },
+                None,
+            ) => {
+                let merges: String = rebuild
+                    .heads
+                    .iter()
+                    .map(|head| format!("git merge --no-ff --no-edit {head} && "))
+                    .collect();
+                vec![
+                    "# 허브의 실패한 트리를 이 머신에 가져오지 못했다. origin에서 같은 트리를 만든다".to_owned(),
+                    format!("{git} fetch origin"),
+                    format!(
+                        "{git} worktree add --detach {dir} {} && (cd {dir} && {merges}{run})",
+                        rebuild.base
+                    ),
+                ]
+            }
+            (Placement::Delivered { rebuild: None }, None) => vec![
+                "# 허브의 실패한 트리를 이 머신에 가져오지 못했고 origin에서 만드는 방법도 알지 못했다. 아래 커밋은 허브에만 있을 수 있다".to_owned(),
+                at_tree,
+            ],
+        };
+        let log = match placement {
+            Placement::Here => step.log.clone(),
+            Placement::Delivered { .. } => self.report_dir(subject).join(&step.log),
+        };
         Ok(StepReport {
             name: step.step.clone(),
             command: configured.run.clone(),
             timeout_s: configured.timeout.as_secs(),
-            log_tail: step.failed_tests.is_empty().then(|| log_tail(&step.log)),
+            log_tail: step.failed_tests.is_empty().then(|| log_tail(&log)),
             tree: step.tree.clone(),
             git_ref: failed_ref.clone(),
-            repro: vec![format!(
-                "git -c core.hooksPath=/dev/null -C {repo} worktree add --detach {dir} {} && (cd {dir} && CHUTE_RUN_ID=repro_{run_id}_$$_$(date +%s) {limit}sh -c {})",
-                step.tree,
-                shell_word(&configured.run)
-            )],
+            repro,
             cleanup: format!("git -C {repo} worktree remove --force {dir}"),
         })
     }
@@ -395,6 +445,21 @@ impl Feedback<'_> {
         };
         Ok((files, text))
     }
+}
+
+fn plain_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b))
+}
+
+#[derive(Clone, Copy)]
+enum Placement<'a> {
+    Here,
+    Delivered { rebuild: Option<&'a Rebuild> },
 }
 
 fn github_merge_subject_prefix(pr: PrNumber) -> String {
@@ -662,6 +727,14 @@ fn render(doc: &ReportDoc, cause: &Cause) -> String {
     out.join("\n")
 }
 
+fn beside_report(path: &Path) -> &'static str {
+    if path.is_relative() {
+        " (이 보고서와 같은 폴더)"
+    } else {
+        ""
+    }
+}
+
 fn render_ci(out: &mut Vec<String>, checks: &[FailedCheck]) {
     out.push("## 실패한 check".to_owned());
     out.push(String::new());
@@ -755,8 +828,9 @@ fn render_step(
         )),
     }
     out.push(format!(
-        "- 로그: {}",
-        code_span(&step.log.display().to_string())
+        "- 로그: {}{}",
+        code_span(&step.log.display().to_string()),
+        beside_report(&step.log)
     ));
     out.push(String::new());
     if !command_fits_inline {
@@ -804,8 +878,9 @@ fn render_step(
                 out.push(format!("- 바뀐 파일: {}", files.join(", ")));
             }
             out.push(format!(
-                "- diff: {}",
-                code_span(&partner.diff.display().to_string())
+                "- diff: {}{}",
+                code_span(&partner.diff.display().to_string()),
+                beside_report(&partner.diff)
             ));
             out.push(String::new());
         }
@@ -901,14 +976,14 @@ fn without_shell_syntax(text: &str) -> String {
         .replace(" .", ".")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Delivery {
     Sent { terminal: TerminalId },
     Spawned(Agent),
     Unreachable(Unreachable),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Unreachable {
     Blocked {
         terminal: TerminalId,
@@ -1039,6 +1114,159 @@ impl Feedback<'_> {
                 written.md.display()
             )));
         }
+        let machine = match self.machine_of(item) {
+            Ok(machine) => machine,
+            Err(why) => return Delivery::Unreachable(why),
+        };
+        match machine {
+            Some(machine) => self.deliver_remote(item, notice, &machine),
+            None => self.deliver_here(item, notice),
+        }
+    }
+
+    fn machine_of(&self, item: &QueueItem) -> Result<Option<Machine>, Unreachable> {
+        let Some(id) = item.agent.as_ref().and_then(|a| a.machine.as_ref()) else {
+            return Ok(None);
+        };
+        let local = machine::core(self.ext).map_err(|e| {
+            Unreachable::Failed(format!(
+                "에이전트가 있는 머신({id})이 이 PC인지 확인하지 못했다: {e:#}"
+            ))
+        })?;
+        if local.id == *id {
+            return Ok(None);
+        }
+        let others = machine::list(self.ext).map_err(|e| {
+            Unreachable::Failed(format!("에이전트가 있는 머신({id})을 찾지 못했다: {e:#}"))
+        })?;
+        others.into_iter().find(|m| m.id == *id).map(Some).ok_or_else(|| {
+            Unreachable::Failed(format!(
+                "에이전트가 있는 머신({id})을 hc가 모른다. 사람이 `hc machine add`로 더하고 전달한다"
+            ))
+        })
+    }
+
+    fn deliver_remote(&self, item: &QueueItem, notice: &Notice<'_>, machine: &Machine) -> Delivery {
+        let name = machine.name.as_str();
+        let slug = self.repo.slug.to_string();
+        let sent = self
+            .parcel(item, notice, &Limits::default())
+            .and_then(|parcel| parcel.encode())
+            .map_err(|e| {
+                Unreachable::Failed(format!("머신 `{name}`로 보낼 묶음을 만들지 못했다: {e:#}"))
+            })
+            .and_then(|bytes| {
+                exec_on_input(
+                    self.ext,
+                    name,
+                    &[],
+                    &["chute", "--slug", &slug, "deliver"],
+                    Some(&bytes),
+                    REMOTE_DELIVER_TIMEOUT,
+                )
+                .map_err(|e| Unreachable::Failed(unreached(name, e.kind)))
+            })
+            .and_then(|answer| self.answer_of(name, &answer));
+        match sent {
+            Ok(Delivery::Spawned(mut agent)) => {
+                agent.machine = Some(machine.id.clone());
+                Delivery::Spawned(agent)
+            }
+            Ok(Delivery::Unreachable(why)) => {
+                Delivery::Unreachable(Unreachable::Failed(format!("머신 `{name}`: {why}")))
+            }
+            Ok(sent) => sent,
+            Err(why) => Delivery::Unreachable(why),
+        }
+    }
+
+    /// Receiving end of `deliver_remote`: files the parcel under this machine's state folder,
+    /// brings the failed tree in, and runs the v1 delivery here. The caller has fetched origin.
+    pub fn receive(&self, parcel: &Parcel) -> Result<Delivery> {
+        let item = &parcel.item;
+        let (failure, failed_ref, rebuild) = match &parcel.notice {
+            ParcelNotice::HeadChanged {
+                registered,
+                current,
+            } => {
+                return Ok(self.deliver_here(
+                    item,
+                    &Notice::HeadChanged {
+                        registered,
+                        current,
+                    },
+                ));
+            }
+            ParcelNotice::Bounced {
+                failure,
+                failed_ref,
+                rebuild,
+            } => (failure, failed_ref, rebuild),
+        };
+        let subject = Subject::from(item);
+        let dir = self.report_dir(&subject);
+        fs::create_dir_all(&dir).with_context(|| format!("만들지 못했다: {}", dir.display()))?;
+        let files: Vec<(&str, Vec<u8>)> = parcel
+            .files
+            .iter()
+            .map(|file| Ok((file.name.as_str(), file.bytes()?)))
+            .collect::<Result<_>>()?;
+        for (name, bytes) in files {
+            write_file(&dir.join(name), bytes)?;
+        }
+        let tree = match failure {
+            Failure::Verify(step) | Failure::Timeout(step) => Some(&step.tree),
+            Failure::Conflict { .. } | Failure::Ci { .. } => None,
+        };
+        let imported = match (&parcel.bundle, failed_ref, tree) {
+            (Some(bundle), Some(name), Some(tree)) => self.import_tree(&dir, bundle, name, tree),
+            _ => None,
+        };
+        let written = self.write_report_at(
+            &subject,
+            failure,
+            imported.as_deref(),
+            Placement::Delivered {
+                rebuild: rebuild.as_ref(),
+            },
+        )?;
+        Ok(self.deliver_here(item, &Notice::Bounced(&written)))
+    }
+
+    fn import_tree(&self, dir: &Path, bundle: &str, name: &str, tree: &Sha) -> Option<String> {
+        let bytes = crate::hub::base64_decode(bundle)?;
+        let file = dir.join("failed-tree.bundle");
+        write_file(&file, bytes).ok()?;
+        let staging = format!("refs/chute/incoming/{}", short(tree));
+        let fetched = self.ext.git(
+            &self.repo.path,
+            [
+                OsString::from("fetch"),
+                "--quiet".into(),
+                file.as_os_str().to_owned(),
+                format!("+{name}:{staging}").into(),
+            ],
+        );
+        let _ = fs::remove_file(&file);
+        let imported = fetched
+            .ok()
+            .filter(|out| out.success())
+            .and_then(|_| self.failed_ref_at(&staging, tree).ok())
+            .and_then(|_| {
+                let moved = self
+                    .ext
+                    .git(&self.repo.path, ["update-ref", name, tree.as_str()])
+                    .ok()?;
+                moved.success().then_some(())
+            })
+            .and_then(|()| self.failed_ref_at(name, tree).ok());
+        let _ = self
+            .ext
+            .git(&self.repo.path, ["update-ref", "-d", &staging]);
+        imported
+    }
+
+    fn deliver_here(&self, item: &QueueItem, notice: &Notice<'_>) -> Delivery {
         let line = notice.line(item);
         if let Some(agent) = &item.agent {
             match self.send(agent, &line) {
@@ -1486,6 +1714,23 @@ fn is_name_taken(out: &Output) -> bool {
         kind: String,
     }
     serde_json::from_slice::<Failure>(&out.stderr).is_ok_and(|f| f.error.kind == "name_taken")
+}
+
+fn unreached(machine: &str, kind: ForwardErrorKind) -> String {
+    match kind {
+        ForwardErrorKind::UnknownMachine => format!(
+            "hc가 머신 `{machine}`을 모른다. 보고서를 보내지 못했다. `hc machine ls`로 등록된 머신을 확인한다"
+        ),
+        ForwardErrorKind::NoChute => format!(
+            "머신 `{machine}`에서 chute를 실행하지 못했다. 보고서를 보내지 못했다. 그 머신의 PATH에 chute가 있는지 확인한다"
+        ),
+        ForwardErrorKind::TimedOut => format!(
+            "머신 `{machine}`가 제때 답하지 않았다. 보고서가 전달됐는지 알 수 없다. `chute status`로 확인한다"
+        ),
+        ForwardErrorKind::Unreachable | ForwardErrorKind::Misconfigured => format!(
+            "머신 `{machine}`에 닿지 못했다. 보고서를 보내지 못했다. `hc machine ls`로 상태를 보고, 로그인이 필요하면 `hc machine login {machine}`을 실행한다"
+        ),
+    }
 }
 
 fn exit_text(code: Option<i32>) -> String {

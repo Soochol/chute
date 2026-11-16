@@ -90,6 +90,7 @@ const LAUNCH_LOCK_FILE: &str = "up.lock";
 const BATCH_FILE: &str = "batch.json";
 const REVERT_FILE: &str = "revert.json";
 const HUB_FILE: &str = "hub.json";
+const TAKEN_FILE: &str = "taken.json";
 
 #[derive(Clone, Debug)]
 pub struct RepoStore {
@@ -218,17 +219,22 @@ impl RepoStore {
     pub fn set_hub(&self, machine_id: MachineId) -> Result<()> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("만들지 못했다: {}", self.dir.display()))?;
+        remove_file_if_present(&self.dir.join(TAKEN_FILE))?;
         write_json_atomic(&self.dir.join(HUB_FILE), &HubConfig { machine_id })
     }
 
+    pub fn taken_from(&self) -> Result<Option<MachineId>> {
+        Ok(read_json::<HubConfig>(&self.dir.join(TAKEN_FILE))?.map(|c| c.machine_id))
+    }
+
+    pub fn mark_taken(&self, from: MachineId) -> Result<()> {
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("만들지 못했다: {}", self.dir.display()))?;
+        write_json_atomic(&self.dir.join(TAKEN_FILE), &HubConfig { machine_id: from })
+    }
+
     pub fn clear_hub(&self) -> Result<()> {
-        let path = self.dir.join(HUB_FILE);
-        match fs::remove_file(&path) {
-            Err(e) if e.kind() != ErrorKind::NotFound => {
-                Err(e).with_context(|| format!("지우지 못했다: {}", path.display()))
-            }
-            _ => Ok(()),
-        }
+        remove_file_if_present(&self.dir.join(HUB_FILE))
     }
 
     pub fn write_batch(&self, record: &BatchRecord) -> Result<()> {
@@ -384,6 +390,15 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         File::open(dir)?.sync_all()
     };
     write().with_context(|| format!("쓰지 못했다: {}", path.display()))
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("지우지 못했다: {}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]

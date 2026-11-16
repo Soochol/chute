@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -187,6 +187,23 @@ impl Ext {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.call_with_input(tool, cwd, args, timeout, None)
+    }
+
+    /// `call` that feeds `input` to the program's stdin. The bytes are written from a thread of
+    /// their own so a program that stops reading cannot stall the deadline.
+    pub fn call_with_input<I, S>(
+        &self,
+        tool: Tool,
+        cwd: Option<&Path>,
+        args: I,
+        timeout: Duration,
+        input: Option<&[u8]>,
+    ) -> Result<Output, ExtError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         let call = std::iter::once(tool.name().into())
             .chain(args.iter().map(|a| a.to_string_lossy()))
@@ -196,7 +213,11 @@ impl Ext {
         let mut command = Command::new(program);
         command
             .args(&args)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
@@ -219,6 +240,12 @@ impl Ext {
             program: program.to_owned(),
             source,
         })?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            let input = input.to_vec();
+            thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
         let deadline = Instant::now() + timeout;
         let io_error = |call: String| move |source| ExtError::Io { call, source };
         let mut pipes = [

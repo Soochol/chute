@@ -2,10 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { actionArgs, causeText, formatDuration, interpret } from "./board.js";
+import { LOCAL_POLL_MS, REMOTE_POLL_MS, actionArgs, causeText, formatDuration, interpret, pollInterval } from "./board.js";
 
 const fixture = JSON.parse(readFileSync(new URL("../../tests/fixtures/status-full.json", import.meta.url), "utf8"));
 const NOW = fixture.batch.started_ms + 312_000;
+
+const unreachable = JSON.parse(
+  readFileSync(new URL("../../tests/fixtures/status-hub-unreachable.json", import.meta.url), "utf8"),
+);
 
 const clone = (value) => structuredClone(value);
 const ok = (data) => ({ code: 0, stdout: JSON.stringify(data), stderr: "" });
@@ -237,7 +241,7 @@ test("human cards carry reason, agent, retries and the last failure", () => {
   assert.equal(budget.retries, "3/3");
   assert.equal(budget.state, "needs_human");
   assert.equal(items.find((i) => i.pr === 21).state, "awaiting_approval");
-  assert.deepEqual(budget.agent, { terminal: "t1rp", name: "impl-h", alive: true, label: "impl-h (t1rp)" });
+  assert.deepEqual(budget.agent, { terminal: "t1rp", name: "impl-h", alive: true, remote: false, host: null, label: "impl-h (t1rp)" });
   assert.equal(budget.failure.summary, "test 단계 실패: skill::tests::prints_manual");
   assert.equal(items.find((i) => i.pr === 10).agent.alive, false);
   assert.equal(items.find((i) => i.pr === 11).agent, null);
@@ -759,7 +763,7 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight"]);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub"]);
     const leaves = [];
     const walk = (value, path, key) => {
       if (value !== null && typeof value === "object") {
@@ -837,8 +841,8 @@ test("batch members follow submission order when the batch record lists none", (
 test("an agent without a name is shown by its terminal", () => {
   const data = withQueue({ ...itemOf(9), agent: { terminal: "t1rs", name: null, alive: true } }, { ...itemOf(21), agent: { terminal: "t9", name: "", alive: false } });
   const agents = Object.fromEntries(section(only(data), "human").items.map((i) => [i.pr, i.agent]));
-  assert.deepEqual(agents[9], { terminal: "t1rs", name: null, alive: true, label: "t1rs" });
-  assert.deepEqual(agents[21], { terminal: "t9", name: null, alive: false, label: "t9" });
+  assert.deepEqual(agents[9], { terminal: "t1rs", name: null, alive: true, remote: false, host: null, label: "t1rs" });
+  assert.deepEqual(agents[21], { terminal: "t9", name: null, alive: false, remote: false, host: null, label: "t9" });
 });
 
 test("an awaiting item without a preflight record says so in a muted tone", () => {
@@ -865,4 +869,80 @@ test("the waiting order does not depend on the input order", () => {
     orders.add(JSON.stringify(prs(section(only(queueOnly(...perm)), "waiting"))));
   }
   assert.deepEqual([...orders], ['[1,2,"?"]']);
+});
+
+const agentOfPr = (repo, pr) => {
+  const cards = repo.sections.flatMap((s) => s.items).filter((item) => item.pr === pr);
+  return cards[0]?.agent;
+};
+
+test("the repo card names the hub host, or this PC when the hub is local", () => {
+  assert.equal(only(fixture).hub.label, "desk-host");
+  const local = clone(fixture);
+  local.hub = { ...local.hub, local: true, host: "this-host", machine: null };
+  assert.equal(only(local).hub.label, "이 PC");
+  const v1 = clone(fixture);
+  delete v1.hub;
+  assert.deepEqual(
+    { local: only(v1).hub.local, reachable: only(v1).hub.reachable, label: only(v1).hub.label },
+    { local: true, reachable: true, label: "이 PC" },
+  );
+});
+
+test("an unreachable hub shows its reason instead of queue, batch and buttons", () => {
+  const repo = only(unreachable);
+  assert.equal(repo.hub.reachable, false);
+  assert.equal(repo.hub.label, "desk-host");
+  assert.equal(repo.hub.error, unreachable.hub.error);
+  assert.deepEqual(repo.sections, []);
+
+  const stale = clone(fixture);
+  stale.hub = clone(unreachable.hub);
+  const hidden = only(stale);
+  assert.deepEqual(hidden.sections, []);
+  assert.equal(hidden.approval, null);
+});
+
+test("an agent on another machine shows its host and can be peeked", () => {
+  const repo = only(fixture);
+  const remote = agentOfPr(repo, 14);
+  assert.equal(remote.remote, true);
+  assert.equal(remote.host, "desk-host");
+  assert.equal(remote.terminal, "desk/t1ru");
+  assert.equal(remote.alive, true);
+
+  const dead = agentOfPr(repo, 10);
+  assert.equal(dead.host, "desk-host");
+  assert.equal(dead.alive, false);
+});
+
+test("an agent on this PC shows no host", () => {
+  const repo = only(fixture);
+  for (const pr of [9, 15, 17, 21]) {
+    const agent = agentOfPr(repo, pr);
+    assert.equal(agent.remote, false, `#${pr}`);
+    assert.equal(agent.host, null, `#${pr}`);
+  }
+  assert.equal(agentOfPr(repo, 11), null);
+});
+
+test("a remote agent without a host falls back to its machine name", () => {
+  const data = queueOnly(itemOf(14));
+  data.queue[0].agent.host = null;
+  assert.equal(agentOfPr(only(data), 14).host, "desk");
+});
+
+test("polling is fast when any hub is remote and the v1 pace when all are local", () => {
+  assert.equal(pollInterval(board([fixture])), REMOTE_POLL_MS);
+  assert.equal(pollInterval(board([unreachable])), REMOTE_POLL_MS);
+  const local = clone(fixture);
+  local.hub = { ...local.hub, local: true, machine: null };
+  assert.equal(pollInterval(board([local])), LOCAL_POLL_MS);
+  assert.equal(pollInterval(board([local, fixture])), REMOTE_POLL_MS);
+  const v1 = clone(fixture);
+  delete v1.hub;
+  assert.equal(pollInterval(board([v1])), LOCAL_POLL_MS);
+  assert.equal(pollInterval(null), LOCAL_POLL_MS);
+  assert.equal(pollInterval({ kind: "failed" }), LOCAL_POLL_MS);
+  assert.ok(REMOTE_POLL_MS < LOCAL_POLL_MS);
 });
