@@ -660,17 +660,20 @@ impl Run<'_> {
     }
 
     fn execute(&mut self, taken: &[QueueItem]) -> Result<()> {
-        self.record.env = Some(env::record(
-            &self.engine.ext,
-            self.slot.path(),
-            &self.engine.store.batch_dir(self.id()).join("env"),
-            &self.config.env_check,
-            &self.engine.cancel,
-        ));
         self.save_record()?;
         let mut by_queue = taken.to_vec();
         by_queue.sort_by_key(|i| self.queue_position[&i.pr]);
         let group = self.admit(&by_queue)?;
+        if !group.is_empty() {
+            self.record.env = Some(env::record(
+                &self.engine.ext,
+                self.slot.path(),
+                &self.engine.store.batch_dir(self.id()).join("env"),
+                &self.config.env_check,
+                &self.engine.cancel,
+            ));
+            self.save_record()?;
+        }
         self.solve(group)?;
         self.recheck_conflicts()
     }
