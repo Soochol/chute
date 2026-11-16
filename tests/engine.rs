@@ -1668,15 +1668,11 @@ fn notify_a_halt_reaches_every_submitting_terminal_once() {
         &orch[0],
         &format!("base={}", &lab.origin_main()[..12])
     ));
-    for key in [
-        "step=",
-        "pushed_by_chute=",
-        "rechecked=",
-        "log=",
-        "suspect=",
-    ] {
-        assert!(!orch[0].contains(key), "{key}: {}", orch[0]);
-    }
+    assert!(has_key(&orch[0], "step=check"), "{}", orch[0]);
+    assert!(has_key(&orch[0], "pushed_by_chute=no"), "{}", orch[0]);
+    assert!(has_key(&orch[0], "rechecked=no"), "{}", orch[0]);
+    assert!(orch[0].contains(" log="), "{}", orch[0]);
+    assert!(!orch[0].contains("suspect="), "{}", orch[0]);
     assert_eq!(lab.lines_sent_to("t1rs").len(), 1);
     assert!(lab.bounced_events().is_empty());
 }
@@ -2285,4 +2281,315 @@ fn waiting_a_pr_behind_one_whose_github_state_cannot_be_read_fails_the_pass_and_
 
     assert!(lab.engine().run_once().is_err());
     assert_eq!(lab.item(2).unwrap().after, prs(&[1]));
+}
+
+const BROKEN_BASE: &str =
+    "[ -e BASEBAD ] && fail \"기준이 깨졌다\"\n[ -e BAD ] && fail \"FAILED bad_test\"";
+
+fn queue_for_worker(lab: &Lab, n: u64) {
+    let head = lab.push_pr_branch(n, &[(&format!("f{n}.txt"), "x\n")]);
+    lab.queue_pr_by(
+        n,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+}
+
+fn halted_lab() -> Lab {
+    let lab = Lab::new(BROKEN_BASE);
+    lab.main_commit(&[("BASEBAD", "")], "feat: broken");
+    queue_for_worker(&lab, 1);
+    let head = lab.push_pr_branch(2, &[("f2.txt", "x\n")]);
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+    lab
+}
+
+fn lines_with(lab: &Lab, terminal: &str, kind: &str) -> Vec<String> {
+    lab.lines_sent_to(terminal)
+        .into_iter()
+        .filter(|l| l.starts_with(&format!("chute 결과 {kind} ")))
+        .collect()
+}
+
+#[test]
+fn repair_a_halt_names_the_step_the_log_and_whether_chute_pushed_the_commit() {
+    let lab = halted_lab();
+
+    let blocked = lab.state().blocked.expect("저장소가 멈춘다");
+    assert_eq!(blocked.step.as_deref(), Some("check"));
+    assert!(!blocked.pushed_by_chute);
+    assert!(!blocked.rechecked);
+    let log = fs::read_to_string(blocked.log.as_ref().expect("로그 경로가 있다")).unwrap();
+    assert!(log.contains("기준이 깨졌다"), "{log}");
+    let status = chute_status(&lab);
+    assert_eq!(status["blocked"]["step"], "check");
+    assert_eq!(status["blocked"]["pushed_by_chute"], false);
+    assert_eq!(status["blocked"]["rechecked"], false);
+    assert_eq!(
+        status["blocked"]["log"].as_str().map(std::path::Path::new),
+        blocked.log.as_deref()
+    );
+    let halted = lines_with(&lab, "t1orch", "halted");
+    assert_eq!(halted.len(), 1, "{halted:?}");
+    assert!(has_key(&halted[0], "step=check"), "{}", halted[0]);
+    assert!(has_key(&halted[0], "pushed_by_chute=no"), "{}", halted[0]);
+}
+
+#[test]
+fn repair_a_repair_pr_is_verified_alone_pushed_and_lifts_the_halt() {
+    let lab = halted_lab();
+    let head = lab.push_pr_branch_removing(3, "BASEBAD");
+    lab.queue_repair_by(3, &head, Some(lab.agent()), Some(lab.orchestrator()));
+    let runs = lab.verify_runs();
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[3]));
+    assert_eq!(
+        lab.verify_runs(),
+        runs + 1,
+        "복구 PR만 한 번 검증한다. 큐의 다른 PR과 묶지 않는다"
+    );
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.prs, prs(&[3]));
+    assert_eq!(record.merges.len(), 1);
+    assert_eq!(lab.merged_prs(), [3]);
+    assert!(lab.state().blocked.is_none());
+    assert!(lab.state().verified_bases.contains(&record.pushed[0]));
+    assert_eq!(lab.item_state(1), Some(ItemState::Queued(None)));
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+    lab.assert_every_pushed_commit_was_verified();
+
+    let merged = lines_with(&lab, "t1orch", "merged");
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert!(has_key(&merged[0], "pr=3"), "{}", merged[0]);
+    assert!(has_key(&merged[0], "repair=yes"), "{}", merged[0]);
+    for terminal in ["t1orch", "t1rs"] {
+        let resumed = lines_with(&lab, terminal, "resumed");
+        assert_eq!(resumed.len(), 1, "{terminal}: {resumed:?}");
+        assert!(has_key(&resumed[0], "by=repair"), "{}", resumed[0]);
+        assert!(
+            has_key(
+                &resumed[0],
+                &format!("base={}", &record.pushed[0].as_str()[..12])
+            ),
+            "{}",
+            resumed[0]
+        );
+    }
+    assert!(has_key(&lines_with(&lab, "t1orch", "resumed")[0], "pr=3"));
+    assert!(lab.events().iter().any(|e| matches!(
+        e,
+        EventKind::Resumed {
+            by: chute::model::ResumedBy::Repair,
+            pr: Some(PrNumber(3)),
+            ..
+        }
+    )));
+
+    let after = done(lab.engine().run_once().unwrap());
+    assert_eq!(after.merged, prs(&[1, 2]));
+    assert!(lab.state().queue.is_empty());
+}
+
+#[test]
+fn repair_a_failing_repair_pr_is_bounced_and_the_queue_stays_halted() {
+    let lab = halted_lab();
+    let before = lab.state().blocked.unwrap();
+    let head = lab.push_pr_branch(3, &[("still-broken.txt", "x\n")]);
+    lab.queue_repair_by(3, &head, Some(lab.agent()), Some(lab.orchestrator()));
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert!(summary.merged.is_empty());
+    assert_eq!(summary.bounced, prs(&[3]));
+    let item = lab.item(3).unwrap();
+    assert_eq!(item.state, ItemState::Bounced(BounceReason::Verify));
+    assert_eq!(item.attempts, 1);
+    assert!(item.repair);
+    let report = fs::read_to_string(item.last_failure.unwrap().report).unwrap();
+    assert!(report.contains("기준이 깨졌다"), "{report}");
+    let to_worker = lab.lines_sent_to("t1rs");
+    assert_eq!(to_worker.len(), 2, "멈춤 줄과 반송 줄: {to_worker:?}");
+    assert!(
+        to_worker[0].starts_with("chute 결과 halted "),
+        "{to_worker:?}"
+    );
+    assert!(!to_worker[1].starts_with("chute 결과 "), "{to_worker:?}");
+    assert_eq!(lab.state().blocked, Some(before), "멈춤은 그대로다");
+    assert!(lab.merge_commits_on_main().is_empty());
+
+    let runs = lab.verify_runs();
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+    assert_eq!(
+        lab.verify_runs(),
+        runs,
+        "복구 항목이 없으면 검증하지 않는다"
+    );
+
+    let fixed = lab.push_pr_branch_removing(3, "BASEBAD");
+    lab.queue_repair_by(3, &fixed, Some(lab.agent()), Some(lab.orchestrator()));
+    let again = done(lab.engine().run_once().unwrap());
+    assert_eq!(again.merged, prs(&[3]));
+    assert!(lab.state().blocked.is_none());
+}
+
+#[test]
+fn repair_a_halt_that_main_moved_off_says_main_moved_and_the_repair_item_goes_first() {
+    let lab = halted_lab();
+    let head = lab.push_pr_branch(3, &[("f3.txt", "x\n")]);
+    lab.queue_repair_by(3, &head, Some(lab.agent()), Some(lab.orchestrator()));
+    lab.remove_from_main("BASEBAD", "fix: 기준을 손으로 고친다");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert!(lab.state().blocked.is_none());
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    let order: Vec<u64> = record.merges.iter().map(|m| m.pr.0).collect();
+    assert_eq!(order, [3, 1, 2], "복구 항목, 나머지 순서다");
+    for terminal in ["t1orch", "t1rs"] {
+        let resumed = lines_with(&lab, terminal, "resumed");
+        assert_eq!(resumed.len(), 1, "{terminal}: {resumed:?}");
+        assert!(has_key(&resumed[0], "by=main_moved"), "{}", resumed[0]);
+        assert!(!resumed[0].contains(" pr="), "{}", resumed[0]);
+    }
+    assert!(lab.events().iter().any(|e| matches!(
+        e,
+        EventKind::Resumed {
+            by: chute::model::ResumedBy::MainMoved,
+            pr: None,
+            ..
+        }
+    )));
+    let merged = lines_with(&lab, "t1orch", "merged");
+    assert_eq!(merged.len(), 2, "{merged:?}");
+    let marked: Vec<&String> = merged
+        .iter()
+        .filter(|l| l.contains(" repair=yes "))
+        .collect();
+    assert_eq!(marked.len(), 1, "복구 표시는 기록으로 남는다: {merged:?}");
+    assert!(has_key(marked[0], "pr=3"), "{}", marked[0]);
+}
+
+const FLIPPING_ENV: &str =
+    "[ -e '@ROOT@/envbroken' ] && fail 'environment broke'\n[ -e BAD ] && fail \"FAILED bad_test\"";
+
+fn lab_on_a_pushed_base() -> Lab {
+    let lab = Lab::new(FLIPPING_ENV);
+    lab.open_pr(1, &[("f1.txt", "x\n")]);
+    done(lab.engine().run_once().unwrap());
+    assert!(
+        lab.state()
+            .verified_bases
+            .iter()
+            .any(|b| b.as_str() == lab.origin_main())
+    );
+    lab
+}
+
+fn queue_by_orchestrator(lab: &Lab, n: u64, files: &[(&str, &str)]) {
+    let head = lab.push_pr_branch(n, files);
+    lab.queue_pr_by(
+        n,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+}
+
+#[test]
+fn recheck_a_pushed_base_is_verified_again_before_the_second_failing_pr_is_bounced() {
+    let lab = lab_on_a_pushed_base();
+    fs::write(lab.sb.root().join("envbroken"), "").unwrap();
+    queue_by_orchestrator(&lab, 2, &[("f2.txt", "x\n")]);
+    queue_by_orchestrator(&lab, 3, &[("f3.txt", "x\n")]);
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+
+    assert_eq!(lab.bounced_events(), [(2, BounceReason::Verify)]);
+    assert_eq!(lab.item_state(3), Some(ItemState::Queued(None)));
+    let blocked = lab.state().blocked.expect("기준이 깨져 멈춘다");
+    assert!(blocked.rechecked);
+    assert!(blocked.pushed_by_chute);
+    assert_eq!(blocked.step.as_deref(), Some("check"));
+    assert_eq!(blocked.base.as_str(), lab.origin_main());
+    let halted = lines_with(&lab, "t1orch", "halted");
+    assert_eq!(halted.len(), 1, "{halted:?}");
+    assert!(has_key(&halted[0], "rechecked=yes"), "{}", halted[0]);
+    assert!(has_key(&halted[0], "pushed_by_chute=yes"), "{}", halted[0]);
+    assert!(has_key(&halted[0], "suspect=2"), "{}", halted[0]);
+    let status = chute_status(&lab);
+    assert_eq!(status["blocked"]["rechecked"], true);
+    assert_eq!(status["blocked"]["pushed_by_chute"], true);
+}
+
+#[test]
+fn recheck_a_base_that_still_passes_lets_the_second_pr_be_bounced_and_resets_the_count() {
+    let lab = lab_on_a_pushed_base();
+    queue_by_orchestrator(&lab, 2, &[("BAD", "")]);
+    queue_by_orchestrator(&lab, 3, &[("BAD", "")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[2, 3]));
+    assert!(lab.state().blocked.is_none());
+    assert_eq!(lab.state().base_doubt, None);
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(
+        record.verifications, 4,
+        "묶음, 2번, 3번, 그리고 3번을 반송하기 전의 기준 재검증"
+    );
+}
+
+#[test]
+fn recheck_a_pass_in_between_does_not_count() {
+    let lab = lab_on_a_pushed_base();
+    queue_by_orchestrator(&lab, 2, &[("BAD", "")]);
+    queue_by_orchestrator(&lab, 4, &[("f4.txt", "x\n")]);
+    queue_by_orchestrator(&lab, 3, &[("BAD", "")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[4]));
+    assert_eq!(summary.bounced, prs(&[2, 3]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(
+        record.verifications, 6,
+        "묶음, 2번, 4와 3, 4, 3, 3번 단독. 기준 재검증은 없다"
+    );
+    let doubt = lab.state().base_doubt.expect("3번이 새로 센다");
+    assert_eq!(doubt.prs, prs(&[3]));
+}
+
+#[test]
+fn recheck_the_same_pr_failing_twice_is_not_two_prs() {
+    let lab = lab_on_a_pushed_base();
+    queue_by_orchestrator(&lab, 2, &[("BAD", "")]);
+    let first = done(lab.engine().run_once().unwrap());
+    assert_eq!(first.bounced, prs(&[2]));
+    let head = lab.item(2).unwrap().head;
+    lab.queue_pr_by(
+        2,
+        &head,
+        Some(lab.agent()),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+
+    let second = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(second.bounced, prs(&[2]));
+    let record = lab.store.read_batch(&second.batch).unwrap().unwrap();
+    assert_eq!(record.verifications, 1, "기준을 다시 검증하지 않는다");
+    assert_eq!(lab.state().base_doubt.unwrap().prs, prs(&[2]));
 }

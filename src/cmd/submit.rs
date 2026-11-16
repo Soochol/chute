@@ -32,6 +32,9 @@ pub struct Args {
     /// 이 PR이 머지된 뒤에 batch에 넣는다. 여러 번 줄 수 있다
     #[arg(long, value_name = "PR")]
     pub after: Vec<PrNumber>,
+    /// 멈춘 큐를 풀 복구 PR로 넣는다. 큐가 멈춰 있을 때만, 한 번에 하나만 받는다
+    #[arg(long)]
+    pub repair: bool,
     /// 결과를 JSON으로 출력한다
     #[arg(long)]
     pub json: bool,
@@ -91,6 +94,9 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
     if config.require_head && (args.head.is_none() || args.relayed_no_head) {
         return Err(Refusal(REQUIRE_HEAD_MESSAGE.to_owned()).into());
     }
+    if args.repair && !args.after.is_empty() {
+        return Err(Refusal(REPAIR_AFTER_MESSAGE.to_owned()).into());
+    }
     let pr = read_pr(ctx, &dir, args.pr)?;
     check_open_and_ready(&pr, &info)?;
     if let Some(head) = &args.head {
@@ -134,6 +140,7 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
         approval: config.approval,
         priority: args.priority,
         after,
+        repair: args.repair,
         now: EpochMs::now(),
     };
     let (done, kept_after) = store.update(|state| {
@@ -153,6 +160,7 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
             pr.number,
             args.priority,
             kept_after,
+            args.repair,
         );
     }
     if let Err(e) = super::up::ensure_daemon(ctx, &info, &store) {
@@ -210,6 +218,9 @@ fn submit_through_hub(
     if args.priority {
         forwarded.push("--priority".to_owned());
     }
+    if args.repair {
+        forwarded.push("--repair".to_owned());
+    }
     for n in &args.after {
         forwarded.extend(["--after".to_owned(), n.0.to_string()]);
     }
@@ -227,6 +238,9 @@ fn submit_through_hub(
     )
 }
 
+const REPAIR_AFTER_MESSAGE: &str = "복구 PR은 `--after`와 함께 쓸 수 없다. 큐가 멈춰 있는 동안 다른 PR은 머지되지 않아 \
+     기다리는 PR이 영영 풀리지 않는다. `--after`를 뺀다";
+
 const REQUIRE_HEAD_MESSAGE: &str = "이 저장소는 확인한 HEAD(`--head`) 없이 submit을 받지 않는다. \
      오케스트레이터 아래에서 일한다면 submit하지 말고 PR과 HEAD를 보고한다";
 
@@ -236,6 +250,7 @@ fn record_submitted(
     pr: PrNumber,
     priority: bool,
     after: Vec<PrNumber>,
+    repair: bool,
 ) {
     let recorded = store.append_history(&Event {
         at_ms: EpochMs::now(),
@@ -244,7 +259,7 @@ fn record_submitted(
             head: head.clone(),
             priority,
             after,
-            repair: false,
+            repair,
         },
     });
     if let Err(e) = recorded {
