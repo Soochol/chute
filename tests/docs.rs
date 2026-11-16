@@ -60,3 +60,101 @@ fn readme_gives_the_plugin_install_lines_and_the_missing_binary_behavior() {
     assert!(text.contains("cargo install --git https://github.com/Soochol/chute"));
     assert!(text.contains("`PATH`에 없으면 훅은 호출을 막지 않고 지나간다"));
 }
+
+fn manual() -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("skill/manual.md")).unwrap()
+}
+
+fn source() -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    out
+}
+
+#[test]
+fn manual_and_readme_quote_only_messages_the_code_prints() {
+    let code = source();
+    let quoted = [
+        "push하지 않은 커밋이 있거나 그사이 다른 커밋이 push됐다",
+        "에이전트가 있는 머신(",
+        "을 이 허브가 모른다",
+        "명령이 기록됐는지 알 수 없다",
+        "명령은 기록되지 않았다",
+        "에 닿지 않는다(",
+        "로 명령을 넘기지 못했다",
+        "에서 chute를 실행하지 못했다",
+        "의 상태가 {}이다",
+        "허브에 닿지 않아 큐를 알 수 없다",
+        "revert는 허브에서만 실행한다",
+        "데몬은 허브에서만 돈다",
+        "그 머신의 로그인 환경 PATH에 chute가 있는지 확인한다",
+        "허브 머신(",
+        "을 hc가 모른다",
+        " · 닿지 않음",
+        "허브: 이 PC",
+        "(연결됨)",
+    ];
+    let manual = manual();
+    let readme = readme();
+    for text in quoted {
+        assert!(code.contains(text), "코드에 `{text}`가 없다");
+    }
+    for text in [
+        "push하지 않은 커밋이 있거나 그사이 다른 커밋이 push됐다",
+        "명령이 기록됐는지 알 수 없다",
+        "revert는 허브에서만 실행한다",
+        "데몬은 허브에서만 돈다",
+        "허브에 닿지 않아 큐를 알 수 없다",
+    ] {
+        assert!(manual.contains(text), "설명서에 `{text}`가 없다");
+    }
+    assert!(readme.contains("그 머신의 로그인 환경 PATH에 chute가 있는지 확인한다"));
+    assert!(readme.contains("revert는 허브에서만 실행한다"));
+}
+
+#[test]
+fn manual_tells_agents_what_to_do_when_the_hub_is_elsewhere() {
+    let text = manual();
+    assert!(text.contains("## 허브가 다른 PC일 때"));
+    assert!(text.contains("--head <SHA>"));
+    assert!(text.contains("에 닿지 않는다"));
+    assert!(text.contains("사용자에게"));
+}
+
+#[test]
+fn readme_multi_pc_section_covers_every_step() {
+    let text = readme();
+    let start = text.find("## 여러 PC에서 쓰기").expect("절이 없다");
+    let end = text[start..]
+        .find("\n## `chute.toml`")
+        .expect("다음 절이 없다")
+        + start;
+    let section = &text[start..end];
+    for needed in [
+        "hc machine add",
+        "로그인 환경",
+        "chute init",
+        "chute hub set <허브>",
+        "chute hub set --local",
+        "chute hub take <옛 허브>",
+        "chute down",
+        "chute hub`로 확인",
+        "허브가 꺼졌을 때",
+        "허브가 둘이 되는 실수",
+        "신뢰 범위",
+        "chute revert",
+        "terminal.peek",
+    ] {
+        assert!(section.contains(needed), "여러 PC 절에 `{needed}`가 없다");
+    }
+}
