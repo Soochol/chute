@@ -288,6 +288,9 @@ fn a_daemon_killed_before_it_told_the_agent_tells_it_after_the_restart() {
         std::fs::read_to_string(root.join("hc-calls"))
             .is_ok_and(|calls| calls.lines().any(|l| l.starts_with("send ")))
     });
+    wait_until("반송 상태가 기록되지 않았다", || {
+        lab.item_state(1) == Some(ItemState::Bounced(chute::model::BounceReason::Verify))
+    });
 
     assert_eq!(
         lab.item_state(1),
