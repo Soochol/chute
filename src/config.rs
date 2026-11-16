@@ -157,8 +157,11 @@ fn default_max_batch() -> u32 {
     8
 }
 
+/// Also the limit of a run that has not fetched the repository's `chute.toml` yet.
+pub const DEFAULT_MAX_PARALLEL: u32 = 2;
+
 fn default_max_parallel() -> u32 {
-    2
+    DEFAULT_MAX_PARALLEL
 }
 
 fn default_logs_days() -> u32 {
