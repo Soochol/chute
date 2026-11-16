@@ -175,8 +175,6 @@ impl<'a> Repo<'a> {
             .then(|| tracked.split_once('/').map(|(_, branch)| branch.to_owned()))?
     }
 
-    /// Same source as `submit`: `chute.toml` on the remote default branch. An unreadable
-    /// config counts as off, so the block message stays the usual one.
     fn requires_head(&self) -> bool {
         self.default_branches
             .first()
@@ -184,7 +182,6 @@ impl<'a> Repo<'a> {
             .is_some_and(|config| config.require_head)
     }
 
-    /// What to do once the work is on the PR branch.
     fn hand_in(&self) -> &'static str {
         if self.requires_head() {
             "PR 번호와 HEAD를 보고한다(이 저장소는 `require_head = true`라 submit하지 않는다)"

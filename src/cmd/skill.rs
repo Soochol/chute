@@ -15,7 +15,6 @@ pub fn run(ctx: &Ctx) -> Result<ExitCode> {
     print(&text_for(ctx))
 }
 
-/// The manual without the line that needs the state folder, for when no folder can be named.
 pub fn run_without_state() -> Result<ExitCode> {
     print(MANUAL)
 }

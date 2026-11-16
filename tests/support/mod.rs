@@ -503,7 +503,6 @@ impl Node {
         self.sb.fake("hc").clear_rules();
     }
 
-    /// Makes the fake `hc exec` report that it cut the output short.
     pub fn truncate_exec_output(&self) {
         fs::write(self.net_dir().join("truncate"), "").unwrap();
     }
