@@ -27,9 +27,9 @@ mod parcel;
 pub use parcel::{Limits, PARCEL_LIMIT, Parcel};
 use parcel::{ParcelNotice, Rebuild};
 
-const HC_NOT_FOUND: i32 = 3;
-const HC_BLOCKED: i32 = 9;
-const HC_FINISHED: i32 = 11;
+pub(crate) const HC_NOT_FOUND: i32 = 3;
+pub(crate) const HC_BLOCKED: i32 = 9;
+pub(crate) const HC_FINISHED: i32 = 11;
 
 const LOG_TAIL_BYTES: u64 = 16 * 1024;
 const LOG_TAIL_LINES: usize = 40;
@@ -42,7 +42,7 @@ const SIBLING_TRIES: u32 = 20;
 const SHELLS: [&str; 9] = [
     "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
 ];
-const PLAIN_MARKS: &str = ".,:/_-+=@%";
+pub(crate) const PLAIN_MARKS: &str = ".,:/_-+=@%";
 const PARTNER_SEARCH_DEPTH: usize = 1000;
 const REMOTE_DELIVER_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -1022,7 +1022,7 @@ fn line_summary(doc: &ReportDoc) -> String {
 }
 
 /// `hc send` pastes the text into the terminal and submits it with Enter.
-fn without_shell_syntax(text: &str) -> String {
+pub(crate) fn without_shell_syntax(text: &str) -> String {
     let plain: String = text
         .chars()
         .map(|c| {
@@ -1081,7 +1081,7 @@ impl fmt::Display for Unreachable {
 }
 
 #[derive(Deserialize)]
-struct TerminalInfo {
+pub(crate) struct TerminalInfo {
     state: TerminalState,
     created_ms: EpochMs,
     #[serde(default, deserialize_with = "status_of_program")]
@@ -1117,7 +1117,7 @@ fn status_of_program<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ProgramSt
 }
 
 impl TerminalInfo {
-    fn is_live_agent(&self, recorded: EpochMs) -> bool {
+    pub(crate) fn is_live_agent(&self, recorded: EpochMs) -> bool {
         self.state == TerminalState::Live
             && self.created_ms == recorded
             && !self.has_left_for_a_shell()
@@ -1361,14 +1361,7 @@ impl Feedback<'_> {
     }
 
     fn terminal(&self, id: &TerminalId) -> Result<Option<TerminalInfo>, Unreachable> {
-        let out = self.run_hc(["get", id.0.as_str(), "--json"])?;
-        match out.code {
-            Some(0) => serde_json::from_slice(&out.stdout).map(Some).map_err(|e| {
-                Unreachable::Failed(format!("hc get {}의 출력을 읽지 못했다: {e}", id.0))
-            }),
-            Some(HC_NOT_FOUND) => Ok(None),
-            _ => Err(Unreachable::Failed(hc_failure("get", &out))),
-        }
+        terminal(self.ext, id)
     }
 
     fn send(&self, agent: &Agent, line: &str) -> Attempt {
@@ -1795,6 +1788,19 @@ fn unreached(machine: &str, kind: ForwardErrorKind) -> String {
         ForwardErrorKind::Unreachable | ForwardErrorKind::Misconfigured => format!(
             "머신 `{machine}`에 닿지 못했다. 보고서를 보내지 못했다. `hc machine ls`로 상태를 보고, 로그인이 필요하면 `hc machine login {machine}`을 실행한다"
         ),
+    }
+}
+
+pub(crate) fn terminal(ext: &Ext, id: &TerminalId) -> Result<Option<TerminalInfo>, Unreachable> {
+    let out = ext
+        .hc(["get", id.0.as_str(), "--json"])
+        .map_err(|e| Unreachable::Failed(e.to_string()))?;
+    match out.code {
+        Some(0) => serde_json::from_slice(&out.stdout)
+            .map(Some)
+            .map_err(|e| Unreachable::Failed(format!("hc get {}의 출력을 읽지 못했다: {e}", id.0))),
+        Some(HC_NOT_FOUND) => Ok(None),
+        _ => Err(Unreachable::Failed(hc_failure("get", &out))),
     }
 }
 

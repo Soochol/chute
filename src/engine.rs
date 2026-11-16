@@ -20,10 +20,11 @@ use crate::gitops::{
     FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, PushOutcome, Slot, SlotLock, SlotName,
 };
 use crate::model::{
-    Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event, EventKind,
-    Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber, QueueItem,
-    QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
+    Agent, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs, Event,
+    EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
+    QueueItem, QueuedReason, RepoInfo, Sha, State, StepFailure, VerifyMode, Warning, WarningKind,
 };
+use crate::notify::{BounceDelivery, Line, Notifier, mode_of};
 use crate::queue;
 use crate::store::{Home, RepoStore};
 use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome};
@@ -133,6 +134,10 @@ impl Engine {
     /// Appends an event, except one already written: a PR is merged once per submission and a
     /// batch finishes once, however many times a run cut short repeats the step.
     fn history(&self, kind: EventKind) -> Result<()> {
+        self.history_at(kind).map(drop)
+    }
+
+    fn history_at(&self, kind: EventKind) -> Result<EpochMs> {
         let once = matches!(
             kind,
             EventKind::Merged { .. } | EventKind::BatchFinished { .. }
@@ -143,7 +148,7 @@ impl Engine {
                 .history()?
                 .events
                 .iter()
-                .any(|e| match (&e.kind, &kind) {
+                .find(|e| match (&e.kind, &kind) {
                     (
                         EventKind::Merged {
                             pr, submitted_ms, ..
@@ -159,15 +164,70 @@ impl Engine {
                         EventKind::BatchFinished { batch: b, .. },
                     ) => batch == b,
                     _ => false,
-                });
-            if seen {
-                return Ok(());
+                })
+                .map(|e| e.at_ms);
+            if let Some(at_ms) = seen {
+                return Ok(at_ms);
             }
         }
-        self.store.append_history(&Event {
-            at_ms: EpochMs::now(),
-            kind,
-        })
+        let at_ms = EpochMs::now();
+        self.store.append_history(&Event { at_ms, kind })?;
+        Ok(at_ms)
+    }
+
+    fn notifier(&self) -> Notifier<'_> {
+        Notifier::new(&self.ext, &self.info, &self.store)
+    }
+
+    fn tell_merged(&self, item: &QueueItem, batch: &BatchId, commit: &Sha, at: EpochMs) {
+        let line = Line::Merged {
+            pr: item.pr,
+            head: item.head.clone(),
+            batch: batch.clone(),
+            commit: commit.clone(),
+            repair: item.repair,
+        };
+        self.notifier().notify(item.submitter.as_ref(), at, &line);
+    }
+
+    fn tell_halted(&self, at: EpochMs) {
+        let state = match self.store.load() {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("경고: 멈춤 알림을 보낼 큐를 읽지 못했다: {e:#}");
+                return;
+            }
+        };
+        let Some(blocked) = &state.blocked else {
+            return;
+        };
+        let filled = blocked.step.is_some()
+            || blocked.log.is_some()
+            || blocked.pushed_by_chute
+            || blocked.rechecked;
+        let line = Line::Halted {
+            base: blocked.base.clone(),
+            step: blocked.step.clone(),
+            pushed_by_chute: filled.then_some(blocked.pushed_by_chute),
+            rechecked: filled.then_some(blocked.rechecked),
+            log: blocked.log.clone(),
+            suspect: None,
+        };
+        let targets: Vec<(Option<&Agent>, PrNumber)> = state
+            .queue
+            .iter()
+            .map(|i| (i.submitter.as_ref(), i.pr))
+            .collect();
+        self.notifier().notify_each(&targets, at, |_| line.clone());
+    }
+
+    fn tell_human(&self, item: &QueueItem, reason: HumanReason, detail: String, at: EpochMs) {
+        let line = Line::Human {
+            pr: item.pr,
+            reason,
+            detail: Some(detail),
+        };
+        self.notifier().notify(item.submitter.as_ref(), at, &line);
     }
 
     fn load_config(&self) -> Result<Config> {
@@ -220,14 +280,17 @@ impl Engine {
                 _ => {}
             }
         }
+        let mut newly_merged: Vec<(&QueueItem, Sha, EpochMs)> = Vec::new();
         for (item, commit) in &settled {
             if !merged_prs.contains(&item.pr) {
-                self.history(EventKind::Merged {
+                let commit = commit.clone().unwrap_or_else(|| item.head.clone());
+                let at = self.history_at(EventKind::Merged {
                     pr: item.pr,
                     batch: id_for_events.clone(),
-                    commit: commit.clone().unwrap_or_else(|| item.head.clone()),
+                    commit: commit.clone(),
                     submitted_ms: item.submitted_ms,
                 })?;
+                newly_merged.push((item, commit, at));
                 merged_prs.push(item.pr);
             }
         }
@@ -247,8 +310,8 @@ impl Engine {
                         record.merges.push(MergeRef {
                             pr: item.pr,
                             commit: commit.clone(),
-                            submitter: None,
-                            agent: None,
+                            submitter: item.submitter.clone(),
+                            agent: item.agent.clone(),
                         });
                     }
                 }
@@ -310,6 +373,9 @@ impl Engine {
             s.batch = None;
             Ok(())
         })?;
+        for (item, commit, at) in &newly_merged {
+            self.tell_merged(item, &id_for_events, commit, *at);
+        }
         self.prune_failed_refs()
     }
 
@@ -633,6 +699,13 @@ enum Blame {
     Combo(Vec<Landed>),
 }
 
+struct Told<'a> {
+    reason: BounceReason,
+    failure: Option<&'a Failure>,
+    attempts: u32,
+    report: Option<&'a Path>,
+}
+
 struct Run<'e> {
     engine: &'e Engine,
     slot: Slot,
@@ -688,15 +761,16 @@ impl Run<'_> {
                     self.closed_any = true;
                 }
                 Inspection::Merged { commit } => {
-                    self.engine.history(EventKind::Merged {
+                    let at = self.engine.history_at(EventKind::Merged {
                         pr: item.pr,
                         batch: self.id().clone(),
-                        commit,
+                        commit: commit.clone(),
                         submitted_ms: item.submitted_ms,
                     })?;
                     self.engine
                         .store
                         .update(|s| Ok(queue::merged(s, item.pr)?))?;
+                    self.engine.tell_merged(item, self.id(), &commit, at);
                     self.merged.push(item.pr);
                 }
                 Inspection::HeadChanged { current } => self.head_changed(item, &current)?,
@@ -827,7 +901,7 @@ impl Run<'_> {
             registered: &item.head,
             current,
         };
-        let (_, unreachable) = self.deliver_and_record(item, &notice, |s| {
+        let (_, unreachable, delivery) = self.deliver_and_record(item, &notice, |s| {
             queue::head_changed(s, pr)?;
             Ok(ItemState::Bounced(BounceReason::HeadChanged))
         })?;
@@ -835,13 +909,43 @@ impl Run<'_> {
         self.sent_back.insert(pr);
         self.conflicted.remove(&pr);
         self.save_record()?;
-        self.engine.history(EventKind::Bounced {
+        let at = self.engine.history_at(EventKind::Bounced {
             pr,
             batch: Some(self.id().clone()),
             reason: BounceReason::HeadChanged,
             attempts: item.attempts,
         })?;
+        let told = Told {
+            reason: BounceReason::HeadChanged,
+            failure: None,
+            attempts: item.attempts,
+            report: None,
+        };
+        self.tell_bounce(item, told, &delivery, at);
         self.note_unreachable(pr, unreachable)
+    }
+
+    fn tell_bounce(&self, item: &QueueItem, told: Told<'_>, delivery: &Delivery, at: EpochMs) {
+        let (worker, how) = match delivery {
+            Delivery::Sent { .. } => (item.agent.clone(), BounceDelivery::Sent),
+            Delivery::Spawned(agent) => (Some(agent.clone()), BounceDelivery::Spawned),
+            Delivery::Unreachable(_) => return,
+        };
+        let notifier = self.engine.notifier();
+        let (mode, partners) = told.failure.map(mode_of).unwrap_or_default();
+        let line = Line::Bounced {
+            pr: item.pr,
+            head: item.head.clone(),
+            reason: told.reason,
+            mode,
+            partners,
+            attempts: told.attempts,
+            budget: self.config.budget,
+            to: worker.as_ref().map(|w| notifier.address_of(w)),
+            delivered: how,
+            report: told.report.map(Path::to_path_buf),
+        };
+        notifier.notify_unless_same(item.submitter.as_ref(), worker.as_ref(), at, &line);
     }
 
     fn feedback(&self) -> Feedback<'_> {
@@ -859,10 +963,10 @@ impl Run<'_> {
         item: &QueueItem,
         notice: &Notice<'_>,
         record: impl FnOnce(&mut State) -> Result<ItemState>,
-    ) -> Result<(ItemState, Option<String>)> {
+    ) -> Result<(ItemState, Option<String>, Delivery)> {
         let delivery = self.feedback().deliver(item, notice);
         let pr = item.pr;
-        self.engine.store.update(|s| {
+        let (to, unreachable) = self.engine.store.update(|s| {
             let to = record(s)?;
             let mut unreachable = None;
             match &delivery {
@@ -874,18 +978,20 @@ impl Run<'_> {
                 }
             }
             Ok((to, unreachable))
-        })
+        })?;
+        Ok((to, unreachable, delivery))
     }
 
     fn note_unreachable(&self, pr: PrNumber, why: Option<String>) -> Result<()> {
-        match why {
-            Some(detail) => self.engine.history(EventKind::NeedsHuman {
-                pr,
-                reason: HumanReason::Unreachable,
-                detail: Some(detail),
-            }),
-            None => Ok(()),
-        }
+        let Some(detail) = why else { return Ok(()) };
+        let at = self.engine.history_at(EventKind::NeedsHuman {
+            pr,
+            reason: HumanReason::Unreachable,
+            detail: Some(detail.clone()),
+        })?;
+        self.engine
+            .tell_human(&self.items[&pr], HumanReason::Unreachable, detail, at);
+        Ok(())
     }
 
     fn ensure_env(&mut self) -> Result<()> {
@@ -933,26 +1039,43 @@ impl Run<'_> {
         )?;
         let budget = self.config.budget;
         let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
-        let (to, unreachable) = if item.attempts < budget {
-            self.deliver_and_record(&item, &Notice::Bounced(&written), record)?
+        let (to, unreachable, delivery) = if item.attempts < budget {
+            let (to, unreachable, delivery) =
+                self.deliver_and_record(&item, &Notice::Bounced(&written), record)?;
+            (to, unreachable, Some(delivery))
         } else {
-            (engine.store.update(record)?, None)
+            (engine.store.update(record)?, None, None)
         };
         self.bounced.push(pr);
         self.conflicted.remove(&pr);
         self.save_record()?;
         match to {
-            ItemState::Bounced(reason) => engine.history(EventKind::Bounced {
-                pr,
-                batch: Some(self.id().clone()),
-                reason,
-                attempts: item.attempts + 1,
-            })?,
-            ItemState::NeedsHuman(reason) => engine.history(EventKind::NeedsHuman {
-                pr,
-                reason,
-                detail: Some(format!("재시도 예산 {budget}번을 모두 썼다")),
-            })?,
+            ItemState::Bounced(reason) => {
+                let at = engine.history_at(EventKind::Bounced {
+                    pr,
+                    batch: Some(self.id().clone()),
+                    reason,
+                    attempts: item.attempts + 1,
+                })?;
+                if let Some(delivery) = &delivery {
+                    let told = Told {
+                        reason,
+                        failure: Some(&written.doc.failure),
+                        attempts: item.attempts + 1,
+                        report: Some(&written.md),
+                    };
+                    self.tell_bounce(&item, told, delivery, at);
+                }
+            }
+            ItemState::NeedsHuman(reason) => {
+                let detail = format!("재시도 예산 {budget}번을 모두 썼다");
+                let at = engine.history_at(EventKind::NeedsHuman {
+                    pr,
+                    reason,
+                    detail: Some(detail.clone()),
+                })?;
+                engine.tell_human(&item, reason, detail, at);
+            }
             other => bail!("{pr}의 실패 처리가 뜻밖의 상태로 끝났다: {other:?}"),
         }
         self.note_unreachable(pr, unreachable)
@@ -1172,22 +1295,24 @@ impl Run<'_> {
             self.record.pushed.push(b.tip.clone());
         }
         for (pr, commit) in &b.landing {
+            let item = &self.items[pr];
             self.record.merges.push(MergeRef {
                 pr: *pr,
                 commit: commit.clone(),
-                submitter: None,
-                agent: None,
+                submitter: item.submitter.clone(),
+                agent: item.agent.clone(),
             });
         }
         self.save_record()?;
+        let mut merged_at = Vec::new();
         for pr in &b.members {
             let item = &self.items[pr];
-            engine.history(EventKind::Merged {
+            merged_at.push(engine.history_at(EventKind::Merged {
                 pr: *pr,
                 batch: self.id().clone(),
                 commit: commits.get(pr).unwrap_or(&item.head).clone(),
                 submitted_ms: item.submitted_ms,
-            })?;
+            })?);
         }
         engine.store.update(|s| {
             for pr in &b.members {
@@ -1200,6 +1325,11 @@ impl Run<'_> {
             }
             Ok(())
         })?;
+        for (pr, at) in b.members.iter().zip(merged_at) {
+            let item = &self.items[pr];
+            let commit = commits.get(pr).unwrap_or(&item.head);
+            engine.tell_merged(item, self.id(), commit, at);
+        }
         for pr in &b.members {
             if commits.contains_key(pr) {
                 self.landed.push(Landed {
@@ -1331,10 +1461,11 @@ impl Run<'_> {
             });
             Ok(())
         })?;
-        engine.history(EventKind::Blocked {
+        let at = engine.history_at(EventKind::Blocked {
             reason: BlockReason::BaseBroken,
             base: base.clone(),
         })?;
+        engine.tell_halted(at);
         Err(Halt::Blocked.into())
     }
 
@@ -1354,13 +1485,14 @@ impl Run<'_> {
                 }
                 Some(ItemResult::AlreadyMerged) => {
                     let held = self.items[&pr].clone();
-                    engine.history(EventKind::Merged {
+                    let at = engine.history_at(EventKind::Merged {
                         pr,
                         batch: self.id().clone(),
                         commit: held.head.clone(),
                         submitted_ms: held.submitted_ms,
                     })?;
                     engine.store.update(|s| Ok(queue::merged(s, pr)?))?;
+                    engine.tell_merged(&held, self.id(), &held.head, at);
                     self.merged.push(pr);
                 }
                 Some(ItemResult::Merged { .. }) => {

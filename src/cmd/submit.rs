@@ -28,10 +28,18 @@ pub struct Args {
     pub json: bool,
     #[arg(long, hide = true, value_name = "JSON", value_parser = parse_relayed)]
     pub relayed_agent: Option<Relayed>,
+    #[arg(long, hide = true, value_name = "JSON", value_parser = parse_relayed)]
+    pub relayed_submitter: Option<Relayed>,
 }
 
 #[derive(Clone, Debug)]
-pub struct Relayed(Option<Agent>);
+pub struct Relayed(Option<Box<Agent>>);
+
+impl Relayed {
+    fn agent(&self) -> Option<Agent> {
+        self.0.as_deref().cloned()
+    }
+}
 
 fn parse_relayed(text: &str) -> Result<Relayed, String> {
     serde_json::from_str(text)
@@ -76,13 +84,20 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
     }
     let this_pc = || this_machine(ctx);
     let agent = match &args.relayed_agent {
-        Some(Relayed(agent)) => {
-            if let Some(agent) = agent {
+        Some(relayed) => {
+            let agent = relayed.agent();
+            if let Some(agent) = &agent {
                 check_agent_machine(&ctx.ext, agent, this_pc().as_ref())?;
             }
-            agent.clone()
+            agent
         }
         None => identify_agent(ctx, &dir, args.agent.as_deref(), this_pc),
+    };
+    let submitter = match (&args.relayed_submitter, &args.relayed_agent) {
+        (Some(relayed), _) => relayed.agent(),
+        (None, Some(_)) => None,
+        (None, None) if args.agent.as_deref().is_none_or(str::is_empty) => agent.clone(),
+        (None, None) => identify_submitter(ctx, &dir, this_pc),
     };
 
     let config_edit = pr.config_edit();
@@ -99,6 +114,7 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
         branch: pr.head_ref_name,
         head: pr.head_ref_oid.clone(),
         agent,
+        submitter,
         touches_config: config_edit != ConfigEdit::No,
         approval: config.approval,
         now: EpochMs::now(),
@@ -133,7 +149,12 @@ fn submit_through_hub(
     let pr = read_pr(ctx, dir, args.pr)?;
     check_open_and_ready(&pr, info)?;
     let this_pc = machine::core(&ctx.ext)?.id;
-    let agent = identify_agent(ctx, dir, args.agent.as_deref(), || Some(this_pc));
+    let agent = identify_agent(ctx, dir, args.agent.as_deref(), || Some(this_pc.clone()));
+    let submitter = if args.agent.as_deref().is_none_or(str::is_empty) {
+        agent.clone()
+    } else {
+        identify_submitter(ctx, dir, || Some(this_pc))
+    };
     let head = match &args.head {
         Some(head) => head.clone(),
         None => local_head(&ctx.ext, dir)?,
@@ -145,6 +166,8 @@ fn submit_through_hub(
         head.to_string(),
         "--relayed-agent".to_owned(),
         serde_json::to_string(&agent)?,
+        "--relayed-submitter".to_owned(),
+        serde_json::to_string(&submitter)?,
     ];
     if args.json {
         forwarded.push("--json".to_owned());
@@ -358,16 +381,41 @@ fn identify_agent(
         );
         return None;
     };
-    match lookup_agent(ctx, address, dir) {
-        Ok(agent) => {
-            let machine = machine_of(ctx, &agent.terminal, this_pc);
-            Some(Agent { machine, ..agent })
-        }
+    match resolve_terminal(ctx, address, dir, this_pc) {
+        Ok(agent) => Some(agent),
         Err(e) => {
             eprintln!("경고: 에이전트를 확인하지 못했다({address}): {e:#}. 에이전트 없이 등록한다");
             None
         }
     }
+}
+
+fn identify_submitter(
+    ctx: &Ctx,
+    dir: &Path,
+    this_pc: impl FnOnce() -> Option<MachineId>,
+) -> Option<Agent> {
+    let address = ctx.terminal().filter(|a| !a.is_empty())?;
+    match resolve_terminal(ctx, address, dir, this_pc) {
+        Ok(agent) => Some(agent),
+        Err(e) => {
+            eprintln!(
+                "경고: submit한 터미널을 확인하지 못했다({address}): {e:#}. 결과 알림을 받을 터미널 없이 등록한다"
+            );
+            None
+        }
+    }
+}
+
+fn resolve_terminal(
+    ctx: &Ctx,
+    address: &str,
+    dir: &Path,
+    this_pc: impl FnOnce() -> Option<MachineId>,
+) -> Result<Agent> {
+    let agent = lookup_agent(ctx, address, dir)?;
+    let machine = machine_of(ctx, &agent.terminal, this_pc);
+    Ok(Agent { machine, ..agent })
 }
 
 fn machine_of(
