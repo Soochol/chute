@@ -296,7 +296,7 @@ fn after_the_budget_is_spent_the_next_failure_goes_to_a_human_and_nothing_is_sen
 
 #[test]
 fn a_finished_agent_is_replaced_and_the_new_address_is_recorded() {
-    let lab = Lab::new(BAD);
+    let lab = Lab::build(BAD, "respawn = [\"claude\"]", 60);
     let hc = lab.sb.fake("hc");
     hc.respond(
         "get t1gone --json",
@@ -330,7 +330,7 @@ fn a_finished_agent_is_replaced_and_the_new_address_is_recorded() {
 
 #[test]
 fn without_an_agent_or_a_respawn_command_the_pr_waits_for_a_human() {
-    let lab = Lab::build(BAD, "respawn = []", 60);
+    let lab = Lab::new(BAD);
     let hc = lab.sb.fake("hc");
     hc.respond(
         "get t1gone --json",
