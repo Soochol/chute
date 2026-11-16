@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use chute::engine::{Pass, Summary};
 use chute::model::{
     Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, HumanReason, ItemState,
-    PrNumber, ProbeEvidence, StatusView, VerifyMode, WarningKind,
+    PrNumber, ProbeEvidence, SkippedStep, StatusView, VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -623,6 +623,7 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
             verify_s: 0,
             pushed: Vec::new(),
             verifications: 0,
+            skipped: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -926,6 +927,7 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
             verify_s: 7,
             pushed: vec![landed],
             verifications: 3,
+            skipped: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -987,6 +989,7 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
             verify_s: 0,
             pushed: Vec::new(),
             verifications: 0,
+            skipped: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1027,6 +1030,7 @@ fn batch_record(
         verify_s: 0,
         pushed: Vec::new(),
         verifications: 0,
+        skipped: Vec::new(),
         env: None,
     }
 }
@@ -2640,4 +2644,82 @@ fn recheck_the_same_pr_failing_twice_is_not_two_prs() {
     let record = lab.store.read_batch(&second.batch).unwrap().unwrap();
     assert_eq!(record.verifications, 1, "기준을 다시 검증하지 않는다");
     assert_eq!(lab.state().base_doubt.unwrap().prs, prs(&[2]));
+}
+
+const WEB_ONLY: &str = r#"paths = ["web/", "Cargo.toml"]"#;
+
+fn skipped(round: u32) -> SkippedStep {
+    SkippedStep {
+        round,
+        step: "check".to_owned(),
+    }
+}
+
+#[test]
+fn a_batch_runs_a_step_when_a_changed_file_matches_its_paths() {
+    let lab = Lab::build_with_step("", "", 60, WEB_ONLY);
+    lab.open_pr(1, &[("docs/a.md", "a\n")]);
+    lab.open_pr(2, &[("web/b.js", "b\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2]));
+    assert_eq!(lab.verify_runs(), 1);
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.skipped.is_empty());
+}
+
+#[test]
+fn a_batch_skips_a_step_no_changed_file_matches_and_records_it() {
+    let lab = Lab::build_with_step("fail 'must not run'", "", 60, WEB_ONLY);
+    lab.open_pr(1, &[("docs/a.md", "a\n")]);
+    lab.open_pr(2, &[("src/b.rs", "b\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2]));
+    assert_eq!(lab.verify_runs(), 0);
+    assert_eq!(lab.merge_commits_on_main().len(), 2);
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.verifications, 1);
+    assert_eq!(record.skipped, [skipped(1)]);
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(
+        json.contains(r#""skipped":[{"round":1,"step":"check"}]"#),
+        "{json}"
+    );
+}
+
+#[test]
+fn a_split_batch_measures_its_changes_from_the_base_the_batch_started_on() {
+    let lab = Lab::build_with_step(BAD, "", 60, WEB_ONLY);
+    lab.open_pr(1, &[("docs/1.md", "x")]);
+    lab.open_pr(2, &[("docs/2.md", "x")]);
+    lab.open_pr(3, &[("web/3.js", "x"), ("BAD", "")]);
+    lab.open_pr(4, &[("docs/4.md", "x")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2, 4]));
+    assert_eq!(summary.bounced, prs(&[3]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(!record.skipped.is_empty(), "문서만 고친 쪽은 건너뛴다");
+    assert!(
+        record.skipped.iter().all(|s| s.round > 1),
+        "처음 검증은 web/을 고친 PR이 있어 돈다: {:?}",
+        record.skipped
+    );
+}
+
+#[test]
+fn checking_a_base_runs_every_step_even_when_paths_would_skip_it() {
+    let lab = Lab::build_with_step("[ -e BASEBAD ] && fail \"기준이 깨졌다\"", "", 60, WEB_ONLY);
+    lab.main_commit(&[("BASEBAD", "")], "feat: broken");
+    lab.open_pr(1, &[("web/a.js", "a\n")]);
+
+    assert_eq!(lab.engine().run_once().unwrap(), Pass::Blocked);
+
+    let blocked = lab.state().blocked.expect("저장소가 멈춘다");
+    assert_eq!(blocked.reason, BlockReason::BaseBroken);
+    assert!(lab.bounced_events().is_empty());
 }
