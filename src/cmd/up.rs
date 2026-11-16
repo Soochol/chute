@@ -112,6 +112,9 @@ fn launch(ctx: &Ctx, info: &RepoInfo) -> Result<Output> {
 /// `hc run` terminals do not inherit the caller's environment.
 fn daemon_command(home: &Home, ext: &Ext) -> Vec<String> {
     let absolute = |path: &Path| {
+        if path.components().count() == 1 {
+            return path.display().to_string();
+        }
         std::path::absolute(path)
             .unwrap_or_else(|_| path.to_owned())
             .display()
@@ -176,8 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_gets_absolute_paths_because_it_starts_in_the_repository() {
-        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| "bin/gh".into()));
+    fn the_daemon_gets_absolute_paths_but_a_tool_named_on_path_keeps_its_name() {
+        let ext = Ext::from_vars(|k| match k {
+            "CHUTE_GH" => Some("bin/gh".into()),
+            "CHUTE_HC" => Some("hc-work".into()),
+            _ => None,
+        });
         let command = daemon_command(&Home::at("rel/home"), &ext);
         let cwd = std::env::current_dir().unwrap();
 
@@ -190,7 +197,8 @@ mod tests {
             command[2],
             format!("CHUTE_GH={}", cwd.join("bin/gh").display())
         );
-        assert_eq!(command[3..], ["chute", "daemon"]);
+        assert_eq!(command[3], "CHUTE_HC=hc-work");
+        assert_eq!(command[4..], ["chute", "daemon"]);
     }
 
     #[test]

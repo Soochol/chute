@@ -116,7 +116,6 @@ pub struct Engine {
     cancel: Cancel,
     timing: Timing,
     ci_looked: Mutex<BTreeMap<PrNumber, Instant>>,
-    unfit_looked: Mutex<BTreeMap<PrNumber, Instant>>,
 }
 
 impl Engine {
@@ -133,7 +132,6 @@ impl Engine {
             cancel: Cancel::new(),
             timing: Timing::default(),
             ci_looked: Mutex::new(BTreeMap::new()),
-            unfit_looked: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -550,26 +548,13 @@ impl Engine {
         Ok(())
     }
 
-    fn parked_unfit(&self, state: &State) -> BTreeSet<PrNumber> {
-        let mut looked = self.unfit_looked.lock().unwrap_or_else(|e| e.into_inner());
-        looked.retain(|pr, _| state.queue.iter().any(|i| i.pr == *pr));
-        let now = self.timing.clock.now();
-        looked
-            .iter()
-            .filter(|(_, at)| now.duration_since(**at) < self.timing.ci_recheck)
-            .map(|(pr, _)| *pr)
-            .collect()
-    }
-
     fn due_ci_waiters(&self, state: &State) -> BTreeSet<PrNumber> {
-        let parked = self.parked_unfit(state);
         let mut looked = self.ci_looked.lock().unwrap_or_else(|e| e.into_inner());
         looked.retain(|pr, _| state.queue.iter().any(|i| i.pr == *pr));
         state
             .queue
             .iter()
             .filter(|i| i.state == ItemState::Queued(Some(QueuedReason::CiPending)))
-            .filter(|i| !parked.contains(&i.pr))
             .filter(|i| {
                 looked.get(&i.pr).is_none_or(|at| {
                     self.timing.clock.now().duration_since(*at) >= self.timing.ci_recheck
@@ -649,11 +634,10 @@ impl Engine {
                 .map(|i| i.pr)
                 .collect();
             let prs = {
-                let due = &if config.require_ci {
-                    due_waiters.clone()
+                let due = if config.require_ci {
+                    &due_waiters
                 } else {
-                    let parked = self.parked_unfit(s);
-                    waiting_on_ci.difference(&parked).copied().collect()
+                    &waiting_on_ci
                 };
                 if repairing {
                     queue::take_repair(s, due)
@@ -952,12 +936,19 @@ impl Run<'_> {
             }
             Inspection::HeadChanged { current } => self.head_changed(item, &current)?,
             Inspection::Draft | Inspection::Retargeted => {
-                self.defer(item.pr, false)?;
+                self.engine.store.update(|s| {
+                    queue::requeue(s, item.pr)?;
+                    queue::drop_item(s, item.pr)?;
+                    if let Some(batch) = &mut s.batch {
+                        batch.prs.retain(|p| *p != item.pr);
+                    }
+                    Ok(())
+                })?;
+                let at = self.engine.history_at(EventKind::Dropped { pr: item.pr })?;
                 self.engine
-                    .unfit_looked
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(item.pr, self.engine.timing.clock.now());
+                    .notifier()
+                    .notify_waiters(item.pr, WaitingWhy::Dropped, at);
+                self.closed_any = true;
             }
         }
         Ok(())

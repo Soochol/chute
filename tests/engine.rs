@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use chute::engine::{Pass, Summary};
 use chute::model::{
     Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, HumanReason, ItemState,
-    PrNumber, ProbeEvidence, QueuedReason, SkippedStep, StatusView, VerifyMode, WarningKind,
+    PrNumber, ProbeEvidence, SkippedStep, StatusView, VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -526,49 +526,50 @@ fn a_pr_closed_while_the_batch_verifies_is_not_merged_and_the_rest_is_verified_a
 }
 
 #[test]
-fn a_pr_turned_into_a_draft_while_the_batch_verifies_is_not_merged_and_stays_queued() {
+fn a_pr_turned_into_a_draft_while_the_batch_verifies_is_not_merged_and_leaves_the_queue() {
     let lab = changed_during_verification("touch @ROOT@/gh-state/2.draft");
 
     let summary = done(lab.engine().run_once().unwrap());
 
     assert_only_pr_1_landed_after_a_second_verification(&lab, &summary);
-    assert_eq!(
-        lab.item_state(2),
-        Some(ItemState::Queued(Some(QueuedReason::CiPending)))
+    assert!(lab.item(2).is_none());
+    assert!(
+        lab.events()
+            .iter()
+            .any(|e| matches!(e, EventKind::Dropped { pr } if pr.0 == 2))
     );
     assert!(lab.bounced_events().is_empty());
 }
 
 #[test]
-fn a_pr_retargeted_while_the_batch_verifies_is_not_merged_and_stays_queued() {
+fn a_pr_retargeted_while_the_batch_verifies_is_not_merged_and_leaves_the_queue() {
     let lab = changed_during_verification("echo release > @ROOT@/gh-state/2.base");
 
     let summary = done(lab.engine().run_once().unwrap());
 
     assert_only_pr_1_landed_after_a_second_verification(&lab, &summary);
-    assert_eq!(
-        lab.item_state(2),
-        Some(ItemState::Queued(Some(QueuedReason::CiPending)))
+    assert!(lab.item(2).is_none());
+    assert!(
+        lab.events()
+            .iter()
+            .any(|e| matches!(e, EventKind::Dropped { pr } if pr.0 == 2))
     );
 }
 
 #[test]
-fn draft_prs_at_the_front_neither_block_the_queue_nor_are_read_on_every_pass() {
+fn a_draft_pr_at_the_front_leaves_the_queue_once_and_does_not_block_the_ready_pr_behind_it() {
     let lab = Lab::build("", "max_batch = 1\n", 60);
     lab.open_pr(1, &[("a.txt", "a\n")]);
     lab.open_pr(2, &[("b.txt", "b\n")]);
     fs::write(lab.sb.root().join("gh-state/1.draft"), "").unwrap();
-    let engine = lab.engine_rechecking_ci_every(Duration::from_secs(3600));
+    let engine = lab.engine();
 
     for _ in 0..5 {
         engine.run_once().unwrap();
     }
 
     assert_eq!(lab.merged_prs(), [2]);
-    assert_eq!(
-        lab.item_state(1),
-        Some(ItemState::Queued(Some(QueuedReason::CiPending)))
-    );
+    assert!(lab.item(1).is_none());
     let calls = fs::read_to_string(lab.sb.root().join("gh-state/calls")).unwrap();
     let reads_of_1 = calls
         .lines()
