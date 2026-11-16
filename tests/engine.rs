@@ -1878,6 +1878,7 @@ fn waiting_a_pr_behind_one_that_merges_joins_the_next_batch_and_hears_nothing() 
 
     assert_eq!(second.merged, prs(&[2]));
     assert!(waiting_lines(&lab).is_empty());
+}
 
 const FLAKE_ONCE: &str =
     "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; fail \"FAILED flaky_test\"; fi";
