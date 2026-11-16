@@ -332,6 +332,16 @@ pub struct QueueItem {
     pub submitted_ms: EpochMs,
     pub touches_config: bool,
     pub last_failure: Option<FailureRecord>,
+    /// The terminal that ran `chute submit`. It receives the outcome. `agent` is the worker.
+    #[serde(default)]
+    pub submitter: Option<Agent>,
+    #[serde(default)]
+    pub priority: bool,
+    /// PRs that must merge before this one joins a batch.
+    #[serde(default)]
+    pub after: Vec<PrNumber>,
+    #[serde(default)]
+    pub repair: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +561,39 @@ pub struct Blocked {
     pub reason: BlockReason,
     pub base: Sha,
     pub since_ms: EpochMs,
+    /// The verification step that failed on the base. Blocks written before it was kept have none.
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub log: Option<PathBuf>,
+    /// The broken commit is one chute pushed itself.
+    #[serde(default)]
+    pub pushed_by_chute: bool,
+    /// The base had already been verified and failed when verified again.
+    #[serde(default)]
+    pub rechecked: bool,
+}
+
+/// What `run_once` knows about how often single PRs failed on one base.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseDoubt {
+    pub base: Sha,
+    pub prs: Vec<PrNumber>,
+}
+
+/// Where a verification ran: the machine, and what each `env_check` command printed there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvRecord {
+    pub machine_id: MachineId,
+    pub host: String,
+    pub checks: Vec<EnvCheck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvCheck {
+    pub run: String,
+    pub output: String,
+    pub ok: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,6 +616,8 @@ pub struct PreflightRecord {
     /// The queued PRs the head was verified together with.
     #[serde(default)]
     pub with: Vec<PrNumber>,
+    #[serde(default)]
+    pub env: Option<EnvRecord>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -584,6 +629,8 @@ pub enum WarningKind {
     History,
     Engine,
     Hub,
+    FlakyChronic,
+    Gc,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,12 +649,19 @@ pub struct State {
     pub verified_bases: Vec<Sha>,
     pub preflights: BTreeMap<String, PreflightRecord>,
     pub warnings: Vec<Warning>,
+    #[serde(default)]
+    pub base_doubt: Option<BaseDoubt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRef {
     pub pr: PrNumber,
     pub commit: Sha,
+    /// Who to tell if this merge is reverted. The queue item is gone by then.
+    #[serde(default)]
+    pub submitter: Option<Agent>,
+    #[serde(default)]
+    pub agent: Option<Agent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +686,8 @@ pub struct BatchRecord {
     pub pushed: Vec<Sha>,
     #[serde(default)]
     pub verifications: u32,
+    #[serde(default)]
+    pub env: Option<EnvRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,6 +761,76 @@ pub enum EventKind {
         reason: BlockReason,
         base: Sha,
     },
+    Submitted {
+        pr: PrNumber,
+        head: Sha,
+        priority: bool,
+        after: Vec<PrNumber>,
+        repair: bool,
+    },
+    Dropped {
+        pr: PrNumber,
+    },
+    Notified {
+        kind: NotifyKind,
+        pr: Option<PrNumber>,
+        to: Option<TerminalId>,
+        delivered: Delivered,
+    },
+    Resumed {
+        base: Sha,
+        by: ResumedBy,
+        pr: Option<PrNumber>,
+    },
+    FlakyProbe {
+        batch: BatchId,
+        step: String,
+        tests: Vec<String>,
+        evidence: ProbeEvidence,
+        runs: u32,
+        failures: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyKind {
+    Merged,
+    Bounced,
+    Human,
+    Halted,
+    Resumed,
+    Reverted,
+    Waiting,
+    Flaky,
+}
+
+/// What became of one notification. Only `Sent` reached a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivered {
+    Sent,
+    SameAsAgent,
+    NoTerminal,
+    Gone,
+    Blocked,
+    UnknownMachine,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumedBy {
+    Repair,
+    MainMoved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeEvidence {
+    Base,
+    Made,
+    Unresolved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,6 +912,14 @@ pub struct ItemView {
     pub touches_config: bool,
     pub preflight: Option<PreflightView>,
     pub last_failure: Option<FailureView>,
+    #[serde(default)]
+    pub submitter: Option<AgentView>,
+    #[serde(default)]
+    pub priority: bool,
+    #[serde(default)]
+    pub after: Vec<PrNumber>,
+    #[serde(default)]
+    pub repair: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -837,6 +971,7 @@ impl ItemView {
         budget: u32,
         preflight: Option<&PreflightRecord>,
         agent: Option<AgentView>,
+        submitter: Option<AgentView>,
     ) -> ItemView {
         ItemView {
             pr: item.pr,
@@ -858,6 +993,10 @@ impl ItemView {
                 summary: f.summary.clone(),
                 report: f.report.clone(),
             }),
+            submitter,
+            priority: item.priority,
+            after: item.after.clone(),
+            repair: item.repair,
         }
     }
 }
@@ -977,6 +1116,269 @@ mod tests {
         assert!(view.blocked.is_some());
         assert!(view.batch.is_some());
         assert!(!view.warnings.is_empty());
+    }
+
+    #[test]
+    fn status_fixture_covers_the_v3_fields() {
+        let view: StatusView = serde_json::from_str(FIXTURE).unwrap();
+        let item = |pr: u64| view.queue.iter().find(|i| i.pr == PrNumber(pr)).unwrap();
+        assert!(view.queue.iter().any(|i| i.priority && !i.repair));
+        assert!(view.queue.iter().any(|i| i.repair));
+        let held = view.queue.iter().find(|i| !i.after.is_empty()).unwrap();
+        assert!(
+            held.after
+                .iter()
+                .all(|n| view.queue.iter().any(|i| i.pr == *n))
+        );
+        let apart = view
+            .queue
+            .iter()
+            .filter(|i| i.submitter.is_some() && i.submitter != i.agent)
+            .count();
+        assert!(apart >= 1);
+        let same = item(23);
+        assert_eq!(same.submitter, same.agent);
+        assert!(view.queue.iter().any(|i| i.submitter.is_none()));
+        let blocked = view.blocked.unwrap();
+        assert!(blocked.step.is_some() && blocked.log.is_some());
+        assert!(blocked.pushed_by_chute && blocked.rechecked);
+    }
+
+    #[test]
+    fn an_item_view_from_before_v3_reads_with_empty_new_fields() {
+        let mut old: Value = serde_json::from_str(FIXTURE).unwrap();
+        let first = old["queue"][0].as_object_mut().unwrap();
+        for key in ["submitter", "priority", "after", "repair"] {
+            first.remove(key);
+        }
+        old["blocked"] = json!({"reason": "base_broken", "base": "0a1b2c3", "since_ms": 1});
+        let view: StatusView = serde_json::from_value(old).unwrap();
+        let item = &view.queue[0];
+        assert!(item.submitter.is_none() && !item.priority && !item.repair);
+        assert!(item.after.is_empty());
+        let blocked = view.blocked.unwrap();
+        assert_eq!((blocked.step, blocked.log), (None, None));
+        assert!(!blocked.pushed_by_chute && !blocked.rechecked);
+    }
+
+    #[test]
+    fn a_v2_state_json_is_read_without_the_new_fields() {
+        let v2 = json!({
+            "queue": [{
+                "pr": 4, "title": "t", "branch": "b", "head": "abc1234",
+                "state": "queued", "state_reason": null, "agent": null,
+                "attempts": 0, "submitted_ms": 1, "touches_config": false,
+                "last_failure": null
+            }],
+            "batch": null,
+            "blocked": {"reason": "base_broken", "base": "abc1234", "since_ms": 2},
+            "verified_bases": ["abc1234"],
+            "preflights": {"b": {
+                "head": "abc1234", "result": "pass", "report": null, "at_ms": 3
+            }},
+            "warnings": []
+        });
+        let state: State = serde_json::from_value(v2).unwrap();
+        let item = &state.queue[0];
+        assert!(item.submitter.is_none() && !item.priority && !item.repair);
+        assert!(item.after.is_empty());
+        assert_eq!(state.base_doubt, None);
+        let blocked = state.blocked.unwrap();
+        assert!(blocked.step.is_none() && blocked.log.is_none());
+        assert!(!blocked.pushed_by_chute && !blocked.rechecked);
+        assert_eq!(state.preflights["b"].env, None);
+    }
+
+    #[test]
+    fn a_v2_batch_record_is_read_without_the_new_fields() {
+        let v2 = json!({
+            "id": "b1", "base": "abc1234", "prs": [4], "started_ms": 1,
+            "finished_ms": null,
+            "merges": [{"pr": 4, "commit": "def5678"}],
+            "bounced": [], "flaky": [], "verify_s": 0
+        });
+        let record: BatchRecord = serde_json::from_value(v2).unwrap();
+        assert_eq!(record.env, None);
+        assert!(record.merges[0].submitter.is_none() && record.merges[0].agent.is_none());
+    }
+
+    #[test]
+    fn an_env_record_round_trips_on_batch_and_preflight_records() {
+        let env = EnvRecord {
+            machine_id: MachineId::try_from("9a0c".to_owned()).unwrap(),
+            host: "laptop-host".into(),
+            checks: vec![
+                EnvCheck {
+                    run: "cargo --version".into(),
+                    output: "cargo 1.90.0".into(),
+                    ok: true,
+                },
+                EnvCheck {
+                    run: "missing-tool".into(),
+                    output: "sh: 1: missing-tool: not found".into(),
+                    ok: false,
+                },
+            ],
+        };
+        let batch = json!({
+            "id": "b1", "base": "abc1234", "prs": [], "started_ms": 1,
+            "finished_ms": null, "merges": [], "bounced": [], "flaky": [],
+            "verify_s": 0,
+            "env": {"machine_id": "9a0c", "host": "laptop-host", "checks": [
+                {"run": "cargo --version", "output": "cargo 1.90.0", "ok": true},
+                {"run": "missing-tool", "output": "sh: 1: missing-tool: not found", "ok": false}
+            ]}
+        });
+        let record: BatchRecord = serde_json::from_value(batch).unwrap();
+        assert_eq!(record.env, Some(env.clone()));
+        let again: BatchRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(again, record);
+        let preflight = PreflightRecord {
+            head: Sha::try_from("abc1234".to_owned()).unwrap(),
+            result: PreflightResult::Pass,
+            report: None,
+            at_ms: EpochMs(1),
+            base: None,
+            with: Vec::new(),
+            env: Some(env),
+        };
+        let back: PreflightRecord =
+            serde_json::from_value(serde_json::to_value(&preflight).unwrap()).unwrap();
+        assert_eq!(back, preflight);
+    }
+
+    #[test]
+    fn the_new_event_kinds_round_trip_as_the_same_json() {
+        let lines = [
+            json!({"at_ms": 1, "event": "submitted", "pr": 4, "head": "abc1234",
+                   "priority": true, "after": [2, 3], "repair": false}),
+            json!({"at_ms": 2, "event": "dropped", "pr": 4}),
+            json!({"at_ms": 3, "event": "notified", "kind": "merged", "pr": 4,
+                   "to": "desk/t7", "delivered": "sent"}),
+            json!({"at_ms": 4, "event": "notified", "kind": "halted", "pr": null,
+                   "to": null, "delivered": "no_terminal"}),
+            json!({"at_ms": 5, "event": "resumed", "base": "abc1234", "by": "repair", "pr": 9}),
+            json!({"at_ms": 6, "event": "resumed", "base": "abc1234", "by": "main_moved",
+                   "pr": null}),
+            json!({"at_ms": 7, "event": "flaky_probe", "batch": "b1", "step": "test",
+                   "tests": ["a::b"], "evidence": "made", "runs": 20, "failures": 1}),
+        ];
+        for line in lines {
+            let event: Event = serde_json::from_value(line.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&event).unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn every_notification_kind_delivery_and_evidence_has_one_spelling() {
+        let kinds = [
+            (NotifyKind::Merged, "merged"),
+            (NotifyKind::Bounced, "bounced"),
+            (NotifyKind::Human, "human"),
+            (NotifyKind::Halted, "halted"),
+            (NotifyKind::Resumed, "resumed"),
+            (NotifyKind::Reverted, "reverted"),
+            (NotifyKind::Waiting, "waiting"),
+            (NotifyKind::Flaky, "flaky"),
+        ];
+        let deliveries = [
+            (Delivered::Sent, "sent"),
+            (Delivered::SameAsAgent, "same_as_agent"),
+            (Delivered::NoTerminal, "no_terminal"),
+            (Delivered::Gone, "gone"),
+            (Delivered::Blocked, "blocked"),
+            (Delivered::UnknownMachine, "unknown_machine"),
+            (Delivered::Failed, "failed"),
+        ];
+        let evidence = [
+            (ProbeEvidence::Base, "base"),
+            (ProbeEvidence::Made, "made"),
+            (ProbeEvidence::Unresolved, "unresolved"),
+        ];
+        for (kind, name) in kinds {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<NotifyKind>(json!(name)).unwrap(),
+                kind
+            );
+        }
+        for (delivered, name) in deliveries {
+            assert_eq!(serde_json::to_value(delivered).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<Delivered>(json!(name)).unwrap(),
+                delivered
+            );
+        }
+        for (item, name) in evidence {
+            assert_eq!(serde_json::to_value(item).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<ProbeEvidence>(json!(name)).unwrap(),
+                item
+            );
+        }
+        assert!(serde_json::from_value::<Delivered>(json!("delivered")).is_err());
+    }
+
+    #[test]
+    fn the_new_warning_kinds_round_trip() {
+        for (kind, name) in [
+            (WarningKind::FlakyChronic, "flaky_chronic"),
+            (WarningKind::Gc, "gc"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<WarningKind>(json!(name)).unwrap(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn new_stored_fields_round_trip_in_the_state() {
+        let sha = |s: &str| Sha::try_from(s.to_owned()).unwrap();
+        let agent = |t: &str| Agent {
+            terminal: TerminalId(t.into()),
+            created_ms: EpochMs(5),
+            name: None,
+            workdir: "/w".into(),
+            alive: true,
+            machine: None,
+        };
+        let state = State {
+            queue: vec![QueueItem {
+                pr: PrNumber(8),
+                title: "t".into(),
+                branch: "b".into(),
+                head: sha("abc1234"),
+                state: ItemState::Queued(None),
+                agent: Some(agent("t2")),
+                attempts: 0,
+                submitted_ms: EpochMs(1),
+                touches_config: false,
+                last_failure: None,
+                submitter: Some(agent("t1")),
+                priority: true,
+                after: vec![PrNumber(3)],
+                repair: true,
+            }],
+            blocked: Some(Blocked {
+                reason: BlockReason::BaseBroken,
+                base: sha("def5678"),
+                since_ms: EpochMs(2),
+                step: Some("test".into()),
+                log: Some("/s/test.1.log".into()),
+                pushed_by_chute: true,
+                rechecked: true,
+            }),
+            base_doubt: Some(BaseDoubt {
+                base: sha("def5678"),
+                prs: vec![PrNumber(7)],
+            }),
+            ..State::default()
+        };
+        let text = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<State>(&text).unwrap(), state);
     }
 
     #[test]
@@ -1108,6 +1510,10 @@ mod tests {
                         report: "/s/r.md".into(),
                         at_ms: EpochMs(2),
                     }),
+                    submitter: None,
+                    priority: false,
+                    after: Vec::new(),
+                    repair: false,
                 })
                 .collect(),
             ..State::default()

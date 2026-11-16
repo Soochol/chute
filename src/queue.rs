@@ -268,6 +268,7 @@ pub enum Change {
     Added,
     Requeued,
     HeadUpdated,
+    OptionsUpdated,
     Unchanged,
 }
 
@@ -294,6 +295,10 @@ pub fn submit(state: &mut State, s: Submission) -> Result<Submitted, TransitionE
             submitted_ms: s.now,
             touches_config: s.touches_config,
             last_failure: None,
+            submitter: None,
+            priority: false,
+            after: Vec::new(),
+            repair: false,
         });
         return Ok(Submitted {
             state: entry,
@@ -709,6 +714,10 @@ mod tests {
             submitted_ms: EpochMs(pr),
             touches_config: false,
             last_failure: None,
+            submitter: None,
+            priority: false,
+            after: Vec::new(),
+            repair: false,
         }
     }
 
@@ -1173,6 +1182,7 @@ mod tests {
             at_ms: EpochMs(1),
             base: None,
             with: Vec::new(),
+            env: None,
         }
     }
 

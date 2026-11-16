@@ -69,6 +69,10 @@ impl World {
             submitted_ms: EpochMs(1),
             touches_config: false,
             last_failure: None,
+            submitter: None,
+            priority: false,
+            after: Vec::new(),
+            repair: false,
         }
     }
 

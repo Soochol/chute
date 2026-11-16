@@ -682,6 +682,7 @@ fn preflight_at(w: &World, head: &str) {
                     at_ms: EpochMs(5),
                     base: None,
                     with: Vec::new(),
+                    env: None,
                 },
             );
             Ok(())

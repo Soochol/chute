@@ -226,6 +226,7 @@ fn render(report: &Report, touches_config: bool) -> String {
         (Change::Requeued, ItemState::AwaitingApproval) => "HEAD가 바뀌어 다시 승인을 기다린다",
         (Change::Requeued, _) => "다시 큐에 올렸다",
         (Change::HeadUpdated, _) => "HEAD를 바꿔 다시 등록했다",
+        (Change::OptionsUpdated, _) => "옵션을 바꿔 다시 등록했다",
         (Change::Unchanged, _) => "이미 등록돼 있고 바뀐 것이 없다",
     };
     let mut text = format!(

@@ -62,6 +62,7 @@ fn step(name: &str, script: impl Into<String>) -> VerifyStep {
         run: script.into(),
         timeout: Duration::from_secs(60),
         failed: None,
+        probe: None,
     }
 }
 

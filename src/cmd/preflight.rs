@@ -600,6 +600,7 @@ fn record(ctx: &Ctx, store: &RepoStore, target: &Target, report: &Report) -> Res
             at_ms: report.at_ms,
             base: Some(report.base.clone()),
             with: report.with.clone(),
+            env: None,
         },
     };
     deliver(ctx, store, &entry)

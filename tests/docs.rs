@@ -28,6 +28,7 @@ fn readme_names_every_chute_toml_key() {
     let mut found = BTreeSet::new();
     keys(&table, &mut found);
     found.insert("failed".to_owned());
+    found.insert("probe".to_owned());
     let text = readme();
     for key in &found {
         let named = text.contains(&format!("`{key}`")) || text.contains(&format!("`verify.{key}`"));
@@ -39,9 +40,16 @@ fn readme_names_every_chute_toml_key() {
 #[test]
 fn readme_states_the_respawn_default_and_its_permission_effect() {
     let text = readme();
-    assert!(text.contains(r#"["claude", "--dangerously-skip-permissions"]"#));
-    assert!(text.contains("권한 확인 없이 명령을 실행하게 한다"));
-    assert!(text.contains("respawn = []"));
+    let config = chute::config::Config::parse(&chute::config::draft("cargo test")).unwrap();
+    assert!(config.respawn.is_empty());
+    assert!(text.contains("| `respawn` | `[]` |"));
+    assert!(text.contains("`respawn`의 기본값은 `[]`이다"));
+    assert!(text.contains("값을 넣으면 그 명령으로 새 에이전트를 띄운다"));
+    assert!(text.contains(r#"respawn = ["claude", "--dangerously-skip-permissions"]"#));
+    assert!(text.contains(
+        "`--dangerously-skip-permissions`를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행하게 한다"
+    ));
+    assert!(!text.contains("| `respawn` | `[\"claude\""));
 }
 
 #[test]

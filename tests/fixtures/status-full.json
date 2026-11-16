@@ -24,7 +24,11 @@
   "blocked": {
     "reason": "base_broken",
     "base": "0a1b2c3",
-    "since_ms": 1794724080000
+    "since_ms": 1794724080000,
+    "step": "test",
+    "log": "/home/dev/.local/state/chute/repos/Soochol__chute/batches/b20261115-152000/verify-1/test.1.log",
+    "pushed_by_chute": true,
+    "rechecked": true
   },
   "batch": {
     "id": "b20261115-153000",
@@ -64,7 +68,11 @@
         "mode": "combo",
         "summary": "test 단계 실패: skill::tests::prints_manual",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-9/3.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 10,
@@ -91,7 +99,11 @@
         "mode": "solo",
         "summary": "clippy 단계 실패",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-10/1.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 11,
@@ -111,7 +123,11 @@
         "mode": null,
         "summary": "src/engine.rs가 #8과 충돌",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-11/2.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 15,
@@ -141,7 +157,11 @@
         "mode": "solo",
         "summary": "test 단계 실패: feedback::tests::report_lists_partners",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-15/2.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 14,
@@ -168,7 +188,11 @@
         "mode": null,
         "summary": "src/model.rs가 #9와 충돌",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-14/1.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 16,
@@ -195,7 +219,11 @@
         "mode": "combo",
         "summary": "test 단계가 1800초 안에 끝나지 않았다",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-16/1.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 18,
@@ -222,7 +250,11 @@
         "mode": null,
         "summary": "GitHub check build 실패",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-18/1.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 17,
@@ -244,7 +276,11 @@
       "submitted_ms": 1794722700000,
       "touches_config": false,
       "preflight": null,
-      "last_failure": null
+      "last_failure": null,
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 12,
@@ -274,7 +310,11 @@
         "mode": "combo",
         "summary": "test 단계 실패: queue::tests::retry_resets_budget",
         "report": "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-12/1.md"
-      }
+      },
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 13,
@@ -296,7 +336,11 @@
       "submitted_ms": 1794723120000,
       "touches_config": false,
       "preflight": null,
-      "last_failure": null
+      "last_failure": null,
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 19,
@@ -321,7 +365,11 @@
         "result": "fail",
         "head": "18d0000"
       },
-      "last_failure": null
+      "last_failure": null,
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 20,
@@ -336,7 +384,11 @@
       "submitted_ms": 1794723960000,
       "touches_config": false,
       "preflight": null,
-      "last_failure": null
+      "last_failure": null,
+      "submitter": null,
+      "priority": true,
+      "after": [],
+      "repair": false
     },
     {
       "pr": 21,
@@ -361,7 +413,113 @@
         "result": "pass",
         "head": "21e5678"
       },
-      "last_failure": null
+      "last_failure": null,
+      "submitter": null,
+      "priority": false,
+      "after": [],
+      "repair": false
+    },
+    {
+      "pr": 22,
+      "title": "기준 커밋 복구",
+      "branch": "orch/feat-22",
+      "head": "22e5678",
+      "state": "queued",
+      "state_reason": null,
+      "agent": {
+        "terminal": "desk/t1s5",
+        "name": "impl-fix",
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794724140000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": null,
+      "submitter": {
+        "terminal": "t1s0",
+        "name": "orch",
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
+      },
+      "priority": false,
+      "after": [],
+      "repair": true
+    },
+    {
+      "pr": 23,
+      "title": "긴급 문서 수정",
+      "branch": "orch/feat-23",
+      "head": "23e5678",
+      "state": "queued",
+      "state_reason": null,
+      "agent": {
+        "terminal": "t1s0",
+        "name": "orch",
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794724260000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": null,
+      "submitter": {
+        "terminal": "t1s0",
+        "name": "orch",
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
+      },
+      "priority": true,
+      "after": [],
+      "repair": false
+    },
+    {
+      "pr": 24,
+      "title": "복구 뒤에 넣을 변경",
+      "branch": "orch/feat-24",
+      "head": "24e5678",
+      "state": "queued",
+      "state_reason": null,
+      "agent": {
+        "terminal": "desk/t1s6",
+        "name": "impl-late",
+        "alive": true,
+        "machine_id": "17e07b51405d8b1893cff2b28d51913a",
+        "host": "desk-host",
+        "machine": "desk"
+      },
+      "attempts": 0,
+      "budget": 3,
+      "submitted_ms": 1794724320000,
+      "touches_config": false,
+      "preflight": null,
+      "last_failure": null,
+      "submitter": {
+        "terminal": "t1s0",
+        "name": "orch",
+        "alive": true,
+        "machine_id": "9a0c3f5e7d2b4a6c8e1f0a3b5c7d9e2f",
+        "host": "laptop-host",
+        "machine": null
+      },
+      "priority": false,
+      "after": [
+        12,
+        22
+      ],
+      "repair": false
     }
   ],
   "today": {

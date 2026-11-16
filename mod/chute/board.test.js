@@ -29,7 +29,7 @@ test("every fixture item lands in one of the six sections", () => {
   assert.deepEqual(repo.sections.map((s) => s.title), ["멈춤·경고", "사람 차례", "검증 중", "대기", "반송", "오늘"]);
   assert.deepEqual(prs(section(repo, "human")), [9, 10, 11, 21]);
   assert.deepEqual(section(repo, "batch").items[0].prs.map((p) => p.pr), [12, 13]);
-  assert.deepEqual(prs(section(repo, "waiting")), [19, 20]);
+  assert.deepEqual(prs(section(repo, "waiting")), [19, 20, 22, 23, 24]);
   assert.deepEqual(prs(section(repo, "bounced")), [15, 14, 16, 18, 17]);
 
   const placed = ["human", "waiting", "bounced"].flatMap((id) => prs(section(repo, id))).length + 2;
@@ -181,6 +181,9 @@ test("ci_pending is waiting for CI, a ci bounce is a CI failure", () => {
   assert.deepEqual(waiting.map((item) => [item.pr, item.label, item.ciPending]), [
     [19, "CI 대기", true],
     [20, "대기", false],
+    [22, "대기", false],
+    [23, "대기", false],
+    [24, "대기", false],
   ]);
   const ci = section(repo, "bounced").items.find((item) => item.pr === 18);
   assert.equal(ci.reason, "CI 실패");

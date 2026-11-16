@@ -173,6 +173,10 @@ fn rebase(ctx: &Ctx, info: &RepoInfo, mut v: StatusView, now: &DateTime<Local>) 
         }
         for item in &mut v.queue {
             item.agent = item.agent.take().map(|a| rebase_agent(machines, hub_id, a));
+            item.submitter = item
+                .submitter
+                .take()
+                .map(|a| rebase_agent(machines, hub_id, a));
         }
     }
     v
@@ -361,6 +365,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
                     budget,
                     state.preflights.get(&item.branch),
                     item.agent.as_ref().map(agent_view),
+                    item.submitter.as_ref().map(agent_view),
                 )
             })
             .collect(),
@@ -416,7 +421,12 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
             | EventKind::GaveUp { .. }
             | EventKind::Closed { .. }
             | EventKind::NeedsHuman { .. }
-            | EventKind::Blocked { .. } => {}
+            | EventKind::Blocked { .. }
+            | EventKind::Submitted { .. }
+            | EventKind::Dropped { .. }
+            | EventKind::Notified { .. }
+            | EventKind::Resumed { .. }
+            | EventKind::FlakyProbe { .. } => {}
         }
     }
     leads.sort_unstable();

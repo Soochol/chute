@@ -171,7 +171,7 @@ herdr의 머신 연결은 ssh다. 허브에 명령을 넘기는 PC는 허브에 
 1. **다른 머신 에이전트의 터미널 주소.** 현황판에서 다른 머신의 에이전트를 누르면 `terminal.peek`에 `desk/t1ru` 같은 `<머신 이름>/<터미널>` 주소를 넘긴다. Herdr 앱이 이 형식을 받는지 확인하지 못했다. 눌러도 터미널이 열리지 않으면 알린다.
 2. **허브가 다른 머신일 때의 현황판.** 상태 폴더 감시는 이 PC의 폴더만 지켜보므로 허브가 다른 머신인 저장소는 5초마다 허브를 읽는다. 허브의 변화가 몇 초 안에 보이는지, 허브를 끄면 "허브에 닿지 않는다"로 바뀌고 켜면 돌아오는지 본다.
 3. **`chute`의 `PATH`.** 허브와 각 PC에서 `hc exec --on <이름> -- chute --version`이 두 머신 모두 같은 버전을 내는지 본다.
-4. **반송이 다른 PC의 에이전트에게 닿는지.** 다른 PC의 에이전트가 일부러 실패하는 PR을 submit해서, 반송 한 줄이 그 PC의 터미널에 입력되고 보고서 경로가 그 PC에 있는지 본다. 에이전트가 끝난 PC면 chute가 그 PC에서 새 에이전트를 띄우는지도 본다.
+4. **반송이 다른 PC의 에이전트에게 닿는지.** 다른 PC의 에이전트가 일부러 실패하는 PR을 submit해서, 반송 한 줄이 그 PC의 터미널에 입력되고 보고서 경로가 그 PC에 있는지 본다. 에이전트가 끝난 PC면 `respawn`이 비어 있을 때는 새 에이전트가 뜨지 않고 사람 차례가 되는지, `respawn`에 명령을 넣었을 때는 chute가 그 PC에서 새 에이전트를 띄우는지도 본다.
 5. **큰 반송.** 보고서 묶음이 `hc exec`의 stdin 한도를 넘으면 git bundle이 빠지고 로그가 잘린다. 검증 로그가 큰 저장소에서 반송 보고서가 읽을 만한지 본다.
 
 ## `chute.toml`
@@ -184,13 +184,30 @@ budget = 3
 max_batch = 8
 serialize = false
 require_ci = false
-respawn = ["claude", "--dangerously-skip-permissions"]
+require_head = false
+max_parallel = 2
+env_check = []
+respawn = []
+
+[retention]
+logs_days = 7
+reports_days = 30
+
+[cache]
+seed = []
+
+[flaky]
+probe_repeats = 20
+probe_seconds = 180
+chronic = 3
+chronic_days = 30
 
 [[verify]]
 name = "test"
 run = "cargo test"
 timeout = 3600
 failed = 'test (\S+) \.\.\. FAILED'
+# probe = "cargo test {tests} -- --exact"
 ```
 
 | 키 | 기본값 | 뜻 |
@@ -200,14 +217,28 @@ failed = 'test (\S+) \.\.\. FAILED'
 | `max_batch` | `8` | 한 batch의 PR 수 상한. 1 이상 |
 | `serialize` | `false` | `true`면 검증을 한 번에 하나만 돈다. preflight와 batch 검증은 기본으로 동시에 돈다. 포트나 DB처럼 겹치는 자원을 쓰는 저장소가 켠다 |
 | `require_ci` | `false` | `true`면 PR마다 등록된 HEAD의 GitHub check가 통과한 PR만 batch에 넣는다. 아래에 설명한다 |
-| `respawn` | `["claude", "--dangerously-skip-permissions"]` | 반송을 받을 에이전트가 없을 때 띄우는 명령 |
+| `require_head` | `false` | `true`면 `--head` 없는 submit을 거절한다 |
+| `max_parallel` | `2` | 동시에 도는 preflight 수의 상한(슬롯 수의 상한). 1 이상 |
+| `env_check` | `[]` | 검증 전에 돌려 결과를 남길 명령의 목록. 빈 항목은 안 된다. 예: `["cargo --version"]` |
+| `respawn` | `[]` | 반송을 받을 에이전트가 없을 때 띄우는 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다 |
+| `retention` (`[retention]`) | 아래 두 키 | 정리할 때 남기는 기간 |
+| `logs_days` | `7` | 검증 로그와 preflight 로그를 남기는 날수. 1 이상 |
+| `reports_days` | `30` | 반송 보고서, preflight 보고서, 실패 트리 참조를 남기는 날수. 1 이상 |
+| `cache` (`[cache]`) | 아래 한 키 | 슬롯의 빌드 캐시 |
+| `seed` | `[]` | 새 슬롯에 복사해 올, git이 무시하는 경로의 목록. 빈 항목은 안 된다. 예: `["target"]` |
+| `flaky` (`[flaky]`) | 아래 네 키 | 흔들린 시험의 처리 |
+| `probe_repeats` | `20` | 흔들린 시험을 되풀이하는 횟수의 상한. 1 이상 |
+| `probe_seconds` | `180` | 되풀이하는 시간의 상한(초). 1 이상 |
+| `chronic` | `3` | 기간 안에 이만큼 흔들린 시험을 만성으로 본다. 1 이상 |
+| `chronic_days` | `30` | 만성을 세는 기간(일). 1 이상 |
 | `verify` (`[[verify]]`) | 없음. 하나 이상 필요 | 검증 단계. 적은 순서대로 돌고 하나라도 실패하면 그 batch는 실패다 |
 | `verify.name` | 필수 | 단계 이름. 겹치거나 `/`를 담거나 `.`으로 시작하면 안 된다 |
 | `verify.run` | 필수 | 검증 worktree에서 `sh -c`로 실행하는 명령 |
 | `verify.timeout` | `3600` | 초. 넘기면 그 단계는 실패(`시간 초과`)다. 시간 초과는 다시 돌려 보지 않는다 |
+| `verify.probe` | 없음 | 선택. 흔들린 시험만 되풀이하는 명령. `{tests}` 자리가 있어야 하며 없으면 설정 오류다. 예: `cargo test {tests} -- --exact` |
 | `verify.failed` | 없음 | 선택. 실패한 시험 이름을 뽑는 정규식. 캡처 그룹이 있으면 그 값이, 없으면 일치한 글이 이름이다. 없으면 보고서에 로그의 끝부분이 들어간다 |
 
-**`respawn`의 기본값 `["claude", "--dangerously-skip-permissions"]`는 새 에이전트가 권한 확인 없이 명령을 실행하게 한다.** 무인으로 뜨는 에이전트가 권한 대화상자에서 멈추지 않게 하려는 선택이다. 다른 명령으로 바꾸려면 배열을 바꾼다. 실행 파일과 인자를 나눠 적는다(`respawn = ["claude"]`면 권한 확인을 건너뛰지 않는다). 빈 배열(`respawn = []`)이면 에이전트를 띄우지 않고 그 PR을 사람 차례(`전달 실패`)로 올린다. 새 에이전트는 PR 브랜치의 worktree에서 돈다. 원래 에이전트의 worktree가 남아 있으면 그곳이고, 없으면 `~/.herdr/worktrees/<저장소>/<브랜치>`에 만든다. 사용자의 chute 체크아웃이 그 PR 브랜치를 쥐고 있으면 새 에이전트가 그 폴더에서 돈다. 기본값이면 그곳에서도 권한 확인 없이 실행된다.
+**`respawn`의 기본값은 `[]`이다.** 반송을 받을 에이전트가 없거나 터미널이 끝났으면 chute는 에이전트를 띄우지 않고 그 PR을 사람 차례(`전달 실패`)로 올린다. 값을 넣으면 그 명령으로 새 에이전트를 띄운다. 실행 파일과 인자를 나눠 적는다(`respawn = ["claude"]`). **`--dangerously-skip-permissions`를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행하게 한다.** 무인으로 뜨는 에이전트가 권한 대화상자에서 멈추지 않게 하려는 선택이지만, 사용자가 직접 켜는 옵션으로만 둔다(`respawn = ["claude", "--dangerously-skip-permissions"]`). 새 에이전트는 PR 브랜치의 worktree에서 돈다. 원래 에이전트의 worktree가 남아 있으면 그곳이고, 없으면 `~/.herdr/worktrees/<저장소>/<브랜치>`에 만든다. 사용자의 chute 체크아웃이 그 PR 브랜치를 쥐고 있으면 새 에이전트가 그 폴더에서 돈다. 권한 확인을 건너뛰는 값을 넣었다면 그곳에서도 권한 확인 없이 실행된다.
 
 **`require_ci`.** 켜면 batch에 넣기 전에 PR마다 등록된 HEAD의 GitHub check를 `gh`로 읽는다. 모두 통과했으면 batch에 넣는다(건너뛴 check와 중립은 통과로 본다). check가 도는 중이거나 아직 하나도 없으면 PR을 `대기(CI 기다림)`으로 두고 이번 batch에서 뺀다. 다음 batch 때 다시 보고, 큐에 CI를 기다리는 PR만 남았으면 30초쯤마다 다시 본다. check가 submit부터(반송 뒤 다시 submit했으면 마지막 반송부터) 10분 넘게 하나도 없으면 현황판에 경고를 한 번 남긴다. CI가 없는 저장소에서 옵션만 켠 경우를 알리기 위해서다. check가 생기거나 PR이 큐에서 빠지거나 옵션을 끄면 경고가 사라진다. 실패했거나 취소됐으면 실패한 check의 이름과 링크를 담아 반송하고 재시도 예산을 한 번 쓴다. 보는 것은 PR 자신의 HEAD에 대한 check뿐이다. 합친 트리는 여전히 로컬 검증이 판정한다. **로컬 검증이 최종이라는 원칙은 그대로이고 이 옵션은 그 앞의 추가 관문이다.** `chute preflight`는 이 옵션과 무관하다.
 
