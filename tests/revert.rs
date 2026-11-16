@@ -462,3 +462,68 @@ fn revert_on_the_hub_itself_still_runs() {
     assert_eq!(out.status.code(), Some(1), "{}", forward_kit::err(&out));
     assert!(forward_kit::err(&out).contains("그런 batch가 없다"));
 }
+
+#[test]
+fn revert_notify_tells_each_submitting_terminal_which_of_its_prs_were_undone() {
+    let lab = Lab::new("");
+    let by_orch = [(1, "a.txt"), (2, "b.txt")];
+    for (n, path) in by_orch {
+        let head = lab.push_pr_branch(n, &[(path, "x\n")]);
+        lab.queue_pr_by(
+            n,
+            &head,
+            Some(lab.agent()),
+            Some(lab.orchestrator()),
+            chute::model::Approval::Agent,
+        );
+    }
+    let own = lab.push_pr_branch(3, &[("c.txt", "x\n")]);
+    lab.queue_pr_by(
+        3,
+        &own,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        chute::model::Approval::Agent,
+    );
+    let orphan = lab.push_pr_branch(4, &[("d.txt", "x\n")]);
+    lab.queue_pr(4, &orphan, Some(lab.agent()), chute::model::Approval::Agent);
+    let id = match lab.engine().run_once().unwrap() {
+        Pass::Done(summary) => {
+            assert_eq!(summary.merged.len(), 4, "{summary:?}");
+            summary.batch
+        }
+        other => panic!("batch가 끝나야 한다: {other:?}"),
+    };
+    let told_before = lab.hc_calls("send").len();
+
+    let out = chute(&lab, &["revert", &id.0]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let tip = lab.origin_main();
+    let orch = lab.lines_sent_to("t1orch");
+    let worker = lab.lines_sent_to("t1rs");
+    assert_eq!(lab.hc_calls("send").len() - told_before, 2);
+    let reverted = |lines: &[String]| -> String {
+        let found: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("chute 결과 reverted "))
+            .collect();
+        assert_eq!(found.len(), 1, "{lines:?}");
+        found[0].clone()
+    };
+    let to_orch = reverted(&orch);
+    assert!(to_orch.contains(" prs=1,2 "), "{to_orch}");
+    assert!(to_orch.contains(&format!(" batch={} ", id.0)), "{to_orch}");
+    assert!(
+        to_orch.contains(&format!(" commit={} ", &tip[..12])),
+        "{to_orch}"
+    );
+    let to_worker = reverted(&worker);
+    assert!(to_worker.contains(" prs=3 "), "{to_worker}");
+    let sent = lab
+        .notified()
+        .into_iter()
+        .filter(|(kind, _)| *kind == chute::model::NotifyKind::Reverted)
+        .count();
+    assert_eq!(sent, 2);
+}
