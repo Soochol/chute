@@ -11,7 +11,7 @@ for pr in $a $b; do submit "$pr" >"$W/submit-$pr.log" 2>&1 || { cat "$W/submit-$
 old_pid=$(daemon_pid)
 daemon_resume
 wait_for 30 "[[ \$(cd $W/clone && '$LT_CHUTE' status --json | jq -r '.batch.phase // empty') == verifying ]]" \
-  || say "batch가 verifying에 들어가지 않았다"
+  || die "batch가 verifying에 들어가지 않았다"
 sleep 2
 before=$(main_sha)
 kill -9 "$old_pid"

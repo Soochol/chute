@@ -16,7 +16,7 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 | 변수 | 뜻 |
 |---|---|
 | `CHUTE_BIN` | 시험할 chute 실행 파일. 기본값은 `target/debug/chute`이고 없으면 `cargo build`를 한다 |
-| `LIVETEST_REPO` | 시험 저장소. 이름이 `/chute-sandbox`로 끝나야 한다. 다른 저장소에는 강제 push와 PR 닫기를 하지 않는다 |
+| `LIVETEST_REPO` | 시험 저장소. `owner/chute-sandbox` 꼴이어야 한다. 다른 저장소에는 강제 push와 PR 닫기를 하지 않는다 |
 | `LIVETEST_TIMEOUT` | 시나리오 하나의 제한 시간(초). 기본 600 |
 
 `run.sh`는 시나리오마다 통과, 실패, 시간 초과, 환경 오류를 표로 보이고 끝에 남은 것(터미널, 열린 PR, 브랜치, 임시 폴더, 시험 데몬)을 확인한다. 종료 코드 0은 모두 통과하고 남은 것도 없다는 뜻이다. 시나리오별 로그는 `/tmp/chute-livetest-logs.*`에 남는다.

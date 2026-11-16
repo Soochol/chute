@@ -13,7 +13,7 @@ say() { printf '  %s\n' "$*"; }
 die() { printf 'livetest: %s\n' "$*" >&2; exit 2; }
 
 guard_repo() {
-  [[ $LT_SANDBOX == */chute-sandbox ]] || die "시험 저장소 이름이 chute-sandbox가 아니다: $LT_SANDBOX"
+  [[ $LT_SANDBOX =~ ^[A-Za-z0-9_.-]+/chute-sandbox$ ]] || die "시험 저장소 이름이 owner/chute-sandbox 꼴이 아니다: $LT_SANDBOX"
 }
 
 check() {
@@ -119,7 +119,7 @@ sc_teardown() {
     lt_hc kill "$t" >/dev/null 2>&1
     lt_hc rm "$t" >/dev/null 2>&1
   done
-  sandbox_reset
+  (sandbox_reset)
   rm -rf "$W"
   exit $rc
 }
@@ -248,9 +248,10 @@ status_json() { chute_json status --json; }
 events_json() { chute_json events --json --limit 1000; }
 
 ev_count() {
-  local kind=$1 pr=${2:-}
-  events_json | jq -s --arg k "$kind" --arg pr "$pr" \
-    '[.[] | select(.event == $k) | select($pr == "" or ((.pr // 0) | tostring) == $pr)] | length'
+  local kind=$1 pr=${2:-} out
+  out=$(events_json) || { printf 'events-failed'; return 1; }
+  jq -s --arg k "$kind" --arg pr "$pr" \
+    '[.[] | select(.event == $k) | select($pr == "" or ((.pr // 0) | tostring) == $pr)] | length' <<<"$out"
 }
 
 ev_has() {
