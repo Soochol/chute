@@ -2195,6 +2195,7 @@ mod tests {
             cause,
             detail,
             log: "/logs/test.1.log".into(),
+            confirmed: None,
         }
     }
 

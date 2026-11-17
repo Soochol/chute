@@ -5,19 +5,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, PostVerify};
+use crate::config::{Config, PostVerify, VerifyStep};
 use crate::engine::reap_orphans;
 use crate::ext::Ext;
 use crate::flaky;
 use crate::gitops::{Gitops, Slot, SlotLock, SlotName};
 use crate::model::{
-    Agent, BatchId, Culprit, EpochMs, Event, EventKind, GreenMark, MergeRef, PostPhase, PostRed,
-    PostRun, PostState, PrNumber, RepoInfo, Sha,
+    Agent, BatchId, Culprit, EpochMs, Event, EventKind, GreenMark, MergeRef, NonEmpty, PostPhase,
+    PostRed, PostRun, PostState, PrNumber, RepoInfo, Sha,
 };
 use crate::notify::{Line, Notifier};
 use crate::pc_limit::Wait;
 use crate::store::{Home, RepoStore};
-use crate::verify::{self, Cancel, Detail, Failed, FlakyStep, Options, Outcome};
+use crate::verify::{self, Cancel, Detail, Failed, FlakyStep, Options, Outcome, Wanted};
 
 const SLOT_LOCK_TRIES: u32 = 40;
 const SLOT_LOCK_PAUSE: Duration = Duration::from_millis(50);
@@ -163,7 +163,7 @@ impl PostVerifier {
 
     fn check_tip(&self, scope: &Scope, tip: &Sha, before: &PostState) -> Result<PostPass> {
         let started = Instant::now();
-        match self.check(scope, tip, PostPhase::Verifying)? {
+        match self.check(scope, tip, PostPhase::Verifying, None)? {
             Checked::Cancelled => Ok(PostPass::Cancelled),
             Checked::Passed { flaky } => {
                 self.record_flaky(scope, tip, flaky)?;
@@ -180,7 +180,13 @@ impl PostVerifier {
         }
     }
 
-    fn check(&self, scope: &Scope, commit: &Sha, phase: PostPhase) -> Result<Checked> {
+    fn check(
+        &self,
+        scope: &Scope,
+        commit: &Sha,
+        phase: PostPhase,
+        wanted: Option<Wanted>,
+    ) -> Result<Checked> {
         let slot = scope.slot;
         slot.checkout(commit)?;
         let changed = scope
@@ -212,7 +218,7 @@ impl PostVerifier {
         };
         let steps = Config {
             serialize: false,
-            verify: scope.post.steps.clone(),
+            verify: self.current_steps(scope),
             ..scope.config.clone()
         };
         let outcome = verify::run(
@@ -226,6 +232,7 @@ impl PostVerifier {
                 on_step: Some(&on_step),
                 on_machine_wait: Some(&on_machine_wait),
                 rerun_with_probe: true,
+                wanted,
                 changed: changed.as_deref(),
                 ..Options::default()
             },
@@ -235,6 +242,30 @@ impl PostVerifier {
             Outcome::Failed(failed) => Checked::Failed(failed),
             Outcome::Cancelled => Checked::Cancelled,
         })
+    }
+
+    fn current_steps(&self, scope: &Scope) -> NonEmpty<VerifyStep> {
+        let latest = self
+            .gitops
+            .fetch_base_tip()
+            .and_then(|tip| Config::load_at(&self.ext, &self.info.path, tip.as_str()))
+            .ok()
+            .and_then(|config| config.post);
+        let steps = scope.post.steps.iter().map(|step| {
+            let now = latest
+                .iter()
+                .flat_map(|post| post.steps.iter())
+                .find(|now| now.name == step.name);
+            match now {
+                Some(now) => VerifyStep {
+                    probe: now.probe.clone(),
+                    failed: now.failed.clone(),
+                    ..step.clone()
+                },
+                None => step.clone(),
+            }
+        });
+        NonEmpty::new(steps.collect()).unwrap_or_else(|| scope.post.steps.clone())
     }
 
     fn report_dir(&self, commit: &Sha) -> PathBuf {
@@ -315,7 +346,7 @@ impl PostVerifier {
 
     fn fail(&self, scope: &Scope, tip: &Sha, before: &PostState, failed: &Failed) -> Result<bool> {
         let baseline = scope.baseline;
-        let tests = failed_tests(failed);
+        let tests = failed.tests();
         if let Some(old) = &before.red
             && old.step == failed.step
             && old.tests == tests
@@ -390,10 +421,10 @@ impl PostVerifier {
     }
 
     fn locate(&self, scope: &Scope, tip: &Sha, failure: &Failed) -> Result<Search> {
-        let wanted = failed_tests(failure);
+        let wanted = failure.tests();
         let same = |other: &Failed| {
             other.step == failure.step && {
-                let seen = failed_tests(other);
+                let seen = other.confirmed.clone().unwrap_or_else(|| other.tests());
                 wanted.iter().all(|test| seen.contains(test))
             }
         };
@@ -415,7 +446,11 @@ impl PostVerifier {
             let mut decided = false;
             for probe in probes(passing, bad as isize, mid, &different) {
                 let commit = &commits[probe as usize];
-                match self.check(scope, commit, PostPhase::Searching)? {
+                let search = Wanted {
+                    step: &failure.step,
+                    tests: &wanted,
+                };
+                match self.check(scope, commit, PostPhase::Searching, Some(search))? {
                     Checked::Cancelled => return Ok(Search::Cancelled),
                     Checked::Passed { flaky } => {
                         self.record_flaky(scope, commit, flaky)?;
@@ -527,13 +562,6 @@ fn probes(passing: isize, bad: isize, mid: isize, skip: &[isize]) -> Vec<isize> 
         }
     }
     order
-}
-
-fn failed_tests(failed: &Failed) -> Vec<String> {
-    match &failed.detail {
-        Detail::Tests(tests) => tests.to_vec(),
-        Detail::Tail(_) => Vec::new(),
-    }
 }
 
 fn is_due(state: &PostState, tip: &Sha, post: &PostVerify, now: EpochMs) -> bool {

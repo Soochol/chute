@@ -858,3 +858,235 @@ fn flakes_in_the_check_after_the_merge_pile_up_into_a_chronic_warning_without_te
     assert!(warnings[0].message.contains("wobbly_test"), "{warnings:?}");
     assert!(lab.hc_calls("send").is_empty(), "알림은 보내지 않는다");
 }
+
+fn plain_lab(body: &str) -> Lab {
+    let lab = post_lab(body, "", POST_STEP);
+    let root = lab.sb.root().to_string_lossy().into_owned();
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script)
+        .unwrap()
+        .replace("@ROOT@", &root);
+    fs::write(&script, text).unwrap();
+    lab
+}
+
+fn queue_all(lab: &Lab, prs: &[(u64, &str)]) {
+    for (n, file) in prs {
+        let head = lab.push_pr_branch(*n, &[(*file, "x\n")]);
+        lab.queue_pr(*n, &head, Some(lab.agent()), chute::model::Approval::Agent);
+    }
+    merged(lab);
+}
+
+const OLD_AND_NEW: &str = "if [ -e svc/OLD ]; then echo 'FAILED old_test'; f=1; fi\nif [ -e svc/NEW ]; then echo 'FAILED new_test'; f=1; fi\n[ -z \"$f\" ] || exit 1";
+const OLD_AND_NEW_PROBE: &str = "for t in \"$@\"; do\n  if [ \"$t\" = old_test ] && [ -e svc/OLD ]; then echo 'FAILED old_test'; f=1; fi\n  if [ \"$t\" = new_test ] && [ -e svc/NEW ]; then echo 'FAILED new_test'; f=1; fi\ndone\n[ -z \"$f\" ] || exit 1";
+
+#[test]
+fn the_search_rechecks_the_tips_tests_and_a_commit_where_they_pass_alone_counts_as_passing() {
+    let lab = probe_lab(OLD_AND_NEW, OLD_AND_NEW_PROBE, "");
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "svc/OLD"), (2, "c.txt"), (3, "svc/NEW")]);
+    let fix = lab.push_pr_branch_removing(4, "svc/OLD");
+    lab.queue_pr(4, &fix, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+    queue_all(&lab, &[(5, "e.txt")]);
+    let tip = lab.origin_main();
+    let merges = lab.merge_commits_on_main();
+    assert_eq!(merges.len(), 5);
+    let green_run = lines_of(&lab, "post-runs.log").len();
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    assert_eq!(
+        lines_of(&lab, "post-runs.log")[green_run..],
+        [tip, merges[1].clone(), merges[2].clone()],
+        "단계 전체는 tip과 후보 둘에서 한 번씩 돈다"
+    );
+    assert_eq!(
+        lines_of(&lab, "probe-args.log"),
+        ["new_test", "new_test", "new_test"],
+        "옛 실패만 있는 후보도 tip의 시험으로 다시 돈다"
+    );
+    let red = lab.state().post.red.expect("실패가 남아야 한다");
+    assert_eq!(red.tests, ["new_test"]);
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(3)));
+    assert!(
+        events_of(&lab, |e| matches!(e, EventKind::Flaky { .. })).is_empty(),
+        "옛 실패는 흔들림이 아니다"
+    );
+}
+
+#[test]
+fn a_whole_rerun_keeps_only_the_tests_that_failed_both_times() {
+    let lab = plain_lab(
+        "h=$(git rev-parse HEAD)\nn=$(grep -c \"^$h\\$\" '@ROOT@/post-runs.log')\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; f=1; fi\nif [ -e svc/TIP ] && [ \"$n\" = 2 ]; then echo 'FAILED wobbly_test'; f=1; fi\n[ -z \"$f\" ] || exit 1",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "a.txt"), (2, "svc/BREAK"), (3, "svc/TIP")]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.expect("실패가 남아야 한다");
+    assert_eq!(red.tests, ["broken_test"], "한 번만 실패한 시험은 뺀다");
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
+    let line = lab
+        .lines_sent_to("t1rs")
+        .into_iter()
+        .find(|l| l.contains("post_failed"))
+        .expect("알림이 가야 한다");
+    assert!(line.contains("tests=broken_test"), "{line}");
+}
+
+#[test]
+fn a_probe_that_fails_without_naming_a_test_during_the_search_is_not_blamed() {
+    let lab = probe_lab(
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; f=1; fi\nif [ -e svc/WOBBLE ]; then m=\"@ROOT@/seen-$(git rev-parse HEAD)\"; if [ ! -e \"$m\" ]; then touch \"$m\"; echo 'FAILED broken_test'; f=1; fi; fi\n[ -z \"$f\" ] || exit 1",
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\nif [ -e svc/WOBBLE ]; then echo 'probe: unsupported'; exit 1; fi",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "svc/WOBBLE"), (2, "svc/BREAK"), (3, "c.txt")]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.expect("실패가 남아야 한다");
+    assert_eq!(red.tests, ["broken_test"]);
+    assert!(
+        red.culprit.is_none(),
+        "이름 없이 실패한 probe로는 범인을 가리지 못한다: {:?}",
+        red.culprit
+    );
+}
+
+#[test]
+fn a_probe_set_on_the_default_branch_after_the_check_started_is_used_for_the_next_commit() {
+    let lab = plain_lab(
+        "while [ -e '@ROOT@/gate' ]; do sleep 0.05; done\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi",
+    );
+    let root = lab.sb.root().to_string_lossy().into_owned();
+    fs::write(
+        lab.sb.root().join("probe.sh"),
+        format!("echo \"$@\" >> '{root}/probe-args.log'\nif [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\n"),
+    )
+    .unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "a.txt"), (2, "svc/BREAK"), (3, "c.txt")]);
+    fs::write(lab.sb.root().join("gate"), "").unwrap();
+    let green_run = lines_of(&lab, "post-runs.log").len();
+    let post = lab.post();
+
+    let tip = thread::scope(|scope| {
+        let run = scope.spawn(|| post.run_once().unwrap());
+        wait_until("the tip's step starts", || {
+            lines_of(&lab, "post-runs.log").len() == green_run + 1
+        });
+        let mut config = fs::read_to_string(lab.repo.path().join("chute.toml")).unwrap();
+        config.push_str(&format!("probe = \"sh {root}/probe.sh {{tests}}\"\n"));
+        lab.main_commit(&[("chute.toml", &config)], "chore: probe를 더한다");
+        fs::remove_file(lab.sb.root().join("gate")).unwrap();
+        assert_eq!(run.join().unwrap(), PostPass::Failed);
+        lines_of(&lab, "post-runs.log")[green_run].clone()
+    });
+
+    let runs = &lines_of(&lab, "post-runs.log")[green_run..];
+    assert_eq!(
+        runs.iter().filter(|c| **c == tip).count(),
+        2,
+        "검사를 시작할 때는 probe가 없어 tip은 단계 전체를 두 번 돈다: {runs:?}"
+    );
+    assert_eq!(
+        lines_of(&lab, "probe-args.log"),
+        ["broken_test"],
+        "그 뒤의 후보 커밋에서는 새 probe가 돈다"
+    );
+    assert_eq!(
+        lab.state().post.red.unwrap().culprit.unwrap().pr,
+        Some(PrNumber(2))
+    );
+}
+
+#[test]
+fn a_test_the_search_reran_and_passed_is_flaky_but_a_failure_it_did_not_rerun_is_not() {
+    let lab = probe_lab(
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; f=1; fi\nif [ -e svc/WOBBLE ]; then m=\"@ROOT@/seen-$(git rev-parse HEAD)\"; if [ ! -e \"$m\" ]; then touch \"$m\"; echo 'FAILED broken_test'; echo 'FAILED other_test'; f=1; fi; fi\n[ -z \"$f\" ] || exit 1",
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "svc/WOBBLE"), (2, "svc/BREAK"), (3, "c.txt")]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
+    let wobbles: Vec<Vec<String>> = events_of(&lab, |e| matches!(e, EventKind::Flaky { .. }))
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Flaky { tests, .. } => Some(tests),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wobbles, [["broken_test"]], "other_test는 다시 돌지 않았다");
+}
+
+#[test]
+fn the_search_of_fourteen_merges_runs_the_whole_step_five_times_and_the_probe_five_times() {
+    let lab = probe_lab(
+        "if [ -e svc/LIST ]; then echo 'FAILED list_format_test'; f=1; fi\nif [ -e svc/STALE ]; then echo 'FAILED stale_test'; f=1; fi\n[ -z \"$f\" ] || exit 1",
+        "for t in \"$@\"; do\n  if [ \"$t\" = list_format_test ] && [ -e svc/LIST ]; then echo 'FAILED list_format_test'; f=1; fi\n  if [ \"$t\" = stale_test ] && [ -e svc/STALE ]; then echo 'FAILED stale_test'; f=1; fi\ndone\n[ -z \"$f\" ] || exit 1",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(
+        &lab,
+        &[
+            (1, "svc/LIST"),
+            (2, "f2.txt"),
+            (3, "f3.txt"),
+            (4, "f4.txt"),
+            (5, "svc/STALE"),
+            (6, "f6.txt"),
+            (7, "f7.txt"),
+        ],
+    );
+    let fix = lab.push_pr_branch_removing(8, "svc/LIST");
+    lab.queue_pr(8, &fix, Some(lab.agent()), chute::model::Approval::Agent);
+    merged(&lab);
+    queue_all(
+        &lab,
+        &[
+            (9, "f9.txt"),
+            (10, "f10.txt"),
+            (11, "f11.txt"),
+            (12, "f12.txt"),
+            (13, "f13.txt"),
+            (14, "f14.txt"),
+        ],
+    );
+    let tip = lab.origin_main();
+    let merges = lab.merge_commits_on_main();
+    assert_eq!(merges.len(), 14);
+    let green_run = lines_of(&lab, "post-runs.log").len();
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    assert_eq!(
+        lines_of(&lab, "post-runs.log")[green_run..],
+        [
+            tip,
+            merges[6].clone(),
+            merges[2].clone(),
+            merges[4].clone(),
+            merges[3].clone()
+        ],
+        "단계 전체는 tip과 후보 넷에서 한 번씩 돈다"
+    );
+    assert_eq!(
+        lines_of(&lab, "probe-args.log"),
+        ["stale_test"; 5],
+        "probe는 모두 tip의 시험 하나만 다시 돈다"
+    );
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["stale_test"]);
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(5)));
+}
