@@ -212,10 +212,11 @@ function actionsOf(item, repoPath) {
     }));
 }
 
-function cardOf(item, repoPath) {
+function cardOf(item, repoPath, slug) {
   const card = {
     key: `${repoPath}#${item.pr}`,
     pr: item.pr,
+    url: pullUrl(slug, item.pr),
     title: str(item.title),
     state: item.state,
     agent: agentOf(item.agent),
@@ -396,13 +397,14 @@ function postVerifyOf(post, now) {
   };
 }
 
-function batchOf(batch, members, now, usualS) {
+function batchOf(batch, members, now, usualS, slug) {
   if (!isObject(batch) && members.length === 0) return [];
   const b = isObject(batch) ? batch : {};
   const unlisted = new Map();
   for (const item of members) unlisted.set(item.pr, [...(unlisted.get(item.pr) ?? []), item]);
   const entryOf = (pr, item) => ({
     pr,
+    url: pullUrl(slug, pr),
     title: str(item?.title),
     marks: item ? marksOf(item) : [],
     submitter: item ? submitterOf(item) : null,
@@ -440,7 +442,7 @@ const chronicFlaky = (view) =>
 function todayOf(today, chronic) {
   if (!isObject(today)) return null;
   return {
-    line: `${num(today.merged)} merged · ${num(today.bounced)} bounced · median ${formatDuration(today.median_lead_s)}`,
+    parts: [`${num(today.merged)} merged`, `${num(today.bounced)} bounced`, `median ${formatDuration(today.median_lead_s)}`],
     details: [
       { key: "flaky", label: "Flaky", value: num(today.flaky), note: chronic ? "chronic" : null },
       { key: "batches", label: "Batches", value: num(today.batches) },
@@ -537,9 +539,71 @@ export function badgeText(board) {
   return count > 0 ? String(count) : null;
 }
 
-export const needsClock = (board) =>
-  board?.kind === "board" &&
-  board.repos.some((repo) => repo.sections.some((s) => s.id === "batch") || repo.postVerify?.run != null);
+export const needsClock = (board) => board?.kind === "board" && board.repos.some((repo) => repo.active);
+
+export const RECENT_DEFAULT = 3;
+
+// The recent merges to draw: the first few, or all of them when `open`. `hidden` is how many `+ N more` stands for.
+export function recentWindow(recent, open) {
+  const rows = open ? recent : recent.slice(0, RECENT_DEFAULT);
+  return { rows, hidden: Math.max(0, recent.length - RECENT_DEFAULT), more: recent.length - rows.length };
+}
+
+// Most urgent first. A repo's grade is its status line's tone.
+const GRADE = table({ error: 0, human: 0, working: 1, waiting: 2, ok: 3 });
+export const gradeOf = (tone) => GRADE[tone] ?? 3;
+
+const DAEMON_OFF_KEY = "daemon:off";
+
+// What the next fold state is for one repo.
+// `prev` is `{ keys, auto }` from the last read (`keys` null before the first read), `keys` the problem keys now,
+// `saved` whether the user left the repo folded. A folded repo opens by itself while a key it did not have before
+// is on it, and folds again once every key is gone.
+export function nextFold(prev, keys, saved) {
+  const had = prev?.keys instanceof Set ? prev.keys : new Set();
+  const now = new Set(keys);
+  const fresh = keys.some((key) => !had.has(key));
+  const auto = !saved ? false : fresh ? true : now.size === 0 ? false : prev?.auto === true;
+  return { folded: saved && !auto, auto, keys: now };
+}
+
+// The user pressed the head line: what they see flips and becomes their choice.
+export const toggleFold = ({ saved, auto }) => ({ saved: !(saved && !auto), auto: false });
+
+const TIME = (ms) => new Date(ms);
+const two = (n) => String(n).padStart(2, "0");
+export const clockText = (ms) => (Number.isFinite(ms) ? `${two(TIME(ms).getHours())}:${two(TIME(ms).getMinutes())}` : "");
+export const clockExact = (ms) => {
+  if (!Number.isFinite(ms)) return "";
+  const d = TIME(ms);
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+};
+
+const OVERALL = table({ error: "failed", human: "attention", working: "running", waiting: "running", ok: "ok" });
+const URGENCY = ["failed", "attention", "running", "ok"];
+
+// One number set for the head line and for `chute.status`. Null while nothing has been read.
+export function overview(board) {
+  if (board?.kind === "failed" || board?.kind === "missing") return { grade: "failed", issues: 1, running: 0, repos: 0 };
+  if (board?.kind === "empty") return { grade: "ok", issues: 0, running: 0, repos: 0 };
+  if (board?.kind !== "board") return null;
+  const grades = board.repos.map((repo) => OVERALL[repo.status.tone] ?? "ok");
+  const issues = board.repos.reduce((sum, repo) => {
+    if (!repo.hub.reachable) return sum + 1;
+    const human = repo.sections.find((s) => s.id === "human")?.items.length ?? 0;
+    const alerts = repo.sections.find((s) => s.id === "alerts")?.items.filter((a) => a.tone === "error").length ?? 0;
+    return sum + human + alerts;
+  }, 0);
+  return {
+    grade: URGENCY.find((g) => grades.includes(g)) ?? "ok",
+    issues,
+    running: grades.filter((g) => g === "running").length,
+    repos: board.repos.length,
+  };
+}
+
+export const overviewText = (o) =>
+  [`${o.repos} ${o.repos === 1 ? "repo" : "repos"}`, `${o.running} running`, `${o.issues} ${o.issues === 1 ? "issue" : "issues"}`];
 
 function repoBoard(view, now) {
   const repo = isObject(view.repo) ? view.repo : {};
@@ -553,6 +617,8 @@ function repoBoard(view, now) {
     stateDir: str(repo.state_dir),
     hub,
     notices: [],
+    problems: [],
+    active: false,
     postVerify: null,
     recent: [],
     today: null,
@@ -578,6 +644,7 @@ function repoBoard(view, now) {
       const ciPending = item.state_reason === "ci_pending";
       placed.waiting.push({
         pr: item.pr,
+        url: pullUrl(slug, item.pr),
         title: str(item.title),
         position: placed.waiting.length + 1,
         ciPending,
@@ -593,18 +660,22 @@ function repoBoard(view, now) {
         state: item.state ?? "(none)",
         reason: item.state_reason,
       });
-    } else placed[section].push(cardOf(item, path));
+    } else placed[section].push(cardOf(item, path, slug));
   }
   const recent = recentMergedOf(view, slug, now);
   placed.alerts = alertsOf(view, queue, now, recent);
-  placed.batch = batchOf(view.batch, inBatch, now, usualSeconds(view.recent));
+  placed.batch = batchOf(view.batch, inBatch, now, usualSeconds(view.recent), slug);
 
+  const notices = noticesOf(view, queue, placed.alerts);
+  const postVerify = postVerifyOf(view.post_verify, now);
   return {
     ...base,
     approval: named(APPROVAL, view.approval),
     status: statusLineOf(view, queue, placed.batch[0] ?? null),
-    notices: noticesOf(view, queue, placed.alerts),
-    postVerify: postVerifyOf(view.post_verify, now),
+    notices,
+    problems: [...notices.map((n) => n.key), ...(placed.alerts.some((a) => a.kind === "daemon") ? [DAEMON_OFF_KEY] : [])],
+    active: placed.batch.length > 0 || postVerify?.run != null,
+    postVerify,
     recent,
     today: todayOf(view.today, chronicFlaky(view)),
     sections: SECTION_ORDER.filter((id) => placed[id].length > 0).map((id) => ({
@@ -648,5 +719,6 @@ export function interpret(run, clock = Date.now()) {
   }
   if (views.length === 0) return failed("chute status output isn't repository state")
 ;
-  return { kind: "board", repos: views.map((view) => repoBoard(view, now)) };
+  const repos = views.map((view) => repoBoard(view, now)).sort((a, b) => gradeOf(a.status.tone) - gradeOf(b.status.tone));
+  return { kind: "board", repos };
 }
