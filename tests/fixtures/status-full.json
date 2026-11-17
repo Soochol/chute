@@ -39,6 +39,11 @@
     ],
     "phase": "verifying",
     "step": "test",
+    "steps": [
+      "fmt",
+      "clippy",
+      "test"
+    ],
     "round": 1,
     "started_ms": 1794724200000,
     "waiting_machine": false,
@@ -554,6 +559,29 @@
       "bounced": [],
       "seconds": 301,
       "finished_ms": 1794720900000
+    }
+  ],
+  "recent_merged": [
+    {
+      "pr": 8,
+      "title": "feat: 큐 상태 전이 추가",
+      "batch": "b20261115-150000",
+      "merged_ms": 1794722690000,
+      "bounces": 1
+    },
+    {
+      "pr": 7,
+      "title": "fix: 잠금 해제 순서를 고친다",
+      "batch": "b20261115-150000",
+      "merged_ms": 1794722680000,
+      "bounces": 0
+    },
+    {
+      "pr": 6,
+      "title": null,
+      "batch": "b20261115-143000",
+      "merged_ms": 1794720890000,
+      "bounces": 0
     }
   ],
   "warnings": [

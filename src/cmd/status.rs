@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -10,8 +11,8 @@ use crate::hub::{self, Route};
 use crate::machine::Machines;
 use crate::model::{
     Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemView,
-    MachineId, PostPhase, PostState, RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView,
-    TerminalId, Today, VerifiedBy, Warning, WarningKind,
+    MachineId, MergedView, PostPhase, PostState, PrNumber, RecentBatch, RepoInfo, RepoView,
+    SchemaV1, StatusView, TerminalId, Today, VerifiedBy, Warning, WarningKind,
 };
 use crate::queue;
 
@@ -26,6 +27,7 @@ pub struct Args {
 }
 
 const RECENT_BATCHES: usize = 10;
+const RECENT_MERGED: usize = 5;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
@@ -281,6 +283,7 @@ fn hub_down(
         queue: Vec::new(),
         today: Today::default(),
         recent: Vec::new(),
+        recent_merged: Vec::new(),
         warnings: vec![hub_warning(message, now)],
         post_verify: PostState::default(),
     }
@@ -349,7 +352,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
             at_ms: EpochMs(now.timestamp_millis().max(0) as u64),
         });
     }
-    let (today, recent) = summarize(&history.events, now);
+    let (today, recent, recent_merged) = summarize(&history.events, now);
     Ok(StatusView {
         schema: SchemaV1,
         repo: RepoView {
@@ -382,12 +385,16 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
             .collect(),
         today,
         recent,
+        recent_merged,
         warnings,
         post_verify: state.post.clone(),
     })
 }
 
-pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, Vec<RecentBatch>) {
+pub fn summarize<Tz: TimeZone>(
+    events: &[Event],
+    now: &DateTime<Tz>,
+) -> (Today, Vec<RecentBatch>, Vec<MergedView>) {
     let day = now.date_naive();
     let tz = now.timezone();
     let is_today = |ms: EpochMs| {
@@ -398,7 +405,22 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
     let mut today = Today::default();
     let mut leads = Vec::new();
     let mut recent = Vec::new();
+    let mut recent_merged = Vec::new();
+    let mut bounces: HashMap<PrNumber, u32> = HashMap::new();
     for event in events {
+        match &event.kind {
+            EventKind::Bounced { pr, .. } => *bounces.entry(*pr).or_default() += 1,
+            EventKind::Merged {
+                pr, batch, title, ..
+            } => recent_merged.push(MergedView {
+                pr: *pr,
+                title: title.clone(),
+                batch: batch.clone(),
+                merged_ms: event.at_ms,
+                bounces: bounces.remove(pr).unwrap_or(0),
+            }),
+            _ => {}
+        }
         if let EventKind::BatchFinished {
             batch,
             merged,
@@ -453,7 +475,9 @@ pub fn summarize<Tz: TimeZone>(events: &[Event], now: &DateTime<Tz>) -> (Today, 
     };
     recent.reverse();
     recent.truncate(RECENT_BATCHES);
-    (today, recent)
+    recent_merged.reverse();
+    recent_merged.truncate(RECENT_MERGED);
+    (today, recent, recent_merged)
 }
 
 fn post_lines(post: &PostState) -> Vec<String> {
@@ -702,6 +726,7 @@ mod tests {
                 batch: BatchId("b".into()),
                 commit: sha.clone(),
                 submitted_ms: EpochMs(at(&now, minutes_ago).0 - lead_s as u64 * 1000),
+                title: None,
             },
         };
         let finished = |name: &str, minutes_ago| Event {
@@ -732,7 +757,7 @@ mod tests {
             finished("first", 9),
             finished("second", 1),
         ];
-        let (today, recent) = summarize(&events, &now);
+        let (today, recent, _) = summarize(&events, &now);
         assert_eq!(
             today,
             Today {
@@ -749,6 +774,63 @@ mod tests {
     }
 
     #[test]
+    fn recent_merged_lists_five_newest_first_with_bounces_counted_before_the_merge() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
+        let sha = Sha::try_from("abc1234".to_owned()).unwrap();
+        let bounced = |pr, minutes_ago| Event {
+            at_ms: at(&now, minutes_ago),
+            kind: EventKind::Bounced {
+                pr: PrNumber(pr),
+                batch: None,
+                reason: BounceReason::Conflict,
+                attempts: 1,
+            },
+        };
+        let merged = |pr, minutes_ago, title: Option<&str>| Event {
+            at_ms: at(&now, minutes_ago),
+            kind: EventKind::Merged {
+                pr: PrNumber(pr),
+                batch: BatchId(format!("b{pr}")),
+                commit: sha.clone(),
+                submitted_ms: EpochMs(1),
+                title: title.map(str::to_owned),
+            },
+        };
+        let events = vec![
+            merged(1, 100, None),
+            bounced(2, 90),
+            bounced(2, 80),
+            merged(2, 70, Some("fix: two")),
+            bounced(3, 65),
+            merged(3, 60, Some("feat: three")),
+            merged(4, 50, Some("feat: four")),
+            merged(5, 40, Some("feat: five")),
+            merged(6, 30, Some("feat: six")),
+            bounced(7, 20),
+        ];
+        let (_, _, recent) = summarize(&events, &now);
+        let prs: Vec<u64> = recent.iter().map(|m| m.pr.0).collect();
+        assert_eq!(prs, [6, 5, 4, 3, 2], "the oldest merge falls off");
+        assert_eq!(recent[0].title.as_deref(), Some("feat: six"));
+        assert_eq!(recent[0].batch, BatchId("b6".into()));
+        assert_eq!(recent[0].merged_ms, at(&now, 30));
+        let bounces: Vec<u32> = recent.iter().map(|m| m.bounces).collect();
+        assert_eq!(
+            bounces,
+            [0, 0, 0, 1, 2],
+            "bounces of #7 (not merged) count for no one"
+        );
+
+        let (_, _, all) = summarize(&events[..2], &now);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].title, None, "an old event has no title");
+        assert_eq!(
+            serde_json::to_value(&all[0]).unwrap()["title"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn median_of_an_even_count_and_flaky_count() {
         let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
         let sha = Sha::try_from("abc1234".to_owned()).unwrap();
@@ -761,6 +843,7 @@ mod tests {
                     batch: BatchId("b".into()),
                     commit: sha.clone(),
                     submitted_ms: EpochMs(at(&now, 1).0 - lead_s * 1000),
+                    title: None,
                 },
             })
             .collect();
@@ -773,7 +856,7 @@ mod tests {
                 tree: sha.clone(),
             },
         });
-        let (today, _) = summarize(&events, &now);
+        let (today, _, _) = summarize(&events, &now);
         assert_eq!(today.median_lead_s, Some(250));
         assert_eq!(today.flaky, 1);
     }

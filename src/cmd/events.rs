@@ -674,6 +674,7 @@ mod tests {
                 batch: batch.clone(),
                 commit: sha("9f8e7d6a5b4c"),
                 submitted_ms: EpochMs(1),
+                title: None,
             },
             EventKind::Bounced {
                 pr: PrNumber(1),
@@ -778,6 +779,7 @@ mod tests {
                 batch: BatchId("b1".into()),
                 commit: sha("9f8e7d6a5b4c"),
                 submitted_ms: EpochMs(1),
+                title: None,
             },
         };
         assert_eq!(

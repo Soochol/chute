@@ -569,6 +569,8 @@ pub struct Batch {
     pub prs: Vec<PrNumber>,
     pub phase: Phase,
     pub step: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<String>,
     pub round: u32,
     pub started_ms: EpochMs,
     /// True while verification waits for a free PC slot (`machine.toml`'s `max_verify`).
@@ -866,6 +868,8 @@ pub enum EventKind {
         batch: BatchId,
         commit: Sha,
         submitted_ms: EpochMs,
+        #[serde(default)]
+        title: Option<String>,
     },
     Bounced {
         pr: PrNumber,
@@ -1038,6 +1042,9 @@ pub struct StatusView {
     pub queue: Vec<ItemView>,
     pub today: Today,
     pub recent: Vec<RecentBatch>,
+    /// Newest first.
+    #[serde(default)]
+    pub recent_merged: Vec<MergedView>,
     pub warnings: Vec<Warning>,
     /// Absent from the output of a chute older than the check after the merge.
     #[serde(default)]
@@ -1130,6 +1137,15 @@ pub struct Today {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergedView {
+    pub pr: PrNumber,
+    pub title: Option<String>,
+    pub batch: BatchId,
+    pub merged_ms: EpochMs,
+    pub bounces: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentBatch {
     pub batch: BatchId,
     pub merged: Vec<PrNumber>,
@@ -1189,6 +1205,40 @@ mod tests {
             let view: StatusView = serde_json::from_value(original.clone()).unwrap();
             assert_eq!(serde_json::to_value(&view).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn batch_steps_are_empty_in_a_state_file_written_before_they_existed() {
+        let mut old: Value = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(old["batch"]["steps"], json!(["fmt", "clippy", "test"]));
+        old["batch"].as_object_mut().unwrap().remove("steps");
+        let batch: Batch = serde_json::from_value(old["batch"].clone()).unwrap();
+        assert!(batch.steps.is_empty());
+        let view: StatusView = serde_json::from_value(old).unwrap();
+        assert!(view.batch.unwrap().steps.is_empty());
+    }
+
+    #[test]
+    fn merged_title_is_none_on_a_history_line_written_before_it_existed() {
+        let old = r#"{"at_ms":5,"event":"merged","pr":4,"batch":"b1","commit":"abc1234","submitted_ms":1}"#;
+        let event: Event = serde_json::from_str(old).unwrap();
+        assert!(matches!(event.kind, EventKind::Merged { title: None, .. }));
+        let shown: Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(shown["title"], Value::Null);
+        let new = old.replace(
+            r#""submitted_ms":1"#,
+            r#""submitted_ms":1,"title":"feat: x""#,
+        );
+        let event: Event = serde_json::from_str(&new).unwrap();
+        assert!(matches!(event.kind, EventKind::Merged { title: Some(t), .. } if t == "feat: x"));
+    }
+
+    #[test]
+    fn recent_merged_is_empty_in_the_status_of_a_chute_older_than_it() {
+        let mut old: Value = serde_json::from_str(FIXTURE).unwrap();
+        old.as_object_mut().unwrap().remove("recent_merged");
+        let view: StatusView = serde_json::from_value(old).unwrap();
+        assert!(view.recent_merged.is_empty());
     }
 
     #[test]

@@ -155,6 +155,47 @@ fn status_has_the_planned_shape_during_and_after_a_batch() {
 }
 
 #[test]
+fn batch_steps_in_the_status_during_verification_name_the_rounds_steps() {
+    let lab = Lab::new("@STATUS@");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let during = fs::read_to_string(lab.sb.root().join("status-during.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&during).unwrap();
+    assert_eq!(json["batch"]["steps"], serde_json::json!(["check"]));
+}
+
+#[test]
+fn merged_title_is_the_queue_items_title_in_history_and_in_recent_merged() {
+    let lab = Lab::new("");
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let titles: Vec<Option<String>> = lab
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Merged { title, .. } => Some(title),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            Some("feat: change 1".to_owned()),
+            Some("feat: change 2".to_owned())
+        ]
+    );
+    let status = chute_status(&lab);
+    assert_eq!(status["recent_merged"][0]["pr"], 2);
+    assert_eq!(status["recent_merged"][0]["title"], "feat: change 2");
+    assert_eq!(status["recent_merged"][1]["title"], "feat: change 1");
+}
+
+#[test]
 fn a_pr_that_conflicts_with_main_is_bounced_with_a_report_and_one_message() {
     let lab = Lab::new("");
     lab.open_pr(1, &[("a.txt", "a\n")]);
@@ -1295,6 +1336,7 @@ fn a_finished_event_already_written_is_not_written_again() {
                 prs: Vec::new(),
                 phase: chute::model::Phase::Verifying,
                 step: None,
+                steps: Vec::new(),
                 round: 1,
                 started_ms: chute::model::EpochMs::now(),
                 waiting_machine: false,

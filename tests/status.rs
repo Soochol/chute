@@ -225,6 +225,50 @@ fn the_submitter_and_queue_options_are_shown_and_addressed_like_the_agent() {
 }
 
 #[test]
+fn batch_steps_and_recent_merged_reach_a_pc_that_is_not_the_hub() {
+    let net = net();
+    let (hub, pc) = (net.node("hub"), net.node("pc"));
+    let dir = hub.sb.chute_home().join("repos").join("acme__widget");
+    let state = serde_json::json!({
+        "queue": [],
+        "batch": {"id": "b1", "base": "abc1234", "prs": [3], "phase": "verifying",
+                  "step": "test", "steps": ["fmt", "test"], "round": 1, "started_ms": 5},
+        "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let merged = |pr: u64, at: u64, title: &str| {
+        let title = if title.is_empty() {
+            String::new()
+        } else {
+            format!(r#","title":"{title}""#)
+        };
+        format!(
+            r#"{{"at_ms":{at},"event":"merged","pr":{pr},"batch":"b0","commit":"abc1234","submitted_ms":1{title}}}"#
+        )
+    };
+    let bounced =
+        r#"{"at_ms":15,"event":"bounced","pr":2,"batch":null,"reason":"conflict","attempts":1}"#;
+    let lines = [
+        merged(1, 10, ""),
+        bounced.to_owned(),
+        merged(2, 20, "fix: two"),
+    ];
+    fs::write(dir.join("history.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let at_hub = status(hub, &[]);
+    let at_pc = status(pc, &[]);
+
+    assert_eq!(at_pc["batch"]["steps"], serde_json::json!(["fmt", "test"]));
+    assert_eq!(at_pc["recent_merged"], at_hub["recent_merged"]);
+    let shown = at_pc["recent_merged"].as_array().unwrap();
+    assert_eq!(shown.len(), 2);
+    assert_eq!(shown[0]["pr"], 2);
+    assert_eq!(shown[0]["title"], "fix: two");
+    assert_eq!(shown[0]["bounces"], 1);
+    assert_eq!(shown[1]["title"], Value::Null);
+}
+
+#[test]
 fn what_the_pc_prints_reads_as_the_status_type() {
     let net = net();
     let text = ok(&net.node("pc").chute(BIN, &["status", "--json"]));

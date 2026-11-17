@@ -410,6 +410,7 @@ impl Engine {
                     batch: id_for_events.clone(),
                     commit: commit.clone(),
                     submitted_ms: item.submitted_ms,
+                    title: Some(item.title.clone()),
                 })?;
                 newly_merged.push((item, commit, at));
                 merged_prs.push(item.pr);
@@ -657,6 +658,7 @@ impl Engine {
                     prs: prs.clone(),
                     phase: Phase::Building,
                     step: None,
+                    steps: Vec::new(),
                     round: 0,
                     started_ms: EpochMs::now(),
                     waiting_machine: false,
@@ -998,6 +1000,7 @@ impl Run<'_> {
                     batch: self.id().clone(),
                     commit: commit.clone(),
                     submitted_ms: item.submitted_ms,
+                    title: Some(item.title.clone()),
                 })?;
                 self.engine
                     .store
@@ -1522,9 +1525,11 @@ impl Run<'_> {
         }
         self.record.verifications += 1;
         let round = self.record.verifications;
+        let steps = self.config.steps_for(changed.as_deref());
         self.update_batch(|b| {
             b.round = round;
             b.step = None;
+            b.steps = steps.clone();
             b.reused = None;
             b.phase = if b.phase == Phase::Building {
                 Phase::Verifying
@@ -1706,6 +1711,7 @@ impl Run<'_> {
                 batch: self.id().clone(),
                 commit: commits.get(pr).unwrap_or(&item.head).clone(),
                 submitted_ms: item.submitted_ms,
+                title: Some(item.title.clone()),
             })?);
         }
         let resumes = self.repairing && pushed;
@@ -1967,6 +1973,7 @@ impl Run<'_> {
                         batch: self.id().clone(),
                         commit: held.head.clone(),
                         submitted_ms: held.submitted_ms,
+                        title: Some(held.title.clone()),
                     })?;
                     engine.store.update(|s| Ok(queue::merged(s, pr)?))?;
                     engine.tell_merged(&held, self.id(), &held.head, at);

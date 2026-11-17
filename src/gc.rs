@@ -685,6 +685,7 @@ mod tests {
                     prs: vec![pr(1)],
                     phase: Phase::Verifying,
                     step: None,
+                    steps: Vec::new(),
                     round: 1,
                     started_ms: EpochMs(1),
                     waiting_machine: false,
