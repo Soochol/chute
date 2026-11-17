@@ -594,14 +594,6 @@ mod tests {
         );
     }
 
-    struct Release(PathBuf);
-
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _ = File::create(&self.0);
-        }
-    }
-
     fn held_pipes() -> Vec<String> {
         std::fs::read_dir("/proc/self/fd")
             .unwrap()
@@ -611,13 +603,12 @@ mod tests {
             .collect()
     }
 
-    fn escaped_grandchild_script(ids: &Path, release: &Path) -> String {
+    fn escaped_grandchild_script(ids: &Path) -> String {
         format!(
             "setsid sh -c \"readlink /proc/\\$\\$/fd/1 /proc/\\$\\$/fd/2 > '{ids}.tmp'; \
              mv '{ids}.tmp' '{ids}'; \
-             i=0; while [ ! -e '{release}' ] && [ \\$i -lt 6000 ]; do i=\\$((i+1)); sleep 0.05; done\" &\nsleep 300\n",
-            ids = ids.display(),
-            release = release.display()
+             i=0; while [ -e '{ids}' ] && [ \\$i -lt 6000 ]; do i=\\$((i+1)); sleep 0.05; done\" &\nsleep 300\n",
+            ids = ids.display()
         )
     }
 
@@ -625,8 +616,7 @@ mod tests {
     fn pipes_close_after_a_timeout_even_for_an_escaped_grandchild() {
         let sb = Sandbox::new();
         let ids = sb.root().join("pipe-ids");
-        let release = Release(sb.root().join("release"));
-        let gh = sb.script("escape-gh", &escaped_grandchild_script(&ids, &release.0));
+        let gh = sb.script("escape-gh", &escaped_grandchild_script(&ids));
         let clock = Clock::frozen();
         let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()))
             .with_clock(clock.clone());
@@ -656,7 +646,6 @@ mod tests {
                 "시간 초과 뒤에도 {pipe}가 열려 있다: {held:?}"
             );
         }
-        drop(release);
     }
 
     #[test]
