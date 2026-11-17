@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -u
+
+usage() {
+  cat <<'EOF'
+사용법: scripts/stress [--hogs N] [--jobs M] [--rounds R] <cargo test 인수> [-- <시험 바이너리 인수>]
+
+바쁜 루프(hog) N개를 띄워 CPU를 채운 채, 시험 바이너리를 동시에 M개씩 R라운드 돌려
+"몇 회 중 몇 회 실패"와 실패한 시험 이름별 횟수를 낸다. 흔들리는 시험을 재현하고,
+고친 뒤 부하 속 반복 통과 횟수를 남길 때 쓴다.
+
+옵션:
+  --hogs N     바쁜 루프 수 (기본: nproc의 1.25배, 0이면 부하 없음)
+  --jobs M     바이너리마다 동시에 돌리는 수 (기본: nproc의 절반, 최소 1)
+  --rounds R   라운드 수 (기본: 8)
+  -h, --help   이 도움말
+
+--hogs, --jobs, --rounds 말고 `--` 앞의 인수는 `cargo test --no-run`에 그대로 넘겨
+빌드할 시험 바이너리를 정한다(cargo 자신의 --jobs는 쓸 수 없다). `--` 뒤의 인수는
+시험 바이너리에 그대로 넘긴다. 빌드는 한 번만 하고 반복은 바이너리를 직접 띄운다.
+바이너리가 여럿이면 라운드마다 모두 돌고, 총 횟수는 라운드 × 동시 수 × 바이너리 수다.
+
+예:
+  scripts/stress --test daemon -- --exact a_stop_request_made_after_the_daemon_started_is_kept
+  scripts/stress --lib -- env::tests
+
+각 실행의 출력은 ${TMPDIR:-/tmp}/chute-stress-XXXXXX 아래 파일로 남는다.
+종료 코드: 0 = 전부 통과, 1 = 한 번이라도 실패, 2 = 인수 오류나 빌드 실패,
+130·143 = INT·TERM으로 중단.
+EOF
+}
+
+die() {
+  echo "stress: $*" >&2
+  exit 2
+}
+
+cores=$(nproc)
+hogs=$((cores * 5 / 4))
+jobs=$((cores / 2))
+((jobs < 1)) && jobs=1
+rounds=8
+cargo_args=()
+bin_args=()
+
+number_arg() {
+  local name=$1 value=$2 min=$3
+  [[ $value =~ ^[0-9]{1,9}$ ]] && ((10#$value >= min)) || die "$name에는 $min 이상의 정수를 준다: '$value'"
+}
+
+while (($#)); do
+  case $1 in
+    -h | --help) usage; exit 0 ;;
+    --hogs | --jobs | --rounds)
+      (($# >= 2)) || die "$1에 값이 없다"
+      name=${1#--}
+      printf -v "${name}" '%s' "$2"
+      shift 2
+      ;;
+    --hogs=* | --jobs=* | --rounds=*)
+      name=${1%%=*}
+      name=${name#--}
+      printf -v "${name}" '%s' "${1#*=}"
+      shift
+      ;;
+    --)
+      shift
+      bin_args=("$@")
+      break
+      ;;
+    *)
+      cargo_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+number_arg --hogs "$hogs" 0
+number_arg --jobs "$jobs" 1
+number_arg --rounds "$rounds" 1
+hogs=$((10#$hogs))
+jobs=$((10#$jobs))
+rounds=$((10#$rounds))
+command -v jq >/dev/null || die "jq가 필요하다"
+
+hog_pid=
+test_pids=()
+
+kill_session() {
+  pkill -"$1" -s "$2" 2>/dev/null
+}
+
+cleanup() {
+  trap - EXIT INT TERM
+  local pid
+  for pid in "${test_pids[@]}" ${hog_pid:+"$hog_pid"}; do
+    kill_session TERM "$pid"
+  done
+  sleep 0.2
+  for pid in "${test_pids[@]}" ${hog_pid:+"$hog_pid"}; do
+    kill_session KILL "$pid"
+  done
+  wait 2>/dev/null
+}
+
+trap cleanup EXIT
+trap 'echo "stress: INT를 받아 중단한다" >&2; exit 130' INT
+trap 'echo "stress: TERM을 받아 중단한다" >&2; exit 143' TERM
+
+log_dir=$(mktemp -d "${TMPDIR:-/tmp}/chute-stress-XXXXXX") || die "로그 폴더를 만들 수 없다"
+head_sha=$(git rev-parse HEAD 2>/dev/null || echo "알 수 없음")
+if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
+  head_sha+=" (커밋 안 된 변경 있음)"
+fi
+
+echo "stress: 시험 바이너리를 빌드한다 (로그 폴더 $log_dir)" >&2
+cargo test --no-run --message-format=json-render-diagnostics "${cargo_args[@]}" \
+  >"$log_dir/build.json" || die "cargo test --no-run이 실패했다"
+mapfile -t binaries < <(
+  jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' \
+    "$log_dir/build.json" | sort -u
+)
+((${#binaries[@]})) || die "실행할 시험 바이너리가 없다"
+
+load_start=$(cut -d' ' -f1-3 /proc/loadavg)
+
+if ((hogs > 0)); then
+  setsid bash -c '
+    parent=$1
+    for ((i = 0; i < $2; i++)); do
+      (
+        n=0
+        while :; do
+          ((++n % 200000)) || kill -0 "$parent" 2>/dev/null || exit
+        done
+      ) &
+    done
+    wait
+  ' hog "$$" "$hogs" &
+  hog_pid=$!
+fi
+
+echo "stress: hog $hogs개, 동시 $jobs개, $rounds라운드, 바이너리 ${#binaries[@]}개" >&2
+
+total=0
+failed_runs=0
+for ((round = 1; round <= rounds; round++)); do
+  for bin in "${binaries[@]}"; do
+    test_pids=()
+    run_logs=()
+    for ((job = 1; job <= jobs; job++)); do
+      log="$log_dir/r$round-$(basename "$bin")-j$job.log"
+      setsid "$bin" "${bin_args[@]}" >"$log" 2>&1 &
+      test_pids+=("$!")
+      run_logs+=("$log")
+    done
+    for i in "${!test_pids[@]}"; do
+      total=$((total + 1))
+      wait "${test_pids[$i]}"
+      code=$?
+      kill_session KILL "${test_pids[$i]}"
+      if ((code != 0)); then
+        failed_runs=$((failed_runs + 1))
+        echo "$code" >"${run_logs[$i]}.exit"
+      fi
+    done
+    test_pids=()
+  done
+done
+
+load_end=$(cut -d' ' -f1-3 /proc/loadavg)
+cleanup
+
+failed_line_re='test [^ ]* \.\.\. FAILED'
+failed_names=$(cat "$log_dir"/*.log 2>/dev/null |
+  grep -o "$failed_line_re" | awk '{print $2}' | sort | uniq -c | sort -rn)
+unnamed=0
+for exit_file in "$log_dir"/*.exit; do
+  [[ -e $exit_file ]] || continue
+  grep -q "$failed_line_re" "${exit_file%.exit}" || unnamed=$((unnamed + 1))
+done
+
+echo
+echo "== stress 요약 =="
+echo "HEAD: $head_sha"
+echo "nproc: $cores"
+echo "load average: 시작 $load_start / 끝 $load_end"
+echo "hog $hogs개, 동시 $jobs개, $rounds라운드, 바이너리 ${#binaries[@]}개"
+echo "총 $total회 중 $failed_runs회 실패"
+if [[ -n $failed_names ]]; then
+  echo "실패한 시험:"
+  while read -r count name; do
+    echo "  $name: $count회"
+  done <<<"$failed_names"
+fi
+((unnamed > 0)) && echo "시험 이름을 뽑지 못한 실패: $unnamed회 (충돌, 신호, 또는 -q 같은 출력 형식. 로그의 .exit 파일에 종료 코드)"
+echo "로그 폴더: $log_dir"
+
+((failed_runs == 0))
+status=$?
+exit $status
