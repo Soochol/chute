@@ -7,13 +7,15 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+
+use crate::clock::Clock;
 
 const HERDR_APP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -119,6 +121,7 @@ pub struct Ext {
     hc: PathBuf,
     herdr_app: PathBuf,
     timeout: Duration,
+    clock: Clock,
 }
 
 impl Ext {
@@ -141,11 +144,17 @@ impl Ext {
             hc: program(Tool::Hc),
             herdr_app: program(Tool::HerdrApp),
             timeout: Ext::DEFAULT_TIMEOUT,
+            clock: Clock::System,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Ext {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_clock(mut self, clock: Clock) -> Ext {
+        self.clock = clock;
         self
     }
 
@@ -267,7 +276,7 @@ impl Ext {
                 let _ = stdin.write_all(&input);
             });
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = self.clock.now() + timeout;
         let io_error = |call: String| move |source| ExtError::Io { call, source };
         let mut pipes = [
             Pipe::new(child.stdout.take().map(OwnedFd::from)).map_err(io_error(call.clone()))?,
@@ -280,10 +289,10 @@ impl Ext {
             if exited.is_none() {
                 exited = child.try_wait().map_err(io_error(call.clone()))?;
                 if exited.is_some() {
-                    grace_end = Instant::now() + PIPE_GRACE;
+                    grace_end = self.clock.now() + PIPE_GRACE;
                 }
             }
-            let now = Instant::now();
+            let now = self.clock.now();
             let limit = match exited {
                 Some(_) if pipes.iter().all(Pipe::is_closed) || now >= grace_end => break,
                 Some(_) => grace_end,
@@ -452,6 +461,8 @@ fn kill_group(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::testkit::{Reply, Sandbox};
 
@@ -543,8 +554,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    fn wait_for(path: &Path) -> bool {
-        let until = Instant::now() + Duration::from_secs(5);
+    const STUCK: Duration = Duration::from_secs(30);
+
+    fn wait_for(path: &Path, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
         while Instant::now() < until {
             if path.exists() {
                 return true;
@@ -575,23 +588,75 @@ mod tests {
             .call(Tool::Hc, None, ["run"], Duration::from_secs(5))
             .unwrap();
         assert_eq!(out.stdout_text(), "started\n");
-        assert!(wait_for(&mark), "호출이 끝난 뒤에도 파이프가 열려 있다");
+        assert!(
+            wait_for(&mark, Duration::from_secs(5)),
+            "호출이 끝난 뒤에도 파이프가 열려 있다"
+        );
+    }
+
+    struct Release(PathBuf);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = File::create(&self.0);
+        }
+    }
+
+    fn held_pipes() -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|target| target.to_string_lossy().into_owned())
+            .filter(|target| target.starts_with("pipe:["))
+            .collect()
+    }
+
+    fn escaped_grandchild_script(ids: &Path, release: &Path) -> String {
+        format!(
+            "setsid sh -c \"readlink /proc/\\$\\$/fd/1 /proc/\\$\\$/fd/2 > '{ids}.tmp'; \
+             mv '{ids}.tmp' '{ids}'; \
+             i=0; while [ ! -e '{release}' ] && [ \\$i -lt 600 ]; do i=\\$((i+1)); sleep 0.05; done\" &\nsleep 30\n",
+            ids = ids.display(),
+            release = release.display()
+        )
     }
 
     #[test]
     fn pipes_close_after_a_timeout_even_for_an_escaped_grandchild() {
         let sb = Sandbox::new();
-        let mark = sb.root().join("pipe-closed");
-        let gh = sb.script(
-            "escape-gh",
-            &format!("setsid {} &\nsleep 30\n", late_writer(&mark)),
+        let ids = sb.root().join("pipe-ids");
+        let release = Release(sb.root().join("release"));
+        let gh = sb.script("escape-gh", &escaped_grandchild_script(&ids, &release.0));
+        let clock = Clock::frozen();
+        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()))
+            .with_clock(clock.clone());
+        let (escaped, result) = thread::scope(|s| {
+            let call =
+                s.spawn(|| ext.call(Tool::Gh, None, ["pr", "view"], Duration::from_millis(200)));
+            let escaped = wait_for(&ids, STUCK);
+            clock.advance(Duration::from_secs(1));
+            (escaped, call.join().unwrap())
+        });
+        assert!(escaped, "손자가 그룹을 벗어나지 못했다");
+        assert!(
+            matches!(result, Err(ExtError::Timeout { .. })),
+            "{result:?}"
         );
-        let ext = Ext::from_vars(|k| (k == "CHUTE_GH").then(|| gh.clone().into()));
-        let err = ext
-            .call(Tool::Gh, None, ["pr", "view"], Duration::from_millis(200))
-            .unwrap_err();
-        assert!(matches!(err, ExtError::Timeout { .. }), "{err}");
-        assert!(wait_for(&mark), "시간 초과 뒤에도 파이프가 열려 있다");
+
+        let grandchild_pipes: Vec<String> = std::fs::read_to_string(&ids)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(grandchild_pipes.len(), 2, "{grandchild_pipes:?}");
+        let held = held_pipes();
+        for pipe in &grandchild_pipes {
+            assert!(
+                !held.contains(pipe),
+                "시간 초과 뒤에도 {pipe}가 열려 있다: {held:?}"
+            );
+        }
+        drop(release);
     }
 
     #[test]

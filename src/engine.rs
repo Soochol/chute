@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 
 use crate::ci::{self, Verdict as CiVerdict};
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::env::{self, EnvSection};
 use crate::ext::Ext;
@@ -40,31 +41,6 @@ const SLOT_LOCK_TRIES: u32 = 40;
 const SLOT_LOCK_PAUSE: Duration = Duration::from_millis(50);
 pub const VERIFIED_BASES_KEPT: usize = 100;
 const NO_CHECKS_WARNING_AFTER_MS: u64 = 10 * 60 * 1000;
-
-#[derive(Clone, Debug)]
-pub enum Clock {
-    System,
-    Frozen(Arc<Mutex<Instant>>),
-}
-
-impl Clock {
-    pub fn frozen() -> Clock {
-        Clock::Frozen(Arc::new(Mutex::new(Instant::now())))
-    }
-
-    pub fn advance(&self, by: Duration) {
-        if let Clock::Frozen(now) = self {
-            *now.lock().unwrap_or_else(|e| e.into_inner()) += by;
-        }
-    }
-
-    fn now(&self) -> Instant {
-        match self {
-            Clock::System => Instant::now(),
-            Clock::Frozen(now) => *now.lock().unwrap_or_else(|e| e.into_inner()),
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Timing {

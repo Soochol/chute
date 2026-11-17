@@ -3,7 +3,8 @@ mod support;
 
 use std::time::Duration;
 
-use chute::engine::{Clock, Pass, Summary};
+use chute::clock::Clock;
+use chute::engine::{Pass, Summary};
 use chute::model::{
     Approval, BounceReason, EpochMs, Failure, ItemState, PrNumber, QueuedReason, WarningKind,
 };
