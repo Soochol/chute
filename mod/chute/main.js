@@ -26,6 +26,7 @@ import {
   interpret,
   needsClock,
   pollInterval,
+  toneToken,
 } from "./board.js";
 
 const TICK_MS = 1000;
@@ -58,9 +59,7 @@ const recall = (key) => {
   }
 };
 
-// The one place that turns a meaning into a theme token.
-const toneColor = (name, t) =>
-  ({ ok: t.done, working: t.working, human: t.blocked, error: t.ansi1, warn: t.ansi3, waiting: t.muted }[name] ?? t.dim);
+const toneColor = (name, t) => t[toneToken(name)];
 
 // The layout node that holds a copy of this mod, as `layout()` reports it. Null when there is not exactly one.
 function ownNodeId() {
@@ -219,7 +218,7 @@ export default class Chute extends View {
         const r = (await exec(this.bin, action.args)) ?? {};
         if (r.code !== 0) text = failureText(r);
       } catch (e) {
-        text = causeText(e) || "명령을 실행하지 못했다";
+        text = causeText(e) || "Couldn't run the command";
       }
       if (text) this.errors.set(card.key, { text, state: card.state });
       this.busy.delete(card.key);
@@ -260,7 +259,7 @@ export default class Chute extends View {
     cx.spawn(async (cx) => {
       try {
         const text = await readTextFile(this.file.file, { on: this.file.on ?? null });
-        if (text === null) this.fileError = "파일이 없다";
+        if (text === null) this.fileError = "File not found";
         else {
           let value = text;
           if (text.length > MAX_VIEW_CHARS) {
@@ -280,7 +279,7 @@ export default class Chute extends View {
           });
         }
       } catch (e) {
-        this.fileError = `파일을 읽지 못했다: ${causeText(e) || "알 수 없는 오류"}`;
+        this.fileError = `Couldn't read file: ${causeText(e) || "unknown error"}`;
       }
       cx.notify();
     });
@@ -314,7 +313,7 @@ export default class Chute extends View {
   }
 
   fileView(frame, t) {
-    const close = iconButton("chute-file-close", "닫기", t, () => this.overlay && closeOverlay(this.overlay));
+    const close = iconButton("chute-file-close", "Close", t, () => this.overlay && closeOverlay(this.overlay));
     return frame
       .child(
         h_flex()
@@ -327,7 +326,7 @@ export default class Chute extends View {
           .border_color(t.border)
           .child(div().flex_1().min_w(0).truncate().font_semibold().child(this.file.title || fileName(this.file.file)))
           .when(Boolean(this.cut), (el) =>
-            el.child(div().flex_none().text_size(11).text_color(t.ansi3).child(`앞 ${this.cut}자는 잘랐다`)),
+            el.child(div().flex_none().text_size(11).text_color(t.ansi3).child(`First ${this.cut} characters cut`)),
           )
           .child(close),
       )
@@ -339,7 +338,7 @@ export default class Chute extends View {
               .text_size(12)
               .text_color(this.fileError ? t.ansi1 : t.dim)
               .whitespace_normal()
-              .child(this.fileError || "불러오는 중"),
+              .child(this.fileError || "Loading"),
       );
   }
 
@@ -358,7 +357,7 @@ export default class Chute extends View {
         const panel = ownNodeId();
         return panel
           ? el.child(
-              iconButton("chute-dock", "패널 열기", t, () => {
+              iconButton("chute-dock", "Open panel", t, () => {
                 run("layout.show", { id: panel });
                 closeOverlay(this.overlay);
               }),
@@ -367,20 +366,20 @@ export default class Chute extends View {
       })
       .when(this.overlay === null, (el) =>
         el.child(
-          iconButton("chute-fold", this.folded ? "▸" : "▾", t, (cx) => this.fold(cx), this.folded ? "펼치기" : "접기"),
+          iconButton("chute-fold", this.folded ? "▸" : "▾", t, (cx) => this.fold(cx), this.folded ? "Expand" : "Collapse"),
         ),
       )
       .when(node !== null, (el) =>
-        el.child(iconButton("chute-close", "✕", t, () => run("layout.hide", { id: node }), "닫기")),
+        el.child(iconButton("chute-close", "✕", t, () => run("layout.hide", { id: node }), "Close")),
       )
       .when(this.overlay !== null, (el) =>
-        el.child(iconButton("chute-overlay-close", "닫기", t, () => closeOverlay(this.overlay))),
+        el.child(iconButton("chute-overlay-close", "Close", t, () => closeOverlay(this.overlay))),
       );
   }
 
   bodyOf(body, t) {
     if (body.kind === "loading") {
-      return [h_flex().gap(8).text_color(t.dim).child(div().frames(SPINNER, 90)).child("불러오는 중")];
+      return [h_flex().gap(8).text_color(t.dim).child(div().frames(SPINNER, 90)).child("Loading")];
     }
     if (body.kind !== "board") return [notice(body, t)];
     const repos = body.repos.map((repo) => (this.folded ? foldedRepo(repo, t) : this.repoView(repo, t)));
@@ -403,7 +402,7 @@ export default class Chute extends View {
                 .when(Boolean(repo.hub.error), (box) =>
                   box.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(repo.hub.error)),
                 )
-                .child(div().text_size(12).text_color(t.dim).child(`${REMOTE_POLL_MS / 1000}초마다 다시 읽는다`)),
+                .child(div().text_size(12).text_color(t.dim).child(`Retrying every ${REMOTE_POLL_MS / 1000}s`)),
             ),
           ),
       )
@@ -495,7 +494,7 @@ export default class Chute extends View {
           .gap(8)
           .items_start()
           .child(agentChip(card.agent, t, card.key))
-          .child(div().flex_none().text_size(12).text_color(t.dim).child(`재시도 ${card.retries}`)),
+          .child(div().flex_none().text_size(12).text_color(t.dim).child(`Retries ${card.retries}`)),
       )
       .when(Boolean(card.report), (el) =>
         el.child(
@@ -526,7 +525,7 @@ export default class Chute extends View {
   }
 
   bouncedRow(repo, card, t) {
-    const who = card.agent ? card.agent.label : "에이전트 없음";
+    const who = card.agent ? card.agent.label : "No agent";
     const row = card.report
       ? linkRow(`bounced-${card.key}`, t, () => this.openFile(card.report, repo.hub.machine))
       : h_flex().id(`bounced-${card.key}`).px(6).py(4).gap(8);
@@ -541,7 +540,7 @@ export default class Chute extends View {
             h_flex()
               .gap(6)
               .items_baseline()
-              .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${card.pr}`))
+              .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${card.pr}`))
               .child(div().flex_1().min_w(0).truncate().child(card.title))
               .child(div().flex_none().text_size(12).text_color(t.ansi1).child(card.headline)),
           )
@@ -550,7 +549,7 @@ export default class Chute extends View {
               .text_size(11)
               .text_color(t.dim)
               .truncate()
-              .child(`${who} · 재시도 ${card.retries}`),
+              .child(`${who} · Retries ${card.retries}`),
           ),
       )
       .when(Boolean(card.report), (el) => el.child(chevron(t)));
@@ -559,13 +558,15 @@ export default class Chute extends View {
   recentView(repo, t) {
     return v_flex()
       .gap(4)
-      .child(sectionTitle("최근 머지", null, t))
+      .child(sectionTitle("Recently merged", null, t))
       .children(
         repo.recent.map((m, i) => {
           const body = [
-            div().w(26).flex_none().text_color(t.accent).font_semibold().child(`#${m.pr}`),
-            div().flex_1().min_w(0).truncate().child(m.title || "제목 없음").text_color(m.title ? t.foreground : t.dim),
-            m.bounces > 0 ? div().flex_none().text_size(11).text_color(t.dim).child(`반송 ${m.bounces}`) : null,
+            div().flex_none().min_w(32).whitespace_nowrap().text_color(t.accent).font_semibold().child(`#${m.pr}`),
+            div().flex_1().min_w(0).truncate().child(m.title),
+            m.bounces > 0
+              ? div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`)
+              : null,
             div().flex_none().min_w(44).text_right().text_size(11).text_color(t.dim).child(m.ago),
           ].filter(Boolean);
           if (!m.url) return h_flex().id(`merged-${repo.id}-${i}`).px(6).py(4).gap(8).items_baseline().children(body);
@@ -585,7 +586,7 @@ export default class Chute extends View {
       .child(
         linkRow(`today-${repo.id}`, t, (cx) => this.toggleToday(repo, cx))
           .items_baseline()
-          .child(div().flex_none().text_size(11).font_semibold().text_color(t.muted).child("오늘"))
+          .child(div().flex_none().text_size(11).font_semibold().text_color(t.muted).child("Today"))
           .child(div().flex_1().min_w(0).truncate().text_size(12).child(today.line))
           .child(chevron(t, open ? "⌄" : "›")),
       )
@@ -632,7 +633,7 @@ export default class Chute extends View {
       .when(running !== undefined, (el) => el.opacity(0.5))
       .hover((s) => s.bg(primary ? t.solid : t.hover))
       .on_click((_e, cx) => this.act(card, action, cx))
-      .child(running === action.verb ? "처리 중…" : action.label);
+      .child(running === action.verb ? "Working…" : action.label);
   }
 }
 
@@ -710,7 +711,7 @@ function repoHead(repo, t) {
         .child(repo.name),
     )
     .child(div().flex_1())
-    .when(!repo.hub.local, (el) => el.child(chip(`허브 ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1)));
+    .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1)));
 }
 
 function statusLine(status, t) {
@@ -719,7 +720,7 @@ function statusLine(status, t) {
     .gap(8)
     .items_center()
     .child(dot(color))
-    .child(div().flex_1().min_w(0).whitespace_normal().text_color(status.tone === "waiting" ? t.muted : color).child(status.text));
+    .child(div().flex_1().min_w(0).whitespace_normal().text_color(status.tone === "waiting" ? t.muted : status.tone === "ok" ? t.foreground : color).child(status.text));
 }
 
 function foldedRepo(repo, t) {
@@ -764,12 +765,12 @@ function titleLine(card, t) {
   return h_flex()
     .gap(6)
     .items_start()
-    .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${card.pr}`))
+    .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${card.pr}`))
     .child(div().flex_1().min_w(0).whitespace_normal().child(card.title));
 }
 
 function agentChip(agent, t, cardKey) {
-  if (!agent) return div().flex_1().min_w(0).text_size(12).text_color(t.dim).child("에이전트 없음");
+  if (!agent) return div().flex_1().min_w(0).text_size(12).text_color(t.dim).child("No agent");
   const label = h_flex()
     .flex_1()
     .min_w(0)
@@ -783,7 +784,7 @@ function agentChip(agent, t, cardKey) {
         .whitespace_normal()
         .text_size(12)
         .text_color(agent.alive ? t.foreground : t.dim)
-        .child(agent.alive ? agent.label : `${agent.label} · 종료됨`),
+        .child(agent.alive ? agent.label : `${agent.label} · exited`),
     )
     .when(Boolean(agent.host), (el) => el.child(chip(agent.host, t.muted)));
   if (!agent.alive) return label;
@@ -800,7 +801,7 @@ function submitterLine(submitter, t) {
 }
 
 function batchView(batch, t) {
-  const step = batch.waitingMachine ? "PC 자리를 기다리는 중" : batch.stepText ?? batch.phase ?? "검증 중";
+  const step = batch.waitingMachine ? "Waiting for a slot" : batch.stepText ?? batch.phase ?? "Verifying";
   const facts = [batch.round, batch.reused].filter(Boolean);
   return v_flex()
     .gap(6)
@@ -810,7 +811,7 @@ function batchView(batch, t) {
         .px(6)
         .items_center()
         .child(div().text_color(t.working).child("").frames(SPINNER, 90))
-        .child(div().text_size(11).font_semibold().text_color(t.muted).child("지금 batch"))
+        .child(div().text_size(11).font_semibold().text_color(t.muted).child("Current batch"))
         .child(div().flex_1())
         .when(Boolean(batch.elapsed), (el) =>
           el.child(div().min_w(48).text_right().text_size(12).text_color(t.foreground).child(batch.elapsed)),
@@ -825,7 +826,7 @@ function batchView(batch, t) {
             h_flex()
               .gap(6)
               .items_start()
-              .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
+              .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
               .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title)),
           )
           .when(entry.marks.length > 0, (el) =>
@@ -850,7 +851,7 @@ function batchView(batch, t) {
         .px(6)
         .items_baseline()
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.working).child(step))
-        .when(batch.longer, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi3).child("평소보다 길다")))
+        .when(batch.longer, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi3).child("Slower than usual")))
         .when(Boolean(batch.usual), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(batch.usual))),
     )
     .when(facts.length > 0, (el) =>
@@ -871,15 +872,16 @@ function postVerifyView(post, t) {
   const run = post.run;
   return v_flex()
     .gap(2)
-    .child(sectionTitle("머지 뒤 검사", null, t))
-    .when(Boolean(post.green), (el) => el.child(row("✓", t.done, `${post.green.commit} 통과`, post.green.ago)))
+    .child(sectionTitle("Post-merge check", null, t))
+    .when(Boolean(post.green), (el) => el.child(row("✓", t[toneToken("ok")], `${post.green.commit} passed`, post.green.ago)))
     .when(Boolean(run), (el) =>
       el.child(
         row(
           "◌",
           t.working,
           run.waitingMachine
-            ? `${run.commit} PC 자리 기다리는 중`
+            ? `${run.commit} waiting for a slot`
+
             : `${run.commit} ${run.label}${run.step ? ` · ${run.step}` : ""}`,
           run.elapsed,
         ),
@@ -892,7 +894,7 @@ function numberedTitle(prefix, item, t) {
     .gap(6)
     .items_start()
     .when(prefix != null, (el) => el.child(div().w(18).flex_none().text_right().text_color(t.dim).child(String(prefix))))
-    .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${item.pr}`))
+    .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${item.pr}`))
     .child(div().flex_1().min_w(0).whitespace_normal().child(item.title));
 }
 
@@ -911,7 +913,7 @@ function waitingRow(item, t) {
         .gap(6)
         .items_baseline()
         .child(div().w(18).flex_none().text_right().text_size(12).text_color(t.dim).child(String(item.position)))
-        .child(div().flex_none().font_semibold().text_color(t.accent).child(`#${item.pr}`))
+        .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${item.pr}`))
         .child(div().flex_1().min_w(0).truncate().child(item.title))
         .children(tags.map((tag) => div().flex_none().text_size(11).text_color(tag.color).child(tag.text))),
     )

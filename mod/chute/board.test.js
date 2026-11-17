@@ -15,6 +15,7 @@ import {
   needsClock,
   pollInterval,
   pullUrl,
+  toneToken,
   usualSeconds,
 } from "./board.js";
 
@@ -40,7 +41,7 @@ test("every fixture item lands in one of the six sections", () => {
   assert.equal(result.kind, "board");
   const repo = result.repos[0];
   assert.deepEqual(repo.sections.map((s) => s.id), ["alerts", "human", "batch", "waiting", "bounced"]);
-  assert.deepEqual(repo.sections.map((s) => s.title), ["멈춤·경고", "사람 차례", "검증 중", "대기", "반송"]);
+  assert.deepEqual(repo.sections.map((s) => s.title), ["Alerts", "Needs you", "Verifying", "Queued", "Bounced"]);
   assert.deepEqual(prs(section(repo, "human")), [9, 10, 11, 21]);
   assert.deepEqual(section(repo, "batch").items[0].prs.map((p) => p.pr), [12, 13]);
   assert.deepEqual(prs(section(repo, "waiting")), [19, 20, 22, 23, 24]);
@@ -74,15 +75,15 @@ test("every state and reason in the fixture is covered", () => {
     ["human", "bounced"].flatMap((id) => section(repo, id).items.map((item) => [item.pr, item.reason])),
   );
   assert.deepEqual(reasons, {
-    9: "재시도 예산을 다 썼다",
-    10: "에이전트에게 전달하지 못했다",
-    11: "에이전트가 포기를 선언했다",
-    21: "승인 대기",
-    15: "검증 실패",
-    14: "충돌",
-    16: "시간 초과",
-    18: "CI 실패",
-    17: "HEAD 변경",
+    9: "Out of retries",
+    10: "Couldn't reach the agent",
+    11: "Agent gave up",
+    21: "Awaiting approval",
+    15: "Verification failed",
+    14: "Conflict",
+    16: "Timed out",
+    18: "CI failed",
+    17: "HEAD changed",
   });
 });
 
@@ -91,10 +92,10 @@ test("buttons: approve and drop on awaiting approval, retry and drop on needs_hu
   const buttons = (id) =>
     Object.fromEntries(section(repo, id).items.map((item) => [item.pr, item.actions.map((a) => a.label)]));
   assert.deepEqual(buttons("human"), {
-    9: ["다시 시도", "빼기"],
-    10: ["다시 시도", "빼기"],
-    11: ["다시 시도", "빼기"],
-    21: ["승인", "빼기"],
+    9: ["Retry", "Drop"],
+    10: ["Retry", "Drop"],
+    11: ["Retry", "Drop"],
+    21: ["Approve", "Drop"],
   });
   for (const id of ["bounced", "waiting"]) {
     for (const item of section(repo, id).items) assert.equal(item.actions?.length ?? 0, 0, `#${item.pr}`);
@@ -122,7 +123,7 @@ test("an awaiting item whose head is missing or unsafe gets no approve button, o
   for (const head of unsafe) {
     const item = section(only(withQueue({ ...itemOf(21), head })), "human").items[0];
     assert.deepEqual(item.actions.map((a) => a.verb), ["drop"], JSON.stringify(head));
-    assert.equal(item.approvalBlocked, "HEAD를 알 수 없어 승인할 수 없다", JSON.stringify(head));
+    assert.equal(item.approvalBlocked, "Can't approve: HEAD unknown", JSON.stringify(head));
   }
   for (const head of ["abcd", "a".repeat(64), "09e5678"]) {
     const item = section(only(withQueue({ ...itemOf(21), head })), "human").items[0];
@@ -162,10 +163,10 @@ test("blocked queue and warnings come first", () => {
   const alerts = section(repo, "alerts");
   assert.equal(repo.sections[0].id, "alerts");
   assert.equal(alerts.items[0].kind, "blocked");
-  assert.match(alerts.items[0].text, /멈췄다/);
-  assert.equal(alerts.items[0].detail, "기준 0a1b2c3 · 7분 12초 전부터");
+  assert.match(alerts.items[0].text, /Queue stopped/);
+  assert.equal(alerts.items[0].detail, "base 0a1b2c3 · for 7m 12s");
   assert.deepEqual(
-    alerts.items.filter((a) => a.kind === "warning").map((a) => a.text),
+    alerts.items.filter((a) => a.kind === "warning").map((a) => a.detail),
     fixture.warnings.map((w) => w.message),
   );
 });
@@ -180,7 +181,7 @@ test("a stopped daemon is announced in the first section", () => {
   assert.equal(repo.sections[0].id, "alerts");
   assert.equal(repo.sections[0].items.length, 1);
   assert.equal(repo.sections[0].items[0].kind, "daemon");
-  assert.match(repo.sections[0].items[0].text, /데몬이 꺼져/);
+  assert.match(repo.sections[0].items[0].text, /Daemon is off/);
 });
 
 test("a healthy repo has no alerts section", () => {
@@ -195,14 +196,14 @@ test("ci_pending is waiting for CI, a ci bounce is a CI failure", () => {
   const repo = only([fixture]);
   const waiting = section(repo, "waiting").items;
   assert.deepEqual(waiting.map((item) => [item.pr, item.label, item.ciPending]), [
-    [19, "CI 대기", true],
-    [20, "대기", false],
-    [22, "대기", false],
-    [23, "대기", false],
-    [24, "대기", false],
+    [19, "Waiting on CI", true],
+    [20, "Queued", false],
+    [22, "Queued", false],
+    [23, "Queued", false],
+    [24, "Queued", false],
   ]);
   const ci = section(repo, "bounced").items.find((item) => item.pr === 18);
-  assert.equal(ci.reason, "CI 실패");
+  assert.equal(ci.reason, "CI failed");
   assert.equal(ci.failure.summary, "GitHub check build 실패");
 });
 
@@ -219,10 +220,10 @@ test("batch shows members, phase, step, round and elapsed time", () => {
     { pr: 12, title: "큐 상태 전이 추가", marks: [], submitter: null },
     { pr: 13, title: "검증 실행기", marks: [], submitter: null },
   ]);
-  assert.equal(batch.phase, "검증 중");
+  assert.equal(batch.phase, "Verifying");
   assert.equal(batch.step, "test");
-  assert.equal(batch.round, "1번째 검증");
-  assert.equal(batch.elapsed, "5분 12초");
+  assert.equal(batch.round, "Round 1");
+  assert.equal(batch.elapsed, "5m 12s");
   assert.equal(batch.waitingMachine, false);
 });
 
@@ -234,7 +235,7 @@ test("batch shows that it waits for a free slot on this PC", () => {
 
 test("batch says which verification's pass it took over, and nothing when it ran its own", () => {
   const [reused] = section(only([fixture]), "batch").items;
-  assert.equal(reused.reused, "preflight의 통과 결과를 다시 씀");
+  assert.equal(reused.reused, "Reused preflight pass");
   const own = { ...fixture, batch: { ...fixture.batch, reused: null } };
   assert.equal(section(only([own]), "batch").items[0].reused, null);
   const unknown = { ...fixture, batch: { ...fixture.batch, reused: "elsewhere" } };
@@ -252,22 +253,22 @@ test("an in_batch item with no batch record is still shown", () => {
 
 test("awaiting approval shows the preflight result and whether chute.toml changed", () => {
   const item = section(only([fixture]), "human").items.find((i) => i.pr === 21);
-  assert.deepEqual([item.preflight.text, item.preflight.tone], ["preflight 통과", "ok"]);
-  assert.equal(item.config, "chute.toml 변경");
+  assert.deepEqual([item.preflight.text, item.preflight.tone], ["Preflight passed", "ok"]);
+  assert.equal(item.config, "chute.toml changed");
   assert.equal(item.configChanged, true);
 
   const data = withQueue({ ...itemOf(21), touches_config: false, preflight: { result: "fail", head: "21e5678" } });
   const plain = section(only(data), "human").items[0];
-  assert.deepEqual([plain.preflight.text, plain.preflight.tone], ["preflight 실패", "error"]);
-  assert.equal(plain.config, "chute.toml 변경 없음");
+  assert.deepEqual([plain.preflight.text, plain.preflight.tone], ["Preflight failed", "error"]);
+  assert.equal(plain.config, "chute.toml unchanged");
 
   const stale = section(only(withQueue({ ...itemOf(21), preflight: { result: "pass", head: "old0000" } })), "human").items[0];
-  assert.equal(stale.preflight.text, "preflight 통과 (이전 HEAD)");
+  assert.equal(stale.preflight.text, "Preflight passed (old HEAD)");
   assert.equal(stale.preflight.stale, true);
   assert.equal(stale.preflight.tone, "muted");
 
   const none = section(only(withQueue({ ...itemOf(21), preflight: null })), "human").items[0];
-  assert.equal(none.preflight.text, "preflight 없음");
+  assert.equal(none.preflight.text, "No preflight");
 });
 
 test("human cards carry reason, agent, retries and the last failure", () => {
@@ -285,32 +286,32 @@ test("human cards carry reason, agent, retries and the last failure", () => {
 test("bounced cards carry mode, summary, agent, retries and report path", () => {
   const items = section(only([fixture]), "bounced").items;
   const verify = items.find((i) => i.pr === 15);
-  assert.equal(verify.failure.mode, "단독");
+  assert.equal(verify.failure.mode, "Solo");
   assert.equal(verify.failure.summary, "test 단계 실패: feedback::tests::report_lists_partners");
   assert.equal(verify.failure.report, "/home/dev/.local/state/chute/repos/Soochol__chute/reports/pr-15/2.md");
   assert.equal(verify.retries, "2/3");
   assert.equal(verify.agent.label, "impl-d (t1rv)");
-  assert.equal(items.find((i) => i.pr === 16).failure.mode, "조합");
+  assert.equal(items.find((i) => i.pr === 16).failure.mode, "Combined");
   assert.equal(items.find((i) => i.pr === 14).failure.mode, null);
   const headChanged = items.find((i) => i.pr === 17);
   assert.equal(headChanged.failure, null);
-  assert.equal(headChanged.reason, "HEAD 변경");
+  assert.equal(headChanged.reason, "HEAD changed");
 });
 
 test("today is one line, and the expanded rows call the verify time a sum", () => {
   const today = only([fixture]).today;
-  assert.equal(today.line, "머지 7 · 반송 2 · 중앙값 6분 52초");
+  assert.equal(today.line, "7 merged · 2 bounced · median 6m 52s");
   assert.deepEqual(
     today.details.map((d) => [d.key, d.label, d.value, d.hint ?? null]),
     [
-      ["flaky", "flaky", "1", null],
-      ["batches", "batch", "3", null],
-      ["verify", "검증 시간 합계", "21분", "(batch 3개를 더한 시간)"],
+      ["flaky", "Flaky", "1", null],
+      ["batches", "Batches", "3", null],
+      ["verify", "Total verify time", "21m", "(sum of 3 batches)"],
     ],
   );
   const data = clone(fixture);
   data.today.median_lead_s = null;
-  assert.equal(only(data).today.line, "머지 7 · 반송 2 · 중앙값 —");
+  assert.equal(only(data).today.line, "7 merged · 2 bounced · median —");
   delete data.today;
   assert.equal(only(data).today, null);
 });
@@ -330,7 +331,7 @@ test("several repos from --all, and a single object", () => {
   const keys = result.repos.map((r) => section(r, "human").items[0].key);
   assert.equal(new Set(keys).size, 2, keys.join());
   assert.equal(result.repos[0].stateDir, fixture.repo.state_dir);
-  assert.equal(result.repos[0].approval, "에이전트 신뢰");
+  assert.equal(result.repos[0].approval, "Agent trusted");
 });
 
 test("no registered repos", () => {
@@ -354,14 +355,14 @@ test("a failing chute shows the first line of its error", () => {
   const result = interpret({ code: 1, stdout: "", stderr: "\n상태 파일이 깨졌다: state.json\n  원인: eof\n" }, NOW);
   assert.equal(result.kind, "failed");
   assert.equal(result.detail, "상태 파일이 깨졌다: state.json");
-  assert.equal(interpret({ code: 3, stdout: "", stderr: "" }, NOW).detail, "종료 코드 3");
+  assert.equal(interpret({ code: 3, stdout: "", stderr: "" }, NOW).detail, "Exit code 3");
 });
 
 test("chute that cannot start shows that fact and install guidance", () => {
   const result = interpret({ spawnError: "cannot start chute: program not found" }, NOW);
   assert.equal(result.kind, "missing");
   assert.equal(result.detail, "cannot start chute: program not found");
-  assert.match(result.title, /실행할 수 없다/);
+  assert.match(result.title, /Can't run chute/);
   assert.match(result.hint, /cargo install/);
   assert.match(result.hint, /bin/);
 });
@@ -388,7 +389,7 @@ test("unknown values are shown as they are", () => {
   assert.equal(section(repo, "bounced").items[0].reason, "cosmic_rays");
   assert.equal(section(repo, "human").items.find((i) => i.pr === 32).reason, "novel");
   assert.equal(section(repo, "waiting").items[0].note, "later");
-  assert.equal(section(repo, "alerts").items[0].text, "큐가 멈췄다: new_reason");
+  assert.equal(section(repo, "alerts").items[0].text, "Queue stopped: new_reason");
   assert.equal(repo.approval, "robot");
   assert.equal(
     repo.sections.reduce((n, s) => n + (s.id === "alerts" || s.id === "today" || s.id === "batch" ? 0 : s.items.length), 0),
@@ -401,26 +402,26 @@ test("an unknown batch phase and preflight result are shown as they are", () => 
   data.batch.phase = "teleporting";
   const repo = only(data);
   assert.equal(section(repo, "batch").items[0].phase, "teleporting");
-  assert.equal(section(repo, "human").items[0].preflight.text, "preflight vanished");
+  assert.equal(section(repo, "human").items[0].preflight.text, "Preflight vanished");
 });
 
 test("missing fields do not break the board", () => {
   const sparse = { schema: 1, queue: [{ pr: 1, state: "queued" }, { pr: 2, state: "needs_human" }, "junk", null] };
   const repo = only(sparse);
-  assert.equal(repo.slug, "(이름 없는 저장소)");
+  assert.equal(repo.slug, "(unnamed repo)");
   assert.deepEqual(prs(section(repo, "waiting")), [1]);
   assert.deepEqual(prs(section(repo, "human")), [2]);
   assert.equal(section(repo, "human").items[0].retries, "—/—");
 });
 
 test("formatDuration", () => {
-  assert.equal(formatDuration(0), "0초");
-  assert.equal(formatDuration(59), "59초");
-  assert.equal(formatDuration(60), "1분");
-  assert.equal(formatDuration(125), "2분 5초");
-  assert.equal(formatDuration(3600), "1시간");
-  assert.equal(formatDuration(3660), "1시간 1분");
-  assert.equal(formatDuration(59.6), "1분");
+  assert.equal(formatDuration(0), "0s");
+  assert.equal(formatDuration(59), "59s");
+  assert.equal(formatDuration(60), "1m");
+  assert.equal(formatDuration(125), "2m 5s");
+  assert.equal(formatDuration(3600), "1h");
+  assert.equal(formatDuration(3660), "1h 1m");
+  assert.equal(formatDuration(59.6), "1m");
   assert.equal(formatDuration(null), "—");
   assert.equal(formatDuration(-1), "—");
 });
@@ -446,9 +447,9 @@ test("values that are names of built-in object keys are shown as they are", () =
     assert.equal(find("bounced", 35).failure.mode, word, word);
     assert.equal(find("human", 32).reason, word, word);
     assert.equal(find("waiting", 33).note, word, word);
-    assert.equal(find("human", 34).preflight.text, `preflight ${word}`, word);
+    assert.equal(find("human", 34).preflight.text, `Preflight ${word}`, word);
     assert.equal(section(repo, "batch").items[0].phase, word, word);
-    assert.equal(section(repo, "alerts").items[0].text, `큐가 멈췄다: ${word}`, word);
+    assert.equal(section(repo, "alerts").items[0].text, `Queue stopped: ${word}`, word);
     assert.equal(repo.approval, word, word);
   }
 });
@@ -477,7 +478,7 @@ test("an item without a PR number gets no buttons", () => {
 test("an exit code that is not a number is reported without printing null", () => {
   const result = interpret({ code: null, stdout: "", stderr: "" }, NOW);
   assert.equal(result.kind, "failed");
-  assert.equal(result.detail, "비정상 종료");
+  assert.equal(result.detail, "Exited abnormally");
 });
 
 test("warnings alone still make the alerts section", () => {
@@ -527,30 +528,30 @@ test("objects where numbers or strings belong never reach the screen code as obj
 });
 
 test("every batch phase and approval label is pinned", () => {
-  const phases = { building: "합치는 중", verifying: "검증 중", bisecting: "이분 탐색 중", pushing: "push 중" };
+  const phases = { building: "Building", verifying: "Verifying", bisecting: "Bisecting", pushing: "Pushing" };
   for (const [code, label] of Object.entries(phases)) {
     const data = clone(fixture);
     data.batch.phase = code;
     assert.equal(section(only(data), "batch").items[0].phase, label, code);
   }
-  for (const [code, label] of Object.entries({ agent: "에이전트 신뢰", human: "사람 확인" })) {
+  for (const [code, label] of Object.entries({ agent: "Agent trusted", human: "Human review" })) {
     assert.equal(only({ ...clone(fixture), approval: code }).approval, label, code);
   }
 });
 
 test("every preflight result has its text and tone", () => {
   const cases = [
-    ["pass", "preflight 통과", "ok"],
-    ["fail", "preflight 실패", "error"],
-    ["conflict", "preflight 충돌", "error"],
-    ["skipped", "preflight 생략", "muted"],
+    ["pass", "Preflight passed", "ok"],
+    ["fail", "Preflight failed", "error"],
+    ["conflict", "Preflight conflict", "error"],
+    ["skipped", "Preflight skipped", "muted"],
   ];
   for (const [result, text, tone] of cases) {
     const item = section(only(withQueue({ ...itemOf(21), preflight: { result, head: "21e5678" } })), "human").items[0];
     assert.deepEqual([item.preflight.text, item.preflight.tone], [text, tone], result);
   }
   const empty = section(only(withQueue({ ...itemOf(21), preflight: {} })), "human").items[0];
-  assert.equal(empty.preflight.text, "preflight ? (이전 HEAD)");
+  assert.equal(empty.preflight.text, "Preflight ? (old HEAD)");
 });
 
 test("alerts keep their text, kind and tone", () => {
@@ -562,7 +563,7 @@ test("alerts keep their text, kind and tone", () => {
     ["warning", "warn"],
     ["warning", "warn"],
   ]);
-  assert.equal(alerts[0].text, "기준 커밋이 검증에 실패해 큐가 멈췄다");
+  assert.equal(alerts[0].text, "Queue stopped: base commit failed verification");
 
   const data = {
     ...clone(fixture),
@@ -572,26 +573,30 @@ test("alerts keep their text, kind and tone", () => {
     warnings: ["문자열 경고", { kind: "config" }, { message: "" }, {}],
   };
   assert.deepEqual(section(only(data), "alerts").items.map((a) => [a.kind, a.tone, a.text]), [
-    ["daemon", "error", "데몬이 꺼져 있다"],
-    ["warning", "warn", "문자열 경고"],
-    ["warning", "warn", "config"],
-    ["warning", "warn", "경고"],
-    ["warning", "warn", "경고"],
+    ["daemon", "error", "Daemon is off"],
+    ["warning", "warn", "Warning"],
+    ["warning", "warn", "Can't read config"],
+    ["warning", "warn", "Warning"],
+    ["warning", "warn", "Warning"],
   ]);
+  assert.deepEqual(
+    section(only(data), "alerts").items.filter((a) => a.kind === "warning").map((a) => a.detail),
+    ["문자열 경고", "", "", ""],
+  );
 });
 
 test("a blocked reason that is not a known word is shown as it is, and a future time adds no age", () => {
   const data = clone(fixture);
   data.blocked = { reason: 5, base: "abc", since_ms: NOW + 10_000 };
   const [alert] = section(only(data), "alerts").items;
-  assert.equal(alert.text, "큐가 멈췄다: 5");
-  assert.equal(alert.detail, "기준 abc");
+  assert.equal(alert.text, "Queue stopped: 5");
+  assert.equal(alert.detail, "base abc");
   data.blocked = { reason: { x: 1 } };
-  assert.equal(section(only(data), "alerts").items[0].text, '큐가 멈췄다: {"x":1}');
+  assert.equal(section(only(data), "alerts").items[0].text, 'Queue stopped: {"x":1}');
   data.blocked = {};
-  assert.equal(section(only(data), "alerts").items[0].text, "큐가 멈췄다: 사유 모름");
+  assert.equal(section(only(data), "alerts").items[0].text, "Queue stopped: unknown reason");
   data.blocked = "base_broken";
-  assert.equal(section(only(data), "alerts").items[0].text, "기준 커밋이 검증에 실패해 큐가 멈췄다");
+  assert.equal(section(only(data), "alerts").items[0].text, "Queue stopped: base commit failed verification");
 });
 
 test("a daemon record that does not say running:false raises no alert", () => {
@@ -607,7 +612,7 @@ test("a batch that has not started its first round shows no round, and one that 
   data.batch.started_ms = NOW + 60_000;
   const [batch] = section(only(data), "batch").items;
   assert.equal(batch.round, null);
-  assert.equal(batch.elapsed, "0초");
+  assert.equal(batch.elapsed, "0s");
 });
 
 test("a clock that is not a number falls back to the real clock", () => {
@@ -615,7 +620,7 @@ test("a clock that is not a number falls back to the real clock", () => {
   Date.now = () => NOW;
   try {
     for (const clock of [NaN, Infinity, null, "x"]) {
-      assert.equal(section(board([fixture], clock).repos[0], "alerts").items[0].detail, "기준 0a1b2c3 · 7분 12초 전부터", String(clock));
+      assert.equal(section(board([fixture], clock).repos[0], "alerts").items[0].detail, "base 0a1b2c3 · for 7m 12s", String(clock));
     }
   } finally {
     Date.now = real;
@@ -634,9 +639,9 @@ test("the unknown section comes after bounced, in submission order, with title a
   );
   const repo = only(data);
   assert.deepEqual(repo.sections.map((s) => s.id), ["bounced", "unknown"]);
-  assert.equal(section(repo, "unknown").title, "알 수 없는 상태");
+  assert.equal(section(repo, "unknown").title, "Unknown state");
   assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.title, i.state, i.reason]), [
-    [30, "첫째", "(없음)", null],
+    [30, "첫째", "(none)", null],
     [31, "둘째", "zeta", null],
   ]);
 });
@@ -674,23 +679,23 @@ test("a bounced item without a reason falls back to the failure kind, then to a 
     { ...itemOf(15), pr: 99, state_reason: null, last_failure: null },
   );
   const reasons = Object.fromEntries(section(only(data), "bounced").items.map((i) => [i.pr, i.reason]));
-  assert.deepEqual(reasons, { 97: "CI 실패", 98: "사유 없음", 99: "사유 없음" });
+  assert.deepEqual(reasons, { 97: "CI failed", 98: "No reason", 99: "No reason" });
 });
 
 test("a needs_human item with an empty reason is just the human's turn", () => {
   const data = withQueue({ ...itemOf(9), state_reason: "" });
-  assert.equal(section(only(data), "human").items[0].reason, "사람 차례");
+  assert.equal(section(only(data), "human").items[0].reason, "Needs you");
 });
 
 test("failure text prefers stderr, then stdout, then the exit code", () => {
   assert.equal(interpret({ code: 2, stdout: "out line\nmore", stderr: "" }, NOW).detail, "out line");
   assert.equal(interpret({ code: 2, stdout: "out", stderr: "err\n" }, NOW).detail, "err");
-  assert.equal(interpret({ code: 2, stdout: "", stderr: "" }, NOW).detail, "종료 코드 2");
+  assert.equal(interpret({ code: 2, stdout: "", stderr: "" }, NOW).detail, "Exit code 2");
   assert.equal(interpret({ code: 2, stdout: "", stderr: "\n   spaced out  \n" }, NOW).detail, "spaced out");
   assert.equal(interpret({ code: 0, stdout: `${"x".repeat(300)}\nmore` }, NOW).detail.length < 200, true);
   assert.equal(interpret({ spawnError: "" }, NOW).kind, "missing");
-  assert.equal(interpret({ code: 1, stdout: { a: 1 }, stderr: { b: 2 } }, NOW).detail, "종료 코드 1");
-  assert.equal(interpret({ code: null, stdout: {}, stderr: [] }, NOW).detail, "비정상 종료");
+  assert.equal(interpret({ code: 1, stdout: { a: 1 }, stderr: { b: 2 } }, NOW).detail, "Exit code 1");
+  assert.equal(interpret({ code: null, stdout: {}, stderr: [] }, NOW).detail, "Exited abnormally");
 });
 
 test("batch members come from the batch record even when the queue lacks them", () => {
@@ -725,7 +730,7 @@ test("a very deeply nested value is shown without throwing", () => {
   );
   const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
   assert.equal(result.kind, "board");
-  assert.equal(section(result.repos[0], "unknown").items[0].state, "(표시할 수 없는 값)");
+  assert.equal(section(result.repos[0], "unknown").items[0].state, "(can't display)");
 });
 
 test("a batch record with garbage in its PR list does not leak objects", () => {
@@ -876,7 +881,7 @@ test("random malformed status never breaks the board", () => {
       for (const _ of Array.isArray(view.warnings) ? view.warnings : []) kinds.push("warning");
       assert.deepEqual((shown.alerts ?? []).map((a) => a.kind), kinds, `alerts :: ${ctx}`);
       if (kinds.length) assert.equal(repo.sections[0].id, "alerts", ctx);
-      for (const row of shown.waiting ?? []) assert.equal(row.ciPending, row.label === "CI 대기", ctx);
+      for (const row of shown.waiting ?? []) assert.equal(row.ciPending, row.label === "Waiting on CI", ctx);
     });
   }
 });
@@ -896,20 +901,20 @@ test("an agent without a name is shown by its terminal", () => {
 
 test("an awaiting item without a preflight record says so in a muted tone", () => {
   const item = section(only(withQueue({ ...itemOf(21), preflight: null })), "human").items[0];
-  assert.deepEqual([item.preflight.text, item.preflight.tone, item.preflight.stale], ["preflight 없음", "muted", false]);
+  assert.deepEqual([item.preflight.text, item.preflight.tone, item.preflight.stale], ["No preflight", "muted", false]);
 });
 
 test("a run error is cut to its first line and an empty output is not quoted", () => {
   assert.equal(interpret({ spawnError: "first\r\nsecond" }, NOW).detail, "first");
-  assert.equal(interpret({ code: 0, stdout: "", stderr: "" }, NOW).detail, "chute status가 JSON이 아닌 출력을 냈다");
+  assert.equal(interpret({ code: 0, stdout: "", stderr: "" }, NOW).detail, "chute status printed non-JSON output");
   assert.equal(interpret({ code: 2, stdout: "", stderr: "line one\r\nline two" }, NOW).detail, "line one");
 });
 
 test("numbers that overflow to infinity are not printed as numbers", () => {
   const text = '[{"today":{"merged":1e999,"bounced":2,"median_lead_s":1e999,"verify_s":5400}}]';
   const today = interpret({ code: 0, stdout: text }, NOW).repos[0].today;
-  assert.equal(today.line, "머지 — · 반송 2 · 중앙값 —");
-  assert.equal(today.details.find((d) => d.key === "verify").value, "1시간 30분");
+  assert.equal(today.line, "— merged · 2 bounced · median —");
+  assert.equal(today.details.find((d) => d.key === "verify").value, "1h 30m");
 });
 
 test("the waiting order does not depend on the input order", () => {
@@ -930,12 +935,12 @@ test("the repo card names the hub host, or this PC when the hub is local", () =>
   assert.equal(only(fixture).hub.label, "desk-host");
   const local = clone(fixture);
   local.hub = { ...local.hub, local: true, host: "this-host", machine: null };
-  assert.equal(only(local).hub.label, "이 PC");
+  assert.equal(only(local).hub.label, "this PC");
   const v1 = clone(fixture);
   delete v1.hub;
   assert.deepEqual(
     { local: only(v1).hub.local, reachable: only(v1).hub.reachable, label: only(v1).hub.label },
-    { local: true, reachable: true, label: "이 PC" },
+    { local: true, reachable: true, label: "this PC" },
   );
 });
 
@@ -1002,25 +1007,25 @@ const waitingItem = (data, pr) => section(only(data), "waiting").items.find((ite
 
 test("v3: a priority item is marked urgent, with or without an agent", () => {
   const data = withQueue(itemOf(20), itemOf(23));
-  assert.deepEqual(marksOfItem(waitingItem(data, 20)), ["급함"]);
-  assert.deepEqual(marksOfItem(waitingItem(data, 23)), ["급함"]);
+  assert.deepEqual(marksOfItem(waitingItem(data, 20)), ["Urgent"]);
+  assert.deepEqual(marksOfItem(waitingItem(data, 23)), ["Urgent"]);
   assert.deepEqual(marksOfItem(waitingItem(withQueue(itemOf(19)), 19)), []);
 });
 
 test("v3: an item held behind other PRs lists every one of them", () => {
   const data = withQueue(itemOf(24), itemOf(12));
-  assert.deepEqual(marksOfItem(waitingItem(data, 24)), ["#12, #22 뒤"]);
+  assert.deepEqual(marksOfItem(waitingItem(data, 24)), ["after #12, #22"]);
   const one = itemOf(24);
   one.after = [7];
-  assert.deepEqual(marksOfItem(waitingItem(withQueue(one), 24)), ["#7 뒤"]);
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(one), 24)), ["after #7"]);
 });
 
 test("v3: a repair item is marked, and marks combine", () => {
-  assert.deepEqual(marksOfItem(waitingItem(withQueue(itemOf(22)), 22)), ["복구"]);
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(itemOf(22)), 22)), ["Repair"]);
   const both = itemOf(22);
   both.priority = true;
   both.after = [3];
-  assert.deepEqual(marksOfItem(waitingItem(withQueue(both), 22)), ["급함", "복구", "#3 뒤"]);
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(both), 22)), ["Urgent", "Repair", "after #3"]);
 });
 
 test("v3: cards in the human and bounced sections carry the marks too", () => {
@@ -1030,8 +1035,8 @@ test("v3: cards in the human and bounced sections carry the marks too", () => {
   const bounced = itemOf(14);
   bounced.repair = true;
   const repo = only(withQueue(human, bounced));
-  assert.deepEqual(marksOfItem(section(repo, "human").items[0]), ["급함", "#5, #6 뒤"]);
-  assert.deepEqual(marksOfItem(section(repo, "bounced").items[0]), ["복구"]);
+  assert.deepEqual(marksOfItem(section(repo, "human").items[0]), ["Urgent", "after #5, #6"]);
+  assert.deepEqual(marksOfItem(section(repo, "bounced").items[0]), ["Repair"]);
 });
 
 test("v3: the submitter is shown only when it differs from the agent", () => {
@@ -1053,13 +1058,13 @@ test("v3: the submitter is shown only when it differs from the agent", () => {
 test("v3: a halt shows step, who pushed, the recheck, the log, and the repair PR waiting", () => {
   const [alert] = section(only([fixture]), "alerts").items;
   assert.deepEqual(alert.facts, [
-    "실패한 단계 test",
-    "chute가 push한 커밋",
-    "다시 검증했다",
-    "복구 PR #22 검증 대기",
+    "Failed step test",
+    "Commit pushed by chute",
+    "Rechecked",
+    "Repair PR #22 queued",
   ]);
   assert.equal(alert.log, fixture.blocked.log);
-  assert.equal(alert.detail, "기준 0a1b2c3 · 7분 12초 전부터");
+  assert.equal(alert.detail, "base 0a1b2c3 · for 7m 12s");
 });
 
 test("v3: a halt not pushed by chute and not rechecked says so, and a repair in a batch is being verified", () => {
@@ -1069,7 +1074,7 @@ test("v3: a halt not pushed by chute and not rechecked says so, and a repair in 
   data.blocked.log = null;
   data.queue.find((item) => item.pr === 22).state = "in_batch";
   const [alert] = section(only(data), "alerts").items;
-  assert.deepEqual(alert.facts, ["실패한 단계 test", "chute가 push하지 않은 커밋", "복구 PR #22 검증 중"]);
+  assert.deepEqual(alert.facts, ["Failed step test", "Commit not pushed by chute", "Repair PR #22 verifying"]);
   assert.equal(alert.log, null);
 });
 
@@ -1077,14 +1082,14 @@ test("v3: a repair item that is no longer queued is not called waiting for verif
   const data = clone(fixture);
   data.queue.find((item) => item.pr === 22).state = "bounced";
   const [alert] = section(only(data), "alerts").items;
-  assert.ok(alert.facts.includes("복구 PR #22 처리 필요"));
+  assert.ok(alert.facts.includes("Repair PR #22 needs attention"));
 });
 
 test("v3: no repair item means no repair line", () => {
   const data = clone(fixture);
   data.queue = data.queue.filter((item) => !item.repair);
   const [alert] = section(only(data), "alerts").items;
-  assert.ok(!alert.facts.some((fact) => fact.includes("복구")));
+  assert.ok(!alert.facts.some((fact) => fact.includes("Repair")));
 });
 
 test("v3: a repair item is not announced when the queue is not halted", () => {
@@ -1100,12 +1105,12 @@ test("v3: flaky_chronic and gc warnings come out like other warnings; chronic al
   );
   const repo = only(data);
   const warnings = section(repo, "alerts").items.filter((a) => a.kind === "warning");
-  assert.deepEqual(warnings.slice(-2).map((a) => [a.tone, a.text]), [
-    ["warn", "build::slow가 30일 안에 3번 흔들렸다"],
-    ["warn", "정리하지 못한 폴더가 있다"],
+  assert.deepEqual(warnings.slice(-2).map((a) => [a.tone, a.text, a.detail]), [
+    ["warn", "Chronic flaky test", "build::slow가 30일 안에 3번 흔들렸다"],
+    ["warn", "Cleanup incomplete", "정리하지 못한 폴더가 있다"],
   ]);
   const stats = repo.today.details;
-  assert.equal(stats.find((s) => s.key === "flaky").note, "만성");
+  assert.equal(stats.find((s) => s.key === "flaky").note, "chronic");
   assert.ok(stats.filter((s) => s.key !== "flaky").every((s) => !s.note));
   assert.equal(only([fixture]).today.details.find((s) => s.key === "flaky").note, null);
 });
@@ -1135,7 +1140,7 @@ test("v3: JSON without any v3 field draws as before", () => {
   const [alert] = section(repo, "alerts").items;
   assert.deepEqual(alert.facts, []);
   assert.equal(alert.log, null);
-  assert.equal(alert.detail, "기준 0a1b2c3 · 7분 12초 전부터");
+  assert.equal(alert.detail, "base 0a1b2c3 · for 7m 12s");
 });
 
 test("v3: malformed v3 fields do not break the board", () => {
@@ -1145,7 +1150,7 @@ test("v3: malformed v3 fields do not break the board", () => {
   item.repair = 1;
   item.submitter = "orch";
   const queued = waitingItem(withQueue(item), 24);
-  assert.deepEqual(marksOfItem(queued), ["#9 뒤"]);
+  assert.deepEqual(marksOfItem(queued), ["after #9"]);
   assert.equal(queued.submitter, null);
   item.after = "12";
   assert.deepEqual(marksOfItem(waitingItem(withQueue(item), 24)), []);
@@ -1153,7 +1158,7 @@ test("v3: malformed v3 fields do not break the board", () => {
   data.blocked = { reason: "base_broken", step: 5, pushed_by_chute: "yes", rechecked: "yes", log: 7 };
   const [alert] = section(only(data), "alerts").items;
   assert.equal(alert.log, null);
-  assert.deepEqual(alert.facts, ["복구 PR #22 검증 대기"]);
+  assert.deepEqual(alert.facts, ["Repair PR #22 queued"]);
 });
 
 test("v3: members of a running batch keep their marks and submitter", () => {
@@ -1161,7 +1166,7 @@ test("v3: members of a running batch keep their marks and submitter", () => {
   repair.state = "in_batch";
   const data = { ...clone(fixture), queue: [repair], batch: { ...clone(fixture.batch), prs: [22] } };
   const [entry] = section(only(data), "batch").items[0].prs;
-  assert.deepEqual(entry.marks.map((m) => m.text), ["복구"]);
+  assert.deepEqual(entry.marks.map((m) => m.text), ["Repair"]);
   assert.equal(entry.submitter.text, "submit orch (t1s0)");
 });
 
@@ -1169,42 +1174,42 @@ test("v3: priority is a warning color and repair an error color", () => {
   const both = itemOf(22);
   both.priority = true;
   const { marks } = waitingItem(withQueue(both), 22);
-  assert.deepEqual(marks.map((m) => [m.text, m.tone]), [["급함", "warn"], ["복구", "error"]]);
+  assert.deepEqual(marks.map((m) => [m.text, m.tone]), [["Urgent", "warn"], ["Repair", "error"]]);
 });
 
 test("v3: a PR listed twice in after is shown once", () => {
   const item = itemOf(24);
   item.after = [12, 12, 22];
-  assert.deepEqual(marksOfItem(waitingItem(withQueue(item), 24)), ["#12, #22 뒤"]);
+  assert.deepEqual(marksOfItem(waitingItem(withQueue(item), 24)), ["after #12, #22"]);
 });
 
 test("a failed check after the merge is an alert with the culprit, the last green commit and the revert hint", () => {
   const alert = section(only([fixture]), "alerts").items.find((a) => a.kind === "post_verify");
   assert.equal(alert.tone, "error");
-  assert.equal(alert.text, "머지 뒤 검사가 실패했다 · e2e");
+  assert.equal(alert.text, "Post-merge check failed · e2e");
   assert.match(alert.detail, /^9f8e7d6 · /);
   assert.deepEqual(alert.facts, [
-    "원인 #12",
-    "실패한 시험 login flow",
-    "마지막 통과 1e2d3c4",
-    "되돌리려면 chute revert b20261117-091500",
+    "Culprit #12",
+    "Failed tests login flow",
+    "Last green 1e2d3c4",
+    "To undo: chute revert b20261117-091500",
   ]);
   assert.match(alert.log, /e2e\.1\.log$/);
-  assert.deepEqual(alert.files.map((f) => f.label), ["보고서", "로그"]);
+  assert.deepEqual(alert.files.map((f) => f.label), ["Report", "Log"]);
 
   const data = clone(fixture);
   data.post_verify.red.culprit = null;
   data.post_verify.red.last_green = null;
   data.post_verify.red.holding = true;
   const lost = section(only(data), "alerts").items.find((a) => a.kind === "post_verify");
-  assert.deepEqual(lost.facts, ["원인 머지를 찾지 못했다", "실패한 시험 login flow", "관련 PR은 고칠 때까지 기다린다"]);
+  assert.deepEqual(lost.facts, ["Culprit merge not found", "Failed tests login flow", "Related PRs wait until it's fixed"]);
 });
 
 test("the culprit's title comes from the recently merged list when it has one", () => {
   const data = clone(fixture);
   data.recent_merged.push({ pr: 12, title: "feat: 큐 상태 전이", batch: "b", merged_ms: 1, bounces: 0 });
   const alert = section(only(data), "alerts").items.find((a) => a.kind === "post_verify");
-  assert.equal(alert.facts[0], "원인 #12 feat: 큐 상태 전이");
+  assert.equal(alert.facts[0], "Culprit #12 feat: 큐 상태 전이");
 });
 
 test("the check after the merge: last green and the running check are two rows, none when both are missing", () => {
@@ -1212,15 +1217,15 @@ test("the check after the merge: last green and the running check are two rows, 
   const now = fixture.post_verify.run.started_ms + 190_000;
   const at = (data) => interpret(ok(data), now).repos[0].postVerify;
   assert.equal(at(fixture).green.commit, "1e2d3c4");
-  assert.match(at(fixture).green.ago, /전$/);
+  assert.match(at(fixture).green.ago, /ago$/);
   assert.deepEqual(
     [at(fixture).run.commit, at(fixture).run.label, at(fixture).run.step, at(fixture).run.elapsed],
-    ["5a4b3c2", "범인 찾는 중", "e2e", "3분 10초"],
+    ["5a4b3c2", "Finding culprit", "e2e", "3m 10s"],
   );
   const data = clone(fixture);
   data.post_verify.run.phase = "verifying";
   data.post_verify.run.waiting_machine = true;
-  assert.equal(at(data).run.label, "검사 중");
+  assert.equal(at(data).run.label, "Checking");
   assert.equal(at(data).run.waitingMachine, true);
   data.post_verify.run = null;
   assert.equal(post(data).run, null);
@@ -1235,41 +1240,41 @@ const quiet = () => ({ ...clone(fixture), blocked: null, post_verify: {}, batch:
 
 test("the status line takes the first matching row of the table, and only one", () => {
   const data = clone(fixture);
-  assert.deepEqual(statusOf(data), { tone: "error", text: "멈춤 · 기준 커밋이 검증에 실패했다" });
+  assert.deepEqual(statusOf(data), { tone: "error", text: "Stopped · base failed verification" });
   data.blocked = null;
-  assert.deepEqual(statusOf(data), { tone: "error", text: "머지 뒤 검사 실패 · e2e" });
+  assert.deepEqual(statusOf(data), { tone: "error", text: "Post-merge check failed · e2e" });
   data.post_verify.red = null;
   data.daemon.running = false;
-  assert.deepEqual(statusOf(data), { tone: "error", text: "데몬이 꺼져 있다" });
+  assert.deepEqual(statusOf(data), { tone: "error", text: "Daemon is off" });
   data.daemon.running = true;
-  assert.deepEqual(statusOf(data), { tone: "human", text: "사람 차례 4건" });
+  assert.deepEqual(statusOf(data), { tone: "human", text: "Needs you · 4" });
   data.queue = data.queue.filter((item) => item.state !== "needs_human" && item.state !== "awaiting_approval");
-  assert.deepEqual(statusOf(data), { tone: "working", text: "검증 중 · test 3/3단계" });
+  assert.deepEqual(statusOf(data), { tone: "working", text: "Verifying · test 3/3" });
   data.batch.step = "fmt";
-  assert.equal(statusOf(data).text, "검증 중 · fmt 1/3단계");
+  assert.equal(statusOf(data).text, "Verifying · fmt 1/3");
   data.batch.waiting_machine = true;
-  assert.deepEqual(statusOf(data), { tone: "working", text: "PC 자리 기다리는 중" });
+  assert.deepEqual(statusOf(data), { tone: "working", text: "Waiting for a slot" });
   data.batch = null;
   data.queue = data.queue.filter((item) => item.state === "queued");
-  assert.deepEqual(statusOf(data), { tone: "waiting", text: `대기 ${data.queue.length}건` });
-  assert.deepEqual(statusOf(quiet()), { tone: "ok", text: "정상 · 대기 없음" });
+  assert.deepEqual(statusOf(data), { tone: "waiting", text: `Queued · ${data.queue.length}` });
+  assert.deepEqual(statusOf(quiet()), { tone: "ok", text: "All clear" });
 });
 
 test("an unreachable hub is the first row of the status line", () => {
   const repo = interpret(ok(unreachable), NOW).repos[0];
-  assert.deepEqual(repo.status, { tone: "error", text: "허브에 닿지 않는다" });
+  assert.deepEqual(repo.status, { tone: "error", text: "Hub unreachable" });
 });
 
 test("a batch without a step list shows the step name only, and one without a step says just that it verifies", () => {
   const data = quiet();
   data.batch = { prs: [12], phase: "verifying", step: "test", started_ms: NOW - 1000 };
-  assert.equal(statusOf(data).text, "검증 중 · test");
+  assert.equal(statusOf(data).text, "Verifying · test");
   data.batch.steps = [];
-  assert.equal(statusOf(data).text, "검증 중 · test");
+  assert.equal(statusOf(data).text, "Verifying · test");
   data.batch.steps = ["fmt", "clippy"];
-  assert.equal(statusOf(data).text, "검증 중 · test");
+  assert.equal(statusOf(data).text, "Verifying · test");
   data.batch.step = null;
-  assert.equal(statusOf(data).text, "검증 중");
+  assert.equal(statusOf(data).text, "Verifying");
 });
 
 test("the usual time is the median of recent seconds, and absent below three samples", () => {
@@ -1284,12 +1289,12 @@ test("the running batch shows its step n/m, elapsed time, and a progress bar onl
   const data = quiet();
   data.batch = clone(fixture.batch);
   const batch = (now) => interpret(ok(data), now).repos[0].sections.find((s) => s.id === "batch").items[0];
-  assert.equal(batch(NOW).stepText, "test 3/3단계");
-  assert.equal(batch(NOW).elapsed, "5분 12초");
+  assert.equal(batch(NOW).stepText, "test 3/3");
+  assert.equal(batch(NOW).elapsed, "5m 12s");
   assert.equal(batch(NOW).progress, null);
   assert.equal(batch(NOW).usual, null);
   data.recent = [{ seconds: 200 }, { seconds: 600 }, { seconds: 400 }];
-  assert.equal(batch(NOW).usual, "평소 6분 40초");
+  assert.equal(batch(NOW).usual, "usually 6m 40s");
   assert.equal(Math.round(batch(NOW).progress * 100), 78);
   assert.equal(batch(NOW).longer, false);
   const late = batch(fixture.batch.started_ms + 500_000);
@@ -1304,7 +1309,7 @@ test("recent merges: five from recent_merged, with titles, bounce counts and a G
   data.recent_merged = Array.from({ length: 7 }, (_, i) => ({ pr: 20 - i, title: `제목 ${i}`, batch: "b", merged_ms: NOW - 60_000 * (i + 1), bounces: i === 1 ? 2 : 0 }));
   const recent = only(data).recent;
   assert.equal(recent.length, 5);
-  assert.deepEqual(recent[1], { pr: 19, title: "제목 1", bounces: 2, ago: "2분 전", url: "https://github.com/Soochol/chute/pull/19" });
+  assert.deepEqual(recent[1], { pr: 19, title: "제목 1", bounces: 2, ago: "2m ago", url: "https://github.com/Soochol/chute/pull/19" });
   assert.deepEqual(only([fixture]).recent.map((m) => [m.pr, m.title, m.bounces]), [
     [8, "feat: 큐 상태 전이 추가", 1],
     [7, "fix: 잠금 해제 순서를 고친다", 0],
@@ -1323,7 +1328,7 @@ test("an old chute without recent_merged gives the numbers of recent[].merged, w
 test("the GitHub address comes only out of a slug shaped owner/name", () => {
   assert.equal(pullUrl("a/b", 3), "https://github.com/a/b/pull/3");
   assert.equal(pullUrl("Soochol/chute.rs", 3), "https://github.com/Soochol/chute.rs/pull/3");
-  for (const slug of ["", "ab", "a/b/c", "a/", "/b", "a b/c", "a/b?x=1", "../b", "a/..", "(이름 없는 저장소)", null, 5]) {
+  for (const slug of ["", "ab", "a/b/c", "a/", "/b", "a b/c", "a/b?x=1", "../b", "a/..", "(unnamed repo)", null, 5]) {
     assert.equal(pullUrl(slug, 3), null, String(slug));
   }
   assert.equal(pullUrl("a/b", 0), null);
@@ -1332,7 +1337,7 @@ test("the GitHub address comes only out of a slug shaped owner/name", () => {
 });
 
 test("formatAgo", () => {
-  assert.deepEqual([0, 59_000, 60_000, 3_599_000, 3_600_000, 86_400_000 * 3].map(formatAgo), ["방금", "방금", "1분 전", "59분 전", "1시간 전", "3일 전"]);
+  assert.deepEqual([0, 59_000, 60_000, 3_599_000, 3_600_000, 86_400_000 * 3].map(formatAgo), ["just now", "just now", "1m ago", "59m ago", "1h ago", "3d ago"]);
   assert.equal(formatAgo(-1), "");
   assert.equal(formatAgo(NaN), "");
 });
@@ -1377,7 +1382,7 @@ test("diffNotices: the first read tells nothing, later only new items, and a gon
   const after = diffNotices(before.next, read(grown));
   assert.deepEqual(after.fresh.map((n) => n.key.split(":")[0]), ["approval"]);
   assert.equal(after.fresh[0].level, "warning");
-  assert.match(after.fresh[0].body, /^#21 승인 대기/);
+  assert.match(after.fresh[0].body, /^#21 awaiting approval/);
 });
 
 test("diffNotices: an unreachable hub keeps what was known, a failed read changes nothing", () => {
@@ -1413,6 +1418,47 @@ test("the clock runs only while a batch or the check after the merge is running"
 
 test("bounced cards read as one line, and carry the report to open", () => {
   const card = section(only([fixture]), "bounced").items.find((c) => c.pr === 15);
-  assert.equal(card.headline, "검증 실패 · 단독");
-  assert.deepEqual(card.report, { label: "보고서", path: fixture.queue.find((i) => i.pr === 15).last_failure.report });
+  assert.equal(card.headline, "Verification failed · Solo");
+  assert.deepEqual(card.report, { label: "Report", path: fixture.queue.find((i) => i.pr === 15).last_failure.report });
+});
+
+test("tones map to theme tokens, and ok is green rather than done", () => {
+  assert.deepEqual(
+    ["ok", "error", "working", "human", "warn", "waiting"].map(toneToken),
+    ["ansi2", "ansi1", "working", "blocked", "ansi3", "muted"],
+  );
+  for (const tone of ["ok", "error", "working", "human", "warn", "waiting", "muted", "toString", "", undefined, null]) {
+    assert.notEqual(toneToken(tone), "done", String(tone));
+  }
+  assert.equal(toneToken("muted"), "dim");
+  assert.equal(toneToken("constructor"), "dim");
+});
+
+test("every warning kind gets an English title, an unknown kind is just Warning, and the message stays apart", () => {
+  const kinds = ["not_merged", "no_checks", "config", "history", "engine", "hub", "flaky_chronic", "gc", "post"];
+  const data = { ...clone(fixture), blocked: null, post_verify: {}, warnings: [...kinds.map((kind) => ({ kind, message: `본체 ${kind}` })), { kind: "brand_new", message: "새 경고" }] };
+  const warnings = section(only(data), "alerts").items.filter((a) => a.kind === "warning");
+  assert.equal(warnings.length, kinds.length + 1);
+  for (const [i, kind] of kinds.entries()) {
+    assert.match(warnings[i].text, /^[A-Za-z' -]+$/, kind);
+    assert.notEqual(warnings[i].text, "Warning", kind);
+    assert.equal(warnings[i].detail, `본체 ${kind}`, kind);
+  }
+  assert.equal(warnings.at(-1).text, "Warning");
+  assert.equal(warnings.at(-1).detail, "새 경고");
+});
+
+test("a recent merge without a title keeps its number and has an empty title, with no placeholder", () => {
+  const data = clone(fixture);
+  data.recent_merged = [{ pr: 421, batch: "b", merged_ms: NOW - 60_000, bounces: 0 }];
+  assert.deepEqual(only(data).recent.map((m) => [m.pr, m.title]), [[421, ""]]);
+  delete data.recent_merged;
+  data.recent = [{ merged: [5], finished_ms: NOW - 60_000, seconds: 10 }];
+  assert.deepEqual(only(data).recent.map((m) => [m.pr, m.title]), [[5, ""]]);
+});
+
+test("no Hangul is left in the English wording of formatted times", () => {
+  assert.equal(formatDuration(3900), "1h 5m");
+  assert.equal(formatDuration(45), "45s");
+  assert.equal(formatDuration(252), "4m 12s");
 });
