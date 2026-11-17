@@ -55,7 +55,8 @@
 | `repoHead` 첫 줄: 접기 표시 · 데몬 점 · 저장소 이름 · 허브 칩 · (빈칸) · 상태 한 줄. 지금의 상태 점은 데몬 점으로 바뀌고, 배치나 머지 뒤 검사가 돌 때 지금처럼 깜빡인다(`repo.active`). 상태 한 줄의 글자 색은 지금 규칙(`repoHead`의 `text_color`)을 지킨다 | 요청은 "이름과 데몬 상태 점"이다. 점이 둘이면 시끄럽다. 상태 한 줄은 접힌 저장소의 한 줄 요약(board-polish 결정 1)이라 남긴다 |
 | 데몬 점의 툴팁: `Daemon running`, `Daemon idle · queue empty`, `Daemon off · N PRs in queue`, `Daemon state unknown` | 점 색만으로 뜻을 전하지 않는다 |
 | `board.js`의 저장소 보기에 `daemon` 필드를 더한다: `{ state, tone, text }`. `state`는 `running`(`daemon.running === true`, tone `ok`), `off`(`running === false`이고 `queue`에 항목이 하나라도 있음, tone `error`), `idle`(`running === false`이고 큐가 빔, tone `idle`), `unknown`(daemon 기록이 없거나 `running`이 불리언이 아님, 또는 허브에 닿지 않음, tone `idle`). 큐 항목은 상태와 상관없이 모두 센다 | orch(`orch.py`의 `chute-daemon-down`)가 `len(status["queue"])`가 0보다 크고 데몬이 안 돌 때만 문제로 본다. 같은 기준이다. `idle` tone은 `toneToken`에서 `dim`이 된다(회색) |
-| 경고 카드 `Daemon is off`, 상태 한 줄 `Daemon is off`, 머리 요약의 issues 수, 저절로 펼치기 키 `daemon:off`는 지금 그대로 둔다(큐가 비어도 빨강) | 기존 시험(`board.test.js`의 overview issues 시험, `problem keys are the notice keys plus the stopped daemon`, 무작위 시험의 경고 목록)이 큐가 빈 저장소의 꺼진 데몬을 문제로 본다. 이것을 바꾸면 기존 시험을 고쳐야 한다. 6절 결정 1로 사용자에게 묻는다 |
+| 경고 카드 `Daemon is off`와 상태 한 줄 `Daemon is off`도 같은 기준을 따른다. `alertsOf`와 `statusLineOf`는 `daemon.running === false`이고 큐에 항목이 하나라도 있을 때만 이것을 낸다. 머리 요약의 issues 수(`overview`)와 저절로 펼치기 키 `daemon:off`(`problems`)는 이 경고에서 나오므로 함께 따라간다. 큐가 빈 저장소의 꺼진 데몬은 회색 점 하나로만 보인다 | 사용자 결정(2026-11-18, 6절 결정 1). 회색 점과 빨간 경고가 함께 보이지 않게 한다 |
+| 위 변경으로 기대가 바뀌는 기존 시험 셋은 지우지 않고 기대만 고친다. (1) `overview: issues are human turns, error alerts and unreachable hubs; warn alerts do not count`: `daemonOff`에 대기 항목 하나를 넣어 issues 1을 지키고, 큐가 빈 꺼진 데몬은 issues 0이라는 줄을 더한다. (2) `problem keys are the notice keys plus the stopped daemon`: `off`에 대기 항목 하나를 넣어 `["daemon:off"]`를 지키고, 큐가 빈 꺼진 데몬은 `[]`라는 줄을 더한다. (3) `random malformed status never breaks the board`: 경고 목록 기대에서 `daemon`을 넣는 조건에 `queue.length > 0`을 더한다(그 시험의 `queue`는 객체만 거른 `view.queue`) | 사용자가 이 기대 변경을 승인했다. 큐가 있을 때의 경고는 그대로 시험하고, 큐가 빌 때의 새 뜻을 시험에 더한다. 플랜 작성 때 시험 사본에서 이 변경으로 148개가 모두 통과하는 것을 확인했다 |
 | 네 칸은 `board.js`가 `cells` 필드로 준다: `[{ key: "batch", label: "Batch", value }, { key: "queued", label: "Queued", value }, { key: "bounced", label: "Bounced", value }, { key: "merged", label: "Merged today", value }]`. `batch`는 배치의 PR 수(배치가 없으면 0), `queued`와 `bounced`는 그 구역의 항목 수, `merged`는 `today.merged`(정수가 아니거나 `today`가 없으면 `null`). 허브에 닿지 않는 저장소는 `cells`가 `null`이다 | "오늘 머지"는 status의 `today.merged`에 이미 있다. 지금 `todayOf`는 이 값을 문자열로만 넘겨서 숫자가 따로 필요하다. 필드를 더하는 것이고 있는 필드는 바꾸지 않는다 |
 | 네 칸은 같은 너비로 나란히 둔다. 숫자(고정폭, 15px 안팎, 굵게) 위, 이름(11px, `t.dim`) 아래. 값이 0이거나 `null`(`—`로 그림)인 칸은 숫자도 `t.dim`으로 그린다. 저장소가 펼쳐졌을 때만 보인다 | 요청의 "0인 칸은 흐리게"다. 접은 저장소는 한 줄로 줄이는 것이 접기의 뜻이라 칸을 숨긴다 |
 | `TODAY` 줄(`todayView`)은 지금대로 둔다 | 오늘 반송 수, 중앙값, 펼친 세부를 보인다. 네 칸의 `Merged today`와 겹치는 것은 머지 수 하나뿐이다 |
@@ -118,7 +119,7 @@
 
 | 작업 | 맡는 것 | 순서 | 방식 | 방식의 이유 |
 |---|---|---|---|---|
-| `board-head` | 3.1의 `tint`·고정폭 도우미, 3.2 머리와 네 칸, 3.3 빈 구역 한 줄, 3.4 배치 | 먼저 | `basic` | 화면 조정과 `board.js`의 읽기 전용 필드 추가다. 상태 저장, 머지·검증 판정, 잠금, 프로세스, orch 코드를 건드리지 않는다 |
+| `board-head` | 3.1의 `tint`·고정폭 도우미, 3.2 머리와 네 칸(데몬 경고 기준 변경 포함), 3.3 빈 구역 한 줄, 3.4 배치 | 먼저 | `poteto` | `board.js`에 데이터 필드(`daemon`, `cells`, `stage`)를 더하고 데몬 경고·상태 한 줄·issues·저절로 펼치기의 기준을 바꾼다(사용자 결정, 2026-11-18) |
 | `board-rows` | 3.5 줄 격자, 3.6 카드, 3.7 반송 줄 | `board-head` 뒤 | `basic` | 화면 조정뿐이다. `board.js`는 바꾸지 않는다 |
 
 순차로 둔 이유: 두 작업 모두 `main.js`의 `batchView`를 다시 짠다(`board-head`는 머리·막대·면, `board-rows`는 그 안의 PR 줄). `board-rows`는 `board-head`가 만든 `tint`와 고정폭 도우미를 쓴다.
@@ -127,13 +128,16 @@
 
 - 고치는 파일: `mod/chute/main.js`, `mod/chute/board.js`(`board-head`만, 필드 추가), `mod/chute/board.test.js`(`board-head`만, 시험 추가).
 - 고치지 않는 것: chute 본체(`src/`), `tests/fixtures/`, `mod/chute/mod.json`, `mod/chute-tabs/`, `chute.toml`, 다른 플랜 문서, 사용자의 `~/.config/herdr-app/` 아래 파일.
-- `board.test.js`의 기존 줄은 지우거나 바꾸지 않는다. 시험은 더하기만 한다.
+- `board.test.js`의 기존 줄은 지우거나 바꾸지 않는다. 시험은 더하기만 한다. 예외는 3.2절에 적은 `board-head`의 기존 시험 셋의 기대 변경뿐이다.
 
-## 6. 사용자가 정해야 하는 결정
+## 6. 사용자가 정한 결정 (2026-11-18)
 
-1. **큐가 빈데 데몬이 꺼진 저장소의 경고.** 이 플랜에서 데몬 점은 회색(쉬는 중)이 되지만, 경고 카드 `Daemon is off`, 빨간 상태 한 줄, 머리 요약의 issues 1, 접은 저장소 저절로 펼치기는 지금처럼 남는다. 그래서 그 저장소는 회색 점과 빨간 경고가 함께 보인다. orch처럼 이것들도 큐가 있을 때만 띄우려면 기존 시험 셋(overview issues 시험의 `daemonOff`, `problem keys are the notice keys plus the stopped daemon`, 무작위 시험의 경고 목록 기대값)의 기대를 바꿔야 한다. 요청이 기존 시험을 약하게 하지 말라고 해서 이 플랜은 하지 않았다. 원하면 작은 작업 하나로 더한다.
-2. **화면 확인이 막혔을 때.** 4절의 격리 창이 안 되면 사진 없이 끝난다. 사용자 Herdr에 `place: "none"` 사본을 잠깐 설치하고 사용자 창의 테마를 바꿔 찍는 것을 허용할지 정한다. 허용하지 않으면(이 플랜의 기본) 머지 뒤 `chute install`로 설치한 화면을 사용자가 테마 고르기로 두 테마를 보고 확인한다.
-3. **mod 시험이 chute 검증에 없다.** `chute.toml`의 검증은 `cargo fmt`, `clippy`, `cargo test`뿐이라 `node --test mod/chute/`는 chute가 병합 전에 돌리지 않는다. 작업자가 성공 조건으로 돌리지만, 병합 전 합친 결과에서도 돌리려면 `chute.toml`에 단계를 더하는 별도 결정이 필요하다. 이 플랜은 `chute.toml`을 고치지 않는다.
+처음 플랜에서 사용자에게 물은 셋과 방식 하나를 사용자가 정했다.
+
+1. **큐가 빈데 데몬이 꺼진 저장소의 경고: orch 기준에 맞춘다.** 큐가 비면 `Daemon is off` 경고, 빨간 상태 한 줄, issues 수, 저절로 펼치기를 내지 않고 점만 회색(쉬는 중)이다. 큐에 PR이 있는데 꺼졌을 때만 지금처럼 경고한다. 이 때문에 바뀌는 기존 시험 셋의 기대 변경을 승인했다(3.2절). 시험은 지우지 않는다.
+2. **화면 확인이 막혔을 때: 기본안.** 사용자 Herdr에 사본을 설치하거나 사용자 창의 테마를 바꾸지 않고 한계를 보고한다. 그 경우 머지 뒤 `chute install`로 설치한 화면을 사용자가 테마 고르기로 두 테마를 보고 확인한다.
+3. **mod 시험이 chute 검증에 없다: 기록만 한다.** `chute.toml`의 검증은 `cargo fmt`, `clippy`, `cargo test`뿐이라 `node --test mod/chute/`는 chute가 병합 전에 돌리지 않는다. 작업자가 성공 조건으로 돌린다. `chute.toml`에 단계를 더하는 것은 이 플랜의 범위 밖이고 후속 작업으로 남긴다.
+4. **`board-head`의 방식은 `poteto`.** `board.js`에 데이터 필드를 더하기 때문이다. `board-rows`는 `basic` 그대로다.
 
 ## 7. 범위 밖
 
@@ -141,4 +145,4 @@
 - 탭 막대 버튼(`mod/chute-tabs/`)과 `chute.status` 공유 값.
 - 파일 보기 창(`fileView`)과 오버레이 머리 버튼.
 - 패널 너비, 폴링 간격, 알림과 배지.
-- 6절 결정 1의 경고 기준 변경.
+- `chute.toml`에 mod 시험 단계를 더하는 일(6절 결정 3, 후속 작업).
