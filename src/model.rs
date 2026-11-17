@@ -265,8 +265,6 @@ pub enum BounceReason {
     Ci,
 }
 
-/// Why an old chute put a PR on a human's turn. Only `history.jsonl` lines and old
-/// `state.json` items still carry it; nothing writes it any more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanReason {
@@ -280,7 +278,6 @@ pub enum HumanReason {
 pub enum RemovedReason {
     Budget,
     GaveUp,
-    /// An item an older chute had put on a human's turn, taken out when the state was first rewritten.
     Upgrade,
 }
 
@@ -882,7 +879,6 @@ pub enum EventKind {
         batch: Option<BatchId>,
         reason: BounceReason,
         attempts: u32,
-        /// Why the worker could not be reached, so the bounce went to the submitter instead.
         #[serde(default)]
         unreachable: Option<String>,
     },

@@ -1197,8 +1197,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The worker gets the bounce unless it is also the submitter. When no worker can take it,
-    /// the submitter gets it instead, even if it is the worker's own terminal.
     fn tell_bounce(&self, item: &QueueItem, told: Told<'_>, delivery: &Delivery, at: EpochMs) {
         let notifier = self.engine.notifier();
         let (worker, how) = match delivery {

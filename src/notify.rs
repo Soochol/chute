@@ -21,11 +21,9 @@ const DETAIL_CHARS: usize = 200;
 pub enum BounceDelivery {
     Sent,
     Spawned,
-    /// There was no worker to take the bounce, so the line goes to the submitter.
     Unreachable(String),
 }
 
-/// Why a PR left the queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Removal {
     Budget {

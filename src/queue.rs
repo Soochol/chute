@@ -490,7 +490,6 @@ pub fn drop_item(state: &mut State, pr: PrNumber) -> Result<QueueItem, Transitio
     take_out(state, pr, Action::Drop)
 }
 
-/// Takes the item out of the queue. A PR submitted again later is a new item with no bounces counted.
 pub fn give_up(state: &mut State, pr: PrNumber) -> Result<QueueItem, TransitionError> {
     take_out(state, pr, Action::GiveUp)
 }
@@ -587,8 +586,6 @@ pub fn record_agent(state: &mut State, pr: PrNumber, agent: Agent) -> Result<(),
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recorded {
     Bounced(BounceReason),
-    /// The bounce budget was already used up, so the item left the queue. It still carries
-    /// the failure that did it.
     OverBudget(Box<QueueItem>),
 }
 

@@ -148,7 +148,6 @@ impl RepoStore {
 
     /// A snapshot of `state.json` without the lock. Writers rename into place, so a reader
     /// sees either the old or the new file. A missing file is the empty state; a corrupt one is an error.
-    /// Items an older chute left on a human's turn are not in the snapshot.
     pub fn load(&self) -> Result<State> {
         Ok(self.read_state()?.0)
     }
@@ -181,8 +180,6 @@ impl RepoStore {
         Ok((state, old))
     }
 
-    /// The write that drops the items is the caller's. A crash between the two leaves them in
-    /// `state.json` for the next write, which skips the ones already recorded.
     fn record_old_human_items_removed(&self, items: &[OldHumanItem]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -406,7 +403,6 @@ impl RepoStore {
     }
 }
 
-/// An item an older chute left on a human's turn, which `ItemState` no longer has.
 struct OldHumanItem {
     pr: PrNumber,
     reason: Option<String>,
