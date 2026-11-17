@@ -69,6 +69,17 @@ pub struct Options<'a> {
     pub changed: Option<&'a [String]>,
     /// Called with the step's name for each step left out because of `paths`.
     pub on_skip: Option<&'a dyn Fn(&str)>,
+    pub wanted: Option<Wanted<'a>>,
+}
+
+/// The failure a culprit search looks for: one step, and the tests that failed twice at the tip.
+#[derive(Clone, Copy, Debug)]
+pub struct Wanted<'a> {
+    pub step: &'a str,
+    pub tests: &'a [String],
+    /// The `failed` pattern that named `tests`. A step whose pattern is another one does not
+    /// run `tests` by `probe`, since the names may not be the ones its `probe` takes.
+    pub named_by: Option<&'a str>,
 }
 
 impl Default for Options<'_> {
@@ -83,6 +94,7 @@ impl Default for Options<'_> {
             on_machine_wait: None,
             changed: None,
             on_skip: None,
+            wanted: None,
         }
     }
 }
@@ -108,6 +120,20 @@ pub struct Failed {
     pub detail: Detail,
     /// The log of the attempt that ended the run.
     pub log: PathBuf,
+    /// With `rerun_with_probe`, when the step failed twice: the tests that both attempts named.
+    /// Empty when an attempt named none. `None` when the step was not run twice.
+    pub confirmed: Option<Vec<String>>,
+    /// The `failed` pattern of the step, which named the tests.
+    pub named_by: Option<String>,
+}
+
+impl Failed {
+    pub fn tests(&self) -> Vec<String> {
+        match &self.detail {
+            Detail::Tests(tests) => tests.to_vec(),
+            Detail::Tail(_) => Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,22 +313,48 @@ impl Ctx<'_> {
             return Ok(StepEnd::Failed(failure(step, cause, first_log)?));
         }
         let first_tests = failed_tests(step, &read_window(&first_log)?);
-        let probe = self.probe_step(step, &first_tests);
+        let searched = self
+            .opts
+            .wanted
+            .filter(|w| w.step == step.name && !w.tests.is_empty())
+            .filter(|w| w.named_by == step.failed.as_ref().map(|re| re.as_str()));
+        let by_wanted = searched.and_then(|w| self.probe_step(step, w.tests));
+        let probe = by_wanted
+            .clone()
+            .or_else(|| self.probe_step(step, &first_tests));
         match self.attempt(probe.as_ref().unwrap_or(step), &second_log)? {
-            End::Passed => Ok(StepEnd::Passed {
-                flaky: Some(FlakyStep {
+            End::Passed => {
+                let tests = match searched.filter(|_| by_wanted.is_some()) {
+                    Some(w) => first_tests
+                        .into_iter()
+                        .filter(|test| w.tests.contains(test))
+                        .collect(),
+                    None => first_tests,
+                };
+                let flaky = (by_wanted.is_none() || !tests.is_empty()).then(|| FlakyStep {
                     step: step.name.clone(),
-                    tests: first_tests,
-                }),
-            }),
+                    tests,
+                });
+                Ok(StepEnd::Passed { flaky })
+            }
             End::Cancelled => Ok(StepEnd::Cancelled),
             End::Failed(cause) => {
                 let mut failed = failure(step, cause, second_log)?;
-                if probe.is_some()
-                    && matches!(failed.detail, Detail::Tail(_))
-                    && let Some(tests) = NonEmpty::new(first_tests)
-                {
-                    failed.detail = Detail::Tests(tests);
+                if self.opts.rerun_with_probe {
+                    let second = failed.tests();
+                    let both: Vec<String> = second
+                        .into_iter()
+                        .filter(|test| first_tests.contains(test))
+                        .collect();
+                    failed.confirmed = Some(both.clone());
+                    if let Some(tests) = NonEmpty::new(both) {
+                        failed.detail = Detail::Tests(tests);
+                    } else if probe.is_some()
+                        && matches!(failed.detail, Detail::Tail(_))
+                        && let Some(tests) = NonEmpty::new(first_tests)
+                    {
+                        failed.detail = Detail::Tests(tests);
+                    }
                 }
                 Ok(StepEnd::Failed(failed))
             }
@@ -480,6 +532,8 @@ fn failure(step: &VerifyStep, cause: Cause, log: PathBuf) -> Result<Failed> {
         cause,
         detail,
         log,
+        confirmed: None,
+        named_by: step.failed.as_ref().map(|re| re.as_str().to_owned()),
     })
 }
 
