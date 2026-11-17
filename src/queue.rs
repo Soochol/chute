@@ -379,7 +379,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     item.head = s.head;
     item.title = s.title;
     item.touches_config = s.touches_config;
-    if head_changed || item.config_change.is_none() {
+    if head_changed || released || item.config_change.is_none() {
         item.config_change = s.config_change;
     }
     if s.agent.is_some() {
@@ -1498,6 +1498,22 @@ mod tests {
         );
         let held = submit(&mut state, removed).unwrap();
         assert_eq!((held.state, held.change), (AWAITING, Change::Unchanged));
+    }
+
+    #[test]
+    fn releasing_an_old_awaiting_item_replaces_its_config_summary() {
+        use crate::model::ConfigChangeKind::{Edited, Invalid};
+        let mut state = queue_of(&[(1, AWAITING)]);
+        state.queue[0].touches_config = true;
+        state.queue[0].config_change = summary(Invalid);
+        let edited = with_config(
+            submission(1, "abc1234", Approval::Agent, true),
+            Edited,
+            true,
+        );
+        submit(&mut state, edited).unwrap();
+        assert_eq!(state_of(&state, 1), QUEUED);
+        assert_eq!(state.queue[0].config_change, summary(Edited));
     }
 
     #[test]
