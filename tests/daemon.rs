@@ -172,13 +172,6 @@ fn a_stop_request_left_by_an_earlier_run_does_not_stop_the_new_daemon() {
     std::fs::create_dir_all(lab.store.dir()).unwrap();
     let stop = lab.store.dir().join("stop");
     std::fs::write(&stop, "now").unwrap();
-    let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-    std::fs::File::options()
-        .write(true)
-        .open(&stop)
-        .unwrap()
-        .set_modified(long_ago)
-        .unwrap();
 
     let mut daemon = start_daemon(&lab);
     wait_for_daemon(&lab, &daemon);
@@ -207,14 +200,14 @@ fn up_starts_the_daemon_again_right_after_down() {
 }
 
 #[test]
-fn a_stop_request_made_just_now_is_kept_when_the_daemon_starts() {
+fn a_stop_request_made_after_the_daemon_started_is_kept() {
     let lab = Lab::new("");
-    std::fs::create_dir_all(lab.store.dir()).unwrap();
+    let mut daemon = start_daemon(&lab);
+    wait_for_daemon(&lab, &daemon);
+
     std::fs::write(lab.store.dir().join("stop"), "now").unwrap();
 
-    let mut daemon = start_daemon(&lab);
-
-    wait_until("방금 한 정지 요청이 무시됐다", || {
+    wait_until("데몬이 뜬 뒤의 정지 요청이 무시됐다", || {
         exits(&mut daemon)
     });
 }
@@ -424,10 +417,13 @@ fn the_daemon_runs_gc_when_it_starts_and_leaves_the_records() {
     std::fs::create_dir_all(record.parent().unwrap()).unwrap();
     std::fs::write(&record, "{}").unwrap();
 
-    let mut daemon = start_daemon(&lab);
-    wait_until("시작할 때 정리가 돌지 않았다", || !log.exists());
+    let ran = lab.store.dir().join("gc.json");
+    assert!(!ran.exists());
 
-    assert!(lab.store.dir().join("gc.json").is_file());
+    let mut daemon = start_daemon(&lab);
+    wait_until("시작할 때 정리가 돌지 않았다", || ran.is_file());
+
+    assert!(!log.exists());
     assert!(record.exists());
     ok(chute(&lab, &["down", "--now"]).output().unwrap());
     wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
@@ -441,7 +437,7 @@ fn the_daemon_checks_the_tip_after_the_merge_beside_the_queue_and_down_ends_the_
     std::fs::write(
         root.join("post.sh"),
         format!(
-            "echo $$ > '{r}/post.pid'\nwhile [ -e '{r}/gate' ]; do sleep 0.05; done\n",
+            "echo $$ > '{r}/post.pid.tmp'\nmv '{r}/post.pid.tmp' '{r}/post.pid'\nwhile [ -e '{r}/gate' ]; do sleep 0.05; done\n",
             r = root.display()
         ),
     )
@@ -471,10 +467,14 @@ fn the_daemon_checks_the_tip_after_the_merge_beside_the_queue_and_down_ends_the_
             .is_some_and(|green| green.commit.as_str() == merged_tip)
     });
 
+    std::fs::remove_file(root.join("post.pid")).unwrap();
     std::fs::write(root.join("gate"), "").unwrap();
     lab.open_pr(2, &[("b.txt", "b\n")]);
     wait_until("두 번째 검사가 시작되지 않았다", || {
         lab.state().post.run.is_some_and(|run| run.step.is_some())
+    });
+    wait_until("이번 검사의 pid가 남지 않았다", || {
+        root.join("post.pid").exists()
     });
     let pid: i32 = std::fs::read_to_string(root.join("post.pid"))
         .unwrap()
