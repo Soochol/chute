@@ -201,7 +201,7 @@ fn readme_covers_the_v3_commands_the_repair_flow_and_every_first_run_check() {
         "hc send <머신>/<터미널>",
         "require_head = true",
         "pushed_by_chute",
-        "human reason=unreachable",
+        "delivered=unreachable",
         "env_check",
         "max_parallel",
         "chute gc --dry-run",
@@ -219,7 +219,7 @@ fn readme_and_manual_notice_kinds_match() {
     for kind in [
         "merged",
         "bounced",
-        "human",
+        "removed",
         "halted",
         "resumed",
         "reverted",

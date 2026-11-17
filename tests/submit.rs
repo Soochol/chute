@@ -4,8 +4,8 @@ mod support;
 use std::process::Output;
 
 use chute::model::{
-    Agent, BlockReason, Blocked, BounceReason, EpochMs, EventKind, HumanReason, ItemState,
-    MachineId, PrNumber, PreflightRecord, PreflightResult, Sha, Slug, State, TerminalId,
+    Agent, BlockReason, Blocked, BounceReason, EpochMs, EventKind, ItemState, MachineId, PrNumber,
+    PreflightRecord, PreflightResult, Sha, Slug, State, TerminalId,
 };
 use chute::store::Home;
 use queue_kit::{World, item, stderr};
@@ -695,21 +695,16 @@ fn a_bounced_pr_in_human_mode_says_it_waits_for_approval_and_not_that_it_is_queu
 }
 
 #[test]
-fn a_pr_in_a_batch_or_on_a_humans_turn_is_refused_and_left_alone() {
-    for from in [
-        ItemState::InBatch,
-        ItemState::NeedsHuman(HumanReason::GaveUp),
-    ] {
-        let w = World::new();
-        seed_at(&w, 12, OLD_HEAD, from);
-        gh_pr(&w, Some(12), pr(12, HEAD));
-        let before = w.state();
+fn a_pr_in_a_batch_is_refused_and_left_alone() {
+    let w = World::new();
+    seed_at(&w, 12, OLD_HEAD, ItemState::InBatch);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    let before = w.state();
 
-        let out = submit_as(&w, Some("t1rs"), &["12"]);
+    let out = submit_as(&w, Some("t1rs"), &["12"]);
 
-        assert_eq!(code(&out), Some(1), "{from:?}");
-        assert_eq!(w.state(), before, "{from:?}");
-    }
+    assert_eq!(code(&out), Some(1));
+    assert_eq!(w.state(), before);
 }
 
 fn preflight_at(w: &World, head: &str) {

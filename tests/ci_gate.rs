@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use chute::engine::{Clock, Pass, Summary};
 use chute::model::{
-    Approval, BounceReason, EpochMs, Failure, HumanReason, ItemState, PrNumber, QueuedReason,
-    WarningKind,
+    Approval, BounceReason, EpochMs, Failure, ItemState, PrNumber, QueuedReason, WarningKind,
 };
 use engine_kit::Lab;
 
@@ -224,7 +223,7 @@ fn a_cancelled_check_and_a_failure_beside_a_running_one_both_bounce() {
 }
 
 #[test]
-fn ci_failures_spend_the_retry_budget_and_then_go_to_a_human() {
+fn ci_failures_spend_the_retry_budget_and_then_the_pr_leaves_the_queue() {
     let lab = lab_requiring_ci();
     let head = lab.open_pr(1, &[("a.txt", "a\n")]);
     lab.gh_checks(1, &[("build", "fail")]);
@@ -239,10 +238,7 @@ fn ci_failures_spend_the_retry_budget_and_then_go_to_a_human() {
     let summary = done(lab.engine().run_once().unwrap());
 
     assert_eq!(summary.bounced, prs(&[1]));
-    assert_eq!(
-        lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Budget))
-    );
+    assert_eq!(lab.item_state(1), None);
     assert_eq!(lab.hc_calls("send").len(), 3);
 }
 
@@ -592,7 +588,7 @@ fn a_no_checks_warning_does_not_outlive_the_queued_state_of_its_pr() {
     assert_eq!(lab.state().warnings.len(), 1);
     lab.store
         .update(|s| {
-            s.queue[0].state = ItemState::NeedsHuman(HumanReason::GaveUp);
+            s.queue[0].state = ItemState::Bounced(BounceReason::Conflict);
             Ok(())
         })
         .unwrap();

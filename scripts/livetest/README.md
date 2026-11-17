@@ -55,7 +55,7 @@ scripts/livetest/scenarios/05-flaky.sh   # 한 시나리오를 직접
 | `06-timeout` | 단계 시간 초과 반송, 멈춘 프로세스가 남지 않음 |
 | `07-head-moved` | submit 뒤 push하면 `head_changed` 반송, 예산을 쓰지 않음, 다시 submit하면 머지 |
 | `08-daemon-kill` | batch 검증 도중 데몬을 `kill -9`하고 다시 띄워도 큐와 main이 맞게 이어짐 |
-| `09-unreachable` | 반송받을 터미널이 끝났거나 지워졌을 때 사람 차례(`unreachable`)와 submitter 알림 |
+| `09-unreachable` | 반송받을 터미널이 끝났거나 지워졌을 때 `bounced`에 남고 submitter가 반송 줄을 `delivered=unreachable`로 받는지 |
 | `10-after-priority` | `--after`는 대상이 머지될 때까지 batch에 넣지 않고 `--priority`는 먼저 넣음 |
 | `11-revert` | `chute revert`는 revert PR이 아니라 main에 revert 커밋을 쌓음 |
 | `12-pr-closed` | batch 도중 닫힌 PR은 머지되지 않고 나머지는 머지 |

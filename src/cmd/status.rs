@@ -431,6 +431,9 @@ pub fn summarize<Tz: TimeZone>(
     for event in events {
         match &event.kind {
             EventKind::Bounced { pr, .. } => *bounces.entry(*pr).or_default() += 1,
+            EventKind::Removed { pr, .. } => {
+                bounces.remove(pr);
+            }
             EventKind::Merged {
                 pr,
                 batch,
@@ -481,6 +484,7 @@ pub fn summarize<Tz: TimeZone>(
             | EventKind::GaveUp { .. }
             | EventKind::Closed { .. }
             | EventKind::NeedsHuman { .. }
+            | EventKind::Removed { .. }
             | EventKind::Blocked { .. }
             | EventKind::Submitted { .. }
             | EventKind::Dropped { .. }
@@ -778,6 +782,7 @@ mod tests {
                     batch: None,
                     reason: BounceReason::Conflict,
                     attempts: 1,
+                    unreachable: None,
                 },
             },
             finished("first", 9),
@@ -810,6 +815,7 @@ mod tests {
                 batch: None,
                 reason: BounceReason::Conflict,
                 attempts: 1,
+                unreachable: None,
             },
         };
         let merged = |pr, minutes_ago, title: Option<&str>| Event {
@@ -905,6 +911,7 @@ mod tests {
                 batch: None,
                 reason: BounceReason::Conflict,
                 attempts: 1,
+                unreachable: None,
             },
         };
         let events = vec![bounce(1, 100), bounce(2, 150), bounce(1, 300)];
@@ -922,6 +929,7 @@ mod tests {
                 batch: None,
                 reason: BounceReason::Conflict,
                 attempts: 1,
+                unreachable: None,
             },
         }];
         let last = last_bounced_at(&events);

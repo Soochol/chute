@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use chute::engine::{Pass, Summary};
 use chute::model::{
-    Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, HumanReason, ItemState,
-    PrNumber, ProbeEvidence, SkippedStep, StatusView, VerifyMode, WarningKind,
+    Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, ItemState, PrNumber,
+    ProbeEvidence, RemovedReason, SkippedStep, StatusView, VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -384,7 +384,7 @@ fn a_pr_that_runs_past_the_time_limit_is_bounced_as_a_timeout() {
 }
 
 #[test]
-fn after_the_budget_is_spent_the_next_failure_goes_to_a_human_and_nothing_is_sent() {
+fn after_the_budget_is_spent_the_next_failure_takes_the_pr_out_and_sends_nothing_to_the_worker() {
     let lab = Lab::new(BAD);
     let head = lab.open_pr(1, &[("BAD", "")]);
 
@@ -403,19 +403,31 @@ fn after_the_budget_is_spent_the_next_failure_goes_to_a_human_and_nothing_is_sen
     let summary = done(lab.engine().run_once().unwrap());
 
     assert_eq!(summary.bounced, prs(&[1]));
-    assert_eq!(
-        lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Budget))
-    );
+    assert_eq!(lab.item_state(1), None);
     assert_eq!(lab.hc_calls("send").len(), 3);
-    assert!(lab.events().iter().any(|e| matches!(
-        e,
-        EventKind::NeedsHuman {
-            reason: HumanReason::Budget,
+    let removed: Vec<EventKind> = lab
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, EventKind::Removed { .. }))
+        .collect();
+    let [
+        EventKind::Removed {
+            pr,
+            reason: RemovedReason::Budget,
+            report: Some(report),
             ..
-        }
-    )));
-    assert!(lab.item(1).unwrap().last_failure.is_some());
+        },
+    ] = removed.as_slice()
+    else {
+        panic!("removed 이벤트가 하나여야 한다: {removed:?}");
+    };
+    assert_eq!(*pr, PrNumber(1));
+    assert!(report.is_file(), "{}", report.display());
+    assert!(
+        !lab.events()
+            .iter()
+            .any(|e| matches!(e, EventKind::NeedsHuman { .. } | EventKind::GaveUp { .. }))
+    );
 }
 
 #[test]
@@ -453,7 +465,7 @@ fn a_finished_agent_is_replaced_and_the_new_address_is_recorded() {
 }
 
 #[test]
-fn without_an_agent_or_a_respawn_command_the_pr_waits_for_a_human() {
+fn without_an_agent_or_a_respawn_command_the_pr_stays_bounced_and_the_event_says_why() {
     let lab = Lab::new(BAD);
     let hc = lab.sb.fake("hc");
     hc.respond(
@@ -468,17 +480,30 @@ fn without_an_agent_or_a_respawn_command_the_pr_waits_for_a_human() {
 
     assert_eq!(
         lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Unreachable))
+        Some(ItemState::Bounced(BounceReason::Verify))
     );
+    assert_eq!(lab.item(1).unwrap().attempts, 1);
     assert!(lab.hc_calls("run").is_empty());
     assert!(lab.events().iter().any(|e| matches!(
         e,
-        EventKind::NeedsHuman {
-            reason: HumanReason::Unreachable,
-            detail: Some(_),
+        EventKind::Bounced {
+            reason: BounceReason::Verify,
+            unreachable: Some(_),
             ..
         }
     )));
+    assert!(
+        !lab.events()
+            .iter()
+            .any(|e| matches!(e, EventKind::NeedsHuman { .. }))
+    );
+    assert_eq!(
+        lab.notified(),
+        [(
+            chute::model::NotifyKind::Bounced,
+            chute::model::Delivered::NoTerminal
+        )]
+    );
 }
 
 #[test]
@@ -782,6 +807,44 @@ fn a_failed_tree_ref_lives_while_the_pr_is_in_the_queue_and_goes_when_it_leaves(
         ],
         "preflight와 커밋 참조는 engine이 지우지 않는다"
     );
+}
+
+#[test]
+fn recovery_drops_an_item_an_older_chute_left_on_a_humans_turn_and_tells_no_one() {
+    let lab = Lab::new("");
+    lab.open_pr(2, &[("b.txt", "b\n")]);
+    let old = serde_json::json!({
+        "pr": 1, "title": "PR 1", "branch": "feat/1", "head": "abc1234",
+        "state": "needs_human", "state_reason": "budget", "agent": null, "attempts": 3,
+        "submitted_ms": 1, "touches_config": false, "last_failure": null,
+        "submitter": {"terminal": "t1orch", "created_ms": 1, "name": null,
+                      "workdir": "/w", "alive": true}
+    });
+    let path = lab.store.dir().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    state["queue"].as_array_mut().unwrap().push(old);
+    fs::write(&path, state.to_string()).unwrap();
+
+    lab.engine().recover().unwrap();
+    lab.engine().recover().unwrap();
+
+    assert_eq!(lab.item_state(1), None);
+    assert_eq!(lab.item_state(2), Some(ItemState::Queued(None)));
+    let upgrades: Vec<PrNumber> = lab
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Removed {
+                pr,
+                reason: RemovedReason::Upgrade,
+                ..
+            } => Some(pr),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(upgrades, prs(&[1]));
+    assert!(lab.hc_calls("send").is_empty());
 }
 
 #[test]
@@ -1840,7 +1903,7 @@ fn notify_a_worker_that_submitted_for_itself_gets_the_bounce_line_only() {
 }
 
 #[test]
-fn notify_a_spent_budget_is_a_human_line_and_not_a_bounce_line() {
+fn notify_a_spent_budget_is_a_removed_line_with_the_last_report_and_not_a_bounce_line() {
     let lab = Lab::new(BAD);
     let head = lab.push_pr_branch(1, &[("BAD", "")]);
     let submit = |lab: &Lab| {
@@ -1861,19 +1924,30 @@ fn notify_a_spent_budget_is_a_human_line_and_not_a_bounce_line() {
     submit(&lab);
     done(lab.engine().run_once().unwrap());
 
-    assert_eq!(
-        lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Budget))
-    );
+    assert_eq!(lab.item_state(1), None);
     let orch = lab.lines_sent_to("t1orch");
     assert_eq!(orch.len(), 4, "{orch:?}");
-    assert!(orch[3].starts_with("chute 결과 human slug=acme/widget at="));
-    assert!(has_key(&orch[3], "pr=1") && has_key(&orch[3], "reason=budget"));
+    assert!(orch[3].starts_with("chute 결과 removed slug=acme/widget at="));
+    for pair in ["pr=1", "reason=budget", "attempts=3", "budget=3"] {
+        assert!(has_key(&orch[3], pair), "{pair}: {}", orch[3]);
+    }
+    assert!(
+        orch[3].contains(" head=") && orch[3].contains(" report="),
+        "{}",
+        orch[3]
+    );
     assert_eq!(lab.lines_sent_to("t1rs").len(), 3);
+    assert_eq!(
+        lab.notified().last(),
+        Some(&(
+            chute::model::NotifyKind::Removed,
+            chute::model::Delivered::Sent
+        ))
+    );
 }
 
 #[test]
-fn notify_a_bounce_that_cannot_be_delivered_is_a_human_line_for_the_orchestrator() {
+fn notify_a_bounce_that_cannot_be_delivered_goes_to_the_orchestrator_as_an_unreachable_bounce() {
     let lab = Lab::new(BAD);
     let hc = lab.sb.fake("hc");
     hc.respond(
@@ -1895,12 +1969,80 @@ fn notify_a_bounce_that_cannot_be_delivered_is_a_human_line_for_the_orchestrator
 
     assert_eq!(
         lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Unreachable))
+        Some(ItemState::Bounced(BounceReason::Verify))
     );
     let orch = lab.lines_sent_to("t1orch");
     assert_eq!(orch.len(), 1, "{orch:?}");
-    assert!(orch[0].starts_with("chute 결과 human "), "{}", orch[0]);
-    assert!(has_key(&orch[0], "reason=unreachable"), "{}", orch[0]);
+    assert!(orch[0].starts_with("chute 결과 bounced "), "{}", orch[0]);
+    for pair in [
+        "pr=1",
+        "reason=verify",
+        "delivered=unreachable",
+        "to=t1orch",
+    ] {
+        assert!(has_key(&orch[0], pair), "{pair}: {}", orch[0]);
+    }
+    assert!(orch[0].contains(" report="), "{}", orch[0]);
+    assert_eq!(
+        lab.notified(),
+        [(
+            chute::model::NotifyKind::Bounced,
+            chute::model::Delivered::Sent
+        )]
+    );
+
+    let mut gone = lab.agent();
+    gone.terminal = chute::model::TerminalId("t1gone".into());
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(gone),
+        Some(lab.orchestrator()),
+        Approval::Agent,
+    );
+    assert_eq!(lab.item_state(1), Some(ItemState::Queued(None)));
+    assert_eq!(lab.item(1).unwrap().attempts, 1);
+}
+
+#[test]
+fn notify_an_unreachable_bounce_is_still_sent_when_the_worker_is_also_the_submitter() {
+    let lab = Lab::new(BAD);
+    lab.sb
+        .fake("hc")
+        .clear_rules()
+        .respond("get t1rs --json", Reply::file("tests/fixtures/hc/get.json"))
+        .respond("send t1rs *", Reply::ok("").code(9));
+    let head = lab.push_pr_branch(1, &[("BAD", "")]);
+    lab.queue_pr_by(
+        1,
+        &head,
+        Some(lab.agent()),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+
+    done(lab.engine().run_once().unwrap());
+
+    assert_eq!(
+        lab.item_state(1),
+        Some(ItemState::Bounced(BounceReason::Verify))
+    );
+    let to_worker = lab.lines_sent_to("t1rs");
+    assert_eq!(to_worker.len(), 2, "{to_worker:?}");
+    assert!(to_worker[0].starts_with("chute 반송:"), "{}", to_worker[0]);
+    assert!(
+        to_worker[1].starts_with("chute 결과 bounced ")
+            && has_key(&to_worker[1], "delivered=unreachable"),
+        "{}",
+        to_worker[1]
+    );
+    assert_eq!(
+        lab.notified(),
+        [(
+            chute::model::NotifyKind::Bounced,
+            chute::model::Delivered::Blocked
+        )]
+    );
 }
 
 #[test]
@@ -2002,15 +2144,13 @@ fn waiting_a_bounced_pr_tells_the_submitter_of_the_pr_behind_it_and_holds_that_p
 }
 
 #[test]
-fn waiting_a_pr_handed_to_a_human_by_a_spent_budget_says_human() {
+fn waiting_a_pr_taken_out_by_a_spent_budget_says_removed() {
     let lab = Lab::new(BAD);
     queue_bad_pr_and_a_waiter(&lab);
     for _ in 0..4 {
         done(lab.engine().run_once().unwrap());
-        let head = lab.item(1).unwrap().head;
-        if matches!(lab.item_state(1), Some(ItemState::NeedsHuman(_))) {
-            break;
-        }
+        let Some(item) = lab.item(1) else { break };
+        let head = item.head;
         lab.queue_pr_by(
             1,
             &head,
@@ -2020,12 +2160,10 @@ fn waiting_a_pr_handed_to_a_human_by_a_spent_budget_says_human() {
         );
     }
 
-    assert_eq!(
-        lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Budget))
-    );
+    assert_eq!(lab.item_state(1), None);
+    assert_eq!(lab.item(2).unwrap().after, prs(&[1]));
     let lines = waiting_lines(&lab);
-    assert!(has_key(lines.last().unwrap(), "why=human"), "{lines:?}");
+    assert!(has_key(lines.last().unwrap(), "why=removed"), "{lines:?}");
     assert!(
         lines[..lines.len() - 1]
             .iter()

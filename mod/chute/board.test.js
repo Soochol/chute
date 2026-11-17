@@ -51,10 +51,10 @@ test("every fixture item lands in one of the six sections", () => {
   const repo = result.repos[0];
   assert.deepEqual(repo.sections.map((s) => s.id), ["alerts", "human", "batch", "waiting", "bounced"]);
   assert.deepEqual(repo.sections.map((s) => s.title), ["Alerts", "Needs you", "Current batch", "Queued", "Bounced"]);
-  assert.deepEqual(prs(section(repo, "human")), [9, 10, 11, 21]);
+  assert.deepEqual(prs(section(repo, "human")), [21]);
   assert.deepEqual(section(repo, "batch").items[0].prs.map((p) => p.pr), [12, 13]);
   assert.deepEqual(prs(section(repo, "waiting")), [19, 20, 22, 23, 24]);
-  assert.deepEqual(prs(section(repo, "bounced")), [15, 14, 16, 18, 17]);
+  assert.deepEqual(prs(section(repo, "bounced")), [9, 10, 11, 15, 14, 16, 18, 17]);
 
   const placed = ["human", "waiting", "bounced"].flatMap((id) => prs(section(repo, id))).length + 2;
   assert.equal(placed, fixture.queue.length);
@@ -72,9 +72,6 @@ test("every state and reason in the fixture is covered", () => {
       "bounced/timeout",
       "bounced/verify",
       "in_batch/null",
-      "needs_human/budget",
-      "needs_human/gave_up",
-      "needs_human/unreachable",
       "queued/ci_pending",
       "queued/null",
     ],
@@ -84,10 +81,10 @@ test("every state and reason in the fixture is covered", () => {
     ["human", "bounced"].flatMap((id) => section(repo, id).items.map((item) => [item.pr, item.reason])),
   );
   assert.deepEqual(reasons, {
-    9: "Out of retries",
-    10: "Couldn't reach the agent",
-    11: "Agent gave up",
     21: "Awaiting approval",
+    9: "Verification failed",
+    10: "Verification failed",
+    11: "Conflict",
     15: "Verification failed",
     14: "Conflict",
     16: "Timed out",
@@ -96,32 +93,23 @@ test("every state and reason in the fixture is covered", () => {
   });
 });
 
-test("buttons: approve and drop on awaiting approval, retry and drop on needs_human, none elsewhere", () => {
+test("buttons: approve and drop on awaiting approval, none elsewhere", () => {
   const repo = only([fixture]);
   const buttons = (id) =>
     Object.fromEntries(section(repo, id).items.map((item) => [item.pr, item.actions.map((a) => a.label)]));
-  assert.deepEqual(buttons("human"), {
-    9: ["Retry", "Drop"],
-    10: ["Retry", "Drop"],
-    11: ["Retry", "Drop"],
-    21: ["Approve", "Drop"],
-  });
+  assert.deepEqual(buttons("human"), { 21: ["Approve", "Drop"] });
   for (const id of ["bounced", "waiting"]) {
     for (const item of section(repo, id).items) assert.equal(item.actions?.length ?? 0, 0, `#${item.pr}`);
   }
 });
 
-test("approve carries the HEAD the card showed; retry and drop are [verb, pr, --repo, path]", () => {
+test("approve carries the HEAD the card showed; drop is [verb, pr, --repo, path]", () => {
   const repo = only([fixture]);
   const human = Object.fromEntries(section(repo, "human").items.map((item) => [item.pr, item.actions]));
   const path = fixture.repo.path;
   assert.deepEqual(human[21].map((a) => a.args), [
     ["approve", "21", "--head", itemOf(21).head, "--repo", path],
     ["drop", "21", "--repo", path],
-  ]);
-  assert.deepEqual(human[9].map((a) => a.args), [
-    ["retry", "9", "--repo", path],
-    ["drop", "9", "--repo", path],
   ]);
   assert.deepEqual(actionArgs("approve", 7, "/r", "abc1234"), ["approve", "7", "--head", "abc1234", "--repo", "/r"]);
   assert.deepEqual(actionArgs("drop", 7, "/r", "abc1234"), ["drop", "7", "--repo", "/r"]);
@@ -152,12 +140,17 @@ test("a valid head with no buttons for another reason does not claim the head is
   assert.equal(section(only(data), "human").items.find((i) => i.pr === 21).approvalBlocked, null);
 });
 
-test("a needs_human item keeps retry and drop even without a head", () => {
-  const item = section(only(withQueue({ ...itemOf(9), head: undefined })), "human").items[0];
-  assert.deepEqual(item.actions.map((a) => a.args), [
-    ["retry", "9", "--repo", fixture.repo.path],
-    ["drop", "9", "--repo", fixture.repo.path],
-  ]);
+test("only awaiting_approval is the human's turn, and nothing on the board offers a retry", () => {
+  const repo = only([fixture]);
+  assert.deepEqual(section(repo, "human").items.map((i) => i.state), ["awaiting_approval"]);
+  const verbs = repo.sections.flatMap((s) => s.items.flatMap((i) => (i.actions ?? []).map((a) => a.verb)));
+  assert.deepEqual([...new Set(verbs)].sort(), ["approve", "drop"]);
+});
+
+test("a legacy needs_human item is an unknown state, not a human card", () => {
+  const repo = only(withQueue({ ...itemOf(9), state: "needs_human", state_reason: "budget" }, itemOf(21)));
+  assert.deepEqual(prs(section(repo, "human")), [21]);
+  assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.state, i.reason]), [[9, "needs_human", "budget"]]);
 });
 
 test("a repo without a path gets no buttons rather than a command aimed at the current folder", () => {
@@ -280,14 +273,20 @@ test("awaiting approval shows the preflight result and whether chute.toml change
   assert.equal(none.preflight.text, "No preflight");
 });
 
-test("human cards carry reason, agent, retries and the last failure", () => {
-  const items = section(only([fixture]), "human").items;
-  const budget = items.find((i) => i.pr === 9);
-  assert.equal(budget.retries, "3/3");
-  assert.equal(budget.state, "needs_human");
-  assert.equal(items.find((i) => i.pr === 21).state, "awaiting_approval");
-  assert.deepEqual(budget.agent, { terminal: "t1rp", name: "impl-h", alive: true, remote: false, host: null, label: "impl-h (t1rp)" });
-  assert.equal(budget.failure.summary, "test 단계 실패: skill::tests::prints_manual");
+test("human cards carry reason, agent and retries", () => {
+  const [card] = section(only([fixture]), "human").items;
+  assert.equal(card.state, "awaiting_approval");
+  assert.equal(card.reason, "Awaiting approval");
+  assert.equal(card.retries, "0/3");
+  assert.deepEqual(card.agent, { terminal: "t1s4", name: "impl-config", alive: true, remote: false, host: null, label: "impl-config (t1s4)" });
+});
+
+test("bounced cards show a live, a dead and a missing agent", () => {
+  const items = section(only([fixture]), "bounced").items;
+  const retried = items.find((i) => i.pr === 9);
+  assert.equal(retried.retries, "3/3");
+  assert.deepEqual(retried.agent, { terminal: "t1rp", name: "impl-h", alive: true, remote: false, host: null, label: "impl-h (t1rp)" });
+  assert.equal(retried.failure.summary, "test 단계 실패: skill::tests::prints_manual");
   assert.equal(items.find((i) => i.pr === 10).agent.alive, false);
   assert.equal(items.find((i) => i.pr === 11).agent, null);
 });
@@ -385,9 +384,8 @@ test("unknown values are shown as they are", () => {
     state_reason: "because",
   };
   const bounced = { ...itemOf(15), pr: 31, state_reason: "cosmic_rays" };
-  const needs = { ...itemOf(9), pr: 32, state_reason: "novel" };
   const waiting = { ...itemOf(20), pr: 33, state_reason: "later" };
-  const data = withQueue(odd, bounced, needs, waiting, itemOf(21));
+  const data = withQueue(odd, bounced, waiting, itemOf(21));
   data.batch = { ...data.batch, phase: "teleporting", prs: [] };
   data.blocked = { reason: "new_reason", base: "abc", since_ms: 1 };
   data.approval = "robot";
@@ -396,13 +394,12 @@ test("unknown values are shown as they are", () => {
 
   assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.state, i.reason]), [[30, "frobnicated", "because"]]);
   assert.equal(section(repo, "bounced").items[0].reason, "cosmic_rays");
-  assert.equal(section(repo, "human").items.find((i) => i.pr === 32).reason, "novel");
   assert.equal(section(repo, "waiting").items[0].note, "later");
   assert.equal(section(repo, "alerts").items[0].text, "Queue stopped: new_reason");
   assert.equal(repo.approval, "robot");
   assert.equal(
     repo.sections.reduce((n, s) => n + (s.id === "alerts" || s.id === "today" || s.id === "batch" ? 0 : s.items.length), 0),
-    5,
+    4,
   );
 });
 
@@ -415,7 +412,7 @@ test("an unknown batch phase and preflight result are shown as they are", () => 
 });
 
 test("missing fields do not break the board", () => {
-  const sparse = { schema: 1, queue: [{ pr: 1, state: "queued" }, { pr: 2, state: "needs_human" }, "junk", null] };
+  const sparse = { schema: 1, queue: [{ pr: 1, state: "queued" }, { pr: 2, state: "awaiting_approval" }, "junk", null] };
   const repo = only(sparse);
   assert.equal(repo.slug, "(unnamed repo)");
   assert.deepEqual(prs(section(repo, "waiting")), [1]);
@@ -440,7 +437,6 @@ test("values that are names of built-in object keys are shown as they are", () =
     const data = withQueue(
       { ...itemOf(20), pr: 30, state: word },
       { ...itemOf(15), pr: 31, state_reason: word },
-      { ...itemOf(9), pr: 32, state_reason: word },
       { ...itemOf(20), pr: 33, state_reason: word },
       { ...itemOf(21), pr: 34, preflight: { result: word, head: "21e5678" } },
       { ...itemOf(15), pr: 35, last_failure: { ...itemOf(15).last_failure, mode: word } },
@@ -454,7 +450,6 @@ test("values that are names of built-in object keys are shown as they are", () =
     assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.state]), [[30, word]], word);
     assert.equal(find("bounced", 31).reason, word, word);
     assert.equal(find("bounced", 35).failure.mode, word, word);
-    assert.equal(find("human", 32).reason, word, word);
     assert.equal(find("waiting", 33).note, word, word);
     assert.equal(find("human", 34).preflight.text, `Preflight ${word}`, word);
     assert.equal(section(repo, "batch").items[0].phase, word, word);
@@ -475,7 +470,7 @@ test("an object where a state or reason should be is shown as JSON text", () => 
 
 test("an item without a PR number gets no buttons", () => {
   const noPr = { ...itemOf(21), pr: undefined };
-  const items = section(only(withQueue(noPr, itemOf(9))), "human").items;
+  const items = section(only(withQueue(noPr, { ...itemOf(21), pr: 22 })), "human").items;
   assert.equal(items.length, 2);
   for (const item of items) {
     if (item.pr === "?") assert.deepEqual(item.actions, []);
@@ -691,11 +686,6 @@ test("a bounced item without a reason falls back to the failure kind, then to a 
   assert.deepEqual(reasons, { 97: "CI failed", 98: "No reason", 99: "No reason" });
 });
 
-test("a needs_human item with an empty reason is just the human's turn", () => {
-  const data = withQueue({ ...itemOf(9), state_reason: "" });
-  assert.equal(section(only(data), "human").items[0].reason, "Needs you");
-});
-
 test("failure text prefers stderr, then stdout, then the exit code", () => {
   assert.equal(interpret({ code: 2, stdout: "out line\nmore", stderr: "" }, NOW).detail, "out line");
   assert.equal(interpret({ code: 2, stdout: "out", stderr: "err\n" }, NOW).detail, "err");
@@ -780,14 +770,14 @@ test("random malformed status never breaks the board", () => {
   const maybe = (object, key, make, omitted = 0.1) => {
     if (rnd() >= omitted) object[key] = make();
   };
-  const STATES = ["awaiting_approval", "queued", "in_batch", "bounced", "needs_human"];
+  const STATES = ["awaiting_approval", "queued", "in_batch", "bounced"];
   const queueItem = () => {
     const o = {};
     maybe(o, "pr", () => or(() => pick([1, 2, 3, 5, 12, 99])));
     maybe(o, "title", () => or(() => pick(["t", "제목", ""])));
     maybe(o, "head", () => or(() => "abc1234"));
     maybe(o, "state", () => or(() => pick(STATES), 0.2));
-    maybe(o, "state_reason", () => or(() => pick([null, "ci_pending", "ci", "budget", "conflict", "verify", "timeout", "head_changed", "unreachable", "gave_up"])), 0.3);
+    maybe(o, "state_reason", () => or(() => pick([null, "ci_pending", "ci", "conflict", "verify", "timeout", "head_changed"])), 0.3);
     maybe(o, "agent", () => or(() => ({ terminal: or(() => "t1"), name: or(() => "impl"), alive: or(() => true) })));
     maybe(o, "attempts", () => or(() => 1));
     maybe(o, "budget", () => or(() => 3));
@@ -818,7 +808,7 @@ test("random malformed status never breaks the board", () => {
   };
 
   const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
-  const SECTION_OF = new Map(Object.entries({ awaiting_approval: "human", needs_human: "human", queued: "waiting", bounced: "bounced", in_batch: "batch" }));
+  const SECTION_OF = new Map(Object.entries({ awaiting_approval: "human", queued: "waiting", bounced: "bounced", in_batch: "batch" }));
   const validPr = (pr) => Number.isSafeInteger(pr) && pr > 0;
   for (let run = 0; run < 20000; run++) {
     const text = JSON.stringify(rnd() < 0.1 ? garbage() : rnd() < 0.5 ? [statusView(), statusView()] : [statusView()]);
@@ -872,16 +862,16 @@ test("random malformed status never breaks the board", () => {
             const repoPath = action.args.at(-1);
             if (verb === "approve") assert.ok(action.args[2] === "--head" && /^[0-9a-f]{4,64}$/.test(action.args[3]) && action.args.length === 6, `approve head :: ${ctx}`);
             else assert.equal(action.args.length, 4, ctx);
-            assert.ok(action.verb === verb && ["approve", "retry", "drop"].includes(verb), `verb :: ${ctx}`);
+            assert.ok(action.verb === verb && ["approve", "drop"].includes(verb), `verb :: ${ctx}`);
             assert.ok(/^[1-9][0-9]*$/.test(pr) && flag === "--repo" && repoPath === path && path !== "", `args ${action.args} :: ${ctx}`);
             assert.equal(pr, String(item.pr), ctx);
           }
         }
       }
       for (const card of shown.human ?? []) {
-        const want = card.state === "awaiting_approval" ? ["approve", "drop"] : ["retry", "drop"];
+        const want = ["approve", "drop"];
         const got = card.actions.map((a) => a.verb);
-        if (card.state === "awaiting_approval" && got.length === 1 && validPr(card.pr) && path) {
+        if (got.length === 1 && validPr(card.pr) && path) {
           assert.deepEqual(got, ["drop"], `awaiting without a safe head :: ${ctx}`);
           continue;
         }
@@ -906,7 +896,7 @@ test("batch members follow submission order when the batch record lists none", (
 });
 
 test("an agent without a name is shown by its terminal", () => {
-  const data = withQueue({ ...itemOf(9), agent: { terminal: "t1rs", name: null, alive: true } }, { ...itemOf(21), agent: { terminal: "t9", name: "", alive: false } });
+  const data = withQueue({ ...itemOf(21), pr: 9, agent: { terminal: "t1rs", name: null, alive: true } }, { ...itemOf(21), agent: { terminal: "t9", name: "", alive: false } });
   const agents = Object.fromEntries(section(only(data), "human").items.map((i) => [i.pr, i.agent]));
   assert.deepEqual(agents[9], { terminal: "t1rs", name: null, alive: true, remote: false, host: null, label: "t1rs" });
   assert.deepEqual(agents[21], { terminal: "t9", name: null, alive: false, remote: false, host: null, label: "t9" });
@@ -1042,7 +1032,7 @@ test("v3: a repair item is marked, and marks combine", () => {
 });
 
 test("v3: cards in the human and bounced sections carry the marks too", () => {
-  const human = itemOf(9);
+  const human = itemOf(21);
   human.priority = true;
   human.after = [5, 6];
   const bounced = itemOf(14);
@@ -1260,8 +1250,8 @@ test("the status line takes the first matching row of the table, and only one", 
   data.daemon.running = false;
   assert.deepEqual(statusOf(data), { tone: "error", text: "Daemon is off" });
   data.daemon.running = true;
-  assert.deepEqual(statusOf(data), { tone: "human", text: "Needs you · 4" });
-  data.queue = data.queue.filter((item) => item.state !== "needs_human" && item.state !== "awaiting_approval");
+  assert.deepEqual(statusOf(data), { tone: "human", text: "Needs you · 1" });
+  data.queue = data.queue.filter((item) => item.state !== "awaiting_approval");
   assert.deepEqual(statusOf(data), { tone: "working", text: "Verifying · test 3/3" });
   data.batch.step = "fmt";
   assert.equal(statusOf(data).text, "Verifying · fmt 1/3");
@@ -1364,16 +1354,15 @@ test("the repo shows its name only, and keeps the full slug for the tooltip", ()
 
 const noticeKeys = (data) => interpret(ok(data), NOW).repos[0].notices.map((n) => n.key);
 
-test("notices: a halt, a failed check after the merge, approvals waiting and the human's turn", () => {
+test("notices: a halt, a failed check after the merge and approvals waiting", () => {
   const keys = noticeKeys(fixture);
   assert.ok(keys.some((k) => k.startsWith("blocked:")));
   assert.ok(keys.includes("red:9f8e7d6c5b4a39281706f5e4d3c2b1a099887766"));
   assert.ok(keys.some((k) => k.startsWith("approval:21:")));
-  assert.deepEqual(keys.filter((k) => k.startsWith("human:")).sort(), ["human:10:unreachable", "human:11:gave_up", "human:9:budget"]);
+  assert.deepEqual(keys.filter((k) => k.startsWith("human:")), []);
   assert.deepEqual(noticeKeys(quiet()), []);
   const notice = interpret(ok(fixture), NOW).repos[0].notices;
   assert.equal(notice.find((n) => n.key.startsWith("blocked:")).level, "error");
-  assert.match(notice.find((n) => n.key.startsWith("human:9")).file.path, /pr-9\/3\.md$/);
 });
 
 test("diffNotices: the first read tells nothing, later only new items, and a gone-then-back item tells again", () => {
@@ -1386,7 +1375,7 @@ test("diffNotices: the first read tells nothing, later only new items, and a gon
   const calm = diffNotices(same.next, read(quiet()));
   assert.deepEqual(calm.fresh, []);
   const back = diffNotices(calm.next, read(fixture));
-  assert.ok(back.fresh.length >= 5);
+  assert.equal(back.fresh.length, 3);
   assert.ok(back.fresh.every((n) => n.repo.name === "chute"));
 
   const grown = clone(quiet());
@@ -1485,7 +1474,7 @@ const tonedRepo = (slug, mutate = () => {}) => {
 const idle = (slug) => tonedRepo(slug);
 const verifying = (slug) => tonedRepo(slug, (d) => { d.batch = clone(fixture.batch); });
 const queuedOnly = (slug) => tonedRepo(slug, (d) => { d.queue = [{ ...itemOf(fixture.queue.find((i) => i.state === "queued").pr) }]; });
-const humanTurn = (slug) => tonedRepo(slug, (d) => { d.queue = [itemOf(fixture.queue.find((i) => i.state === "needs_human").pr)]; });
+const humanTurn = (slug) => tonedRepo(slug, (d) => { d.queue = [itemOf(fixture.queue.find((i) => i.state === "awaiting_approval").pr)]; });
 const stopped = (slug) => tonedRepo(slug, (d) => { d.blocked = { reason: "base_broken", since_ms: 1 }; });
 
 test("repos are sorted by grade, and keep the status order within a grade", () => {
@@ -1659,7 +1648,7 @@ test("a queued row without a submit time has an empty wait", () => {
 });
 
 test("a needs-you card waits from the first submit, and is empty without one", () => {
-  const card = { ...itemOf(9), submitted_ms: NOW - 12 * MIN };
+  const card = { ...itemOf(21), submitted_ms: NOW - 12 * MIN };
   assert.deepEqual(waitTexts(queueOnly(card), "human"), ["waiting 12m"]);
   assert.deepEqual(waitTexts(queueOnly({ ...card, submitted_ms: undefined }), "human"), [""]);
 });

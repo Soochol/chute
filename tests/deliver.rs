@@ -9,7 +9,7 @@ use chute::engine::Pass;
 use chute::ext::Ext;
 use chute::feedback::{Delivery, Feedback, Notice, Subject, Unreachable};
 use chute::model::{
-    Agent, Approval, EpochMs, EventKind, Failure, HumanReason, ItemState, MachineId, PrNumber,
+    Agent, Approval, BounceReason, EpochMs, EventKind, Failure, ItemState, MachineId, PrNumber,
     QueueItem, Sha, StepFailure, TerminalId, VerifyMode,
 };
 use chute::repo;
@@ -383,7 +383,7 @@ fn a_machine_hc_does_not_know_is_unreachable_without_asking_anyone() {
 }
 
 #[test]
-fn the_engine_hands_the_pr_to_a_human_when_the_agents_machine_is_down() {
+fn the_engine_keeps_the_pr_bounced_and_records_why_when_the_agents_machine_is_down() {
     let lab = Lab::new("[ -e BAD ] && fail \"FAILED bad_test\"");
     let hc = lab.sb.fake("hc");
     hc.clear_rules()
@@ -416,21 +416,17 @@ fn the_engine_hands_the_pr_to_a_human_when_the_agents_machine_is_down() {
     );
     assert_eq!(
         lab.item_state(1),
-        Some(ItemState::NeedsHuman(HumanReason::Unreachable))
+        Some(ItemState::Bounced(BounceReason::Verify))
     );
-    let detail = lab
+    let why = lab
         .events()
         .into_iter()
         .find_map(|e| match e {
-            EventKind::NeedsHuman {
-                reason: HumanReason::Unreachable,
-                detail,
-                ..
-            } => detail,
+            EventKind::Bounced { unreachable, .. } => unreachable,
             _ => None,
         })
-        .expect("사람 차례 사건");
-    assert!(detail.contains("desk"), "{detail}");
+        .expect("닿지 않은 까닭이 든 반송 사건");
+    assert!(why.contains("desk"), "{why}");
 }
 
 #[test]

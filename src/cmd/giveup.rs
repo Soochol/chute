@@ -5,8 +5,8 @@ use serde::Deserialize;
 
 use super::{Ctx, Refusal, finish, run_on_hub};
 use crate::hub::{Route, route};
-use crate::model::{EpochMs, Event, EventKind, HumanReason, PrNumber};
-use crate::notify::{Line, Notifier, WaitingWhy};
+use crate::model::{Delivered, EpochMs, Event, EventKind, PrNumber, RemovedReason};
+use crate::notify::{Line, Notifier, Removal, WaitingWhy};
 use crate::queue;
 
 #[derive(clap::Args, Debug)]
@@ -53,34 +53,36 @@ fn giveup(args: &Args, ctx: &Ctx) -> Result<()> {
         Some(pr) => pr,
         None => current_pr(ctx)?,
     };
-    let submitter = store.update(|state| {
-        queue::give_up(state, pr)?;
-        Ok(state
-            .queue
-            .iter()
-            .find(|i| i.pr == pr)
-            .and_then(|i| i.submitter.clone()))
-    })?;
+    let gone = store.update(|state| Ok(queue::give_up(state, pr)?))?;
     let at_ms = EpochMs::now();
     let recorded = store.append_history(&Event {
         at_ms,
-        kind: EventKind::GaveUp {
+        kind: EventKind::Removed {
             pr,
-            reason: reason.to_owned(),
+            reason: RemovedReason::GaveUp,
+            detail: Some(reason.to_owned()),
+            report: None,
         },
     });
     if let Err(e) = recorded {
         eprintln!("경고: 이유를 history.jsonl에 남기지 못했다: {e:#}");
     }
-    let line = Line::Human {
+    let line = Line::Removed {
         pr,
-        reason: HumanReason::GaveUp,
-        detail: Some(reason.to_owned()),
+        head: gone.head.clone(),
+        removal: Removal::GaveUp {
+            reason: reason.to_owned(),
+        },
     };
     let notifier = Notifier::new(&ctx.ext, &info, &store);
-    notifier.notify(submitter.as_ref(), at_ms, &line);
-    notifier.notify_waiters(pr, WaitingWhy::Human, at_ms);
-    println!("사람 차례로 넘겼다: {pr} (포기: {reason})");
+    let delivered = notifier.notify(gone.submitter.as_ref(), at_ms, &line);
+    notifier.notify_waiters(pr, WaitingWhy::Removed, at_ms);
+    match delivered {
+        Delivered::Sent => println!("큐에서 뺐다: {pr} (포기: {reason}). submit한 터미널에 알렸다"),
+        _ => println!(
+            "큐에서 뺐다: {pr} (포기: {reason}). submit한 터미널에는 알리지 못했다. `chute events`에 남겼다"
+        ),
+    }
     Ok(())
 }
 

@@ -23,13 +23,14 @@ use crate::gitops::{
 };
 use crate::model::{
     Agent, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs,
-    Event, EventKind, Failure, Flaky, HumanReason, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    ProbeEvidence, QueueItem, QueuedReason, RepoInfo, ResumedBy, Reused, Sha, SkippedStep, State,
-    StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode, Warning, WarningKind,
+    Event, EventKind, Failure, Flaky, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
+    ProbeEvidence, QueueItem, QueuedReason, RemovedReason, RepoInfo, ResumedBy, Reused, Sha,
+    SkippedStep, State, StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode, Warning,
+    WarningKind,
 };
-use crate::notify::{BounceDelivery, Line, Notifier, WaitingWhy, mode_of};
+use crate::notify::{BounceDelivery, Line, Notifier, Removal, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
-use crate::queue;
+use crate::queue::{self, Recorded};
 use crate::reuse;
 use crate::store::{Home, RepoStore};
 use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome};
@@ -336,11 +337,11 @@ impl Engine {
         Ok(())
     }
 
-    fn tell_human(&self, item: &QueueItem, reason: HumanReason, detail: String, at: EpochMs) {
-        let line = Line::Human {
+    fn tell_removed(&self, item: &QueueItem, removal: Removal, at: EpochMs) {
+        let line = Line::Removed {
             pr: item.pr,
-            reason,
-            detail: Some(detail),
+            head: item.head.clone(),
+            removal,
         };
         self.notifier().notify(item.submitter.as_ref(), at, &line);
     }
@@ -457,6 +458,7 @@ impl Engine {
                             batch: Some(id.clone()),
                             reason: *reason,
                             attempts: *attempts,
+                            unreachable: None,
                         })?;
                     }
                 }
@@ -1171,10 +1173,8 @@ impl Run<'_> {
             registered: &item.head,
             current,
         };
-        let (_, unreachable, delivery) = self.deliver_and_record(item, &notice, |s| {
-            queue::head_changed(s, pr)?;
-            Ok(ItemState::Bounced(BounceReason::HeadChanged))
-        })?;
+        let ((), delivery) =
+            self.deliver_and_record(item, &notice, |s| Ok(queue::head_changed(s, pr)?))?;
         self.bounced.push(pr);
         self.sent_back.insert(pr);
         self.conflicted.remove(&pr);
@@ -1184,6 +1184,7 @@ impl Run<'_> {
             batch: Some(self.id().clone()),
             reason: BounceReason::HeadChanged,
             attempts: item.attempts,
+            unreachable: unreachable_of(&delivery),
         })?;
         let told = Told {
             reason: BounceReason::HeadChanged,
@@ -1192,18 +1193,21 @@ impl Run<'_> {
             report: None,
         };
         self.tell_bounce(item, told, &delivery, at);
-        let at = self.note_unreachable(pr, unreachable, at)?;
-        self.tell_waiters(pr, at);
+        self.tell_waiters(pr, WaitingWhy::Bounced, at);
         Ok(())
     }
 
     fn tell_bounce(&self, item: &QueueItem, told: Told<'_>, delivery: &Delivery, at: EpochMs) {
+        let notifier = self.engine.notifier();
         let (worker, how) = match delivery {
             Delivery::Sent { .. } => (item.agent.clone(), BounceDelivery::Sent),
             Delivery::Spawned(agent) => (Some(agent.clone()), BounceDelivery::Spawned),
-            Delivery::Unreachable(_) => return,
+            Delivery::Unreachable(why) => (None, BounceDelivery::Unreachable(why.to_string())),
         };
-        let notifier = self.engine.notifier();
+        let receiver = match how {
+            BounceDelivery::Unreachable(_) => item.submitter.as_ref(),
+            BounceDelivery::Sent | BounceDelivery::Spawned => worker.as_ref(),
+        };
         let (mode, partners) = told.failure.map(mode_of).unwrap_or_default();
         let line = Line::Bounced {
             pr: item.pr,
@@ -1213,11 +1217,18 @@ impl Run<'_> {
             partners,
             attempts: told.attempts,
             budget: self.config.budget,
-            to: worker.as_ref().map(|w| notifier.address_of(w)),
+            to: receiver.map(|r| notifier.address_of(r)),
             delivered: how,
             report: told.report.map(Path::to_path_buf),
         };
-        notifier.notify_unless_same(item.submitter.as_ref(), worker.as_ref(), at, &line);
+        match delivery {
+            Delivery::Unreachable(_) => {
+                notifier.notify(item.submitter.as_ref(), at, &line);
+            }
+            Delivery::Sent { .. } | Delivery::Spawned(_) => {
+                notifier.notify_unless_same(item.submitter.as_ref(), worker.as_ref(), at, &line);
+            }
+        }
     }
 
     fn feedback(&self) -> Feedback<'_> {
@@ -1230,53 +1241,25 @@ impl Run<'_> {
         }
     }
 
-    fn deliver_and_record(
+    fn deliver_and_record<T>(
         &self,
         item: &QueueItem,
         notice: &Notice<'_>,
-        record: impl FnOnce(&mut State) -> Result<ItemState>,
-    ) -> Result<(ItemState, Option<String>, Delivery)> {
+        record: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<(T, Delivery)> {
         let delivery = self.feedback().deliver(item, notice);
         let pr = item.pr;
-        let (to, unreachable) = self.engine.store.update(|s| {
-            let to = record(s)?;
-            let mut unreachable = None;
-            match &delivery {
-                Delivery::Sent { .. } => {}
-                Delivery::Spawned(agent) => queue::record_agent(s, pr, agent.clone())?,
-                Delivery::Unreachable(why) => {
-                    queue::unreachable(s, pr)?;
-                    unreachable = Some(why.to_string());
-                }
+        let recorded = self.engine.store.update(|s| {
+            let recorded = record(s)?;
+            if let Delivery::Spawned(agent) = &delivery {
+                queue::record_agent(s, pr, agent.clone())?;
             }
-            Ok((to, unreachable))
+            Ok(recorded)
         })?;
-        Ok((to, unreachable, delivery))
+        Ok((recorded, delivery))
     }
 
-    fn note_unreachable(&self, pr: PrNumber, why: Option<String>, at: EpochMs) -> Result<EpochMs> {
-        let Some(detail) = why else { return Ok(at) };
-        let at = self.engine.history_at(EventKind::NeedsHuman {
-            pr,
-            reason: HumanReason::Unreachable,
-            detail: Some(detail.clone()),
-        })?;
-        self.engine
-            .tell_human(&self.items[&pr], HumanReason::Unreachable, detail, at);
-        Ok(at)
-    }
-
-    fn tell_waiters(&self, pr: PrNumber, at: EpochMs) {
-        let why = match self
-            .engine
-            .store
-            .load()
-            .map(|s| s.queue.iter().find(|i| i.pr == pr).map(|i| i.state))
-        {
-            Ok(Some(ItemState::Bounced(_))) => WaitingWhy::Bounced,
-            Ok(Some(ItemState::NeedsHuman(_))) => WaitingWhy::Human,
-            _ => return,
-        };
+    fn tell_waiters(&self, pr: PrNumber, why: WaitingWhy, at: EpochMs) {
         self.engine.notifier().notify_waiters(pr, why, at);
     }
 
@@ -1325,49 +1308,50 @@ impl Run<'_> {
         )?;
         let budget = self.config.budget;
         let record = |s: &mut State| Ok(queue::record_failure(s, pr, written.record(), budget)?);
-        let (to, unreachable, delivery) = if item.attempts < budget {
-            let (to, unreachable, delivery) =
+        let (failed, delivery) = if item.attempts < budget {
+            let (failed, delivery) =
                 self.deliver_and_record(&item, &Notice::Bounced(&written), record)?;
-            (to, unreachable, Some(delivery))
+            (failed, Some(delivery))
         } else {
-            (engine.store.update(record)?, None, None)
+            (engine.store.update(record)?, None)
         };
+        if let Recorded::OverBudget(gone) = &failed {
+            let at = engine.history_at(EventKind::Removed {
+                pr,
+                reason: RemovedReason::Budget,
+                detail: Some(format!("반송 한도 {budget}번을 넘었다")),
+                report: Some(written.md.clone()),
+            })?;
+            let removal = Removal::Budget {
+                attempts: gone.attempts,
+                budget,
+                report: Some(written.md.clone()),
+            };
+            engine.tell_removed(gone, removal, at);
+            self.tell_waiters(pr, WaitingWhy::Removed, at);
+        }
         self.bounced.push(pr);
         self.conflicted.remove(&pr);
         self.save_record()?;
-        let at = match to {
-            ItemState::Bounced(reason) => {
-                let at = engine.history_at(EventKind::Bounced {
-                    pr,
-                    batch: Some(self.id().clone()),
+        if let Recorded::Bounced(reason) = failed {
+            let at = engine.history_at(EventKind::Bounced {
+                pr,
+                batch: Some(self.id().clone()),
+                reason,
+                attempts: item.attempts + 1,
+                unreachable: delivery.as_ref().and_then(unreachable_of),
+            })?;
+            if let Some(delivery) = &delivery {
+                let told = Told {
                     reason,
+                    failure: Some(&written.doc.failure),
                     attempts: item.attempts + 1,
-                })?;
-                if let Some(delivery) = &delivery {
-                    let told = Told {
-                        reason,
-                        failure: Some(&written.doc.failure),
-                        attempts: item.attempts + 1,
-                        report: Some(&written.md),
-                    };
-                    self.tell_bounce(&item, told, delivery, at);
-                }
-                at
+                    report: Some(&written.md),
+                };
+                self.tell_bounce(&item, told, delivery, at);
             }
-            ItemState::NeedsHuman(reason) => {
-                let detail = format!("재시도 예산 {budget}번을 모두 썼다");
-                let at = engine.history_at(EventKind::NeedsHuman {
-                    pr,
-                    reason,
-                    detail: Some(detail.clone()),
-                })?;
-                engine.tell_human(&item, reason, detail, at);
-                at
-            }
-            other => bail!("{pr}의 실패 처리가 뜻밖의 상태로 끝났다: {other:?}"),
-        };
-        let at = self.note_unreachable(pr, unreachable, at)?;
-        self.tell_waiters(pr, at);
+            self.tell_waiters(pr, WaitingWhy::Bounced, at);
+        }
         Ok(())
     }
 
@@ -2165,6 +2149,13 @@ impl Run<'_> {
             }
             Ok(())
         })
+    }
+}
+
+fn unreachable_of(delivery: &Delivery) -> Option<String> {
+    match delivery {
+        Delivery::Unreachable(why) => Some(why.to_string()),
+        Delivery::Sent { .. } | Delivery::Spawned(_) => None,
     }
 }
 

@@ -35,16 +35,14 @@ pub enum Command {
     Preflight(cmd::preflight::Args),
     /// PR을 큐에 올린다
     Submit(cmd::submit::Args),
-    /// PR을 포기하고 사람 차례로 넘긴다
+    /// PR을 포기하고 큐에서 뺀다. submit한 터미널에 알린다
     Giveup(cmd::giveup::Args),
     /// chute.toml을 읽어 검증 단계와 설정 오류를 보인다. 등록하거나 상태 폴더를 쓰지 않는다
     ConfigCheck(cmd::config_check::Args),
-    /// 큐, batch, 사람 차례, 오늘의 숫자를 보인다
+    /// 큐, batch, 승인 대기, 오늘의 숫자를 보인다
     Status(cmd::status::Args),
     /// 승인을 기다리는 PR을 큐에 넣는다
     Approve(cmd::approve::Args),
-    /// 사람 차례의 PR을 예산을 0으로 하고 큐에 다시 넣는다
-    Retry(cmd::retry::Args),
     /// PR을 큐에서 뺀다
     Drop(cmd::drop::Args),
     /// 데몬을 hc 터미널로 띄운다. 허브가 다른 PC면 허브에 띄운다
@@ -135,7 +133,6 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::ConfigCheck(args) => cmd::config_check::run(&args, ctx.repo_arg()),
         Command::Status(args) => cmd::status::run(args, ctx),
         Command::Approve(args) => cmd::approve::run(args, ctx),
-        Command::Retry(args) => cmd::retry::run(args, ctx),
         Command::Drop(args) => cmd::drop::run(args, ctx),
         Command::Up(args) => cmd::up::run(args, ctx),
         Command::Down(args) => cmd::down::run(args, ctx),

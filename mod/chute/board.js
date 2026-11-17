@@ -2,7 +2,6 @@ const table = (entries) => Object.assign(Object.create(null), entries);
 
 const SECTION_OF_STATE = table({
   awaiting_approval: "human",
-  needs_human: "human",
   in_batch: "batch",
   queued: "waiting",
   bounced: "bounced",
@@ -10,10 +9,9 @@ const SECTION_OF_STATE = table({
 
 const ACTIONS_OF_STATE = table({
   awaiting_approval: ["approve", "drop"],
-  needs_human: ["retry", "drop"],
 });
 
-const ACTION_LABEL = table({ approve: "Approve", retry: "Retry", drop: "Drop" });
+const ACTION_LABEL = table({ approve: "Approve", drop: "Drop" });
 
 // The one place that turns a meaning into a theme token name; `main.js` reads `theme()[name]`.
 const TONE_TOKEN = table({
@@ -53,12 +51,6 @@ const SECTION_TITLE = {
   bounced: "Bounced",
   unknown: "Unknown state",
 };
-
-const HUMAN_REASON = table({
-  budget: "Out of retries",
-  unreachable: "Couldn't reach the agent",
-  gave_up: "Agent gave up",
-});
 
 const BOUNCE_REASON = table({
   conflict: "Conflict",
@@ -238,8 +230,6 @@ function cardOf(item, repoPath, slug, now) {
     card.config = item.touches_config === true ? "chute.toml changed" : "chute.toml unchanged";
     card.configChanged = item.touches_config === true;
     card.approvalBlocked = safeHeadOf(item) ? null : "Can't approve: HEAD unknown";
-  } else if (item.state === "needs_human") {
-    card.reason = named(HUMAN_REASON, item.state_reason) ?? "Needs you";
   } else if (item.state === "bounced") {
     card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind || null) ?? "No reason";
     card.headline = card.failure?.mode ? `${card.reason} · ${card.failure.mode}` : card.reason;
@@ -499,7 +489,7 @@ function statusLineOf(view, queue, batch) {
   }
   if (red) return { tone: "error", text: `Post-merge check failed · ${str(red.step) || "?"}` };
   if (isObject(view.daemon) && view.daemon.running === false) return { tone: "error", text: "Daemon is off" };
-  const human = queue.filter((item) => item.state === "awaiting_approval" || item.state === "needs_human").length;
+  const human = queue.filter((item) => item.state === "awaiting_approval").length;
   if (human > 0) return { tone: "human", text: `Needs you · ${human}` };
   if (batch) {
     if (batch.waitingMachine) return { tone: "working", text: "Waiting for a slot" };
@@ -526,15 +516,6 @@ function noticesOf(view, queue, alerts) {
     const head = str(item.head);
     if (item.state === "awaiting_approval") {
       notices.push({ key: `approval:${item.pr}:${head}`, level: "warning", body: `#${item.pr} awaiting approval · ${str(item.title)}`, file: null });
-    } else if (item.state === "needs_human") {
-      const reason = named(HUMAN_REASON, item.state_reason) ?? "Needs you";
-      const report = str(item.last_failure?.report);
-      notices.push({
-        key: `human:${item.pr}:${item.state_reason ?? ""}`,
-        level: "warning",
-        body: `#${item.pr} needs you · ${reason}`,
-        file: report ? { label: "Report", path: report } : null,
-      });
     }
   }
   return notices;

@@ -647,10 +647,12 @@ fn events(n: u64) -> Vec<chute::model::Event> {
 }
 
 fn three_items(c: &Node) -> Value {
+    let mut first = item_json(1, "queued", Value::Null, agent_json(Some(&c.id)));
+    first["submitter"] = agent_json(None);
     serde_json::json!({
         "queue": [
-            item_json(1, "queued", Value::Null, agent_json(Some(&c.id))),
-            item_json(2, "needs_human", Value::from("gave_up"), agent_json(Some(&c.id))),
+            first,
+            item_json(2, "bounced", Value::from("conflict"), agent_json(Some(&c.id))),
             item_json(3, "queued", Value::Null, agent_json(None)),
         ],
         "batch": null, "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []
@@ -676,6 +678,9 @@ fn with_a_filled_in(mut state: Value, a: &Node) -> Value {
     for item in state["queue"].as_array_mut().unwrap() {
         if item["agent"]["machine"].is_null() {
             item["agent"]["machine"] = Value::from(a.id.clone());
+        }
+        if item["submitter"]["terminal"].is_string() && item["submitter"]["machine"].is_null() {
+            item["submitter"]["machine"] = Value::from(a.id.clone());
         }
     }
     state
@@ -1024,4 +1029,76 @@ fn take_run_again_refuses_when_the_old_hub_has_become_a_hub_again() {
         stderr(&out)
     );
     assert_eq!(hub_of(a), None);
+}
+
+#[test]
+fn take_records_an_item_an_older_chute_left_on_a_humans_turn_instead_of_dropping_it_silently() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let path = home_of(a).repo(&slug()).dir().join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let old = item_json(7, "needs_human", Value::from("budget"), agent_json(None));
+    let state = serde_json::json!({
+        "queue": [old], "batch": null, "blocked": null,
+        "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    std::fs::write(&path, state.to_string()).unwrap();
+
+    let out = take(b, "a");
+
+    ok(&out);
+    let upgrades = |node: &Node| {
+        history_of(node)
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    chute::model::EventKind::Removed {
+                        reason: chute::model::RemovedReason::Upgrade,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(upgrades(a), 1);
+    assert_eq!(
+        upgrades(b),
+        1,
+        "the old hub's history is copied, not written again"
+    );
+}
+
+#[test]
+fn take_keeps_one_upgrade_event_when_both_pcs_hold_the_same_old_item() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let old = item_json(7, "needs_human", Value::from("budget"), agent_json(None));
+    let state = serde_json::json!({
+        "queue": [old], "batch": null, "blocked": null,
+        "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    for node in [a, b] {
+        let path = home_of(node).repo(&slug()).dir().join("state.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, state.to_string()).unwrap();
+    }
+
+    ok(&take(b, "a"));
+
+    let upgrades = history_of(b)
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                chute::model::EventKind::Removed {
+                    reason: chute::model::RemovedReason::Upgrade,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(upgrades, 1);
 }

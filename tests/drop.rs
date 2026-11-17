@@ -2,7 +2,7 @@ mod forward_kit;
 mod queue_kit;
 mod support;
 
-use chute::model::{BounceReason, HumanReason, ItemState};
+use chute::model::{BounceReason, ItemState};
 use queue_kit::{World, item, stderr};
 
 #[test]
@@ -12,7 +12,10 @@ fn drop_takes_a_pr_out_of_the_queue_wherever_it_waits() {
         item(1, ItemState::AwaitingApproval),
         item(2, ItemState::Queued(None)),
         item(3, ItemState::Bounced(BounceReason::Conflict)),
-        item(4, ItemState::NeedsHuman(HumanReason::Unreachable)),
+        item(
+            4,
+            ItemState::Queued(Some(chute::model::QueuedReason::CiPending)),
+        ),
         item(5, ItemState::Queued(None)),
     ]);
 
@@ -34,7 +37,7 @@ fn drop_takes_a_pr_out_of_the_queue_wherever_it_waits() {
 #[test]
 fn drop_works_from_outside_the_repository_with_the_repo_flag() {
     let w = World::new();
-    w.seed(vec![item(12, ItemState::NeedsHuman(HumanReason::Budget))]);
+    w.seed(vec![item(12, ItemState::Bounced(BounceReason::Verify))]);
     let repo = w.repo.path().to_string_lossy().into_owned();
 
     w.ok(w.sb.root(), &["drop", "12", "--repo", &repo]);

@@ -55,8 +55,8 @@
       "title": "설명서",
       "branch": "orch/feat-9",
       "head": "09e5678",
-      "state": "needs_human",
-      "state_reason": "budget",
+      "state": "bounced",
+      "state_reason": "verify",
       "agent": {
         "terminal": "t1rp",
         "name": "impl-h",
@@ -80,15 +80,15 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": 1794721800000
     },
     {
       "pr": 10,
       "title": "install 명령",
       "branch": "orch/feat-10",
       "head": "10e5678",
-      "state": "needs_human",
-      "state_reason": "unreachable",
+      "state": "bounced",
+      "state_reason": "verify",
       "agent": {
         "terminal": "desk/t1rq",
         "name": "impl-i",
@@ -112,15 +112,15 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": 1794722100000
     },
     {
       "pr": 11,
       "title": "revert 명령",
       "branch": "orch/feat-11",
       "head": "11e5678",
-      "state": "needs_human",
-      "state_reason": "gave_up",
+      "state": "bounced",
+      "state_reason": "conflict",
       "agent": null,
       "attempts": 2,
       "budget": 3,
@@ -137,7 +137,7 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": 1794722400000
     },
     {
       "pr": 15,
