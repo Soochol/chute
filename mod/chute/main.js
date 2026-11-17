@@ -581,12 +581,12 @@ export default class Chute extends View {
   humanCard(repo, card, t) {
     const failure = this.errors.get(card.key);
     const error = failure?.state === card.state ? failure.text : null;
-    const detail = [
-      card.preflight?.text,
-      card.config,
-      card.failure?.mode,
-      card.approvalBlocked,
-    ].filter(Boolean);
+    const people = [];
+    if (card.sameSubmitter) people.push(agentChip(card.agent, t, card.key, card.submittedBy));
+    else {
+      if (card.agent) people.push(agentChip(card.agent, t, card.key));
+      if (card.submittedBy) people.push(div().min_w(0).text_size(12).text_color(t.dim).whitespace_normal().child(card.submittedBy));
+    }
     return v_flex()
       .gap(5)
       .p(10)
@@ -594,29 +594,50 @@ export default class Chute extends View {
       .bg(t.surface)
       .border_1()
       .border_color(t.blocked)
-      .child(titleLine(card, t, rowIcons(`human-${card.key}`, { url: card.url, pr: card.pr }, t)))
-      .child(
-        h_flex()
-          .gap(5)
-          .flex_wrap()
-          .items_center()
-          .children(card.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t))))
-          .child(div().text_size(12).font_medium().text_color(card.approvalBlocked ? t.ansi1 : t.blocked).child(card.reason))
-          .when(detail.length > 0, (el) =>
-            el.child(div().text_size(12).text_color(card.configChanged ? t.blocked : t.muted).child(`· ${detail.join(" · ")}`)),
-          ),
+      .child(div().font_semibold().text_color(t.blocked).whitespace_normal().child(card.question))
+      .child(titleLine({ ...card, wait: "" }, t, rowIcons(`human-${card.key}`, { url: card.url, pr: card.pr }, t)))
+      .when(card.marks.length > 0, (el) =>
+        el.child(h_flex().gap(5).flex_wrap().children(card.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t))))),
+      )
+      .child(div().text_size(12).text_color(t.muted).whitespace_normal().child(card.reason))
+      .when(Boolean(card.approvalBlocked), (el) =>
+        el.child(div().text_size(12).text_color(t.ansi1).whitespace_normal().child(card.approvalBlocked)),
       )
       .when(Boolean(card.failure?.summary), (el) =>
         el.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(card.failure.summary)),
       )
-      .when(Boolean(card.submitter), (el) => el.child(submitterLine(card.submitter, t)))
-      .child(
-        h_flex()
-          .gap(8)
-          .items_start()
-          .child(agentChip(card.agent, t, card.key))
-          .child(div().flex_none().text_size(12).text_color(t.dim).child(`Retries ${card.retries}`)),
+      .children(
+        card.summary.map((line, i) =>
+          div()
+            .id(`chg-${card.key}-${i}`)
+            .text_size(12)
+            .text_color(toneColor(line.tone, t))
+            .whitespace_normal()
+            .when(Boolean(line.tip), (el) => el.tooltip(line.tip))
+            .child(line.mark ? `${line.mark} ${line.text}` : line.text),
+        ),
       )
+      .when(Boolean(card.overlap), (el) =>
+        el.child(div().text_size(12).text_color(t.ansi3).whitespace_normal().child(card.overlap)),
+      )
+      .when(card.actions.length > 0 || Boolean(card.diffUrl), (el) =>
+        el.child(
+          h_flex()
+            .gap(6)
+            .items_center()
+            .children(card.actions.map((action, i) => this.button(card, action, i === 0, t)))
+            .child(div().flex_1())
+            .when(Boolean(card.diffUrl), (row) =>
+              row.child(
+                iconLink(`diff-${card.key}`, "View diff ↗", `Open the diff of #${card.pr} on GitHub`, t, (cx) => cx.open_url(card.diffUrl)).child(
+                  "View diff ↗",
+                ),
+              ),
+            ),
+        ),
+      )
+      .child(div().text_size(11).text_color(t.dim).whitespace_normal().child(card.facts.join(" · ")))
+      .when(people.length > 0, (el) => el.child(h_flex().gap(5).items_start().children(people)))
       .when(Boolean(card.report), (el) =>
         el.child(
           linkRow(`report-${card.key}`, t, () => this.openFile(card.report, repo.hub.machine))
@@ -632,14 +653,6 @@ export default class Chute extends View {
                 .child(card.report.path),
             )
             .child(chevron(t)),
-        ),
-      )
-      .when(card.actions.length > 0, (el) =>
-        el.child(
-          h_flex()
-            .gap(6)
-            .flex_wrap()
-            .children(card.actions.map((action, i) => this.button(card, action, i === 0, t))),
         ),
       )
       .when(Boolean(error), (el) => el.child(div().text_size(12).text_color(t.ansi1).whitespace_normal().child(error)));
@@ -929,7 +942,7 @@ function titleLine(card, t, icons = []) {
     .children(icons);
 }
 
-function agentChip(agent, t, cardKey) {
+function agentChip(agent, t, cardKey, text) {
   if (!agent) return div().flex_1().min_w(0).text_size(12).text_color(t.dim).child("No agent");
   const label = h_flex()
     .flex_1()
@@ -944,7 +957,7 @@ function agentChip(agent, t, cardKey) {
         .whitespace_normal()
         .text_size(12)
         .text_color(agent.alive ? t.foreground : t.dim)
-        .child(agent.alive ? agent.label : `${agent.label} · exited`),
+        .child(text ? (agent.alive ? text : `${text} · exited`) : agent.alive ? agent.label : `${agent.label} · exited`),
     )
     .when(Boolean(agent.host), (el) => el.child(chip(agent.host, t.muted)));
   if (!agent.alive) return label;

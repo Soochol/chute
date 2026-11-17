@@ -81,7 +81,7 @@ test("every state and reason in the fixture is covered", () => {
     ["human", "bounced"].flatMap((id) => section(repo, id).items.map((item) => [item.pr, item.reason])),
   );
   assert.deepEqual(reasons, {
-    21: "Awaiting approval",
+    21: "This PR may edit chute.toml, so a person must approve it.",
     9: "Verification failed",
     10: "Verification failed",
     11: "Conflict",
@@ -253,16 +253,18 @@ test("an in_batch item with no batch record is still shown", () => {
   assert.equal(batch.elapsed, null);
 });
 
-test("awaiting approval shows the preflight result and whether chute.toml changed", () => {
+test("awaiting approval keeps the preflight result in the first info line", () => {
   const item = section(only([fixture]), "human").items.find((i) => i.pr === 21);
   assert.deepEqual([item.preflight.text, item.preflight.tone], ["Preflight passed", "ok"]);
-  assert.equal(item.config, "chute.toml changed");
-  assert.equal(item.configChanged, true);
+  assert.deepEqual(item.facts, ["Preflight passed", "Retries 0/3", "waiting 8m"]);
+  for (const card of [item, ...section(only([fixture]), "human").items]) {
+    assert.ok(!JSON.stringify(card).includes("Awaiting approval"));
+    assert.ok(!JSON.stringify(card).includes("chute.toml changed"));
+    assert.ok(!JSON.stringify(card).includes("chute.toml unchanged"));
+  }
 
-  const data = withQueue({ ...itemOf(21), touches_config: false, preflight: { result: "fail", head: "21e5678" } });
-  const plain = section(only(data), "human").items[0];
+  const plain = section(only(withQueue({ ...itemOf(21), touches_config: false, preflight: { result: "fail", head: "21e5678" } })), "human").items[0];
   assert.deepEqual([plain.preflight.text, plain.preflight.tone], ["Preflight failed", "error"]);
-  assert.equal(plain.config, "chute.toml unchanged");
 
   const stale = section(only(withQueue({ ...itemOf(21), preflight: { result: "pass", head: "old0000" } })), "human").items[0];
   assert.equal(stale.preflight.text, "Preflight passed (old HEAD)");
@@ -273,10 +275,156 @@ test("awaiting approval shows the preflight result and whether chute.toml change
   assert.equal(none.preflight.text, "No preflight");
 });
 
-test("human cards carry reason, agent and retries", () => {
+const change = (kind, changes = [], more = 0) => ({ kind, changes, more });
+const op = (kind, path, before = null, after = null) => ({ op: kind, path, before, after });
+const humanCard = (patch, approval = "agent", pr = 21) => {
+  const data = { ...withQueue({ ...itemOf(21), pr, ...patch }), approval };
+  return section(only(data), "human").items[0];
+};
+
+test("question and reason follow the repo approval, touches_config and the change kind", () => {
+  const CONFIG = ["Approve config change?", "This PR edits chute.toml, so a person must approve it."];
+  const MAYBE = ["Approve config change?", "This PR may edit chute.toml, so a person must approve it."];
+  const UNCHECKED = ["Approve to queue?", "chute couldn't check every changed file, so a person must approve it."];
+  const HUMAN = ["Approve to queue?", "This repo asks a person to approve every PR."];
+  const ask = (patch, approval) => {
+    const card = humanCard(patch, approval);
+    return [card.question, card.reason];
+  };
+  for (const kind of ["edited", "added", "removed", "invalid"]) {
+    for (const approval of ["agent", "human"]) {
+      assert.deepEqual(ask({ touches_config: true, config_change: change(kind) }, approval), CONFIG, `${kind} ${approval}`);
+    }
+  }
+  assert.deepEqual(ask({ touches_config: true, config_change: change("unreadable") }, "agent"), MAYBE);
+  assert.deepEqual(ask({ touches_config: true, config_change: undefined }, "agent"), MAYBE);
+  assert.deepEqual(ask({ touches_config: true, config_change: null }, "human"), MAYBE);
+  assert.deepEqual(ask({ touches_config: true, config_change: change("unchanged") }, "agent"), UNCHECKED);
+  assert.deepEqual(ask({ touches_config: true, config_change: change("unchanged") }, "human"), HUMAN);
+  assert.deepEqual(ask({ touches_config: false, config_change: null }, "human"), HUMAN);
+});
+
+test("change lines pair a mark with a tone and show short values inline", () => {
+  const lines = (changes, more = 0) => humanCard({ touches_config: true, config_change: change("edited", changes, more) }).summary;
+  const got = lines([
+    op("added", ["verify", "account-server-test"], null, "{ name = ... }"),
+    op("removed", ["post_verify", "e2e"], "{ name = ... }"),
+    op("added", ["post_verify", "smoke"], null, "{}"),
+    op("removed", ["verify", "lint"], "{}"),
+    op("changed", ["verify", "clippy", "run"], '"cargo clippy"', '"cargo clippy --all-targets -- -D warnings"'),
+    op("changed", ["post_verify", "e2e", "run"], '"a"', '"b"'),
+    op("changed", ["budget"], "3", "5"),
+    op("changed", ["flaky", "chronic"], '"a-very-long-before"', '"a-very-long-after"'),
+    op("added", ["env_check"], null, '["A"]'),
+    op("removed", ["cache", "dir"], '"x"'),
+    op("reordered", ["verify"]),
+    op("reordered", ["post_verify"]),
+  ], 3);
+  assert.deepEqual(
+    got.map((l) => [l.mark, l.text, l.tone]),
+    [
+      ["+", "step account-server-test", "ok"],
+      ["−", "post-merge step e2e", "error"],
+      ["+", "post-merge step smoke", "ok"],
+      ["−", "step lint", "error"],
+      ["~", "clippy: run changed", "warn"],
+      ["~", "post-merge e2e: run: \"a\" → \"b\"", "warn"],
+      ["~", "budget: 3 → 5", "warn"],
+      ["~", "flaky.chronic changed", "warn"],
+      ["+", 'env_check = ["A"]', "ok"],
+      ["−", "cache.dir", "error"],
+      ["~", "steps reordered", "warn"],
+      ["~", "post-merge steps reordered", "warn"],
+      ["+", "3 more changes", "waiting"],
+    ],
+  );
+  const tips = got.map((l) => l.tip);
+  assert.equal(tips[4], '"cargo clippy" → "cargo clippy --all-targets -- -D warnings"');
+  assert.equal(tips[6], null, "short values are on the line");
+  assert.equal(tips[7], '"a-very-long-before" → "a-very-long-after"');
+  assert.equal(lines([op("changed", ["budget"], "3", "5")], 1).at(-1).text, "1 more change");
+  assert.equal(lines([op("changed", ["budget"], "x".repeat(12), "y".repeat(12))])[0].text, "budget: " + "x".repeat(12) + " → " + "y".repeat(12));
+  assert.equal(lines([op("changed", ["budget"], "x".repeat(12), "y".repeat(13))])[0].text, "budget changed");
+});
+
+test("a note stands in for the change lines by kind, and for items from before the field existed", () => {
+  const note = (patch) => humanCard({ touches_config: true, ...patch }).summary.map((l) => [l.text, l.tone]);
+  assert.deepEqual(note({ config_change: change("added") }), [["Adds chute.toml", "waiting"]]);
+  assert.deepEqual(note({ config_change: change("removed") }), [["Removes chute.toml", "error"]]);
+  assert.deepEqual(note({ config_change: change("invalid") }), [["chute.toml in this PR is invalid", "error"]]);
+  assert.deepEqual(note({ config_change: change("edited") }), [["Only comments or formatting changed", "waiting"]]);
+  const none = [["No change summary. Check the diff.", "waiting"]];
+  assert.deepEqual(note({ config_change: change("unreadable") }), none);
+  assert.deepEqual(note({ config_change: change("unchanged") }), none);
+  assert.deepEqual(note({ config_change: undefined }), none);
+  assert.deepEqual(note({ config_change: "garbage" }), none);
+  assert.deepEqual(humanCard({ touches_config: false, config_change: null }).summary, []);
+});
+
+test("View diff opens the files tab of the PR, and is absent without a slug", () => {
+  assert.equal(humanCard({}).diffUrl, "https://github.com/Soochol/chute/pull/21/files");
+  assert.equal(pullUrl("Soochol/chute", 21) + "/files", humanCard({}).diffUrl);
+  const data = clone(fixture);
+  data.repo.slug = "";
+  assert.equal(section(only(data), "human").items.find((i) => i.pr === 21).diffUrl, null);
+});
+
+test("the submitter line says who submitted, once when the agent is the submitter", () => {
+  const orch = { terminal: "t1zz", name: "orch", alive: true };
+  const differs = humanCard({ submitter: orch });
+  assert.deepEqual([differs.submittedBy, differs.sameSubmitter], ["submitted by orch (t1zz)", false]);
+  assert.equal(differs.agent.label, "impl-config (t1s4)");
+
+  const same = humanCard({ submitter: { terminal: "t1s4", name: "impl-config", alive: true } });
+  assert.deepEqual([same.submittedBy, same.sameSubmitter], ["submitted by impl-config (t1s4)", true]);
+
+  const neither = humanCard({ agent: null, submitter: null });
+  assert.deepEqual([neither.submittedBy, neither.sameSubmitter], ["submitted by unknown terminal", false]);
+
+  const agentOnly = humanCard({ submitter: null });
+  assert.equal(agentOnly.submittedBy, null);
+
+  const submitterOnly = humanCard({ agent: null, submitter: orch });
+  assert.equal(submitterOnly.submittedBy, "submitted by orch (t1zz)");
+});
+
+test("an overlap notice names the other PRs that change the same target", () => {
+  const edit = (pr, ...paths) => ({
+    ...itemOf(21),
+    pr,
+    head: `${pr}e5678`.padStart(7, "0"),
+    touches_config: true,
+    config_change: change("edited", paths.map((path) => op("changed", path, "1", "2"))),
+  });
+  const cards = (...items) =>
+    Object.fromEntries(section(only(withQueue(...items)), "human").items.map((card) => [card.pr, card.overlap]));
+
+  assert.deepEqual(cards(edit(21, ["verify", "clippy", "run"]), edit(22, ["verify", "clippy", "timeout"])), {
+    21: "#22 also changes clippy. These may conflict.",
+    22: "#21 also changes clippy. These may conflict.",
+  });
+  assert.deepEqual(cards(edit(21, ["verify", "clippy", "run"]), edit(22, ["verify", "test", "run"])), { 21: null, 22: null });
+  assert.deepEqual(cards(edit(21, ["budget"]), edit(22, ["post_verify", "budget", "run"])), { 21: null, 22: null });
+  assert.equal(cards(edit(21, ["flaky", "chronic"]), edit(22, ["flaky", "chronic"]))[21], "#22 also changes flaky.chronic. These may conflict.");
+
+  const three = cards(edit(21, ["verify", "clippy", "run"]), edit(22, ["verify", "clippy", "run"]), edit(23, ["verify", "clippy", "run"]));
+  assert.equal(three[21], "#22, #23 also change clippy. These may conflict.");
+  assert.equal(three[23], "#21, #22 also change clippy. These may conflict.");
+
+  const first = cards(edit(21, ["budget"], ["verify", "clippy", "run"]), edit(22, ["verify", "clippy", "run"]));
+  assert.equal(first[21], "#22 also changes clippy. These may conflict.");
+
+  const bare = { ...itemOf(21), touches_config: true, config_change: undefined };
+  assert.deepEqual(cards(bare, { ...bare, pr: 22 }), { 21: null, 22: null });
+  assert.deepEqual(cards(edit(21, ["verify", "clippy", "run"]), { ...bare, pr: 22 }), { 21: null, 22: null });
+  const queued = { ...edit(22, ["verify", "clippy", "run"]), state: "queued" };
+  assert.equal(cards(edit(21, ["verify", "clippy", "run"]), queued)[21], null);
+});
+
+test("human cards carry question, agent and retries", () => {
   const [card] = section(only([fixture]), "human").items;
   assert.equal(card.state, "awaiting_approval");
-  assert.equal(card.reason, "Awaiting approval");
+  assert.equal(card.question, "Approve config change?");
   assert.equal(card.retries, "0/3");
   assert.deepEqual(card.agent, { terminal: "t1s4", name: "impl-config", alive: true, remote: false, host: null, label: "impl-config (t1s4)" });
 });
@@ -816,7 +964,7 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report"]);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary"]);
     const leaves = [];
     const walk = (value, path, key) => {
       if (value !== null && typeof value === "object") {
