@@ -1200,3 +1200,25 @@ fn a_failure_that_names_no_test_and_was_not_rerun_by_the_search_is_not_a_flake()
         "다시 돌지 않은 실패는 흔들림이 아니다"
     );
 }
+
+#[test]
+fn a_search_commit_that_fails_without_names_and_passes_a_whole_rerun_is_still_a_flake() {
+    let lab = plain_lab(
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; f=1; fi\nif [ -e svc/CRASH ]; then m=\"@ROOT@/seen-$(git rev-parse HEAD)\"; if [ ! -e \"$m\" ]; then touch \"$m\"; echo 'segmentation fault'; f=1; fi; fi\n[ -z \"$f\" ] || exit 1",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "svc/CRASH"), (2, "svc/BREAK"), (3, "c.txt")]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
+    let wobbles: Vec<Vec<String>> = events_of(&lab, |e| matches!(e, EventKind::Flaky { .. }))
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Flaky { tests, .. } => Some(tests),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wobbles, [Vec::<String>::new()]);
+}
