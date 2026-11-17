@@ -52,9 +52,6 @@ impl Cancel {
 
 pub struct Options<'a> {
     pub rerun_on_exit_failure: bool,
-    /// Runs the second attempt of a step as its `probe` on the tests the first attempt failed,
-    /// when the step has a `probe` and the first attempt named a test. Otherwise the whole step
-    /// runs again.
     pub rerun_with_probe: bool,
     pub cancel: Cancel,
     pub kill_grace: Duration,
@@ -284,7 +281,7 @@ impl Ctx<'_> {
             End::Failed(cause) => cause,
         };
         if !self.opts.rerun_on_exit_failure || cause == Cause::TimedOut {
-            return Ok(StepEnd::Failed(failure(step, cause, first_log, &[])?));
+            return Ok(StepEnd::Failed(failure(step, cause, first_log)?));
         }
         let first_tests = failed_tests(step, &read_window(&first_log)?);
         let probe = self.probe_step(step, &first_tests);
@@ -297,21 +294,28 @@ impl Ctx<'_> {
             }),
             End::Cancelled => Ok(StepEnd::Cancelled),
             End::Failed(cause) => {
-                let earlier = if probe.is_some() {
-                    &first_tests[..]
-                } else {
-                    &[]
-                };
-                Ok(StepEnd::Failed(failure(step, cause, second_log, earlier)?))
+                let mut failed = failure(step, cause, second_log)?;
+                if probe.is_some()
+                    && matches!(failed.detail, Detail::Tail(_))
+                    && let Some(tests) = NonEmpty::new(first_tests)
+                {
+                    failed.detail = Detail::Tests(tests);
+                }
+                Ok(StepEnd::Failed(failed))
             }
         }
     }
 
-    /// The step as its second attempt runs it: its `probe` with the failed tests in place, or
-    /// `None` when the whole step runs again.
     fn probe_step(&self, step: &VerifyStep, tests: &[String]) -> Option<VerifyStep> {
         let probe = step.probe.as_ref().filter(|_| self.opts.rerun_with_probe)?;
-        let (quoted, _) = flaky::quote_within(tests, flaky::MAX_TESTS_BYTES)?;
+        if tests.iter().any(|test| test.contains('\0')) {
+            return None;
+        }
+        let slots = probe.matches(PROBE_PLACEHOLDER).count().max(1);
+        let (quoted, taken) = flaky::quote_within(tests, flaky::MAX_TESTS_BYTES / slots)?;
+        if taken.len() != tests.len() {
+            return None;
+        }
         Some(VerifyStep {
             run: probe.replace(PROBE_PLACEHOLDER, &quoted),
             ..step.clone()
@@ -442,14 +446,9 @@ fn remove_log(path: &Path) -> Result<()> {
     }
 }
 
-/// `earlier` names the tests to report when the log names none.
-fn failure(step: &VerifyStep, cause: Cause, log: PathBuf, earlier: &[String]) -> Result<Failed> {
+fn failure(step: &VerifyStep, cause: Cause, log: PathBuf) -> Result<Failed> {
     let window = read_window(&log)?;
-    let mut tests = failed_tests(step, &window);
-    if tests.is_empty() {
-        tests = earlier.to_vec();
-    }
-    let detail = match NonEmpty::new(tests) {
+    let detail = match NonEmpty::new(failed_tests(step, &window)) {
         Some(tests) => Detail::Tests(tests),
         None => Detail::Tail(tail(&window)),
     };

@@ -317,6 +317,56 @@ fn a_probe_log_without_test_names_keeps_the_names_of_the_first_attempt() {
 }
 
 #[test]
+fn a_failed_test_whose_name_does_not_fit_the_probe_makes_the_rerun_whole() {
+    let rig = Rig::new();
+    let run = "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; echo 'test one ... FAILED'; head -c 70000 /dev/zero | tr '\\0' x | sed 's/^/test /; s/$/ ... FAILED/'; echo; exit 1";
+    let cfg = probed(
+        &rig,
+        run,
+        "echo probe >> '@M@/probe'; echo {tests} > /dev/null",
+    );
+
+    let flaky = passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(flaky[0].tests.len(), 2);
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+    assert!(!rig.mark("probe").exists());
+}
+
+#[test]
+fn a_name_the_probe_command_cannot_carry_makes_the_rerun_whole() {
+    let rig = Rig::new();
+    let run = "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; printf 'test a\\000b ... FAILED\\n'; exit 1";
+    let cfg = probed(
+        &rig,
+        run,
+        "echo probe >> '@M@/probe'; echo {tests} > /dev/null",
+    );
+
+    let flaky = passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(flaky[0].tests, ["a\0b"]);
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+    assert!(!rig.mark("probe").exists());
+}
+
+#[test]
+fn a_probe_with_the_tests_twice_does_not_outgrow_the_argument_limit() {
+    let rig = Rig::new();
+    let run = "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; i=0; while [ $i -lt 1800 ]; do echo \"test name_padding_padding_$i ... FAILED\"; i=$((i+1)); done; exit 1";
+    let cfg = probed(
+        &rig,
+        run,
+        "echo probe >> '@M@/probe'; true {tests}; true {tests}",
+    );
+
+    let flaky = passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(flaky[0].tests.len(), 1800);
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+}
+
+#[test]
 fn a_first_attempt_that_names_no_test_is_rerun_whole_even_with_a_probe() {
     let rig = Rig::new();
     let run =
