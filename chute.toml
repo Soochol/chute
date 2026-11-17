@@ -9,6 +9,12 @@ run = "cargo fmt --check"
 timeout = 300
 
 [[verify]]
+name = "mod"
+run = "node --test mod/*/*.test.js"
+timeout = 300
+failed = '✖ (.+) \(\d[\d.]*ms\)'
+
+[[verify]]
 name = "clippy"
 run = "cargo clippy --all-targets -- -D warnings"
 timeout = 1800

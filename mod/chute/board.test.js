@@ -1479,6 +1479,19 @@ test("the running batch shows its step n/m, elapsed time, and a progress bar onl
   assert.equal(batch(NOW).stepText, "test");
 });
 
+test("a batch without started_ms shows no usual time, elapsed time or progress even when the usual time is known", () => {
+  const data = quiet();
+  data.batch = clone(fixture.batch);
+  data.recent = [{ seconds: 200 }, { seconds: 600 }, { seconds: 400 }];
+  const batch = () => interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0];
+  const started = data.batch.started_ms;
+  delete data.batch.started_ms;
+  const blind = batch();
+  assert.deepEqual([blind.usual, blind.elapsed, blind.progress, blind.longer], [null, null, null, false]);
+  data.batch.started_ms = started;
+  assert.equal(batch().usual, "usually 6m 40s");
+});
+
 test("recent merges: five from recent_merged, with titles, bounce counts and a GitHub address", () => {
   const data = clone(fixture);
   data.recent_merged = Array.from({ length: 7 }, (_, i) => ({ pr: 20 - i, title: `제목 ${i}`, batch: "b", merged_ms: NOW - 60_000 * (i + 1), bounces: i === 1 ? 2 : 0 }));

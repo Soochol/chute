@@ -6,10 +6,11 @@ chute는 herdr 에이전트의 PR을 묶어 로컬에서 검증하고 기본 브
 
 ## 검사
 
-PR을 올리기 전에 세 명령이 모두 통과해야 한다. 저장소 루트의 `chute.toml`에도 같은 명령이 있다.
+PR을 올리기 전에 네 명령이 모두 통과해야 한다. 저장소 루트의 `chute.toml`에도 같은 명령이 있다.
 
 ```sh
 cargo fmt --check
+node --test mod/*/*.test.js
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
