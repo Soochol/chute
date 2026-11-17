@@ -1565,7 +1565,7 @@ mod tests {
     fn the_new_event_kinds_round_trip_as_the_same_json() {
         let lines = [
             json!({"at_ms": 1, "event": "submitted", "pr": 4, "head": "abc1234",
-                   "priority": true, "after": [2, 3], "repair": false}),
+                   "priority": true, "after": [2, 3], "repair": false, "touches_config": true}),
             json!({"at_ms": 2, "event": "dropped", "pr": 4}),
             json!({"at_ms": 3, "event": "notified", "kind": "merged", "pr": 4,
                    "to": "desk/t7", "delivered": "sent"}),
