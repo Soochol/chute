@@ -145,8 +145,6 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `chute down` writes the stop file only while a daemon holds the lock, so a file
-/// that was already there before this daemon took the lock was meant for an earlier one.
 #[derive(Debug, PartialEq, Eq)]
 struct StopFile {
     inode: u64,
