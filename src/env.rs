@@ -202,7 +202,6 @@ mod tests {
     use crate::testkit::Sandbox;
     use std::time::Instant;
 
-    /// Only catches a hang: a wait that gives up fails the test instead of deciding its outcome.
     const STUCK: Duration = Duration::from_secs(30);
 
     fn wait_until(ready: impl Fn() -> bool) {
@@ -324,8 +323,6 @@ mod tests {
                     &Cancel::new(),
                 )
             });
-            // The limit is read before the check starts, so once `start` shows, one jump past it
-            // cuts the first check and the second check's limit is read from the moved clock.
             wait_until(|| fs::read_to_string(&first_log).is_ok_and(|log| log.contains("start")));
             clock.advance(Duration::from_secs(2 * 3600));
             run.join().unwrap()
