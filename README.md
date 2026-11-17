@@ -64,6 +64,21 @@ cargo install --git https://github.com/Soochol/chute
 
 `chute install`은 plugin이 주지 않는 것만 쓴다. Codex 스킬(`~/.codex/skills/chute/SKILL.md`)과 Herdr 현황판 mod(`~/.config/herdr-app/mods/chute/`)다. Claude Code 스킬은 쓰지 않는다. plugin의 스킬과 같은 스킬이 두 번 뜨는 것을 막기 위해서다. 이전 버전의 `chute install`이 쓴 `~/.claude/skills/chute/SKILL.md`가 남아 있으면 plugin과 겹치니 직접 지운다. `chute install`이 그 파일을 알려 준다.
 
+### Herdr 탭 막대 버튼과 패널 레이아웃(선택)
+
+`chute install --layout`은 위의 파일에 더해 Herdr 탭 막대에 `● chute` 버튼을 달고 오른쪽 패널에 chute 현황판을 넣은 레이아웃을 설치한다. 옵션 없는 `chute install`은 이 파일을 쓰지 않는다.
+
+- 그 PC의 Herdr 기본 파일(`layouts/main.json`, `mods/tabs/main.js`)을 **읽어** 복제본을 만든다. 기본 파일은 고치지 않는다. 쓰는 파일은 `layouts/chute.json`과 `mods/chute-tabs/`(`main.js`, `chute.js`, `mod.json`)다. 버튼 동작과 점 색은 `mod/chute-tabs/chute.js`가 정한다.
+- 쓴 뒤 `herdr-app do layout.switch '{"name":"chute"}'`로 chute 레이아웃으로 바꾼다. Herdr가 떠 있지 않거나 명령이 실패하면 설치는 성공으로 두고 바꾸는 명령을 알려 준다. `ctrl-shift-l`로도 고른다.
+- 이 파일들은 chute가 만드니 고치지 않는다. 다음 `chute install --layout`이 덮어쓴다. 같은 이름의 다른 파일(chute의 것이 아닌 `layouts/chute.json`이나 `mods/chute-tabs/main.js`)이 있으면 덮어쓰지 않고 알린다.
+- 복제본은 Herdr가 따라 고쳐 주지 않는다. Herdr를 업데이트한 뒤에는 `chute install --layout`을 다시 실행한다. 옵션 없는 `chute install`은 지금 기본 파일로 다시 만들어 본 결과와 설치된 파일을 견주고, 다르면 경고하고 파일은 쓰지 않는다. Herdr가 기본 탭 막대를 바꿔 바꿔 끼울 줄을 찾지 못하면 설치를 거절하고 이유를 알린다.
+- 단축키는 `keys.json`을 고치지 않고 안내만 한다. 쓰려면 `keys.json`에 다음 구역을 직접 더한다.
+  ```json
+  "layout:chute": { "ctrl-shift-g": "layout.toggle:panel", "ctrl-shift-u": "layout.toggle:chute" }
+  ```
+- 되돌리려면 `chute uninstall --layout`을 실행한다. chute 레이아웃이 보이면 `main`으로 바꾼 뒤 chute가 쓴 파일(`layouts/chute.json`, `mods/chute-tabs/`와 Herdr가 그 폴더에 넣은 `gpui-kit.d.ts`·`herdr.d.ts`·`jsconfig.json`)만 지운다. 다른 파일이 남은 폴더는 두고 알린다. 다시 실행해도 같은 결과다.
+- Herdr가 mod용 탭 막대 버튼 API를 주면 이 복제본을 지우고 갈아탄다.
+
 ## 처음 쓰기
 
 1. 대상 저장소에서 `chute init`을 실행한다. `chute.toml` 초안을 쓰고 저장소를 상태 폴더에 등록한다.

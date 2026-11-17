@@ -15,11 +15,14 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
+const HERDR_APP_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Git,
     Gh,
     Hc,
+    HerdrApp,
 }
 
 impl Tool {
@@ -30,6 +33,7 @@ impl Tool {
             Tool::Git => "git",
             Tool::Gh => "gh",
             Tool::Hc => "hc",
+            Tool::HerdrApp => "herdr-app",
         }
     }
 
@@ -38,6 +42,7 @@ impl Tool {
             Tool::Git => "CHUTE_GIT",
             Tool::Gh => "CHUTE_GH",
             Tool::Hc => "CHUTE_HC",
+            Tool::HerdrApp => "CHUTE_HERDR_APP",
         }
     }
 }
@@ -112,6 +117,7 @@ pub struct Ext {
     git: PathBuf,
     gh: PathBuf,
     hc: PathBuf,
+    herdr_app: PathBuf,
     timeout: Duration,
 }
 
@@ -133,6 +139,7 @@ impl Ext {
             git: program(Tool::Git),
             gh: program(Tool::Gh),
             hc: program(Tool::Hc),
+            herdr_app: program(Tool::HerdrApp),
             timeout: Ext::DEFAULT_TIMEOUT,
         }
     }
@@ -147,6 +154,7 @@ impl Ext {
             Tool::Git => &self.git,
             Tool::Gh => &self.gh,
             Tool::Hc => &self.hc,
+            Tool::HerdrApp => &self.herdr_app,
         }
     }
 
@@ -172,6 +180,19 @@ impl Ext {
         S: AsRef<OsStr>,
     {
         self.call(Tool::Hc, None, args, self.timeout)
+    }
+
+    pub fn herdr_app<I, S>(&self, args: I) -> Result<Output, ExtError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.call(
+            Tool::HerdrApp,
+            None,
+            args,
+            self.timeout.min(HERDR_APP_TIMEOUT),
+        )
     }
 
     /// Runs one call in its own process group and kills the whole group when `timeout` passes.
@@ -465,6 +486,17 @@ mod tests {
         for tool in Tool::ALL {
             assert_eq!(ext.program(tool), Path::new(tool.name()));
         }
+        assert_eq!(ext.program(Tool::HerdrApp), Path::new("herdr-app"));
+    }
+
+    #[test]
+    fn herdr_app_follows_its_own_variable() {
+        let sb = Sandbox::new();
+        sb.fake("herdr-app").respond("status", Reply::ok("{}"));
+        let ext = Ext::from_vars(|k| {
+            (k == "CHUTE_HERDR_APP").then(|| sb.fake("herdr-app").path().as_os_str().to_owned())
+        });
+        assert_eq!(ext.herdr_app(["status"]).unwrap().ok().unwrap(), "{}");
     }
 
     #[test]
