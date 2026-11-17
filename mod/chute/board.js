@@ -606,7 +606,7 @@ function batchOf(batch, members, now, usualS, slug) {
       reused: b.reused === "preflight" || b.reused === "batch" ? `Reused ${b.reused} pass` : null,
       round: Number.isFinite(b.round) && b.round > 0 ? `Round ${b.round}` : null,
       elapsed: elapsedS != null ? formatDuration(elapsedS) : null,
-      usual: usualS != null ? `usually ${formatDuration(usualS)}` : null,
+      usual: usualS != null && elapsedS != null ? `usually ${formatDuration(usualS)}` : null,
       progress: timed ? Math.min(1, elapsedS / usualS) : null,
       longer: timed && elapsedS > usualS,
     },

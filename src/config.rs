@@ -1247,7 +1247,7 @@ probe = "cargo test {tests} -- --exact"
     fn this_repository_config_is_valid() {
         let c = Config::parse(include_str!("../chute.toml")).unwrap();
         let names: Vec<&str> = c.verify.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["fmt", "clippy", "test"]);
+        assert_eq!(names, ["fmt", "mod", "clippy", "test"]);
     }
 
     #[test]

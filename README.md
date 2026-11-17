@@ -39,7 +39,7 @@ plugin은 실행 파일을 빌드하지 않는다. `chute` 실행 파일은 따�
 cargo install --git https://github.com/Soochol/chute
 ```
 
-저장소를 받아 개발할 때는 `cargo install --path .`로 설치하고, `cargo build --release`로 빌드하고 `cargo test`로 시험한다. 빌드한 실행 파일은 `target/release/chute`다.
+저장소를 받아 개발할 때는 `cargo install --path .`로 설치하고, `cargo build --release`로 빌드하고 `cargo test`로 시험한다. 현황판 mod는 `node --test mod/*/*.test.js`로 시험한다. 빌드한 실행 파일은 `target/release/chute`다.
 
 필요한 것은 다음과 같다.
 
