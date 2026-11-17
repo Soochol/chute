@@ -15,7 +15,8 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
 use nix::unistd::Pid;
 
-use crate::config::{Config, VerifyStep};
+use crate::config::{Config, PROBE_PLACEHOLDER, VerifyStep};
+use crate::flaky;
 use crate::model::{EpochMs, NonEmpty};
 use crate::pc_limit::{self, Wait};
 use crate::store::RepoStore;
@@ -51,6 +52,10 @@ impl Cancel {
 
 pub struct Options<'a> {
     pub rerun_on_exit_failure: bool,
+    /// Runs the second attempt of a step as its `probe` on the tests the first attempt failed,
+    /// when the step has a `probe` and the first attempt named a test. Otherwise the whole step
+    /// runs again.
+    pub rerun_with_probe: bool,
     pub cancel: Cancel,
     pub kill_grace: Duration,
     /// Passed to the steps as `CHUTE_CACHE_DIR`; created before the first step.
@@ -70,6 +75,7 @@ impl Default for Options<'_> {
     fn default() -> Self {
         Options {
             rerun_on_exit_failure: true,
+            rerun_with_probe: false,
             cancel: Cancel::new(),
             kill_grace: Duration::from_secs(5),
             cache_dir: None,
@@ -278,18 +284,38 @@ impl Ctx<'_> {
             End::Failed(cause) => cause,
         };
         if !self.opts.rerun_on_exit_failure || cause == Cause::TimedOut {
-            return Ok(StepEnd::Failed(failure(step, cause, first_log)?));
+            return Ok(StepEnd::Failed(failure(step, cause, first_log, &[])?));
         }
-        match self.attempt(step, &second_log)? {
+        let first_tests = failed_tests(step, &read_window(&first_log)?);
+        let probe = self.probe_step(step, &first_tests);
+        match self.attempt(probe.as_ref().unwrap_or(step), &second_log)? {
             End::Passed => Ok(StepEnd::Passed {
                 flaky: Some(FlakyStep {
                     step: step.name.clone(),
-                    tests: failed_tests(step, &read_window(&first_log)?),
+                    tests: first_tests,
                 }),
             }),
             End::Cancelled => Ok(StepEnd::Cancelled),
-            End::Failed(cause) => Ok(StepEnd::Failed(failure(step, cause, second_log)?)),
+            End::Failed(cause) => {
+                let earlier = if probe.is_some() {
+                    &first_tests[..]
+                } else {
+                    &[]
+                };
+                Ok(StepEnd::Failed(failure(step, cause, second_log, earlier)?))
+            }
         }
+    }
+
+    /// The step as its second attempt runs it: its `probe` with the failed tests in place, or
+    /// `None` when the whole step runs again.
+    fn probe_step(&self, step: &VerifyStep, tests: &[String]) -> Option<VerifyStep> {
+        let probe = step.probe.as_ref().filter(|_| self.opts.rerun_with_probe)?;
+        let (quoted, _) = flaky::quote_within(tests, flaky::MAX_TESTS_BYTES)?;
+        Some(VerifyStep {
+            run: probe.replace(PROBE_PLACEHOLDER, &quoted),
+            ..step.clone()
+        })
     }
 
     fn attempt(&self, step: &VerifyStep, log: &Path) -> Result<End> {
@@ -416,9 +442,14 @@ fn remove_log(path: &Path) -> Result<()> {
     }
 }
 
-fn failure(step: &VerifyStep, cause: Cause, log: PathBuf) -> Result<Failed> {
+/// `earlier` names the tests to report when the log names none.
+fn failure(step: &VerifyStep, cause: Cause, log: PathBuf, earlier: &[String]) -> Result<Failed> {
     let window = read_window(&log)?;
-    let detail = match NonEmpty::new(failed_tests(step, &window)) {
+    let mut tests = failed_tests(step, &window);
+    if tests.is_empty() {
+        tests = earlier.to_vec();
+    }
+    let detail = match NonEmpty::new(tests) {
         Some(tests) => Detail::Tests(tests),
         None => Detail::Tail(tail(&window)),
     };

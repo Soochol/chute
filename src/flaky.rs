@@ -13,7 +13,7 @@ use crate::verify::{self, Cancel, CommandEnd, Options};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Linux refuses a single `sh -c` argument of 128 KiB or more.
-const MAX_TESTS_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TESTS_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Key {
@@ -340,7 +340,7 @@ fn repeat(
 
 /// The names that fit in `limit` bytes, each in single quotes, and the names themselves. A name
 /// too long to fit is left out. `None` when no name fits.
-fn quote_within(tests: &[String], limit: usize) -> Option<(String, Vec<String>)> {
+pub(crate) fn quote_within(tests: &[String], limit: usize) -> Option<(String, Vec<String>)> {
     let mut text = String::new();
     let mut taken = Vec::new();
     for test in tests {

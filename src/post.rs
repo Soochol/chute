@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::{Config, PostVerify};
 use crate::engine::reap_orphans;
 use crate::ext::Ext;
+use crate::flaky;
 use crate::gitops::{Gitops, Slot, SlotLock, SlotName};
 use crate::model::{
     Agent, BatchId, Culprit, EpochMs, Event, EventKind, GreenMark, MergeRef, PostPhase, PostRed,
@@ -165,7 +166,7 @@ impl PostVerifier {
         match self.check(scope, tip, PostPhase::Verifying)? {
             Checked::Cancelled => Ok(PostPass::Cancelled),
             Checked::Passed { flaky } => {
-                self.record_flaky(scope.slot, tip, flaky)?;
+                self.record_flaky(scope, tip, flaky)?;
                 self.green(tip, started.elapsed())?;
                 Ok(PostPass::Passed)
             }
@@ -224,6 +225,7 @@ impl PostVerifier {
                 cache_dir: Some(self.gitops.cache_dir()),
                 on_step: Some(&on_step),
                 on_machine_wait: Some(&on_machine_wait),
+                rerun_with_probe: true,
                 changed: changed.as_deref(),
                 ..Options::default()
             },
@@ -249,15 +251,29 @@ impl PostVerifier {
         Ok(at_ms)
     }
 
-    fn record_flaky(&self, slot: &Slot, commit: &Sha, flaky: Vec<FlakyStep>) -> Result<()> {
+    fn record_flaky(&self, scope: &Scope, commit: &Sha, flaky: Vec<FlakyStep>) -> Result<()> {
+        if flaky.is_empty() {
+            return Ok(());
+        }
+        let touched: Vec<flaky::Key> = flaky
+            .iter()
+            .flat_map(|f| flaky::keys_of(&f.step, &f.tests))
+            .collect();
         for step in flaky {
             self.history(EventKind::Flaky {
                 batch: BatchId(format!("post-{}", commit.short())),
                 step: step.step,
                 tests: step.tests,
-                tree: slot.tree_of(commit)?,
+                tree: scope.slot.tree_of(commit)?,
             })?;
         }
+        flaky::refresh_chronic(
+            &self.store,
+            &self.store.history()?.events,
+            EpochMs::now(),
+            &scope.config.flaky,
+            &touched,
+        )?;
         Ok(())
     }
 
@@ -402,7 +418,7 @@ impl PostVerifier {
                 match self.check(scope, commit, PostPhase::Searching)? {
                     Checked::Cancelled => return Ok(Search::Cancelled),
                     Checked::Passed { flaky } => {
-                        self.record_flaky(scope.slot, commit, flaky)?;
+                        self.record_flaky(scope, commit, flaky)?;
                         passing = probe;
                         decided = true;
                     }

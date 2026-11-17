@@ -232,6 +232,104 @@ fn a_step_that_passes_on_the_rerun_is_flaky_and_the_run_goes_on() {
     assert!(!rig.log("t", 2).contains("FAILED"));
 }
 
+const FIRST_FAILS_ONCE: &str = "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; echo 'test one ... FAILED'; exit 1";
+
+fn probed(rig: &Rig, run: &str, probe: &str) -> Config {
+    let m = rig.marks_dir();
+    let mut step = with_failed(step("t", run.replace("@M@", &m)), TEST_NAME);
+    step.probe = Some(probe.replace("@M@", &m));
+    config(vec![step], false)
+}
+
+fn with_probe_rerun() -> Options<'static> {
+    Options {
+        rerun_with_probe: true,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn without_the_probe_option_a_step_with_a_probe_is_rerun_whole() {
+    let rig = Rig::new();
+    let cfg = probed(
+        &rig,
+        FIRST_FAILS_ONCE,
+        "echo probe >> '@M@/probe'; exit 1 # {tests}",
+    );
+
+    let flaky = passed(rig.run(&cfg, &Options::default()));
+
+    assert_eq!(flaky[0].tests, ["one"]);
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+    assert!(!rig.mark("probe").exists());
+}
+
+#[test]
+fn with_the_probe_option_the_rerun_is_the_probe_on_the_failed_tests_only() {
+    let rig = Rig::new();
+    let cfg = probed(&rig, FIRST_FAILS_ONCE, "echo {tests} >> '@M@/probe'");
+
+    let flaky = passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(
+        flaky,
+        [FlakyStep {
+            step: "t".into(),
+            tests: vec!["one".into()]
+        }]
+    );
+    assert_eq!(count_lines(&rig.mark("full")), 1);
+    assert_eq!(fs::read_to_string(rig.mark("probe")).unwrap(), "one\n");
+}
+
+#[test]
+fn a_probe_that_fails_again_fails_the_step_with_its_own_log_and_tests() {
+    let rig = Rig::new();
+    let cfg = probed(
+        &rig,
+        FIRST_FAILS_ONCE,
+        "echo 'test two ... FAILED'; echo {tests} > /dev/null; exit 1",
+    );
+
+    let f = failed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(f.step, "t");
+    assert_eq!(f.log, log_path(&rig.logs(), "t", 2));
+    assert_eq!(
+        f.detail,
+        Detail::Tests(NonEmpty::new(vec!["two".to_owned()]).unwrap())
+    );
+    assert_eq!(count_lines(&rig.mark("full")), 1);
+}
+
+#[test]
+fn a_probe_log_without_test_names_keeps_the_names_of_the_first_attempt() {
+    let rig = Rig::new();
+    let cfg = probed(&rig, FIRST_FAILS_ONCE, "echo boom {tests}; exit 1");
+
+    let f = failed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(f.log, log_path(&rig.logs(), "t", 2));
+    assert_eq!(
+        f.detail,
+        Detail::Tests(NonEmpty::new(vec!["one".to_owned()]).unwrap())
+    );
+}
+
+#[test]
+fn a_first_attempt_that_names_no_test_is_rerun_whole_even_with_a_probe() {
+    let rig = Rig::new();
+    let run =
+        "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; echo boom; exit 1";
+    let cfg = probed(&rig, run, "echo probe >> '@M@/probe'; echo {tests}");
+
+    let flaky = passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert!(flaky[0].tests.is_empty());
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+    assert!(!rig.mark("probe").exists());
+}
+
 #[test]
 fn with_the_rerun_off_the_first_failure_ends_the_run() {
     let rig = Rig::new();
