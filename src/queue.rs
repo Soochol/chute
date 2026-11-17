@@ -3,8 +3,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use crate::model::{
-    Agent, Approval, BounceReason, ConfigChange, EpochMs, FailureKind, FailureRecord, ItemState,
-    PrNumber, PreflightRecord, QueueItem, QueuedReason, Sha, State,
+    Agent, Approval, BounceReason, ConfigChange, ConfigChangeKind, EpochMs, FailureKind,
+    FailureRecord, ItemState, PrNumber, PreflightRecord, QueueItem, QueuedReason, Sha, State,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +56,13 @@ pub fn step(from: ItemState, action: Action) -> Option<Next> {
     let to = |state| Some(Next::To(state));
     match (from, action) {
         (AwaitingApproval, Approve) => to(Queued(None)),
+        (
+            AwaitingApproval,
+            Resubmit {
+                head_changed: false,
+                needs_approval: false,
+            },
+        ) => to(Queued(None)),
         (
             AwaitingApproval | Queued(_),
             Resubmit {
@@ -273,7 +280,11 @@ pub struct Submission {
 
 impl Submission {
     pub fn needs_approval(&self) -> bool {
-        self.approval == Approval::Human || self.touches_config
+        self.approval == Approval::Human
+            || matches!(
+                self.config_change.as_ref().map(|c| c.kind),
+                Some(ConfigChangeKind::Invalid | ConfigChangeKind::Removed)
+            )
     }
 }
 
@@ -338,6 +349,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
             needs_approval,
         },
     )?;
+    let released = item.state == ItemState::AwaitingApproval && to != item.state;
     if s.submitter.is_some() {
         item.submitter = s.submitter;
     }
@@ -347,7 +359,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     item.priority = s.priority;
     item.after = s.after;
     item.repair |= s.repair;
-    let change = match (was_bounced, head_changed) {
+    let change = match (was_bounced || (released && !head_changed), head_changed) {
         (true, _) => Change::Requeued,
         (false, true) => Change::HeadUpdated,
         (false, false) => {
@@ -716,13 +728,9 @@ mod tests {
 
         allow(&mut t, &[AWAITING], Action::Approve, To(QUEUED));
 
+        allow(&mut t, &[AWAITING], resubmit(false, true), To(AWAITING));
+        allow(&mut t, &[AWAITING], resubmit(false, false), To(QUEUED));
         for needs_approval in [false, true] {
-            allow(
-                &mut t,
-                &[AWAITING],
-                resubmit(false, needs_approval),
-                To(AWAITING),
-            );
             allow(
                 &mut t,
                 &[QUEUED],
@@ -1379,33 +1387,74 @@ mod tests {
         );
     }
 
+    fn with_config(
+        mut s: Submission,
+        kind: crate::model::ConfigChangeKind,
+        touches_config: bool,
+    ) -> Submission {
+        s.touches_config = touches_config;
+        s.config_change = Some(ConfigChange {
+            kind,
+            changes: Vec::new(),
+            more: 0,
+        });
+        s
+    }
+
     #[test]
     fn a_new_pr_starts_waiting_or_awaiting_approval() {
-        for (approval, touches_config, expected) in [
-            (Approval::Agent, false, QUEUED),
-            (Approval::Human, false, AWAITING),
-            (Approval::Agent, true, AWAITING),
-            (Approval::Human, true, AWAITING),
-        ] {
-            let mut state = queue_of(&[(1, QUEUED)]);
-            let mut s = submission(2, "def5678", approval, touches_config);
-            s.agent = Some(agent("t1rs"));
-            let done = submit(&mut state, s).unwrap();
-            assert_eq!(
-                done,
-                Submitted {
-                    state: expected,
-                    position: place(1),
-                    change: Change::Added
+        use crate::model::ConfigChangeKind as Kind;
+        let none = None;
+        let kinds = [
+            none,
+            Some(Kind::Edited),
+            Some(Kind::Added),
+            Some(Kind::Unchanged),
+            Some(Kind::Unreadable),
+            Some(Kind::Invalid),
+            Some(Kind::Removed),
+        ];
+        for approval in [Approval::Agent, Approval::Human] {
+            for kind in kinds {
+                let stops_queue = matches!(kind, Some(Kind::Invalid | Kind::Removed));
+                let expected = if approval == Approval::Human || stops_queue {
+                    AWAITING
+                } else {
+                    QUEUED
+                };
+                let touches_config = kind.is_some();
+                let mut state = queue_of(&[(1, QUEUED)]);
+                let mut s = submission(2, "def5678", approval, touches_config);
+                if let Some(kind) = kind {
+                    s = with_config(s, kind, true);
                 }
-            );
-            let added = &state.queue[1];
-            assert_eq!(added.head, sha("def5678"));
-            assert_eq!(added.agent, Some(agent("t1rs")));
-            assert_eq!((added.attempts, added.submitted_ms), (0, EpochMs(1002)));
-            assert_eq!(added.touches_config, touches_config);
-            assert!(added.last_failure.is_none());
+                s.agent = Some(agent("t1rs"));
+                let done = submit(&mut state, s).unwrap();
+                assert_eq!(
+                    done,
+                    Submitted {
+                        state: expected,
+                        position: place(1),
+                        change: Change::Added
+                    },
+                    "{approval:?} {kind:?}"
+                );
+                let added = &state.queue[1];
+                assert_eq!(added.head, sha("def5678"));
+                assert_eq!(added.agent, Some(agent("t1rs")));
+                assert_eq!((added.attempts, added.submitted_ms), (0, EpochMs(1002)));
+                assert_eq!(added.touches_config, touches_config);
+                assert!(added.last_failure.is_none());
+            }
         }
+    }
+
+    #[test]
+    fn a_config_touch_without_a_summary_does_not_need_approval() {
+        let mut state = queue_of(&[]);
+        let done = submit(&mut state, submission(1, "abc1234", Approval::Agent, true)).unwrap();
+        assert_eq!(done.state, QUEUED);
+        assert!(state.queue[0].touches_config);
     }
 
     #[test]
@@ -1424,15 +1473,54 @@ mod tests {
     }
 
     #[test]
+    fn the_same_head_again_moves_an_old_awaiting_item_to_the_queue_only_without_approval() {
+        let mut state = queue_of(&[(1, AWAITING), (2, AWAITING)]);
+        state.queue[0].touches_config = true;
+        let released = submit(&mut state, submission(1, "abc1234", Approval::Agent, true)).unwrap();
+        assert_eq!(
+            released,
+            Submitted {
+                state: QUEUED,
+                position: place(0),
+                change: Change::Requeued
+            }
+        );
+        assert_eq!(state_of(&state, 1), QUEUED);
+
+        let stays = submit(&mut state, submission(2, "abc1234", Approval::Human, false)).unwrap();
+        assert_eq!((stays.state, stays.change), (AWAITING, Change::Unchanged));
+        assert_eq!(state_of(&state, 2), AWAITING);
+
+        let removed = with_config(
+            submission(2, "abc1234", Approval::Agent, true),
+            crate::model::ConfigChangeKind::Removed,
+            true,
+        );
+        let held = submit(&mut state, removed).unwrap();
+        assert_eq!((held.state, held.change), (AWAITING, Change::Unchanged));
+    }
+
+    #[test]
     fn a_new_head_asks_for_approval_again_only_when_approval_is_needed() {
-        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED)]);
+        let mut state = queue_of(&[(1, QUEUED), (2, QUEUED), (3, QUEUED), (4, QUEUED)]);
         let human = submit(&mut state, submission(1, "def5678", Approval::Human, false)).unwrap();
         assert_eq!((human.state, human.change), (AWAITING, Change::HeadUpdated));
         let trust = submit(&mut state, submission(2, "def5678", Approval::Agent, false)).unwrap();
         assert_eq!((trust.state, trust.change), (QUEUED, Change::HeadUpdated));
-        let config = submit(&mut state, submission(3, "def5678", Approval::Agent, true)).unwrap();
-        assert_eq!(config.state, AWAITING);
+        let edited = with_config(
+            submission(3, "def5678", Approval::Agent, true),
+            crate::model::ConfigChangeKind::Edited,
+            true,
+        );
+        let config = submit(&mut state, edited).unwrap();
+        assert_eq!((config.state, config.change), (QUEUED, Change::HeadUpdated));
         assert!(state.queue[2].touches_config);
+        let invalid = with_config(
+            submission(4, "def5678", Approval::Agent, true),
+            crate::model::ConfigChangeKind::Invalid,
+            true,
+        );
+        assert_eq!(submit(&mut state, invalid).unwrap().state, AWAITING);
         assert_eq!(state.queue[0].head, sha("def5678"));
         assert_eq!(state.queue[0].title, "PR 1 v2");
 
@@ -1717,17 +1805,30 @@ mod tests {
     }
 
     #[test]
-    fn a_repair_pr_that_edits_the_config_waits_for_approval() {
+    fn a_repair_pr_waits_for_approval_only_when_the_config_stops_the_queue() {
         let mut state = State::default();
         halt(&mut state);
-        let mut touching = repair_options(2);
-        touching.touches_config = true;
+        let invalid = with_config(
+            repair_options(2),
+            crate::model::ConfigChangeKind::Invalid,
+            true,
+        );
 
-        let done = submit(&mut state, touching).unwrap();
+        let done = submit(&mut state, invalid).unwrap();
 
         assert_eq!(done.state, ItemState::AwaitingApproval);
         assert!(state.queue[0].repair);
         assert!(!repair_ready(&state));
+
+        let mut state = State::default();
+        halt(&mut state);
+        let edited = with_config(
+            repair_options(2),
+            crate::model::ConfigChangeKind::Edited,
+            true,
+        );
+        assert_eq!(submit(&mut state, edited).unwrap().state, QUEUED);
+        assert!(repair_ready(&state));
     }
 
     #[test]

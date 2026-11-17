@@ -144,6 +144,9 @@ function marksOf(item) {
   if (item.repair === true) marks.push({ kind: "repair", text: "Repair", tone: "error" });
   const after = [...new Set(list(item.after).filter((pr) => Number.isSafeInteger(pr) && pr > 0))];
   if (after.length > 0) marks.push({ kind: "after", text: `after ${after.map((pr) => `#${pr}`).join(", ")}`, tone: "muted" });
+  if (item.state !== "awaiting_approval" && item.touches_config === true && configChangeOf(item)?.kind !== "unchanged") {
+    marks.push({ kind: "config", text: "chute.toml", tone: "warn" });
+  }
   return marks;
 }
 
@@ -281,16 +284,21 @@ const CONFIG_EDIT = new Set(["edited", "added", "removed", "invalid"]);
 export function questionOf(item, approval) {
   const touches = item.touches_config === true;
   const kind = configChangeOf(item)?.kind ?? null;
-  if (touches && CONFIG_EDIT.has(kind)) {
-    return { question: "Approve config change?", why: "This PR edits chute.toml, so a person must approve it." };
-  }
-  if (touches && kind === "unchanged" && approval === "agent") {
-    return { question: "Approve to queue?", why: "chute couldn't check every changed file, so a person must approve it." };
-  }
-  if (touches && kind !== "unchanged") {
-    return { question: "Approve config change?", why: "This PR may edit chute.toml, so a person must approve it." };
-  }
-  return { question: "Approve to queue?", why: "This repo asks a person to approve every PR." };
+  return { question: questionTextOf(touches, kind, approval), why: whyOf(touches, kind, approval) };
+}
+
+function questionTextOf(touches, kind, approval) {
+  if (touches && CONFIG_EDIT.has(kind)) return "Approve config change?";
+  if (touches && kind === "unchanged" && approval === "agent") return "Approve to queue?";
+  if (touches && kind !== "unchanged") return "Approve config change?";
+  return "Approve to queue?";
+}
+
+function whyOf(touches, kind, approval) {
+  if (touches && kind === "invalid") return "chute can't read the chute.toml in this PR, so the queue stops after merge.";
+  if (touches && kind === "removed") return "This PR removes chute.toml, so the queue stops after merge.";
+  if (approval === "human") return "This repo asks a person to approve every PR.";
+  return "Waiting under an old chute rule. Approve, or resubmit to queue.";
 }
 
 function targetOf(path) {

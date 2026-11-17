@@ -966,6 +966,8 @@ pub enum EventKind {
         priority: bool,
         after: Vec<PrNumber>,
         repair: bool,
+        #[serde(default)]
+        touches_config: bool,
     },
     Dropped {
         pr: PrNumber,

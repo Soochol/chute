@@ -723,7 +723,7 @@ fn next_steps(
             let mut steps =
                 vec!["보고서의 재현 방법으로 같은 단계를 돌려 실패를 직접 확인한다.".to_owned()];
             if *timed_out {
-                steps.push("시간 제한은 `chute.toml`의 `timeout` 값이다. 값을 늘려서 풀지 않는다. 그 파일을 고친 PR은 사람 승인을 기다린다. 로그 끝부분에서 멈춘 곳을 찾는다.".to_owned());
+                steps.push("시간 제한은 `chute.toml`의 `timeout` 값이다. 값을 늘려서 풀지 않는다. 로그 끝부분에서 멈춘 곳을 찾는다.".to_owned());
             }
             if let VerifyMode::Combo { .. } = step.mode {
                 steps.push(format!(

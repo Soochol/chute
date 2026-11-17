@@ -82,7 +82,7 @@ test("every state and reason in the fixture is covered", () => {
     ["human", "bounced"].flatMap((id) => section(repo, id).items.map((item) => [item.pr, item.reason])),
   );
   assert.deepEqual(reasons, {
-    21: "This PR edits chute.toml, so a person must approve it.",
+    21: "Waiting under an old chute rule. Approve, or resubmit to queue.",
     9: "Verification failed",
     10: "Verification failed",
     11: "Conflict",
@@ -284,25 +284,45 @@ const humanCard = (patch, approval = "agent", pr = 21) => {
 };
 
 test("question and reason follow the repo approval, touches_config and the change kind", () => {
-  const CONFIG = ["Approve config change?", "This PR edits chute.toml, so a person must approve it."];
-  const MAYBE = ["Approve config change?", "This PR may edit chute.toml, so a person must approve it."];
-  const UNCHECKED = ["Approve to queue?", "chute couldn't check every changed file, so a person must approve it."];
-  const HUMAN = ["Approve to queue?", "This repo asks a person to approve every PR."];
+  const OLD = "Waiting under an old chute rule. Approve, or resubmit to queue.";
+  const HUMAN = "This repo asks a person to approve every PR.";
+  const INVALID = "chute can't read the chute.toml in this PR, so the queue stops after merge.";
+  const REMOVED = "This PR removes chute.toml, so the queue stops after merge.";
+  const CONFIG_Q = "Approve config change?";
+  const QUEUE_Q = "Approve to queue?";
   const ask = (patch, approval) => {
     const card = humanCard(patch, approval);
     return [card.question, card.reason];
   };
-  for (const kind of ["edited", "added", "removed", "invalid"]) {
-    for (const approval of ["agent", "human"]) {
-      assert.deepEqual(ask({ touches_config: true, config_change: change(kind) }, approval), CONFIG, `${kind} ${approval}`);
-    }
+  for (const [approval, rest] of [["agent", OLD], ["human", HUMAN]]) {
+    const at = (name) => `${name} ${approval}`;
+    assert.deepEqual(ask({ touches_config: true, config_change: change("edited") }, approval), [CONFIG_Q, rest], at("edited"));
+    assert.deepEqual(ask({ touches_config: true, config_change: change("added") }, approval), [CONFIG_Q, rest], at("added"));
+    assert.deepEqual(ask({ touches_config: true, config_change: change("invalid") }, approval), [CONFIG_Q, INVALID], at("invalid"));
+    assert.deepEqual(ask({ touches_config: true, config_change: change("removed") }, approval), [CONFIG_Q, REMOVED], at("removed"));
+    assert.deepEqual(ask({ touches_config: true, config_change: change("unreadable") }, approval), [CONFIG_Q, rest], at("unreadable"));
+    assert.deepEqual(ask({ touches_config: true, config_change: undefined }, approval), [CONFIG_Q, rest], at("undefined"));
+    assert.deepEqual(ask({ touches_config: true, config_change: change("unchanged") }, approval), [QUEUE_Q, rest], at("unchanged"));
+    assert.deepEqual(ask({ touches_config: false, config_change: null }, approval), [QUEUE_Q, rest], at("plain"));
   }
-  assert.deepEqual(ask({ touches_config: true, config_change: change("unreadable") }, "agent"), MAYBE);
-  assert.deepEqual(ask({ touches_config: true, config_change: undefined }, "agent"), MAYBE);
-  assert.deepEqual(ask({ touches_config: true, config_change: null }, "human"), MAYBE);
-  assert.deepEqual(ask({ touches_config: true, config_change: change("unchanged") }, "agent"), UNCHECKED);
-  assert.deepEqual(ask({ touches_config: true, config_change: change("unchanged") }, "human"), HUMAN);
-  assert.deepEqual(ask({ touches_config: false, config_change: null }, "human"), HUMAN);
+  assert.deepEqual(ask({ touches_config: false, config_change: change("invalid") }, "agent"), [QUEUE_Q, OLD]);
+});
+
+test("a chute.toml mark goes on cards that are not awaiting approval, and never for an unchanged file", () => {
+  const marked = (patch, id = "waiting") => {
+    const data = { ...withQueue({ ...itemOf(19), ...patch }), approval: "agent" };
+    return section(only(data), id).items[0].marks.map((m) => [m.kind, m.text, m.tone]);
+  };
+  const MARK = [["config", "chute.toml", "warn"]];
+  assert.deepEqual(marked({ touches_config: true, config_change: change("edited") }), MARK);
+  assert.deepEqual(marked({ touches_config: true, config_change: change("invalid") }), MARK);
+  assert.deepEqual(marked({ touches_config: true, config_change: undefined }), MARK);
+  assert.deepEqual(marked({ touches_config: true, config_change: change("unchanged") }), []);
+  assert.deepEqual(marked({ touches_config: false, config_change: change("edited") }), []);
+  assert.deepEqual(
+    marked({ ...itemOf(21), touches_config: true, config_change: change("edited") }, "human"),
+    [],
+  );
 });
 
 test("change lines pair a mark with a tone and show short values inline", () => {
