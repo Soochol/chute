@@ -368,6 +368,44 @@ pub struct QueueItem {
     pub after: Vec<PrNumber>,
     #[serde(default)]
     pub repair: bool,
+    #[serde(default)]
+    pub config_change: Option<ConfigChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChange {
+    pub kind: ConfigChangeKind,
+    pub changes: Vec<ConfigDelta>,
+    #[serde(default)]
+    pub more: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChangeKind {
+    Edited,
+    Added,
+    Removed,
+    Invalid,
+    Unchanged,
+    Unreadable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDelta {
+    pub op: ConfigOp,
+    pub path: Vec<String>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOp {
+    Added,
+    Removed,
+    Changed,
+    Reordered,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1115,6 +1153,8 @@ pub struct ItemView {
     /// When a bounced item last bounced (`None` for other states).
     #[serde(default)]
     pub bounced_ms: Option<EpochMs>,
+    #[serde(default)]
+    pub config_change: Option<ConfigChange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1205,6 +1245,7 @@ impl ItemView {
             after: item.after.clone(),
             repair: item.repair,
             bounced_ms,
+            config_change: item.config_change.clone(),
         }
     }
 }
@@ -1224,6 +1265,22 @@ mod tests {
             let view: StatusView = serde_json::from_value(original.clone()).unwrap();
             assert_eq!(serde_json::to_value(&view).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn the_status_fixture_carries_a_config_change_only_on_the_item_that_edits_chute_toml() {
+        let view: StatusView = serde_json::from_str(FIXTURE).unwrap();
+        let with: Vec<_> = view
+            .queue
+            .iter()
+            .filter(|i| i.config_change.is_some())
+            .collect();
+        assert_eq!(with.len(), 1);
+        assert!(with[0].touches_config);
+        let change = with[0].config_change.as_ref().unwrap();
+        assert_eq!(change.kind, ConfigChangeKind::Edited);
+        assert_eq!(change.changes[0].op, ConfigOp::Added);
+        assert_eq!(change.changes[0].path, ["verify", "account-server-test"]);
     }
 
     #[test]
@@ -1401,7 +1458,7 @@ mod tests {
     fn an_item_view_from_before_v3_reads_with_empty_new_fields() {
         let mut old: Value = serde_json::from_str(FIXTURE).unwrap();
         let first = old["queue"][0].as_object_mut().unwrap();
-        for key in ["submitter", "priority", "after", "repair"] {
+        for key in ["submitter", "priority", "after", "repair", "config_change"] {
             first.remove(key);
         }
         old["blocked"] = json!({"reason": "base_broken", "base": "0a1b2c3", "since_ms": 1});
@@ -1435,6 +1492,7 @@ mod tests {
         let item = &state.queue[0];
         assert!(item.submitter.is_none() && !item.priority && !item.repair);
         assert!(item.after.is_empty());
+        assert_eq!(item.config_change, None);
         assert_eq!(state.base_doubt, None);
         let blocked = state.blocked.unwrap();
         assert!(blocked.step.is_none() && blocked.log.is_none());
@@ -1614,6 +1672,7 @@ mod tests {
                 priority: true,
                 after: vec![PrNumber(3)],
                 repair: true,
+                config_change: None,
             }],
             blocked: Some(Blocked {
                 reason: BlockReason::BaseBroken,
@@ -1804,6 +1863,7 @@ mod tests {
                     priority: false,
                     after: Vec::new(),
                     repair: false,
+                    config_change: None,
                 })
                 .collect(),
             ..State::default()

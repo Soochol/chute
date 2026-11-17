@@ -370,6 +370,128 @@ fn a_pr_that_edits_chute_toml_waits_for_approval_even_in_trust_mode() {
     assert_eq!(w.state().queue[1].state, ItemState::Queued(None));
 }
 
+fn git_in(
+    w: &World,
+    dir: &std::path::Path,
+    args: &[&str],
+    index: Option<&std::path::Path>,
+) -> String {
+    let mut cmd = w.sb.command("git");
+    cmd.current_dir(dir).args(args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+fn pr_head_in_origin(w: &World, n: u64, chute_toml: &str) -> String {
+    let origin = w.repo.origin();
+    let scratch = w.sb.root().join(format!("pr-{n}"));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let file = scratch.join("chute.toml");
+    std::fs::write(&file, chute_toml).unwrap();
+    let index = scratch.join("index");
+    git_in(w, origin, &["read-tree", "main"], Some(&index));
+    let blob = git_in(
+        w,
+        origin,
+        &["hash-object", "-w", &file.to_string_lossy()],
+        None,
+    );
+    let cacheinfo = format!("100644,{blob},chute.toml");
+    git_in(
+        w,
+        origin,
+        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+        Some(&index),
+    );
+    let tree = git_in(w, origin, &["write-tree"], Some(&index));
+    let commit = git_in(
+        w,
+        origin,
+        &["commit-tree", &tree, "-p", "main", "-m", "feat: chute.toml"],
+        None,
+    );
+    git_in(
+        w,
+        origin,
+        &["update-ref", &format!("refs/pull/{n}/head"), &commit],
+        None,
+    );
+    commit
+}
+
+fn gh_pr_touching_config(w: &World, n: u64, head: &str) {
+    let touching = with(
+        pr(n, head),
+        "files",
+        json!([{"path": "src/a.rs"}, {"path": "chute.toml"}]),
+    );
+    gh_pr(w, Some(n), with(touching, "changedFiles", json!(2)));
+}
+
+#[test]
+fn a_pr_that_adds_a_step_to_chute_toml_shows_the_added_step_in_status() {
+    let w = World::new();
+    let base = chute::config::draft("true");
+    let head = pr_head_in_origin(
+        &w,
+        12,
+        &format!("{base}\n[[verify]]\nname = \"extra\"\nrun = \"true\"\n"),
+    );
+    gh_pr_touching_config(&w, 12, &head);
+
+    let out = submit(&w, &["12"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("변경 요약"), "{}", stderr(&out));
+    let change = w.entry(12).unwrap()["config_change"].clone();
+    assert_eq!(change["kind"], "edited", "{change}");
+    assert_eq!(change["more"], 0);
+    assert_eq!(
+        change["changes"],
+        json!([{
+            "op": "added", "path": ["verify", "extra"], "before": null,
+            "after": "{ name = \"extra\", run = \"true\" }",
+        }])
+    );
+    assert_eq!(
+        w.state().queue[0].config_change,
+        serde_json::from_value(change).unwrap()
+    );
+}
+
+#[test]
+fn a_pr_head_that_cannot_be_fetched_is_registered_with_an_unreadable_summary_and_a_warning() {
+    let w = World::new();
+    gh_pr_touching_config(&w, 12, HEAD);
+
+    let out = submit(&w, &["12"]);
+
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("경고: #12의 chute.toml 변경 요약을 만들지 못했다"),
+        "{}",
+        stderr(&out)
+    );
+    let item = w.entry(12).unwrap();
+    assert_eq!(item["state"], "awaiting_approval");
+    assert_eq!(
+        item["config_change"],
+        json!({"kind": "unreadable", "changes": [], "more": 0})
+    );
+}
+
+#[test]
+fn a_pr_that_does_not_touch_chute_toml_has_a_null_config_change() {
+    let w = World::new();
+    gh_pr(&w, Some(12), pr(12, HEAD));
+    assert_eq!(code(&submit(&w, &["12"])), Some(0));
+    assert_eq!(w.entry(12).unwrap()["config_change"], Value::Null);
+}
+
 #[test]
 fn a_file_list_cut_short_by_gh_waits_for_approval() {
     let w = World::new();

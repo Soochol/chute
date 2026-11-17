@@ -3,8 +3,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use crate::model::{
-    Agent, Approval, BounceReason, EpochMs, FailureKind, FailureRecord, ItemState, PrNumber,
-    PreflightRecord, QueueItem, QueuedReason, Sha, State,
+    Agent, Approval, BounceReason, ConfigChange, EpochMs, FailureKind, FailureRecord, ItemState,
+    PrNumber, PreflightRecord, QueueItem, QueuedReason, Sha, State,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +263,7 @@ pub struct Submission {
     pub agent: Option<Agent>,
     pub submitter: Option<Agent>,
     pub touches_config: bool,
+    pub config_change: Option<ConfigChange>,
     pub approval: Approval,
     pub priority: bool,
     pub after: Vec<PrNumber>,
@@ -318,6 +319,7 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
             priority: s.priority,
             after: s.after,
             repair: s.repair,
+            config_change: s.config_change,
         });
         return Ok(Submitted {
             state: entry,
@@ -365,6 +367,9 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     item.head = s.head;
     item.title = s.title;
     item.touches_config = s.touches_config;
+    if head_changed || item.config_change.is_none() {
+        item.config_change = s.config_change;
+    }
     if s.agent.is_some() {
         item.agent = s.agent;
     }
@@ -834,6 +839,7 @@ mod tests {
             priority: false,
             after: Vec::new(),
             repair: false,
+            config_change: None,
         }
     }
 
@@ -1337,6 +1343,7 @@ mod tests {
             agent: None,
             submitter: None,
             touches_config,
+            config_change: None,
             approval,
             priority: false,
             after: Vec::new(),
@@ -1432,6 +1439,37 @@ mod tests {
         approve(&mut state, PrNumber(1), None).unwrap();
         let same = submit(&mut state, submission(1, "def5678", Approval::Human, false)).unwrap();
         assert_eq!((same.state, same.change), (QUEUED, Change::Unchanged));
+    }
+
+    fn summary(kind: crate::model::ConfigChangeKind) -> Option<ConfigChange> {
+        Some(ConfigChange {
+            kind,
+            changes: Vec::new(),
+            more: 0,
+        })
+    }
+
+    #[test]
+    fn a_new_head_replaces_the_config_summary_and_the_same_head_keeps_it() {
+        use crate::model::ConfigChangeKind::{Added, Edited, Unreadable};
+        let mut state = queue_of(&[]);
+        let mut first = submission(1, "abc1234", Approval::Agent, true);
+        first.config_change = summary(Edited);
+        submit(&mut state, first).unwrap();
+        assert_eq!(state.queue[0].config_change, summary(Edited));
+
+        let mut same = submission(1, "abc1234", Approval::Agent, true);
+        same.config_change = summary(Unreadable);
+        submit(&mut state, same).unwrap();
+        assert_eq!(state.queue[0].config_change, summary(Edited));
+
+        let mut newer = submission(1, "def5678", Approval::Agent, true);
+        newer.config_change = summary(Added);
+        submit(&mut state, newer).unwrap();
+        assert_eq!(state.queue[0].config_change, summary(Added));
+
+        submit(&mut state, submission(1, "0123abc", Approval::Agent, false)).unwrap();
+        assert_eq!(state.queue[0].config_change, None);
     }
 
     #[test]

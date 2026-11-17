@@ -159,6 +159,7 @@ fn an_old_item_submitted_again_is_a_new_item_with_no_bounces_counted() {
         agent: None,
         submitter: None,
         touches_config: false,
+        config_change: None,
         approval: Approval::Agent,
         priority: false,
         after: Vec::new(),

@@ -7,7 +7,10 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::ext::Ext;
-use crate::model::{Approval, NonEmpty, PreflightPolicy};
+use crate::model::{
+    Approval, ConfigChange, ConfigChangeKind, ConfigDelta, ConfigOp, NonEmpty, PreflightPolicy,
+};
+use toml::{Table, Value};
 
 pub const FILE_NAME: &str = "chute.toml";
 pub const DEFAULT_BUDGET: u32 = 3;
@@ -611,6 +614,188 @@ timeout = 3600          # 초
     )
 }
 
+pub const MAX_DELTAS: usize = 20;
+const MAX_VALUE_CHARS: usize = 500;
+const STEP_SECTIONS: [&str; 2] = ["verify", "post_verify"];
+
+pub fn summarize_change(base: Option<&str>, pr: Option<&str>) -> ConfigChange {
+    let summary = |kind| ConfigChange {
+        kind,
+        changes: Vec::new(),
+        more: 0,
+    };
+    let (base, pr) = match (base, pr) {
+        (None, None) => return summary(ConfigChangeKind::Unchanged),
+        (Some(_), None) => return summary(ConfigChangeKind::Removed),
+        (base, Some(pr)) => (base, pr),
+    };
+    if Config::parse(pr).is_err() {
+        return summary(ConfigChangeKind::Invalid);
+    }
+    let Some(base) = base else {
+        return summary(ConfigChangeKind::Added);
+    };
+    if base == pr {
+        return summary(ConfigChangeKind::Unchanged);
+    }
+    let (Ok(before), Ok(after)) = (toml::from_str::<Table>(base), toml::from_str::<Table>(pr))
+    else {
+        return summary(ConfigChangeKind::Unreadable);
+    };
+    let mut deltas = Vec::new();
+    diff_tables(&mut Vec::new(), &before, &after, &mut deltas);
+    let more = deltas.len().saturating_sub(MAX_DELTAS);
+    deltas.truncate(MAX_DELTAS);
+    ConfigChange {
+        kind: ConfigChangeKind::Edited,
+        changes: deltas,
+        more: u32::try_from(more).unwrap_or(u32::MAX),
+    }
+}
+
+fn delta(
+    op: ConfigOp,
+    path: &[String],
+    before: Option<&Value>,
+    after: Option<&Value>,
+) -> ConfigDelta {
+    ConfigDelta {
+        op,
+        path: path.to_vec(),
+        before: before.map(inline),
+        after: after.map(inline),
+    }
+}
+
+fn diff_tables(path: &mut Vec<String>, before: &Table, after: &Table, out: &mut Vec<ConfigDelta>) {
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        path.push(key.clone());
+        let (b, a) = (before.get(key), after.get(key));
+        let is_steps = path.len() == 1 && STEP_SECTIONS.contains(&key.as_str());
+        match (b, a) {
+            (Some(Value::Array(b)), Some(Value::Array(a))) if is_steps => {
+                diff_steps(key, b, a, out);
+            }
+            (Some(Value::Array(b)), None) if is_steps => diff_steps(key, b, &[], out),
+            (None, Some(Value::Array(a))) if is_steps => diff_steps(key, &[], a, out),
+            (Some(Value::Table(b)), Some(Value::Table(a))) => diff_tables(path, b, a, out),
+            (Some(Value::Table(b)), None) => diff_tables(path, b, &Table::new(), out),
+            (None, Some(Value::Table(a))) => diff_tables(path, &Table::new(), a, out),
+            (Some(b), Some(a)) if b != a => {
+                out.push(delta(ConfigOp::Changed, path, Some(b), Some(a)))
+            }
+            (Some(b), None) => out.push(delta(ConfigOp::Removed, path, Some(b), None)),
+            (None, Some(a)) => out.push(delta(ConfigOp::Added, path, None, Some(a))),
+            _ => {}
+        }
+        path.pop();
+    }
+}
+
+fn diff_steps(section: &str, before: &[Value], after: &[Value], out: &mut Vec<ConfigDelta>) {
+    let named = |steps: &[Value]| -> Option<Vec<String>> {
+        let names: Option<Vec<String>> = steps
+            .iter()
+            .map(|s| s.get("name")?.as_str().map(str::to_owned))
+            .collect();
+        let names = names?;
+        let unique: BTreeSet<&String> = names.iter().collect();
+        (unique.len() == names.len()).then_some(names)
+    };
+    let (before_keys, after_keys, by_name) = match (named(before), named(after)) {
+        (Some(b), Some(a)) => (b, a, true),
+        _ => {
+            let label = |len: usize| (0..len).map(|i| format!("{section}[{i}]")).collect();
+            (label(before.len()), label(after.len()), false)
+        }
+    };
+    let path_of = |key: &str| vec![section.to_owned(), key.to_owned()];
+    for (key, step) in before_keys.iter().zip(before) {
+        match after_keys.iter().position(|k| k == key) {
+            None => out.push(delta(ConfigOp::Removed, &path_of(key), Some(step), None)),
+            Some(at) => {
+                if let (Value::Table(b), Value::Table(a)) = (step, &after[at]) {
+                    let mut path = path_of(key);
+                    diff_tables(&mut path, b, a, out);
+                } else if step != &after[at] {
+                    let path = path_of(key);
+                    out.push(delta(
+                        ConfigOp::Changed,
+                        &path,
+                        Some(step),
+                        Some(&after[at]),
+                    ));
+                }
+            }
+        }
+    }
+    for (key, step) in after_keys.iter().zip(after) {
+        if !before_keys.contains(key) {
+            out.push(delta(ConfigOp::Added, &path_of(key), None, Some(step)));
+        }
+    }
+    let same_set =
+        before_keys.len() == after_keys.len() && before_keys.iter().all(|k| after_keys.contains(k));
+    if by_name && same_set && before_keys != after_keys {
+        out.push(ConfigDelta {
+            op: ConfigOp::Reordered,
+            path: vec![section.to_owned()],
+            before: None,
+            after: None,
+        });
+    }
+}
+
+fn inline(value: &Value) -> String {
+    let mut text = String::new();
+    write_inline(value, &mut text);
+    match text.char_indices().nth(MAX_VALUE_CHARS) {
+        Some((at, _)) => {
+            text.truncate(at);
+            text
+        }
+        None => text,
+    }
+}
+
+fn write_inline(value: &Value, out: &mut String) {
+    match value {
+        Value::Table(table) if table.is_empty() => out.push_str("{}"),
+        Value::Table(table) => {
+            out.push_str("{ ");
+            for (i, (key, value)) in table.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let bare = !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                if bare {
+                    out.push_str(key);
+                } else {
+                    out.push_str(&Value::String(key.clone()).to_string());
+                }
+                out.push_str(" = ");
+                write_inline(value, out);
+            }
+            out.push_str(" }");
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_inline(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,5 +1259,200 @@ probe = "cargo test {tests} -- --exact"
         assert!(
             Config::load_at(&Ext::from_vars(|k| sb.var(k)), repo.path(), "origin/main").is_err()
         );
+    }
+
+    fn step(name: &str, run: &str) -> String {
+        format!("[[verify]]\nname = \"{name}\"\nrun = \"{run}\"\n")
+    }
+
+    fn summary(base: &str, pr: &str) -> ConfigChange {
+        summarize_change(Some(base), Some(pr))
+    }
+
+    fn lines(change: &ConfigChange) -> Vec<String> {
+        change
+            .changes
+            .iter()
+            .map(|d| {
+                format!(
+                    "{:?} {} {} -> {}",
+                    d.op,
+                    d.path.join("/"),
+                    d.before.as_deref().unwrap_or("-"),
+                    d.after.as_deref().unwrap_or("-")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_added_step_is_one_added_change_with_its_inline_table() {
+        let base = step("fmt", "cargo fmt");
+        let pr = format!("{base}{}", step("test", "cargo test"));
+        let change = summary(&base, &pr);
+        assert_eq!(change.kind, ConfigChangeKind::Edited);
+        assert_eq!(
+            lines(&change),
+            [r#"Added verify/test - -> { name = "test", run = "cargo test" }"#]
+        );
+        assert_eq!(change.more, 0);
+    }
+
+    #[test]
+    fn a_removed_post_verify_step_is_one_removed_change() {
+        let base = format!("{MINIMAL}[[post_verify]]\nname = \"e2e\"\nrun = \"npm run e2e\"\n");
+        let change = summary(&base, MINIMAL);
+        assert_eq!(
+            lines(&change),
+            [r#"Removed post_verify/e2e { name = "e2e", run = "npm run e2e" } -> -"#]
+        );
+    }
+
+    #[test]
+    fn a_key_changed_inside_a_step_names_the_step_and_the_key() {
+        let change = summary(
+            &step("clippy", "cargo clippy"),
+            &step("clippy", "cargo clippy -D"),
+        );
+        assert_eq!(
+            lines(&change),
+            [r#"Changed verify/clippy/run "cargo clippy" -> "cargo clippy -D""#]
+        );
+        let timeout = format!("{}timeout = 5\n", step("clippy", "cargo clippy"));
+        let change = summary(&step("clippy", "cargo clippy"), &timeout);
+        assert_eq!(lines(&change), ["Added verify/clippy/timeout - -> 5"]);
+    }
+
+    #[test]
+    fn the_same_steps_in_another_order_are_one_reordered_change() {
+        let base = format!("{}{}", step("a", "x"), step("b", "y"));
+        let pr = format!("{}{}", step("b", "y"), step("a", "x"));
+        let change = summary(&base, &pr);
+        assert_eq!(lines(&change), ["Reordered verify - -> -"]);
+    }
+
+    #[test]
+    fn top_level_keys_and_keys_inside_tables_are_added_removed_and_changed() {
+        let base = format!("budget = 3\nrequire_ci = true\n[flaky]\nchronic = 2\n{MINIMAL}");
+        let pr = format!("budget = 5\nmax_batch = 4\n[flaky]\nchronic_days = 9\n{MINIMAL}");
+        let change = summary(&base, &pr);
+        assert_eq!(
+            lines(&change),
+            [
+                "Changed budget 3 -> 5",
+                "Removed flaky/chronic 2 -> -",
+                "Added flaky/chronic_days - -> 9",
+                "Added max_batch - -> 4",
+                "Removed require_ci true -> -",
+            ]
+        );
+        let table_gone = summary(&format!("[flaky]\nchronic = 2\n{MINIMAL}"), MINIMAL);
+        assert_eq!(lines(&table_gone), ["Removed flaky/chronic 2 -> -"]);
+    }
+
+    #[test]
+    fn an_array_value_is_compared_whole() {
+        let base = format!("respawn = [\"a\", \"b\"]\n{MINIMAL}");
+        let pr = format!("respawn = [\"a\", \"c\"]\n{MINIMAL}");
+        assert_eq!(
+            lines(&summary(&base, &pr)),
+            [r#"Changed respawn ["a", "b"] -> ["a", "c"]"#]
+        );
+    }
+
+    #[test]
+    fn comments_and_formatting_alone_change_nothing() {
+        let pr = "# note\n[[verify]]\nrun   = \"cargo test\"\nname=\"test\"\n";
+        let change = summary(MINIMAL, pr);
+        assert_eq!(change.kind, ConfigChangeKind::Edited);
+        assert!(change.changes.is_empty());
+        assert_eq!(change.more, 0);
+    }
+
+    #[test]
+    fn identical_text_is_unchanged() {
+        let change = summary(MINIMAL, MINIMAL);
+        assert_eq!(change.kind, ConfigChangeKind::Unchanged);
+        assert!(change.changes.is_empty());
+    }
+
+    #[test]
+    fn a_pr_text_that_is_not_a_config_is_invalid_with_no_changes() {
+        for bad in ["budget = \"x\"\n", "[[verify]\n", "budget = 5\n"] {
+            let change = summary(MINIMAL, bad);
+            assert_eq!(change.kind, ConfigChangeKind::Invalid, "{bad}");
+            assert!(change.changes.is_empty());
+        }
+        assert_eq!(
+            summarize_change(None, Some("nope")).kind,
+            ConfigChangeKind::Invalid
+        );
+    }
+
+    #[test]
+    fn a_missing_file_on_either_side_is_added_or_removed() {
+        assert_eq!(
+            summarize_change(None, Some(MINIMAL)).kind,
+            ConfigChangeKind::Added
+        );
+        assert_eq!(
+            summarize_change(Some(MINIMAL), None).kind,
+            ConfigChangeKind::Removed
+        );
+    }
+
+    #[test]
+    fn steps_without_a_name_pair_by_position() {
+        let base = "[[verify]]\nname = \"a\"\nrun = \"x\"\n[[verify]]\nrun = \"y\"\n";
+        let pr = "[[verify]]\nname = \"a\"\nrun = \"x\"\n[[verify]]\nrun = \"z\"\n";
+        assert_eq!(
+            summarize_change(Some(base), Some(pr)).kind,
+            ConfigChangeKind::Invalid,
+            "an unnamed step is not a valid config"
+        );
+        let base: Table = toml::from_str(base).unwrap();
+        let pr: Table = toml::from_str(pr).unwrap();
+        let mut out = Vec::new();
+        diff_tables(&mut Vec::new(), &base, &pr, &mut out);
+        assert_eq!(
+            out.iter().map(|d| d.path.join("/")).collect::<Vec<_>>(),
+            ["verify/verify[1]/run"]
+        );
+    }
+
+    #[test]
+    fn a_repeated_step_name_pairs_by_position() {
+        let base = format!("{}{}", step("a", "x"), step("a", "y"));
+        let pr = format!("{}{}", step("a", "x"), step("a", "z"));
+        let mut out = Vec::new();
+        diff_tables(
+            &mut Vec::new(),
+            &toml::from_str(&base).unwrap(),
+            &toml::from_str(&pr).unwrap(),
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, ["verify", "verify[1]", "run"]);
+    }
+
+    #[test]
+    fn a_value_is_cut_at_500_characters() {
+        let long = "가".repeat(600);
+        let pr = format!("respawn = [\"{long}\"]\n{MINIMAL}");
+        let change = summary(MINIMAL, &pr);
+        let after = change.changes[0].after.as_ref().unwrap();
+        assert_eq!(after.chars().count(), 500);
+        assert!(after.starts_with("[\"가"));
+    }
+
+    #[test]
+    fn changes_beyond_twenty_are_counted_in_more() {
+        let mut pr = MINIMAL.to_owned();
+        for i in 0..25 {
+            pr.push_str(&step(&format!("s{i}"), "x"));
+        }
+        let change = summary(MINIMAL, &pr);
+        assert_eq!(change.changes.len(), 20);
+        assert_eq!(change.more, 5);
     }
 }

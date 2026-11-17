@@ -334,6 +334,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null,"isDraft":%s,"baseRe
             agent,
             submitter,
             touches_config: false,
+            config_change: None,
             approval,
             priority: false,
             after: Vec::new(),

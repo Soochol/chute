@@ -207,7 +207,123 @@ function actionsOf(item, repoPath) {
     }));
 }
 
-function cardOf(item, repoPath, slug, now) {
+const SHORT_VALUES = 24;
+
+const configChangeOf = (item) => {
+  const change = item.config_change;
+  if (!isObject(change)) return null;
+  const kind = str(change.kind);
+  return {
+    kind: ["edited", "added", "removed", "invalid", "unchanged", "unreadable"].includes(kind) ? kind : "unreadable",
+    changes: list(change.changes)
+      .filter(isObject)
+      .map((c) => ({
+        op: str(c.op),
+        path: list(c.path).filter((p) => typeof p === "string"),
+        before: typeof c.before === "string" ? c.before : null,
+        after: typeof c.after === "string" ? c.after : null,
+      }))
+      .filter((c) => c.path.length > 0),
+    more: Number.isSafeInteger(change.more) && change.more > 0 ? change.more : 0,
+  };
+};
+
+const STEP_SECTION = table({ verify: "", post_verify: "post-merge " });
+
+function changeLine(c) {
+  const [head, name] = c.path;
+  const key = c.path.slice(2).join(".");
+  const prefix = STEP_SECTION[head];
+  const label = c.path.join(".");
+  const values = [c.before, c.after].filter((v) => v !== null);
+  const short = [...values.join("")].length <= SHORT_VALUES;
+  const tip = values.length > 0 ? (c.op === "changed" ? `${c.before ?? ""} → ${c.after ?? ""}` : values[0]) : null;
+  const line = (mark, text, tone, shown = false) => ({ mark, text, tone, tip: shown ? null : tip });
+  if (c.op === "reordered") return line("~", `${prefix ?? ""}steps reordered`, "warn");
+  if (prefix !== undefined && c.path.length === 2) {
+    if (c.op === "added") return line("+", `${prefix}step ${name}`, "ok");
+    if (c.op === "removed") return line("−", `${prefix}step ${name}`, "error");
+  }
+  if (prefix !== undefined && c.path.length >= 3) {
+    const where = `${prefix}${name}`;
+    if (c.op === "added") return line("+", short ? `${where}: ${key} = ${c.after ?? ""}` : `${where}: ${key} added`, "ok", short);
+    if (c.op === "removed") return line("−", `${where}: ${key}`, "error");
+    return line("~", short ? `${where}: ${key}: ${c.before ?? ""} → ${c.after ?? ""}` : `${where}: ${key} changed`, "warn", short);
+  }
+  if (c.op === "added") return line("+", short ? `${label} = ${c.after ?? ""}` : label, "ok", short);
+  if (c.op === "removed") return line("−", label, "error");
+  return line("~", short ? `${label}: ${c.before ?? ""} → ${c.after ?? ""}` : `${label} changed`, "warn", short);
+}
+
+const NOTE = table({
+  added: { text: "Adds chute.toml", tone: "waiting" },
+  removed: { text: "Removes chute.toml", tone: "error" },
+  invalid: { text: "chute.toml in this PR is invalid", tone: "error" },
+});
+const NO_SUMMARY = { text: "No change summary. Check the diff.", tone: "waiting" };
+
+export function changeSummary(item) {
+  if (item.touches_config !== true) return [];
+  const change = configChangeOf(item);
+  const note = (n) => [{ mark: "", text: n.text, tone: n.tone, tip: null }];
+  if (!change || change.kind === "unreadable" || change.kind === "unchanged") return note(NO_SUMMARY);
+  if (NOTE[change.kind]) return note(NOTE[change.kind]);
+  if (change.changes.length === 0) return note({ text: "Only comments or formatting changed", tone: "waiting" });
+  const lines = change.changes.map(changeLine);
+  if (change.more > 0) {
+    lines.push({ mark: "+", text: `${change.more} more ${change.more === 1 ? "change" : "changes"}`, tone: "waiting", tip: null });
+  }
+  return lines;
+}
+
+const CONFIG_EDIT = new Set(["edited", "added", "removed", "invalid"]);
+
+export function questionOf(item, approval) {
+  const touches = item.touches_config === true;
+  const kind = configChangeOf(item)?.kind ?? null;
+  if (touches && CONFIG_EDIT.has(kind)) {
+    return { question: "Approve config change?", why: "This PR edits chute.toml, so a person must approve it." };
+  }
+  if (touches && kind === "unchanged" && approval === "agent") {
+    return { question: "Approve to queue?", why: "chute couldn't check every changed file, so a person must approve it." };
+  }
+  if (touches && kind !== "unchanged") {
+    return { question: "Approve config change?", why: "This PR may edit chute.toml, so a person must approve it." };
+  }
+  return { question: "Approve to queue?", why: "This repo asks a person to approve every PR." };
+}
+
+function targetOf(path) {
+  const [head, name] = path;
+  const prefix = STEP_SECTION[head];
+  if (prefix !== undefined && path.length >= 2) return { key: `${head}\u0000${name}`, text: `${prefix}${name}` };
+  return { key: path.slice(0, 2).join("\u0000"), text: path.slice(0, 2).join(".") };
+}
+
+export function overlapNotes(items) {
+  const awaiting = items
+    .filter((item) => item.state === "awaiting_approval" && Number.isSafeInteger(item.pr))
+    .map((item) => ({ pr: item.pr, targets: (configChangeOf(item)?.changes ?? []).map((c) => targetOf(c.path)) }));
+  const notes = new Map();
+  for (const mine of awaiting) {
+    for (const target of mine.targets) {
+      const others = awaiting.filter((o) => o.pr !== mine.pr && o.targets.some((t) => t.key === target.key));
+      if (others.length === 0) continue;
+      const prs = others.map((o) => `#${o.pr}`);
+      notes.set(mine.pr, `${prs.join(", ")} also ${others.length === 1 ? "changes" : "change"} ${target.text}. These may conflict.`);
+      break;
+    }
+  }
+  return notes;
+}
+
+function submittedBy(item, agent) {
+  const submitter = agentOf(item.submitter);
+  if (submitter) return { text: `submitted by ${submitter.label}`, same: submitter.terminal === agent?.terminal };
+  return { text: agent ? null : "submitted by unknown terminal", same: false };
+}
+
+function cardOf(item, repoPath, slug, now, approval) {
   const card = {
     key: `${repoPath}#${item.pr}`,
     pr: item.pr,
@@ -225,10 +341,17 @@ function cardOf(item, repoPath, slug, now) {
   };
   card.report = card.failure?.report ? { label: "Report", path: card.failure.report } : null;
   if (item.state === "awaiting_approval") {
-    card.reason = "Awaiting approval";
+    const { question, why } = questionOf(item, approval);
+    const sub = submittedBy(item, card.agent);
+    card.question = question;
+    card.reason = why;
     card.preflight = preflightOf(item);
-    card.config = item.touches_config === true ? "chute.toml changed" : "chute.toml unchanged";
-    card.configChanged = item.touches_config === true;
+    card.facts = [card.preflight.text, `Retries ${card.retries}`, card.wait].filter(Boolean);
+    card.summary = changeSummary(item);
+    card.overlap = null;
+    card.diffUrl = card.url ? `${card.url}/files` : null;
+    card.submittedBy = sub.text;
+    card.sameSubmitter = sub.same;
     card.approvalBlocked = safeHeadOf(item) ? null : "Can't approve: HEAD unknown";
   } else if (item.state === "bounced") {
     card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind || null) ?? "No reason";
@@ -666,8 +789,10 @@ function repoBoard(view, now) {
         state: item.state ?? "(none)",
         reason: item.state_reason,
       });
-    } else placed[section].push(cardOf(item, path, slug, now));
+    } else placed[section].push(cardOf(item, path, slug, now, view.approval));
   }
+  const overlaps = overlapNotes(queue);
+  for (const card of placed.human) card.overlap = overlaps.get(card.pr) ?? null;
   const recent = recentMergedOf(view, slug, now);
   placed.alerts = alertsOf(view, queue, now, recent);
   placed.batch = batchOf(view.batch, inBatch, now, usualSeconds(view.recent), slug);
