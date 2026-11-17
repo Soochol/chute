@@ -542,6 +542,7 @@ export default class Chute extends View {
       bounced: (item) => this.bouncedRow(repo, item, t),
       unknown: (item) => unknownRow(item, t),
     };
+    if (items.length === 0) return emptyHead(section.title, t);
     const lead = section.id === "alerts" ? [] : [sectionTitle(section.title, section.id === "batch" ? null : items.length, t)];
     if (section.id === "batch") return v_flex().gap(6).children(items.map((item) => rows.batch(item)));
     return v_flex()
@@ -665,11 +666,11 @@ export default class Chute extends View {
               .child(div().flex_none().text_size(12).text_color(t.ansi1).child(card.headline)),
           )
           .child(
-            div()
-              .text_size(11)
-              .text_color(t.dim)
-              .truncate()
-              .child(`${who} · Retries ${card.retries}`),
+            h_flex()
+              .gap(6)
+              .items_baseline()
+              .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(`${who} · Retries ${card.retries}`))
+              .when(Boolean(card.ago), (el) => el.child(timeCell(card.ago, t))),
           ),
       )
       .children(rowIcons(`bounced-${card.key}`, card, t, (file) => this.openFile(file, repo.hub.machine)));
@@ -689,7 +690,7 @@ export default class Chute extends View {
             m.bounces > 0
               ? div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`)
               : null,
-            div().flex_none().min_w(44).text_right().text_size(11).text_color(t.dim).child(m.ago),
+            timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
           ].filter(Boolean);
           const id = `merged-${repo.id}-${i}`;
           if (!m.url) return hoverRow(h_flex().id(id).px(6).py(4).gap(8).items_baseline().children(body), t);
@@ -838,6 +839,20 @@ function linkRow(id, t, onClick) {
     .on_click((_e, cx) => onClick(cx));
 }
 
+// A section with nothing in it keeps its head line, dimmed: `QUEUED 0`.
+function emptyHead(title, t) {
+  return h_flex()
+    .gap(6)
+    .items_center()
+    .px(6)
+    .child(div().flex_1().min_w(0).text_size(11).font_semibold().text_color(t.dim).child(title.toUpperCase()))
+    .child(div().flex_none().min_w(24).text_right().text_size(11).text_color(t.dim).child("0"));
+}
+
+// The time at the right end of a row: it never pushes the title out, and it keeps its place when empty.
+const timeCell = (text, t) =>
+  div().flex_none().whitespace_nowrap().min_w(44).text_right().text_size(11).text_color(t.dim).child(text);
+
 function sectionTitle(title, count, t) {
   return h_flex()
     .gap(6)
@@ -910,6 +925,7 @@ function titleLine(card, t, icons = []) {
     .items_start()
     .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${card.pr}`))
     .child(div().flex_1().min_w(0).whitespace_normal().child(card.title))
+    .when(Boolean(card.wait), (el) => el.child(timeCell(card.wait, t)))
     .children(icons);
 }
 
@@ -1056,6 +1072,7 @@ function waitingRow(repo, item, index, t) {
         .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${item.pr}`))
         .child(div().flex_1().min_w(0).truncate().child(item.title))
         .children(tags.map((tag) => div().flex_none().text_size(11).text_color(tag.color).child(tag.text)))
+        .when(Boolean(item.wait), (el) => el.child(timeCell(item.wait, t)))
         .children(rowIcons(`queued-${repo.id}-${index}`, item, t)),
     )
     .when(Boolean(item.submitter), (el) => el.child(div().pl(24).child(submitterLine(item.submitter, t))));

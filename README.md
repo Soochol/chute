@@ -409,6 +409,8 @@ batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을
 
 현황판은 저장소 머리 줄(이름과 상태 한 줄)을 누르면 그 저장소를 접고 펼치며, 선택은 저장소마다 기억한다. 머리의 `▾`는 모두 접기와 모두 펼치기다. 접어 둔 저장소에도 손쓸 일(멈춤, 머지 뒤 실패, 사람 차례, 데몬 꺼짐)이 새로 생기면 잠시 펼쳐지고, 그 문제가 모두 사라지면 다시 접힌다. 저장소는 문제가 있는 것이 위로 오도록(멈춤·사람 차례, 진행 중, 대기, 정상) 정렬되고 같은 등급은 `chute status`의 순서를 지킨다. 다른 Herdr mod는 `shared("chute.status")`로 현황판의 요약을 읽을 수 있다. 값은 `{ grade, issues, running, repos, since }`이고 `grade`는 `ok`, `running`, `attention`, `failed` 가운데 하나다. 값이 바뀔 때만 갱신되고 현황판이 닫히면 `null`이 된다.
 
+현황판은 항목마다 시간을 오른쪽 끝에 흐리게 보인다. 대기와 사람 차례 항목은 처음 submit한 뒤 기다린 시간(`waiting 3m`, 분 단위), 반송 항목은 둘째 줄 오른쪽에 반송된 지 얼마(`12m ago`), 최근 머지는 submit부터 머지까지 걸린 시간(`18m 4s`)이고 머지 시각은 그 칸에 올리면 뜨는 설명에 있다. 값이 없으면 칸을 비운다. 사람 차례, batch, 대기, 반송 구역은 항목이 없어도 제목과 `0`을 흐리게 한 줄 남긴다(허브에 닿지 않는 저장소는 그리지 않는다). 경고와 알 수 없는 상태 구역은 있을 때만 보인다.
+
 머지 뒤 검사가 실패했으면 `chute status`와 현황판의 1번(멈춤과 경고)에 실패한 단계, 처음 실패한 머지의 PR, 마지막 통과 커밋, 되돌리는 명령이 보인다.
 
 흔들린 시험(flaky)은 에이전트에게 보내지 않고 기록한다. 한 단계가 실패한 뒤 같은 트리에서 그 단계만 다시 돌려 통과하면 flaky로 보고 그 batch를 통과로 머지한다. 흔들리는 시험을 새로 만든 PR도 머지될 수 있다. 머지한 뒤 근거를 모은다. `[[verify]]`에 `probe`가 있으면 흔들린 시험만 되풀이해 기준 트리에서도 실패하는지(`base`), 흔들린 트리에서만 실패하는지(`made`)를 `history.jsonl`에 남기고 `made`면 그 batch PR을 submit한 터미널에 `flaky` 알림을 보낸다. 같은 시험이 `chronic_days`일 안에 `chronic`번 흔들리면 만성으로 경고를 올린다. `chute flaky`가 이 장부를 보인다. 되풀이는 다음 batch를 `probe_seconds`까지 늦춘다. `probe`가 없는 단계는 되풀이하지 않는다.
@@ -461,6 +463,7 @@ batch 검증은 PR을 묶어 머지하기 전에 돈다. 오래 걸리는 단계
 - **고쳐지면 풀린다.** 실패가 남은 뒤 어느 tip이 통과하면 `post_fixed` 알림을 같은 터미널들에 보내고(`chute 결과 post_fixed slug=<owner/name> at=<epoch ms> commit=<12자> was=<12자> [pr=<번호>] <한국어 한 문장>`) `chute events`에 `머지 뒤 검사 풀림`이 남는다.
 - **선택: 고칠 때까지 PR을 잡아 둔다.** `post_verify_hold = true`면 실패가 남은 동안 batch가 실패한 단계의 `paths`에 해당하는 큐의 PR(그 PR이 기본 브랜치와 갈라진 뒤 바꾼 파일로 비교한다)을 가져가지 않는다. 다른 PR은 머지된다. 고치는 PR은 `chute submit --repair`로 넣으면 잡히지 않고 먼저 머지된다. 잡혀 있는 동안 데몬은 15초마다 본다. 실패가 풀리면 잡혔던 PR이 다시 batch에 들어간다. 기본은 끈다.
 - **상태 JSON.** `chute status --json`의 `post_verify`는 `last_green`(`commit`, `at_ms`), `run`(도는 검사: `tip`, `phase`는 `verifying`이나 `searching`, 지금 보는 `commit`, `step`, `started_ms`, `waiting_machine`), `red`(남은 실패: `commit`, `step`, `tests`, `log`, `report`, `since_ms`, `last_green`, `culprit`의 `commit`·`pr`·`batch`, `holding`), `last_started_ms`다. `run`은 검사가 PC 자리를 기다리면 `waiting_machine`이 `true`다.
+- 항목별 시간은 `chute status --json`의 `recent_merged[].submitted_ms`(그 PR을 처음 submit한 시각)와 `queue[].bounced_ms`(상태가 `bounced`인 항목의 가장 늦은 반송 시각, 다른 상태는 `null`)에 있다. 값이 없으면 `null`이다.
 - **데몬이 멈추면** 도는 검사는 취소되고 기록은 남지 않는다. 다음에 데몬이 뜨면 그때의 tip을 처음부터 검사한다.
 
 ## 첫 가동 점검
