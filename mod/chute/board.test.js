@@ -12,8 +12,17 @@ import {
   formatAgo,
   formatDuration,
   interpret,
+  RECENT_DEFAULT,
+  clockExact,
+  clockText,
+  gradeOf,
   needsClock,
+  nextFold,
+  overview,
+  overviewText,
   pollInterval,
+  recentWindow,
+  toggleFold,
   pullUrl,
   toneToken,
   usualSeconds,
@@ -217,8 +226,8 @@ test("waiting items are numbered in submission order", () => {
 test("batch shows members, phase, step, round and elapsed time", () => {
   const [batch] = section(only([fixture]), "batch").items;
   assert.deepEqual(batch.prs, [
-    { pr: 12, title: "큐 상태 전이 추가", marks: [], submitter: null },
-    { pr: 13, title: "검증 실행기", marks: [], submitter: null },
+    { pr: 12, url: "https://github.com/Soochol/chute/pull/12", title: "큐 상태 전이 추가", marks: [], submitter: null },
+    { pr: 13, url: "https://github.com/Soochol/chute/pull/13", title: "검증 실행기", marks: [], submitter: null },
   ]);
   assert.equal(batch.phase, "Verifying");
   assert.equal(batch.step, "test");
@@ -300,7 +309,7 @@ test("bounced cards carry mode, summary, agent, retries and report path", () => 
 
 test("today is one line, and the expanded rows call the verify time a sum", () => {
   const today = only([fixture]).today;
-  assert.equal(today.line, "7 merged · 2 bounced · median 6m 52s");
+  assert.deepEqual(today.parts, ["7 merged", "2 bounced", "median 6m 52s"]);
   assert.deepEqual(
     today.details.map((d) => [d.key, d.label, d.value, d.hint ?? null]),
     [
@@ -311,7 +320,7 @@ test("today is one line, and the expanded rows call the verify time a sum", () =
   );
   const data = clone(fixture);
   data.today.median_lead_s = null;
-  assert.equal(only(data).today.line, "7 merged · 2 bounced · median —");
+  assert.deepEqual(only(data).today.parts, ["7 merged", "2 bounced", "median —"]);
   delete data.today;
   assert.equal(only(data).today, null);
 });
@@ -701,8 +710,8 @@ test("failure text prefers stderr, then stdout, then the exit code", () => {
 test("batch members come from the batch record even when the queue lacks them", () => {
   const data = { ...clone(fixture), queue: [] };
   assert.deepEqual(section(only(data), "batch").items[0].prs, [
-    { pr: 12, title: "", marks: [], submitter: null },
-    { pr: 13, title: "", marks: [], submitter: null },
+    { pr: 12, url: "https://github.com/Soochol/chute/pull/12", title: "", marks: [], submitter: null },
+    { pr: 13, url: "https://github.com/Soochol/chute/pull/13", title: "", marks: [], submitter: null },
   ]);
 });
 
@@ -817,7 +826,7 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "details", "postVerify", "green", "run", "recent", "files", "file", "report"]);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report"]);
     const leaves = [];
     const walk = (value, path, key) => {
       if (value !== null && typeof value === "object") {
@@ -836,7 +845,11 @@ test("random malformed status never breaks the board", () => {
     }
     if (result.kind !== "board") continue;
 
-    const views = (Array.isArray(data) ? data : [data]).filter(isObject);
+    const views = (Array.isArray(data) ? data : [data])
+      .filter(isObject)
+      .map((view) => [view, gradeOf(interpret({ code: 0, stdout: JSON.stringify(view) }, NOW).repos?.[0]?.status.tone)])
+      .sort((a, b) => a[1] - b[1])
+      .map(([view]) => view);
     assert.equal(result.repos.length, views.length, ctx);
     result.repos.forEach((repo, index) => {
       const view = views[index];
@@ -913,7 +926,7 @@ test("a run error is cut to its first line and an empty output is not quoted", (
 test("numbers that overflow to infinity are not printed as numbers", () => {
   const text = '[{"today":{"merged":1e999,"bounced":2,"median_lead_s":1e999,"verify_s":5400}}]';
   const today = interpret({ code: 0, stdout: text }, NOW).repos[0].today;
-  assert.equal(today.line, "— merged · 2 bounced · median —");
+  assert.deepEqual(today.parts, ["— merged", "2 bounced", "median —"]);
   assert.equal(today.details.find((d) => d.key === "verify").value, "1h 30m");
 });
 
@@ -1461,4 +1474,163 @@ test("no Hangul is left in the English wording of formatted times", () => {
   assert.equal(formatDuration(3900), "1h 5m");
   assert.equal(formatDuration(45), "45s");
   assert.equal(formatDuration(252), "4m 12s");
+});
+
+const tonedRepo = (slug, mutate = () => {}) => {
+  const data = queueOnly();
+  data.repo = { ...data.repo, slug, path: `/r/${slug}` };
+  mutate(data);
+  return data;
+};
+const idle = (slug) => tonedRepo(slug);
+const verifying = (slug) => tonedRepo(slug, (d) => { d.batch = clone(fixture.batch); });
+const queuedOnly = (slug) => tonedRepo(slug, (d) => { d.queue = [{ ...itemOf(fixture.queue.find((i) => i.state === "queued").pr) }]; });
+const humanTurn = (slug) => tonedRepo(slug, (d) => { d.queue = [itemOf(fixture.queue.find((i) => i.state === "needs_human").pr)]; });
+const stopped = (slug) => tonedRepo(slug, (d) => { d.blocked = { reason: "base_broken", since_ms: 1 }; });
+
+test("repos are sorted by grade, and keep the status order within a grade", () => {
+  const result = board([idle("o/ok1"), verifying("o/work"), stopped("o/bad1"), idle("o/ok2"), humanTurn("o/human"), queuedOnly("o/wait"), stopped("o/bad2")]);
+  assert.deepEqual(result.repos.map((r) => r.slug), ["o/bad1", "o/human", "o/bad2", "o/work", "o/wait", "o/ok1", "o/ok2"]);
+  assert.deepEqual(["error", "human", "working", "waiting", "ok"].map(gradeOf), [0, 0, 1, 2, 3]);
+});
+
+test("overview: grade is the most urgent repo, waiting alone counts as running", () => {
+  const grade = (...views) => overview(board(views)).grade;
+  assert.equal(grade(idle("o/a"), queuedOnly("o/b")), "running");
+  assert.equal(grade(idle("o/a")), "ok");
+  assert.equal(grade(idle("o/a"), humanTurn("o/b"), verifying("o/c")), "attention");
+  assert.equal(grade(humanTurn("o/b"), stopped("o/c")), "failed");
+  assert.equal(overview(board([verifying("o/a"), queuedOnly("o/b"), idle("o/c")])).running, 2);
+  assert.equal(overview(board([verifying("o/a"), idle("o/c")])).repos, 2);
+});
+
+test("overview: a failed read or a missing chute is one failed issue, an empty list is ok", () => {
+  const failed = { grade: "failed", issues: 1, running: 0, repos: 0 };
+  assert.deepEqual(overview(interpret({ code: 1, stdout: "", stderr: "boom" }, NOW)), failed);
+  assert.deepEqual(overview(interpret({ spawnError: "ENOENT" }, NOW)), failed);
+  assert.deepEqual(overview(board([])), { grade: "ok", issues: 0, running: 0, repos: 0 });
+  assert.equal(overview(null), null);
+});
+
+test("overview: issues are human turns, error alerts and unreachable hubs; warn alerts do not count", () => {
+  assert.equal(overview(board([humanTurn("o/a")])).issues, 1);
+  assert.equal(overview(board([stopped("o/a")])).issues, 1);
+  const warned = tonedRepo("o/w", (d) => { d.warnings = [{ kind: "config", message: "x" }]; });
+  assert.equal(overview(board([warned])).issues, 0);
+  assert.equal(overview(board([warned])).grade, "ok");
+  const daemonOff = tonedRepo("o/d", (d) => { d.daemon = { running: false }; });
+  assert.equal(overview(board([daemonOff])).issues, 1);
+  const hub = overview(interpret(ok(unreachable), NOW));
+  assert.equal(hub.grade, "failed");
+  assert.ok(hub.issues >= 1);
+  const two = overview(board([humanTurn("o/a"), stopped("o/b"), idle("o/c")]));
+  assert.equal(two.issues, 2);
+});
+
+test("overview text uses singular and plural", () => {
+  assert.deepEqual(overviewText({ repos: 1, running: 1, issues: 1 }), ["1 repo", "1 running", "1 issue"]);
+  assert.deepEqual(overviewText({ repos: 2, running: 0, issues: 0 }), ["2 repos", "0 running", "0 issues"]);
+});
+
+test("active: a batch or a running post-merge check is active, otherwise not", () => {
+  assert.equal(only(idle("o/a")).active, false);
+  assert.equal(only(verifying("o/a")).active, true);
+  const post = tonedRepo("o/p", (d) => { d.post_verify = { run: { commit: "abcdef1234", started_ms: 1, phase: "checking" } }; });
+  assert.equal(only(post).active, true);
+  assert.equal(needsClock(board([post])), true);
+  assert.equal(needsClock(board([idle("o/a")])), false);
+  assert.equal(overview(board([post])).grade, "ok");
+  assert.equal(interpret(ok(unreachable), NOW).repos.some((r) => r.active), false);
+});
+
+test("recent merges show three by default and say how many are hidden", () => {
+  const recent = [1, 2, 3, 4, 5].map((n) => ({ pr: n }));
+  assert.equal(RECENT_DEFAULT, 3);
+  assert.deepEqual(recentWindow(recent, false).rows.map((r) => r.pr), [1, 2, 3]);
+  assert.equal(recentWindow(recent, false).more, 2);
+  assert.equal(recentWindow(recent, true).rows.length, 5);
+  assert.equal(recentWindow(recent, true).more, 0);
+  assert.equal(recentWindow(recent.slice(0, 3), false).more, 0);
+  assert.equal(recentWindow(recent.slice(0, 2), false).rows.length, 2);
+});
+
+test("queue rows carry the PR URL, and none without a slug", () => {
+  const repo = only(fixture ? [fixture] : []);
+  const urls = repo.sections.filter((s) => s.id !== "alerts" && s.id !== "unknown" && s.id !== "batch").flatMap((s) => s.items.map((i) => i.url));
+  assert.ok(urls.length > 0);
+  for (const url of urls) assert.match(url, /^https:\/\/github\.com\/.+\/pull\/\d+$/);
+  const noSlug = clone(fixture);
+  delete noSlug.repo.slug;
+  const bare = only([noSlug]);
+  for (const s of bare.sections.filter((x) => x.id !== "alerts" && x.id !== "batch")) for (const item of s.items) assert.equal(item.url, null);
+  for (const entry of section(bare, "batch").items[0].prs) assert.equal(entry.url, null);
+});
+
+const folds = (...steps) => {
+  let state;
+  const out = [];
+  for (const [keys, saved] of steps) {
+    state = nextFold(state, keys, saved);
+    out.push(state);
+  }
+  return out;
+};
+
+test("fold: a folded repo opens for a new problem key, stays open while the same key lasts, folds when all are gone", () => {
+  const [calm, trouble, same, other, cleared] = folds([[], true], [["a"], true], [["a"], true], [["a", "b"], true], [[], true]);
+  assert.equal(calm.folded, true);
+  assert.equal(trouble.folded, false);
+  assert.equal(same.folded, false);
+  assert.equal(other.folded, false);
+  assert.equal(cleared.folded, true);
+  assert.equal(cleared.auto, false);
+});
+
+test("fold: a repo with a problem on the first read opens", () => {
+  assert.equal(nextFold(undefined, ["a"], true).folded, false);
+  assert.equal(nextFold({ keys: null, auto: false }, ["a"], true).folded, false);
+});
+
+test("fold: pressing the head line while it is auto-opened makes the user's choice", () => {
+  const [, trouble] = folds([[], true], [["a"], true]);
+  assert.equal(trouble.auto, true);
+  const chosen = toggleFold({ saved: true, auto: trouble.auto });
+  assert.deepEqual(chosen, { saved: true, auto: false });
+  const after = nextFold({ keys: trouble.keys, auto: chosen.auto }, ["a"], chosen.saved);
+  assert.equal(after.folded, true);
+  const again = nextFold(after, ["a", "b"], true);
+  assert.equal(again.folded, false);
+});
+
+test("fold: toggling flips what the user sees", () => {
+  assert.deepEqual(toggleFold({ saved: true, auto: false }), { saved: false, auto: false });
+  assert.deepEqual(toggleFold({ saved: false, auto: false }), { saved: true, auto: false });
+});
+
+test("fold: a repo the user left open is never folded", () => {
+  const [a, b, c] = folds([[], false], [["a"], false], [[], false]);
+  assert.deepEqual([a.folded, b.folded, c.folded], [false, false, false]);
+});
+
+test("fold: an unreachable hub alone does not open a folded repo, and its problem keys are empty", () => {
+  const hubRepo = interpret(ok(unreachable), NOW).repos[0];
+  assert.equal(hubRepo.hub.reachable, false);
+  assert.deepEqual(hubRepo.problems, []);
+  assert.equal(nextFold({ keys: new Set(), auto: false }, hubRepo.problems, true).folded, true);
+});
+
+test("problem keys are the notice keys plus the stopped daemon", () => {
+  const repo = only([fixture]);
+  for (const notice of repo.notices) assert.ok(repo.problems.includes(notice.key));
+  const off = only(tonedRepo("o/d", (d) => { d.daemon = { running: false }; }));
+  assert.deepEqual(off.problems, ["daemon:off"]);
+  const warned = only(tonedRepo("o/w", (d) => { d.warnings = [{ kind: "config", message: "x" }]; }));
+  assert.deepEqual(warned.problems, []);
+});
+
+test("clock texts are local hh:mm and a full local time", () => {
+  const at = new Date(2026, 10, 17, 9, 4, 31).getTime();
+  assert.equal(clockText(at), "09:04");
+  assert.equal(clockExact(at), "2026-11-17 09:04:31");
+  assert.equal(clockText(NaN), "");
 });

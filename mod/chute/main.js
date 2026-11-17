@@ -12,6 +12,7 @@ import {
   readTextFile,
   run,
   setBadge,
+  setShared,
   settings,
   theme,
   watchFolder,
@@ -21,11 +22,18 @@ import {
   REMOTE_POLL_MS,
   badgeText,
   causeText,
+  clockExact,
+  clockText,
   diffNotices,
   failureText,
   interpret,
   needsClock,
+  nextFold,
+  overview,
+  overviewText,
   pollInterval,
+  recentWindow,
+  toggleFold,
   toneToken,
 } from "./board.js";
 
@@ -33,7 +41,9 @@ const TICK_MS = 1000;
 const MIN_READ_GAP_MS = 1000;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_VIEW_CHARS = 200_000;
-const FOLD_KEY = "chute.folded";
+const OLD_FOLD_KEY = "chute.folded";
+const SHARED_KEY = "chute.status";
+const foldKey = (repoId) => `chute.fold.${repoId}`;
 const todayKey = (repoId) => `chute.today.${repoId}`;
 
 // The folder name this copy was installed under; commands to this mod are addressed `<name>.<command>`.
@@ -100,7 +110,11 @@ export default class Chute extends View {
     this.errors = new Map();
     this.sinceRead = 0;
     this.pollMs = LOCAL_POLL_MS;
-    this.folded = recall(FOLD_KEY);
+    remember(OLD_FOLD_KEY, false);
+    this.folds = new Map();
+    this.moreOpen = new Set();
+    this.readAt = null;
+    this.shared = null;
     this.opened = new Set();
     this.noticed = null;
     this.badge = null;
@@ -115,7 +129,7 @@ export default class Chute extends View {
       for (;;) {
         const command = await nextCommand();
         if (command === "open-file" && this.pendingFile) this.openFile(this.pendingFile.file, this.pendingFile.on);
-        else if (command === "fold") this.fold(cx);
+        else if (command === "fold") this.foldAll(cx);
       }
     });
   }
@@ -144,7 +158,9 @@ export default class Chute extends View {
         }
         this.result = result;
         this.board = interpret(result);
+        this.readAt = Date.now();
         this.settle(this.board, cx);
+        this.publish(this.board);
         cx.notify();
       } finally {
         cx.timer.after(MIN_READ_GAP_MS, (cx) => {
@@ -167,6 +183,12 @@ export default class Chute extends View {
     }
     for (const repo of board.repos) {
       this.watch(repo.stateDir, cx);
+      if (repo.hub.reachable) {
+        const fold = this.foldOf(repo.id);
+        const next = nextFold(fold, repo.problems, fold.saved);
+        fold.keys = next.keys;
+        fold.auto = next.auto;
+      }
       if (!this.opened.has(`seen:${repo.id}`)) {
         this.opened.add(`seen:${repo.id}`);
         if (recall(todayKey(repo.id))) this.opened.add(repo.id);
@@ -181,6 +203,23 @@ export default class Chute extends View {
       this.badge = badge;
       setBadge(badge);
     }
+  }
+
+  // Tells other mods (the tab bar button) how the board is doing. Only a change is written: `setShared` redraws every mod.
+  publish(board) {
+    if (this.overlay || checking()) return;
+    const value = overview(board);
+    if (!value) return;
+    const key = JSON.stringify(value);
+    if (key === this.shared?.key) return;
+    this.shared = { key };
+    setShared(SHARED_KEY, { ...value, since: Date.now() });
+  }
+
+  async close() {
+    if (this.file || this.overlay || checking() || !this.shared) return;
+    this.shared = null;
+    setShared(SHARED_KEY, null);
   }
 
   // The toast click runs `<mod>.open-file`, which `listen()` receives.
@@ -227,9 +266,42 @@ export default class Chute extends View {
     });
   }
 
-  fold(cx) {
-    this.folded = !this.folded;
-    remember(FOLD_KEY, this.folded);
+  foldOf(id) {
+    let fold = this.folds.get(id);
+    if (!fold) {
+      fold = { saved: recall(foldKey(id)), keys: null, auto: false };
+      this.folds.set(id, fold);
+    }
+    return fold;
+  }
+
+  isFolded(id) {
+    const fold = this.foldOf(id);
+    return fold.saved && !fold.auto;
+  }
+
+  toggleRepo(repo, cx) {
+    const fold = this.foldOf(repo.id);
+    Object.assign(fold, toggleFold(fold));
+    remember(foldKey(repo.id), fold.saved);
+    cx.notify();
+  }
+
+  // Folds every repo, or opens every repo when none is open.
+  foldAll(cx) {
+    if (this.board?.kind !== "board") return;
+    const fold = this.board.repos.some((repo) => !this.isFolded(repo.id));
+    for (const repo of this.board.repos) {
+      const state = this.foldOf(repo.id);
+      state.saved = fold;
+      state.auto = false;
+      remember(foldKey(repo.id), fold);
+    }
+    cx.notify();
+  }
+
+  toggleMore(repo, cx) {
+    if (!this.moreOpen.delete(repo.id)) this.moreOpen.add(repo.id);
     cx.notify();
   }
 
@@ -307,7 +379,7 @@ export default class Chute extends View {
         .min_h(0)
         .overflow_y_scrollbar()
         .p(12)
-        .gap(16)
+        .gap(20)
         .children(this.bodyOf(body, t)),
     );
   }
@@ -352,7 +424,8 @@ export default class Chute extends View {
       .items_center()
       .border_b(1)
       .border_color(t.border)
-      .child(div().flex_1().font_semibold().child("chute"))
+      .child(div().flex_none().font_semibold().child("chute"))
+      .child(this.summaryView(t))
       .when(this.overlay !== null, (el) => {
         const panel = ownNodeId();
         return panel
@@ -364,11 +437,10 @@ export default class Chute extends View {
             )
           : el;
       })
-      .when(this.overlay === null, (el) =>
-        el.child(
-          iconButton("chute-fold", this.folded ? "▸" : "▾", t, (cx) => this.fold(cx), this.folded ? "Expand" : "Collapse"),
-        ),
-      )
+      .when(this.overlay === null && this.board?.kind === "board", (el) => {
+        const open = this.board.repos.some((repo) => !this.isFolded(repo.id));
+        return el.child(iconButton("chute-fold", open ? "▾" : "▸", t, (cx) => this.foldAll(cx), open ? "Collapse all" : "Expand all"));
+      })
       .when(node !== null, (el) =>
         el.child(iconButton("chute-close", "✕", t, () => run("layout.hide", { id: node }), "Close")),
       )
@@ -377,34 +449,54 @@ export default class Chute extends View {
       );
   }
 
+  summaryView(t) {
+    const value = overview(this.result ? this.board : null);
+    const left = h_flex().flex_1().min_w(0).gap(4).text_size(11).text_color(t.dim);
+    if (!value) return left;
+    const [repos, running, issues] = overviewText(value);
+    const issueColor = value.grade === "failed" ? t.ansi1 : value.grade === "attention" ? t.blocked : t.dim;
+    return left
+      .child(div().min_w(0).truncate().child(`${repos} · ${running}`))
+      .child(div().flex_none().whitespace_nowrap().text_color(value.issues > 0 ? issueColor : t.dim).child(`· ${issues}`))
+      .child(div().flex_1())
+      .when(this.readAt !== null, (el) =>
+        el.child(
+          div()
+            .id("chute-updated")
+            .flex_none()
+            .whitespace_nowrap()
+            .tooltip(`Updated ${clockExact(this.readAt)}`)
+            .child(clockText(this.readAt)),
+        ),
+      );
+  }
+
   bodyOf(body, t) {
     if (body.kind === "loading") {
       return [h_flex().gap(8).text_color(t.dim).child(div().frames(SPINNER, 90)).child("Loading")];
     }
     if (body.kind !== "board") return [notice(body, t)];
-    const repos = body.repos.map((repo) => (this.folded ? foldedRepo(repo, t) : this.repoView(repo, t)));
-    return repos.flatMap((view, i) => (i === 0 ? [view] : [div().h(1).flex_none().bg(t.border), view]));
+    return body.repos.map((repo) => this.repoView(repo, t));
   }
 
   repoView(repo, t) {
+    const folded = this.isFolded(repo.id);
+    const view = v_flex().gap(6).child(this.repoHead(repo, folded, t));
+    if (folded) return view;
     return v_flex()
-      .gap(14)
+      .gap(12)
       .child(
-        v_flex()
-          .gap(4)
-          .child(repoHead(repo, t))
-          .child(statusLine(repo.status, t))
-          .when(!repo.hub.reachable, (el) =>
-            el.child(
-              v_flex()
-                .gap(2)
-                .pl(15)
-                .when(Boolean(repo.hub.error), (box) =>
-                  box.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(repo.hub.error)),
-                )
-                .child(div().text_size(12).text_color(t.dim).child(`Retrying every ${REMOTE_POLL_MS / 1000}s`)),
-            ),
+        view.when(!repo.hub.reachable, (el) =>
+          el.child(
+            v_flex()
+              .gap(2)
+              .pl(24)
+              .when(Boolean(repo.hub.error), (box) =>
+                box.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(repo.hub.error)),
+              )
+              .child(div().text_size(12).text_color(t.dim).child(`Retrying every ${REMOTE_POLL_MS / 1000}s`)),
           ),
+        ),
       )
       .children(repo.sections.map((section) => this.sectionView(repo, section, t)))
       .when(Boolean(repo.postVerify), (el) => el.child(postVerifyView(repo.postVerify, t)))
@@ -412,13 +504,41 @@ export default class Chute extends View {
       .when(Boolean(repo.today), (el) => el.child(this.todayView(repo, t)));
   }
 
+  repoHead(repo, folded, t) {
+    const approval = repo.approval ? ` · ${repo.approval}` : "";
+    const color = toneColor(repo.status.tone, t);
+    return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx))
+      .items_center()
+      .child(chevron(t, folded ? "▸" : "▾"))
+      .child(div().id(`name-${repo.id}`).min_w(0).truncate().font_semibold().tooltip(`${repo.slug}${approval}`).child(repo.name))
+      .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1)))
+      .child(div().flex_1())
+      .child(
+        h_flex()
+          .id(`status-${repo.id}`)
+          .min_w(0)
+          .gap(6)
+          .items_center()
+          .tooltip(repo.status.text)
+          .child(dot(color, repo.active))
+          .child(
+            div()
+              .min_w(0)
+              .truncate()
+              .text_size(12)
+              .text_color(repo.status.tone === "waiting" ? t.muted : repo.status.tone === "ok" ? t.foreground : color)
+              .child(repo.status.text),
+          ),
+      );
+  }
+
   sectionView(repo, section, t) {
     const items = section.items;
     const rows = {
       alerts: (item) => this.alertCard(repo, item, t),
       human: (item) => this.humanCard(repo, item, t),
-      batch: (item) => batchView(item, t),
-      waiting: (item) => waitingRow(item, t),
+      batch: (item) => batchView(repo, item, t),
+      waiting: (item, i) => waitingRow(repo, item, i, t),
       bounced: (item) => this.bouncedRow(repo, item, t),
       unknown: (item) => unknownRow(item, t),
     };
@@ -427,7 +547,7 @@ export default class Chute extends View {
     return v_flex()
       .gap(section.id === "alerts" ? 8 : 4)
       .children(lead)
-      .children(items.map((item) => rows[section.id](item)));
+      .children(items.map((item, i) => rows[section.id](item, i)));
   }
 
   alertCard(repo, alert, t) {
@@ -473,7 +593,7 @@ export default class Chute extends View {
       .bg(t.surface)
       .border_1()
       .border_color(t.blocked)
-      .child(titleLine(card, t))
+      .child(titleLine(card, t, rowIcons(`human-${card.key}`, { url: card.url, pr: card.pr }, t)))
       .child(
         h_flex()
           .gap(5)
@@ -528,7 +648,7 @@ export default class Chute extends View {
     const who = card.agent ? card.agent.label : "No agent";
     const row = card.report
       ? linkRow(`bounced-${card.key}`, t, () => this.openFile(card.report, repo.hub.machine))
-      : h_flex().id(`bounced-${card.key}`).px(6).py(4).gap(8);
+      : hoverRow(h_flex().id(`bounced-${card.key}`).px(6).py(4).gap(8), t);
     return row
       .items_start()
       .child(
@@ -552,15 +672,17 @@ export default class Chute extends View {
               .child(`${who} · Retries ${card.retries}`),
           ),
       )
-      .when(Boolean(card.report), (el) => el.child(chevron(t)));
+      .children(rowIcons(`bounced-${card.key}`, card, t, (file) => this.openFile(file, repo.hub.machine)));
   }
 
   recentView(repo, t) {
+    const open = this.moreOpen.has(repo.id);
+    const { rows, hidden, more } = recentWindow(repo.recent, open);
     return v_flex()
       .gap(4)
-      .child(sectionTitle("Recently merged", null, t))
+      .child(sectionTitle("Recent", null, t))
       .children(
-        repo.recent.map((m, i) => {
+        rows.map((m, i) => {
           const body = [
             div().flex_none().min_w(32).whitespace_nowrap().text_color(t.accent).font_semibold().child(`#${m.pr}`),
             div().flex_1().min_w(0).truncate().child(m.title),
@@ -569,12 +691,20 @@ export default class Chute extends View {
               : null,
             div().flex_none().min_w(44).text_right().text_size(11).text_color(t.dim).child(m.ago),
           ].filter(Boolean);
-          if (!m.url) return h_flex().id(`merged-${repo.id}-${i}`).px(6).py(4).gap(8).items_baseline().children(body);
-          return linkRow(`merged-${repo.id}-${i}`, t, (cx) => cx.open_url(m.url))
+          const id = `merged-${repo.id}-${i}`;
+          if (!m.url) return hoverRow(h_flex().id(id).px(6).py(4).gap(8).items_baseline().children(body), t);
+          return linkRow(id, t, (cx) => cx.open_url(m.url))
             .items_baseline()
             .children(body)
-            .child(chevron(t));
+            .children(rowIcons(id, m, t));
         }),
+      )
+      .when(hidden > 0, (el) =>
+        el.child(
+          linkRow(`more-${repo.id}`, t, (cx) => this.toggleMore(repo, cx)).child(
+            div().text_size(12).text_color(t.dim).child(more > 0 ? `+ ${more} more` : "Show less"),
+          ),
+        ),
       );
   }
 
@@ -585,9 +715,22 @@ export default class Chute extends View {
       .gap(2)
       .child(
         linkRow(`today-${repo.id}`, t, (cx) => this.toggleToday(repo, cx))
-          .items_baseline()
-          .child(div().flex_none().text_size(11).font_semibold().text_color(t.muted).child("Today"))
-          .child(div().flex_1().min_w(0).truncate().text_size(12).child(today.line))
+          .items_start()
+          .child(div().flex_none().text_size(11).font_semibold().text_color(t.muted).child("TODAY"))
+          .child(
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .flex_wrap()
+              .gap_x(5)
+              .items_baseline()
+              .text_size(12)
+              .children(
+                today.parts.map((part, i) =>
+                  div().flex_none().whitespace_nowrap().child(i < today.parts.length - 1 ? `${part} ·` : part),
+                ),
+              ),
+          )
           .child(chevron(t, open ? "⌄" : "›")),
       )
       .when(open, (el) =>
@@ -637,7 +780,15 @@ export default class Chute extends View {
   }
 }
 
-const dot = (color) => div().w(7).h(7).rounded(4).flex_none().bg(color);
+// A dot that fades in and out while the repo is verifying; the pulse runs natively and never calls `render`.
+const dot = (color, active = false) =>
+  div()
+    .w(7)
+    .h(7)
+    .rounded(4)
+    .flex_none()
+    .bg(color)
+    .when(active, (el) => el.loop("opacity", { from: 1, to: 0.35, period: 1600 }));
 
 const chevron = (t, mark = "›") => div().flex_none().w(10).text_color(t.dim).text_right().child(mark);
 
@@ -692,47 +843,39 @@ function sectionTitle(title, count, t) {
     .gap(6)
     .items_center()
     .px(6)
-    .child(div().text_size(11).font_semibold().text_color(t.muted).child(title))
-    .when(count != null, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(count))));
+    .child(div().flex_1().min_w(0).text_size(11).font_semibold().text_color(t.muted).child(title.toUpperCase()))
+    .when(count != null, (el) => el.child(div().flex_none().min_w(24).text_right().text_size(11).text_color(t.dim).child(String(count))));
 }
 
-function repoHead(repo, t) {
-  const approval = repo.approval ? ` · ${repo.approval}` : "";
-  return h_flex()
-    .gap(8)
-    .items_center()
-    .child(
-      div()
-        .id(`name-${repo.id}`)
-        .min_w(0)
-        .truncate()
-        .font_semibold()
-        .tooltip(`${repo.slug}${approval}`)
-        .child(repo.name),
-    )
-    .child(div().flex_1())
-    .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1)));
+// A small text button at the end of a row. Its click must not reach the row's own handler.
+function iconLink(id, label, tip, t, onClick) {
+  return div()
+    .id(id)
+    .flex_none()
+    .px(4)
+    .rounded(4)
+    .text_size(11)
+    .text_color(t.dim)
+    .cursor_pointer()
+    .hover((s) => s.bg(t.border).text_color(t.foreground))
+    .tooltip(tip)
+    .on_click((_e, cx) => {
+      cx.stop_propagation();
+      onClick(cx);
+    });
 }
 
-function statusLine(status, t) {
-  const color = toneColor(status.tone, t);
-  return h_flex()
-    .gap(8)
-    .items_center()
-    .child(dot(color))
-    .child(div().flex_1().min_w(0).whitespace_normal().text_color(status.tone === "waiting" ? t.muted : status.tone === "ok" ? t.foreground : color).child(status.text));
+// `log` when the status names a report or log file, `↗` when the PR has a URL.
+function rowIcons(id, row, t, openReport) {
+  const icons = [];
+  if (row.report) {
+    icons.push(iconLink(`${id}-log`, "log", `Open ${row.report.label.toLowerCase()}`, t, () => openReport(row.report)).child("log"));
+  }
+  if (row.url) icons.push(iconLink(`${id}-pr`, "↗", `Open #${row.pr} on GitHub`, t, (cx) => cx.open_url(row.url)).child("↗"));
+  return icons;
 }
 
-function foldedRepo(repo, t) {
-  return h_flex()
-    .id(`fold-${repo.id}`)
-    .gap(8)
-    .items_center()
-    .tooltip(repo.slug)
-    .child(dot(toneColor(repo.status.tone, t)))
-    .child(div().flex_none().font_semibold().child(repo.name))
-    .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(repo.status.text));
-}
+const hoverRow = (el, t) => el.rounded(6).hover((s) => s.bg(t.hover));
 
 function notice(body, t) {
   const empty = body.kind === "empty";
@@ -761,12 +904,13 @@ function chip(text, color) {
     .child(text);
 }
 
-function titleLine(card, t) {
+function titleLine(card, t, icons = []) {
   return h_flex()
     .gap(6)
     .items_start()
     .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${card.pr}`))
-    .child(div().flex_1().min_w(0).whitespace_normal().child(card.title));
+    .child(div().flex_1().min_w(0).whitespace_normal().child(card.title))
+    .children(icons);
 }
 
 function agentChip(agent, t, cardKey) {
@@ -800,7 +944,7 @@ function submitterLine(submitter, t) {
   return div().text_size(12).text_color(t.dim).whitespace_normal().child(submitter.text);
 }
 
-function batchView(batch, t) {
+function batchView(repo, batch, t) {
   const step = batch.waitingMachine ? "Waiting for a slot" : batch.stepText ?? batch.phase ?? "Verifying";
   const facts = [batch.round, batch.reused].filter(Boolean);
   return v_flex()
@@ -811,23 +955,22 @@ function batchView(batch, t) {
         .px(6)
         .items_center()
         .child(div().text_color(t.working).child("").frames(SPINNER, 90))
-        .child(div().text_size(11).font_semibold().text_color(t.muted).child("Current batch"))
+        .child(div().text_size(11).font_semibold().text_color(t.muted).child("CURRENT BATCH"))
         .child(div().flex_1())
         .when(Boolean(batch.elapsed), (el) =>
           el.child(div().min_w(48).text_right().text_size(12).text_color(t.foreground).child(batch.elapsed)),
         ),
     )
     .children(
-      batch.prs.map((entry) =>
-        v_flex()
-          .gap(3)
-          .px(6)
+      batch.prs.map((entry, i) =>
+        hoverRow(v_flex().id(`batch-${repo.id}-${i}`).gap(3).px(6).py(2), t)
           .child(
             h_flex()
               .gap(6)
               .items_start()
               .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
-              .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title)),
+              .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title))
+              .children(rowIcons(`batch-${repo.id}-${i}`, entry, t)),
           )
           .when(entry.marks.length > 0, (el) =>
             el.child(h_flex().gap(5).flex_wrap().children(entry.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t))))),
@@ -872,7 +1015,7 @@ function postVerifyView(post, t) {
   const run = post.run;
   return v_flex()
     .gap(2)
-    .child(sectionTitle("Post-merge check", null, t))
+    .child(sectionTitle("Post-merge", null, t))
     .when(Boolean(post.green), (el) => el.child(row("✓", t[toneToken("ok")], `${post.green.commit} passed`, post.green.ago)))
     .when(Boolean(run), (el) =>
       el.child(
@@ -898,16 +1041,13 @@ function numberedTitle(prefix, item, t) {
     .child(div().flex_1().min_w(0).whitespace_normal().child(item.title));
 }
 
-function waitingRow(item, t) {
+function waitingRow(repo, item, index, t) {
   const tags = [
     ...item.marks.map((mark) => ({ text: mark.text, color: toneColor(mark.tone, t) })),
     ...(item.ciPending ? [{ text: item.label, color: t.ansi3 }] : []),
     ...(item.note ? [{ text: item.note, color: t.dim }] : []),
   ];
-  return v_flex()
-    .gap(2)
-    .px(6)
-    .py(2)
+  return hoverRow(v_flex().id(`queued-${repo.id}-${index}`).gap(2).px(6).py(2), t)
     .child(
       h_flex()
         .gap(6)
@@ -915,7 +1055,8 @@ function waitingRow(item, t) {
         .child(div().w(18).flex_none().text_right().text_size(12).text_color(t.dim).child(String(item.position)))
         .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${item.pr}`))
         .child(div().flex_1().min_w(0).truncate().child(item.title))
-        .children(tags.map((tag) => div().flex_none().text_size(11).text_color(tag.color).child(tag.text))),
+        .children(tags.map((tag) => div().flex_none().text_size(11).text_color(tag.color).child(tag.text)))
+        .children(rowIcons(`queued-${repo.id}-${index}`, item, t)),
     )
     .when(Boolean(item.submitter), (el) => el.child(div().pl(24).child(submitterLine(item.submitter, t))));
 }
