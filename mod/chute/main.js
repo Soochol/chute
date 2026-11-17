@@ -33,6 +33,8 @@ import {
   overviewText,
   pollInterval,
   recentWindow,
+  STAGE_NAMES,
+  tint,
   toggleFold,
   toneToken,
 } from "./board.js";
@@ -43,6 +45,7 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const MAX_VIEW_CHARS = 200_000;
 const OLD_FOLD_KEY = "chute.folded";
 const SHARED_KEY = "chute.status";
+const SURFACE_ALPHA = 0.06;
 const foldKey = (repoId) => `chute.fold.${repoId}`;
 const todayKey = (repoId) => `chute.today.${repoId}`;
 
@@ -70,6 +73,15 @@ const recall = (key) => {
 };
 
 const toneColor = (name, t) => t[toneToken(name)];
+
+// `surface` equals `background` in the bundled themes, so the fallback is `raised`, which shows.
+const faded = (t, color, alpha) => tint(color, alpha) ?? t.raised;
+
+// gpui-kit has no tabular-nums feature; the terminal font keeps digits one width.
+const mono = (el) => {
+  const family = settings().font_family;
+  return typeof family === "string" && family ? el.font_family(family) : el;
+};
 
 // The layout node that holds a copy of this mod, as `layout()` reports it. Null when there is not exactly one.
 function ownNodeId() {
@@ -461,10 +473,7 @@ export default class Chute extends View {
       .child(div().flex_1())
       .when(this.readAt !== null, (el) =>
         el.child(
-          div()
-            .id("chute-updated")
-            .flex_none()
-            .whitespace_nowrap()
+          mono(div().id("chute-updated").flex_none().whitespace_nowrap())
             .tooltip(`Updated ${clockExact(this.readAt)}`)
             .child(clockText(this.readAt)),
         ),
@@ -483,10 +492,14 @@ export default class Chute extends View {
     const folded = this.isFolded(repo.id);
     const view = v_flex().gap(6).child(this.repoHead(repo, folded, t));
     if (folded) return view;
+    const filled = repo.sections.filter((section) => section.items.length > 0);
+    const empty = repo.sections.filter((section) => section.items.length === 0);
     return v_flex()
       .gap(12)
       .child(
-        view.when(!repo.hub.reachable, (el) =>
+        view
+          .when(repo.cells !== null, (el) => el.child(cellsView(repo.cells, t)))
+          .when(!repo.hub.reachable, (el) =>
           el.child(
             v_flex()
               .gap(2)
@@ -498,10 +511,11 @@ export default class Chute extends View {
           ),
         ),
       )
-      .children(repo.sections.map((section) => this.sectionView(repo, section, t)))
+      .children(filled.map((section) => this.sectionView(repo, section, t)))
       .when(Boolean(repo.postVerify), (el) => el.child(postVerifyView(repo.postVerify, t)))
       .when(repo.recent.length > 0, (el) => el.child(this.recentView(repo, t)))
-      .when(Boolean(repo.today), (el) => el.child(this.todayView(repo, t)));
+      .when(Boolean(repo.today), (el) => el.child(this.todayView(repo, t)))
+      .when(empty.length > 0, (el) => el.child(emptyLine(empty, t)));
   }
 
   repoHead(repo, folded, t) {
@@ -510,7 +524,19 @@ export default class Chute extends View {
     return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx))
       .items_center()
       .child(chevron(t, folded ? "▸" : "▾"))
-      .child(div().id(`name-${repo.id}`).min_w(0).truncate().font_semibold().tooltip(`${repo.slug}${approval}`).child(repo.name))
+      .child(
+        div()
+          .id(`daemon-${repo.id}`)
+          .flex_none()
+          .w(10)
+          .h(16)
+          .flex()
+          .items_center()
+          .justify_center()
+          .tooltip(repo.daemon.text)
+          .child(dot(toneColor(repo.daemon.tone, t), repo.active)),
+      )
+      .child(div().id(`name-${repo.id}`).flex_shrink(0).max_w(140).truncate().font_semibold().tooltip(`${repo.slug}${approval}`).child(repo.name))
       .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1)))
       .child(div().flex_1())
       .child(
@@ -520,7 +546,6 @@ export default class Chute extends View {
           .gap(6)
           .items_center()
           .tooltip(repo.status.text)
-          .child(dot(color, repo.active))
           .child(
             div()
               .min_w(0)
@@ -542,7 +567,6 @@ export default class Chute extends View {
       bounced: (item) => this.bouncedRow(repo, item, t),
       unknown: (item) => unknownRow(item, t),
     };
-    if (items.length === 0) return emptyHead(section.title, t);
     const lead = section.id === "alerts" ? [] : [sectionTitle(section.title, section.id === "batch" ? null : items.length, t)];
     if (section.id === "batch") return v_flex().gap(6).children(items.map((item) => rows.batch(item)));
     return v_flex()
@@ -852,15 +876,33 @@ function linkRow(id, t, onClick) {
     .on_click((_e, cx) => onClick(cx));
 }
 
-// A section with nothing in it keeps its head line, dimmed: `QUEUED 0`.
-function emptyHead(title, t) {
-  return h_flex()
-    .gap(6)
-    .items_center()
+const emptyLine = (sections, t) =>
+  div()
     .px(6)
-    .child(div().flex_1().min_w(0).text_size(11).font_semibold().text_color(t.dim).child(title.toUpperCase()))
-    .child(div().flex_none().min_w(24).text_right().text_size(11).text_color(t.dim).child("0"));
-}
+    .text_size(11)
+    .text_color(t.dim)
+    .whitespace_normal()
+    .child(`Empty: ${sections.map((section) => section.title).join(" · ")}`);
+
+const cellsView = (cells, t) =>
+  h_flex()
+    .gap(6)
+    .px(6)
+    .children(
+      cells.map((cell) =>
+        v_flex()
+          .id(`cell-${cell.key}`)
+          .flex_1()
+          .min_w(0)
+          .items_center()
+          .child(
+            mono(div().whitespace_nowrap().text_size(15).font_semibold())
+              .text_color(cell.value ? t.foreground : t.dim)
+              .child(cell.value === null ? "—" : String(cell.value)),
+          )
+          .child(div().max_w_full().truncate().text_size(11).text_color(t.dim).child(cell.label)),
+      ),
+    );
 
 // The time at the right end of a row: it never pushes the title out, and it keeps its place when empty.
 const timeCell = (text, t) =>
@@ -976,8 +1018,12 @@ function submitterLine(submitter, t) {
 function batchView(repo, batch, t) {
   const step = batch.waitingMachine ? "Waiting for a slot" : batch.stepText ?? batch.phase ?? "Verifying";
   const facts = [batch.round, batch.reused].filter(Boolean);
+  const fill = batch.waitingMachine ? t.muted : batch.longer ? t.ansi3 : t.working;
   return v_flex()
     .gap(6)
+    .p(10)
+    .rounded(8)
+    .bg(faded(t, t.foreground, SURFACE_ALPHA))
     .child(
       h_flex()
         .gap(6)
@@ -987,7 +1033,14 @@ function batchView(repo, batch, t) {
         .child(div().text_size(11).font_semibold().text_color(t.muted).child("CURRENT BATCH"))
         .child(div().flex_1())
         .when(Boolean(batch.elapsed), (el) =>
-          el.child(div().min_w(48).text_right().text_size(12).text_color(t.foreground).child(batch.elapsed)),
+          el.child(
+            mono(div().flex_none().whitespace_nowrap().text_size(12))
+              .text_color(batch.longer ? t.ansi3 : t.foreground)
+              .child(batch.elapsed),
+          ),
+        )
+        .when(Boolean(batch.usual), (el) =>
+          el.child(div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`/ ${batch.usual}`)),
         ),
     )
     .children(
@@ -1007,15 +1060,22 @@ function batchView(repo, batch, t) {
           .when(Boolean(entry.submitter), (el) => el.child(submitterLine(entry.submitter, t))),
       ),
     )
-    .when(batch.progress != null, (el) =>
-      el.child(
-        div()
-          .mx(6)
-          .h(4)
-          .rounded(2)
-          .bg(t.border)
-          .child(div().h_full().rounded(2).bg(batch.longer ? t.ansi3 : t.working).w(`${Math.round(batch.progress * 100)}%`)),
-      ),
+    .child(
+      h_flex()
+        .gap(4)
+        .px(6)
+        .children(
+          STAGE_NAMES.map((name, i) => {
+            const current = i === batch.stage;
+            return v_flex()
+              .id(`stage-${repo.id}-${name}`)
+              .flex_1()
+              .min_w(0)
+              .gap(3)
+              .child(div().h(4).rounded(2).bg(current ? fill : t.border))
+              .child(div().truncate().text_size(11).text_color(current ? t.foreground : t.dim).child(name));
+          }),
+        ),
     )
     .child(
       h_flex()
@@ -1023,8 +1083,7 @@ function batchView(repo, batch, t) {
         .px(6)
         .items_baseline()
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.working).child(step))
-        .when(batch.longer, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi3).child("Slower than usual")))
-        .when(Boolean(batch.usual), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(batch.usual))),
+        .when(batch.longer, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi3).child("Slower than usual"))),
     )
     .when(facts.length > 0, (el) =>
       el.child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(facts.join(" · "))),

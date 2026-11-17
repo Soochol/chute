@@ -14,6 +14,7 @@ import {
   formatDuration,
   interpret,
   RECENT_DEFAULT,
+  STAGE_NAMES,
   clockExact,
   clockText,
   gradeOf,
@@ -25,6 +26,7 @@ import {
   recentWindow,
   toggleFold,
   pullUrl,
+  tint,
   toneToken,
   usualSeconds,
 } from "./board.js";
@@ -986,6 +988,7 @@ test("random malformed status never breaks the board", () => {
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
     const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary"]);
+    for (const key of ["daemon", "cells"]) CONTAINERS.add(key);
     const leaves = [];
     const walk = (value, path, key) => {
       if (value !== null && typeof value === "object") {
@@ -1049,7 +1052,7 @@ test("random malformed status never breaks the board", () => {
 
       const kinds = [];
       if (view.blocked) kinds.push("blocked");
-      if (isObject(view.daemon) && view.daemon.running === false) kinds.push("daemon");
+      if (isObject(view.daemon) && view.daemon.running === false && queue.length > 0) kinds.push("daemon");
       for (const _ of Array.isArray(view.warnings) ? view.warnings : []) kinds.push("warning");
       assert.deepEqual((shown.alerts ?? []).map((a) => a.kind), kinds, `alerts :: ${ctx}`);
       if (kinds.length) assert.equal(repo.sections[0].id, "alerts", ctx);
@@ -1676,8 +1679,9 @@ test("overview: issues are human turns, error alerts and unreachable hubs; warn 
   const warned = tonedRepo("o/w", (d) => { d.warnings = [{ kind: "config", message: "x" }]; });
   assert.equal(overview(board([warned])).issues, 0);
   assert.equal(overview(board([warned])).grade, "ok");
-  const daemonOff = tonedRepo("o/d", (d) => { d.daemon = { running: false }; });
+  const daemonOff = tonedRepo("o/d", (d) => { d.daemon = { running: false }; d.queue = [itemOf(fixture.queue.find((i) => i.state === "queued").pr)]; });
   assert.equal(overview(board([daemonOff])).issues, 1);
+  assert.equal(overview(board([tonedRepo("o/i", (d) => { d.daemon = { running: false }; })])).issues, 0);
   const hub = overview(interpret(ok(unreachable), NOW));
   assert.equal(hub.grade, "failed");
   assert.ok(hub.issues >= 1);
@@ -1780,8 +1784,9 @@ test("fold: an unreachable hub alone does not open a folded repo, and its proble
 test("problem keys are the notice keys plus the stopped daemon", () => {
   const repo = only([fixture]);
   for (const notice of repo.notices) assert.ok(repo.problems.includes(notice.key));
-  const off = only(tonedRepo("o/d", (d) => { d.daemon = { running: false }; }));
+  const off = only(tonedRepo("o/d", (d) => { d.daemon = { running: false }; d.queue = [itemOf(fixture.queue.find((i) => i.state === "queued").pr)]; }));
   assert.deepEqual(off.problems, ["daemon:off"]);
+  assert.deepEqual(only(tonedRepo("o/i", (d) => { d.daemon = { running: false }; })).problems, []);
   const warned = only(tonedRepo("o/w", (d) => { d.warnings = [{ kind: "config", message: "x" }]; }));
   assert.deepEqual(warned.problems, []);
 });
@@ -1884,4 +1889,113 @@ test("change lines: nested step keys keep the step wording and short values coun
   const emoji = "😀".repeat(12);
   const wide = changeSummary(item([{ op: "changed", path: ["budget"], before: emoji, after: "1" }]));
   assert.equal(wide[0].text, `budget: ${emoji} → 1`);
+});
+
+const queuedItem = () => itemOf(fixture.queue.find((i) => i.state === "queued").pr);
+const bouncedItem = () => itemOf(fixture.queue.find((i) => i.state === "bounced").pr);
+const stoppedDaemon = (slug, ...items) => tonedRepo(slug, (d) => { d.daemon = { running: false }; d.queue = items; });
+
+test("a stopped daemon is an alert, a red status line and an issue only while the queue has items", () => {
+  const resting = stoppedDaemon("o/r");
+  const idleRepo = only(resting);
+  assert.equal(section(idleRepo, "alerts"), undefined);
+  assert.deepEqual(idleRepo.status, { tone: "ok", text: "All clear" });
+  assert.equal(overview(board([resting])).issues, 0);
+  assert.deepEqual(idleRepo.problems, []);
+  assert.equal(idleRepo.daemon.state, "idle");
+
+  const waiting = stoppedDaemon("o/w", queuedItem());
+  const off = only(waiting);
+  assert.deepEqual(section(off, "alerts").items.map((a) => a.kind), ["daemon"]);
+  assert.deepEqual(off.status, { tone: "error", text: "Daemon is off" });
+  assert.equal(overview(board([waiting])).issues, 1);
+  assert.deepEqual(off.problems, ["daemon:off"]);
+  assert.equal(off.daemon.state, "off");
+
+  const bounced = only(stoppedDaemon("o/b", bouncedItem()));
+  assert.deepEqual(bounced.status, { tone: "error", text: "Daemon is off" });
+  assert.equal(bounced.daemon.state, "off");
+});
+
+test("the daemon is running, idle with an empty queue, off only with a queue, and unknown otherwise", () => {
+  const daemonOf = (daemon, ...items) => only(tonedRepo("o/d", (d) => { d.daemon = daemon; d.queue = items; })).daemon;
+  const running = daemonOf({ running: true });
+  assert.equal(running.state, "running");
+  assert.equal(running.tone, "ok");
+  assert.equal(daemonOf({ running: true }, queuedItem()).state, "running");
+
+  for (const state of ["queued", "bounced", "awaiting_approval", "in_batch"]) {
+    const item = itemOf(fixture.queue.find((i) => i.state === state).pr);
+    const off = daemonOf({ running: false }, item);
+    assert.equal(off.state, "off", state);
+    assert.equal(off.tone, "error", state);
+  }
+  assert.match(daemonOf({ running: false }, queuedItem()).text, /^Daemon off · 1 PR in queue$/);
+  assert.match(daemonOf({ running: false }, queuedItem(), bouncedItem()).text, /^Daemon off · 2 PRs in queue$/);
+
+  const idleDaemon = daemonOf({ running: false });
+  assert.equal(idleDaemon.state, "idle");
+  assert.equal(toneToken(idleDaemon.tone), "dim");
+
+  for (const odd of [undefined, null, {}, { running: "yes" }, { running: 1 }, "up", []]) {
+    for (const items of [[], [queuedItem()]]) {
+      const unknown = daemonOf(odd, ...items);
+      assert.equal(unknown.state, "unknown", JSON.stringify(odd));
+      assert.equal(toneToken(unknown.tone), "dim");
+    }
+  }
+});
+
+test("count cells are batch, queued, bounced and merged today", () => {
+  const repo = only([fixture]);
+  assert.deepEqual(repo.cells.map((c) => c.key), ["batch", "queued", "bounced", "merged"]);
+  assert.deepEqual(repo.cells.map((c) => c.label), ["Batch", "Queued", "Bounced", "Merged today"]);
+  assert.deepEqual(repo.cells.map((c) => c.value), [fixture.batch.prs.length, 5, 8, fixture.today.merged]);
+
+  const withToday = (today) => only(tonedRepo("o/t", (d) => { d.today = today; })).cells.at(-1).value;
+  assert.equal(withToday({ merged: 0 }), 0);
+  assert.equal(withToday({ merged: 3 }), 3);
+  for (const odd of [undefined, null, {}, { merged: "7" }, { merged: 1.5 }, { merged: null }, { merged: [] }, "x"]) {
+    assert.equal(withToday(odd), null, JSON.stringify(odd));
+  }
+  assert.deepEqual(only(queueOnly()).cells.map((c) => c.value), [0, 0, 0, fixture.today.merged]);
+});
+
+test("a repo whose hub is unreachable has no count cells and an unknown daemon", () => {
+  const repo = only(unreachable);
+  assert.equal(repo.cells, null);
+  assert.equal(repo.daemon.state, "unknown");
+});
+
+test("the batch stage is the index of the phase, and null for a missing or unknown phase", () => {
+  const stageOf = (phase) => {
+    const data = clone(fixture);
+    if (phase === undefined) delete data.batch.phase;
+    else data.batch.phase = phase;
+    return section(only(data), "batch").items[0].stage;
+  };
+  assert.deepEqual(["building", "verifying", "bisecting", "pushing"].map(stageOf), [0, 1, 2, 3]);
+  assert.deepEqual(STAGE_NAMES, ["Building", "Verifying", "Bisecting", "Pushing"]);
+  for (const odd of [undefined, null, "waiting", "", "Verifying", "toString", "constructor", 1, ["building"]]) {
+    assert.equal(stageOf(odd), null, JSON.stringify(odd));
+  }
+});
+
+test("tint gives #rrggbbaa for #rgb, #rrggbb and #rrggbbaa, and null for anything else", () => {
+  assert.equal(tint("#fff", 0.5), "#ffffff80");
+  assert.equal(tint("#f0a", 1), "#ff00aaff");
+  assert.equal(tint("#336699", 0.1), "#3366991a");
+  assert.equal(tint("#336699", 0), "#33669900");
+  assert.equal(tint("#336699", 1), "#336699ff");
+  assert.equal(tint("#336699", 7), "#336699ff");
+  assert.equal(tint("#336699", -1), "#33669900");
+  assert.equal(tint("#33669980", 0.5), "#33669940");
+  assert.equal(tint("#336699ff", 0.5), tint("#336699", 0.5));
+  assert.equal(tint("#ABCDEF", 1), "#abcdefff");
+  assert.equal(tint("#ABC", 1), "#aabbccff");
+  for (const odd of ["rgb(1, 2, 3)", "rgba(1,2,3,0.5)", "", "red", "#", "#12", "#abcd", "#12345", "#1234567", "#ggg", " #fff", "fff", undefined, null, 255, {}]) {
+    assert.equal(tint(odd, 0.5), null, String(odd));
+  }
+  assert.equal(tint("#fff", NaN), null);
+  assert.equal(tint("#fff", undefined), null);
 });

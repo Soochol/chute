@@ -25,6 +25,17 @@ const TONE_TOKEN = table({
 
 export const toneToken = (tone) => TONE_TOKEN[tone] ?? "dim";
 
+const HEX_COLOR = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+export function tint(color, alpha) {
+  const match = typeof color === "string" ? HEX_COLOR.exec(color) : null;
+  if (!match || !Number.isFinite(alpha)) return null;
+  const hex = match[1].length === 3 ? [...match[1]].map((c) => c + c).join("") : match[1];
+  const base = hex.length === 8 ? parseInt(hex.slice(6), 16) / 255 : 1;
+  const a = Math.round(255 * base * Math.min(1, Math.max(0, alpha)));
+  return `#${hex.slice(0, 6).toLowerCase()}${a.toString(16).padStart(2, "0")}`;
+}
+
 // Mirrors `WarningKind` in src/model.rs.
 const WARNING_TITLE = table({
   not_merged: "Not merged",
@@ -40,7 +51,7 @@ const WARNING_TITLE = table({
 
 const SECTION_ORDER = ["alerts", "human", "batch", "waiting", "bounced", "unknown"];
 
-// These four keep their head line when empty; `alerts` and `unknown` appear only with something to show.
+// These four stay in `sections` when empty; `main.js` folds the empty ones into one line.
 const ALWAYS_SHOWN = new Set(["human", "batch", "waiting", "bounced"]);
 
 const SECTION_TITLE = {
@@ -385,6 +396,19 @@ function haltFacts(blocked, queue) {
   return [...facts, ...repairFacts(queue)];
 }
 
+const daemonStopped = (view) => isObject(view.daemon) && view.daemon.running === false;
+const daemonIsOff = (view, queue) => daemonStopped(view) && queue.length > 0;
+
+const DAEMON_UNKNOWN = { state: "unknown", tone: "idle", text: "Daemon state unknown" };
+
+function daemonOf(view, queue) {
+  if (!isObject(view.daemon)) return DAEMON_UNKNOWN;
+  if (view.daemon.running === true) return { state: "running", tone: "ok", text: "Daemon running" };
+  if (view.daemon.running !== false) return DAEMON_UNKNOWN;
+  if (queue.length === 0) return { state: "idle", tone: "idle", text: "Daemon idle · queue empty" };
+  return { state: "off", tone: "error", text: `Daemon off · ${queue.length} ${queue.length === 1 ? "PR" : "PRs"} in queue` };
+}
+
 function alertsOf(view, queue, now, merged) {
   const alerts = [];
   if (view.blocked) {
@@ -403,7 +427,7 @@ function alertsOf(view, queue, now, merged) {
       log: str(blocked.log) || null,
     });
   }
-  if (isObject(view.daemon) && view.daemon.running === false) {
+  if (daemonIsOff(view, queue)) {
     alerts.push({ kind: "daemon", tone: "error", text: "Daemon is off", detail: "Run `chute up` to start it.", facts: [], files: [], log: null });
   }
   alerts.push(...postVerifyAlerts(view.post_verify, now, merged));
@@ -542,6 +566,13 @@ function postVerifyOf(post, now) {
   };
 }
 
+const STAGES = Object.keys(PHASE);
+export const STAGE_NAMES = Object.values(PHASE);
+const stageOf = (phase) => {
+  const at = typeof phase === "string" ? STAGES.indexOf(phase) : -1;
+  return at >= 0 ? at : null;
+};
+
 function batchOf(batch, members, now, usualS, slug) {
   if (!isObject(batch) && members.length === 0) return [];
   const b = isObject(batch) ? batch : {};
@@ -568,6 +599,7 @@ function batchOf(batch, members, now, usualS, slug) {
     {
       prs,
       phase: b.phase == null ? null : named(PHASE, b.phase),
+      stage: stageOf(b.phase),
       step,
       stepText,
       waitingMachine: b.waiting_machine === true,
@@ -583,6 +615,16 @@ function batchOf(batch, members, now, usualS, slug) {
 
 const chronicFlaky = (view) =>
   list(view.warnings).some((warning) => isObject(warning) && warning.kind === "flaky_chronic");
+
+function cellsOf(placed, today) {
+  const merged = isObject(today) && Number.isInteger(today.merged) ? today.merged : null;
+  return [
+    { key: "batch", label: "Batch", value: placed.batch[0]?.prs.length ?? 0 },
+    { key: "queued", label: "Queued", value: placed.waiting.length },
+    { key: "bounced", label: "Bounced", value: placed.bounced.length },
+    { key: "merged", label: "Merged today", value: merged },
+  ];
+}
 
 function todayOf(today, chronic) {
   if (!isObject(today)) return null;
@@ -619,7 +661,7 @@ function statusLineOf(view, queue, batch) {
     return { tone: "error", text: `Stopped · ${BLOCK_SHORT[reason] ?? (reason || "unknown reason")}` };
   }
   if (red) return { tone: "error", text: `Post-merge check failed · ${str(red.step) || "?"}` };
-  if (isObject(view.daemon) && view.daemon.running === false) return { tone: "error", text: "Daemon is off" };
+  if (daemonIsOff(view, queue)) return { tone: "error", text: "Daemon is off" };
   const human = queue.filter((item) => item.state === "awaiting_approval").length;
   if (human > 0) return { tone: "human", text: `Needs you · ${human}` };
   if (batch) {
@@ -754,6 +796,8 @@ function repoBoard(view, now) {
     hub,
     notices: [],
     problems: [],
+    daemon: DAEMON_UNKNOWN,
+    cells: null,
     active: false,
     postVerify: null,
     recent: [],
@@ -811,6 +855,8 @@ function repoBoard(view, now) {
     ...base,
     approval: named(APPROVAL, view.approval),
     status: statusLineOf(view, queue, placed.batch[0] ?? null),
+    daemon: daemonOf(view, queue),
+    cells: cellsOf(placed, view.today),
     notices,
     problems: [...notices.map((n) => n.key), ...(placed.alerts.some((a) => a.kind === "daemon") ? [DAEMON_OFF_KEY] : [])],
     active: placed.batch.length > 0 || postVerify?.run != null,
