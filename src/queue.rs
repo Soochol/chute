@@ -340,6 +340,14 @@ pub fn submit(state: &mut State, mut s: Submission) -> Result<Submitted, Transit
     };
     let item = &mut state.queue[at];
     let head_changed = item.head != s.head;
+    let unreadable_now = s
+        .config_change
+        .as_ref()
+        .is_some_and(|c| c.kind == ConfigChangeKind::Unreadable);
+    if !head_changed && unreadable_now && item.config_change.is_some() {
+        s.config_change = item.config_change.clone();
+    }
+    let needs_approval = s.needs_approval();
     let was_bounced = matches!(item.state, ItemState::Bounced(_));
     let to = moved(
         s.pr,
@@ -1514,6 +1522,22 @@ mod tests {
         submit(&mut state, edited).unwrap();
         assert_eq!(state_of(&state, 1), QUEUED);
         assert_eq!(state.queue[0].config_change, summary(Edited));
+    }
+
+    #[test]
+    fn an_unreadable_summary_on_the_same_head_does_not_release_a_known_invalid_one() {
+        use crate::model::ConfigChangeKind::{Invalid, Unreadable};
+        let mut state = queue_of(&[(1, AWAITING)]);
+        state.queue[0].touches_config = true;
+        state.queue[0].config_change = summary(Invalid);
+        let unreadable = with_config(
+            submission(1, "abc1234", Approval::Agent, true),
+            Unreadable,
+            true,
+        );
+        let done = submit(&mut state, unreadable).unwrap();
+        assert_eq!((done.state, done.change), (AWAITING, Change::Unchanged));
+        assert_eq!(state.queue[0].config_change, summary(Invalid));
     }
 
     #[test]
