@@ -46,6 +46,10 @@ const MAX_VIEW_CHARS = 200_000;
 const OLD_FOLD_KEY = "chute.folded";
 const SHARED_KEY = "chute.status";
 const SURFACE_ALPHA = 0.06;
+const CARD_ALPHA = 0.12;
+const CHIP_ALPHA = 0.14;
+const ICON_SIZE = 20;
+const CARD_SYMBOL = { error: "✕", warn: "△" };
 const foldKey = (repoId) => `chute.fold.${repoId}`;
 const todayKey = (repoId) => `chute.today.${repoId}`;
 
@@ -537,7 +541,7 @@ export default class Chute extends View {
           .child(dot(toneColor(repo.daemon.tone, t), repo.active)),
       )
       .child(div().id(`name-${repo.id}`).flex_shrink(0).max_w(140).truncate().font_semibold().tooltip(`${repo.slug}${approval}`).child(repo.name))
-      .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1)))
+      .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1, t)))
       .child(div().flex_1())
       .child(
         h_flex()
@@ -577,13 +581,21 @@ export default class Chute extends View {
 
   alertCard(repo, alert, t) {
     const color = toneColor(alert.tone, t);
+    const symbol = CARD_SYMBOL[alert.tone];
     return v_flex()
       .gap(4)
       .p(10)
       .rounded(8)
-      .border_1()
-      .border_color(color)
-      .child(div().font_semibold().text_color(color).whitespace_normal().child(alert.text))
+      .bg(faded(t, color, CARD_ALPHA))
+      .child(
+        h_flex()
+          .gap(6)
+          .items_start()
+          .text_color(color)
+          .font_semibold()
+          .when(Boolean(symbol), (el) => el.child(div().flex_none().child(symbol)))
+          .child(div().flex_1().min_w(0).whitespace_normal().child(alert.text)),
+      )
       .when(Boolean(alert.detail), (el) => el.child(div().text_size(12).text_color(t.dim).whitespace_normal().child(alert.detail)))
       .children(alert.facts.map((fact) => div().text_size(12).text_color(t.muted).whitespace_normal().child(fact)))
       .when(alert.files.length > 0, (el) =>
@@ -611,18 +623,30 @@ export default class Chute extends View {
       if (card.agent) people.push(agentChip(card.agent, t, card.key));
       if (card.submittedBy) people.push(div().min_w(0).text_size(12).text_color(t.dim).whitespace_normal().child(card.submittedBy));
     }
+    const buttons = h_flex()
+      .gap(6)
+      .items_center()
+      .children(card.actions.map((action, i) => this.button(card, action, i === 0, t)))
+      .child(div().flex_1())
+      .when(Boolean(card.diffUrl), (row) =>
+        row.child(textLink(`diff-${card.key}`, "View diff ↗", `Open the diff of #${card.pr} on GitHub`, t, (cx) => cx.open_url(card.diffUrl))),
+      );
     return v_flex()
       .gap(5)
       .p(10)
       .rounded(8)
-      .bg(t.surface)
-      .border_1()
-      .border_color(t.blocked)
-      .child(div().font_semibold().text_color(t.blocked).whitespace_normal().child(card.question))
-      .child(titleLine({ ...card, wait: "" }, t, rowIcons(`human-${card.key}`, { url: card.url, pr: card.pr }, t)))
-      .when(card.marks.length > 0, (el) =>
-        el.child(h_flex().gap(5).flex_wrap().children(card.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t))))),
+      .bg(faded(t, t.blocked, CARD_ALPHA))
+      .child(
+        h_flex()
+          .gap(6)
+          .items_start()
+          .font_semibold()
+          .text_color(t.blocked)
+          .child(div().flex_none().child("?"))
+          .child(div().flex_1().min_w(0).whitespace_normal().child(card.question)),
       )
+      .child(titleLine({ ...card, wait: "" }, t, rowIcons(`human-${card.key}`, { url: card.url, pr: card.pr }, t)))
+      .when(card.marks.length > 0, (el) => el.child(chipRow(card.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t), t)))))
       .child(div().text_size(12).text_color(t.muted).whitespace_normal().child(card.reason))
       .when(Boolean(card.approvalBlocked), (el) =>
         el.child(div().text_size(12).text_color(t.ansi1).whitespace_normal().child(card.approvalBlocked)),
@@ -644,22 +668,6 @@ export default class Chute extends View {
       .when(Boolean(card.overlap), (el) =>
         el.child(div().text_size(12).text_color(t.ansi3).whitespace_normal().child(card.overlap)),
       )
-      .when(card.actions.length > 0 || Boolean(card.diffUrl), (el) =>
-        el.child(
-          h_flex()
-            .gap(6)
-            .items_center()
-            .children(card.actions.map((action, i) => this.button(card, action, i === 0, t)))
-            .child(div().flex_1())
-            .when(Boolean(card.diffUrl), (row) =>
-              row.child(
-                iconLink(`diff-${card.key}`, "View diff ↗", `Open the diff of #${card.pr} on GitHub`, t, (cx) => cx.open_url(card.diffUrl)).child(
-                  "View diff ↗",
-                ),
-              ),
-            ),
-        ),
-      )
       .child(div().text_size(11).text_color(t.dim).whitespace_normal().child(card.facts.join(" · ")))
       .when(people.length > 0, (el) => el.child(h_flex().gap(5).items_start().children(people)))
       .when(Boolean(card.report), (el) =>
@@ -679,38 +687,23 @@ export default class Chute extends View {
             .child(chevron(t)),
         ),
       )
-      .when(Boolean(error), (el) => el.child(div().text_size(12).text_color(t.ansi1).whitespace_normal().child(error)));
+      .when(Boolean(error), (el) => el.child(div().text_size(12).text_color(t.ansi1).whitespace_normal().child(error)))
+      .when(card.actions.length > 0 || Boolean(card.diffUrl), (el) => el.child(buttons));
   }
 
   bouncedRow(repo, card, t) {
-    const who = card.agent ? card.agent.label : "No agent";
+    const id = `bounced-${card.key}`;
     const row = card.report
-      ? linkRow(`bounced-${card.key}`, t, () => this.openFile(card.report, repo.hub.machine))
-      : hoverRow(h_flex().id(`bounced-${card.key}`).px(6).py(4).gap(8), t);
-    return row
-      .items_start()
-      .child(
-        v_flex()
-          .flex_1()
-          .min_w(0)
-          .gap(1)
-          .child(
-            h_flex()
-              .gap(6)
-              .items_baseline()
-              .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${card.pr}`))
-              .child(div().flex_1().min_w(0).truncate().child(card.title))
-              .child(div().flex_none().text_size(12).text_color(t.ansi1).child(card.headline)),
-          )
-          .child(
-            h_flex()
-              .gap(6)
-              .items_baseline()
-              .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(`${who} · Retries ${card.retries}`))
-              .when(Boolean(card.ago), (el) => el.child(timeCell(card.ago, t))),
-          ),
-      )
-      .children(rowIcons(`bounced-${card.key}`, card, t, (file) => this.openFile(file, repo.hub.machine)));
+      ? linkRow(id, t, () => this.openFile(card.report, repo.hub.machine))
+      : hoverRow(h_flex().id(id).px(6).py(4), t);
+    const retries = div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`Retries ${card.retries}`);
+    return gridRow(row, t, {
+      pr: card.pr,
+      title: card.title,
+      time: timeCell(card.ago ?? "", t),
+      icons: rowIcons(id, card, t, (file) => this.openFile(file, repo.hub.machine)),
+      chips: [chip(card.headline, t.ansi1, t), h_flex().flex_none().gap(6).items_center().child(workerLine(card.agent, t)).child(retries)],
+    });
   }
 
   recentView(repo, t) {
@@ -721,20 +714,15 @@ export default class Chute extends View {
       .child(sectionTitle("Recent", null, t))
       .children(
         rows.map((m, i) => {
-          const body = [
-            div().flex_none().min_w(32).whitespace_nowrap().text_color(t.accent).font_semibold().child(`#${m.pr}`),
-            div().flex_1().min_w(0).truncate().child(m.title),
-            m.bounces > 0
-              ? div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`)
-              : null,
-            timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
-          ].filter(Boolean);
           const id = `merged-${repo.id}-${i}`;
-          if (!m.url) return hoverRow(h_flex().id(id).px(6).py(4).gap(8).items_baseline().children(body), t);
-          return linkRow(id, t, (cx) => cx.open_url(m.url))
-            .items_baseline()
-            .children(body)
-            .children(rowIcons(id, m, t));
+          const row = m.url ? linkRow(id, t, (cx) => cx.open_url(m.url)) : hoverRow(h_flex().id(id).px(6).py(4), t);
+          return gridRow(row, t, {
+            pr: m.pr,
+            title: m.title,
+            time: timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
+            icons: rowIcons(id, m, t),
+            chips: m.bounces > 0 ? [chip(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`, t.dim, t)] : [],
+          });
         }),
       )
       .when(hidden > 0, (el) =>
@@ -785,7 +773,7 @@ export default class Chute extends View {
                       .gap(8)
                       .items_baseline()
                       .child(div().flex_1().text_size(12).text_color(t.muted).child(d.label))
-                      .when(Boolean(d.note), (row) => row.child(chip(d.note, t.ansi3)))
+                      .when(Boolean(d.note), (row) => row.child(chip(d.note, t.ansi3, t)))
                       .child(div().min_w(64).text_right().text_size(12).font_medium().child(d.value)),
                   )
                   .when(Boolean(d.hint), (row) =>
@@ -906,7 +894,7 @@ const cellsView = (cells, t) =>
 
 // The time at the right end of a row: it never pushes the title out, and it keeps its place when empty.
 const timeCell = (text, t) =>
-  div().flex_none().whitespace_nowrap().min_w(44).text_right().text_size(11).text_color(t.dim).child(text);
+  mono(div().flex_none().whitespace_nowrap().min_w(44).text_right().text_size(11).text_color(t.dim)).child(text);
 
 function sectionTitle(title, count, t) {
   return h_flex()
@@ -917,8 +905,31 @@ function sectionTitle(title, count, t) {
     .when(count != null, (el) => el.child(div().flex_none().min_w(24).text_right().text_size(11).text_color(t.dim).child(String(count))));
 }
 
-// A small text button at the end of a row. Its click must not reach the row's own handler.
-function iconLink(id, label, tip, t, onClick) {
+// A square icon button at the end of a row. Its click must not reach the row's own handler.
+function iconLink(id, glyph, tip, t, onClick) {
+  return div()
+    .id(id)
+    .flex_none()
+    .w(ICON_SIZE)
+    .h(ICON_SIZE)
+    .flex()
+    .items_center()
+    .justify_center()
+    .rounded(4)
+    .text_size(12)
+    .text_color(t.dim)
+    .cursor_pointer()
+    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+    .tooltip(tip)
+    .on_click((_e, cx) => {
+      cx.stop_propagation();
+      onClick(cx);
+    })
+    .child(glyph);
+}
+
+// A small text button inside a card; like an icon button, its click stays its own.
+function textLink(id, label, tip, t, onClick) {
   return div()
     .id(id)
     .flex_none()
@@ -927,22 +938,71 @@ function iconLink(id, label, tip, t, onClick) {
     .text_size(11)
     .text_color(t.dim)
     .cursor_pointer()
-    .hover((s) => s.bg(t.border).text_color(t.foreground))
+    .hover((s) => s.bg(t.hover).text_color(t.foreground))
     .tooltip(tip)
     .on_click((_e, cx) => {
       cx.stop_propagation();
       onClick(cx);
-    });
+    })
+    .child(label);
 }
 
-// `log` when the status names a report or log file, `↗` when the PR has a URL.
+const iconSlot = () => div().flex_none().w(ICON_SIZE).h(ICON_SIZE);
+
+// Two fixed slots, `≡` then `↗`; a slot with nothing to open stays empty so `↗` keeps its column.
 function rowIcons(id, row, t, openReport) {
-  const icons = [];
-  if (row.report) {
-    icons.push(iconLink(`${id}-log`, "log", `Open ${row.report.label.toLowerCase()}`, t, () => openReport(row.report)).child("log"));
-  }
-  if (row.url) icons.push(iconLink(`${id}-pr`, "↗", `Open #${row.pr} on GitHub`, t, (cx) => cx.open_url(row.url)).child("↗"));
-  return icons;
+  const log = row.report
+    ? iconLink(`${id}-log`, "≡", `Open ${row.report.label.toLowerCase()}`, t, () => openReport(row.report))
+    : iconSlot();
+  const pr = row.url ? iconLink(`${id}-pr`, "↗", `Open #${row.pr} on GitHub`, t, (cx) => cx.open_url(row.url)) : iconSlot();
+  return [log, pr];
+}
+
+const prCell = (pr, t) => mono(div().flex_none().whitespace_nowrap().min_w(40).font_semibold().text_color(t.accent)).child(`#${pr}`);
+
+const chipRow = (children) => h_flex().gap(5).flex_wrap().items_center().children(children);
+
+// One grid for every PR row: index · PR · title (chips and submitter below it) · time and two icon slots.
+// `row` is the row's own element (id, hover, click); `spec.index` is empty for rows without a position.
+function gridRow(row, t, spec) {
+  const body = v_flex()
+    .flex_1()
+    .min_w(0)
+    .gap(3)
+    .child(div().whitespace_normal().child(spec.title))
+    .when(Boolean(spec.chips?.length), (el) => el.child(chipRow(spec.chips)))
+    .when(Boolean(spec.submitter), (el) => el.child(submitterLine(spec.submitter, t)));
+  return row
+    .gap(6)
+    .items_start()
+    .child(div().w(18).flex_none().text_right().text_size(12).text_color(t.dim).child(spec.index == null ? "" : String(spec.index)))
+    .child(prCell(spec.pr, t))
+    .child(body)
+    .child(
+      h_flex()
+        .flex_none()
+        .items_start()
+        .gap(2)
+        .child(spec.time ?? timeCell("", t))
+        .children(spec.icons ?? [iconSlot(), iconSlot()]),
+    );
+}
+
+// The worker of a bounced PR: a life dot, its name, and `exited` once it is gone.
+function workerLine(agent, t) {
+  if (!agent) return div().flex_none().text_size(11).text_color(t.dim).child("No agent");
+  return h_flex()
+    .flex_none()
+    .gap(5)
+    .items_center()
+    .child(div().w(7).h(7).rounded(4).flex_none().bg(agent.alive ? t.ansi2 : t.dim))
+    .child(
+      div()
+        .whitespace_nowrap()
+        .text_size(11)
+        .text_color(agent.alive ? t.muted : t.dim)
+        .child(agent.alive ? agent.label : `${agent.label} · exited`),
+    );
 }
 
 const hoverRow = (el, t) => el.rounded(6).hover((s) => s.bg(t.hover));
@@ -961,24 +1021,15 @@ function notice(body, t) {
     .when(Boolean(body.hint), (el) => el.child(div().text_size(12).text_color(t.dim).whitespace_normal().child(body.hint)));
 }
 
-function chip(text, color) {
-  return div()
-    .flex_none()
-    .px(6)
-    .py(1)
-    .rounded(4)
-    .border_1()
-    .border_color(color)
-    .text_size(11)
-    .text_color(color)
-    .child(text);
+function chip(text, color, t) {
+  return div().flex_none().px(6).py(1).rounded(4).bg(faded(t, color, CHIP_ALPHA)).text_size(11).text_color(color).child(text);
 }
 
 function titleLine(card, t, icons = []) {
   return h_flex()
     .gap(6)
     .items_start()
-    .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${card.pr}`))
+    .child(prCell(card.pr, t))
     .child(div().flex_1().min_w(0).whitespace_normal().child(card.title))
     .when(Boolean(card.wait), (el) => el.child(timeCell(card.wait, t)))
     .children(icons);
@@ -1001,7 +1052,7 @@ function agentChip(agent, t, cardKey, text) {
         .text_color(agent.alive ? t.foreground : t.dim)
         .child(text ? (agent.alive ? text : `${text} · exited`) : agent.alive ? agent.label : `${agent.label} · exited`),
     )
-    .when(Boolean(agent.host), (el) => el.child(chip(agent.host, t.muted)));
+    .when(Boolean(agent.host), (el) => el.child(chip(agent.host, t.muted, t)));
   if (!agent.alive) return label;
   return label
     .id(`peek-${cardKey}-${agent.terminal}`)
@@ -1045,19 +1096,13 @@ function batchView(repo, batch, t) {
     )
     .children(
       batch.prs.map((entry, i) =>
-        hoverRow(v_flex().id(`batch-${repo.id}-${i}`).gap(3).px(6).py(2), t)
-          .child(
-            h_flex()
-              .gap(6)
-              .items_start()
-              .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${entry.pr}`))
-              .child(div().flex_1().min_w(0).whitespace_normal().child(entry.title))
-              .children(rowIcons(`batch-${repo.id}-${i}`, entry, t)),
-          )
-          .when(entry.marks.length > 0, (el) =>
-            el.child(h_flex().gap(5).flex_wrap().children(entry.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t))))),
-          )
-          .when(Boolean(entry.submitter), (el) => el.child(submitterLine(entry.submitter, t))),
+        gridRow(hoverRow(h_flex().id(`batch-${repo.id}-${i}`).px(6).py(2), t), t, {
+          pr: entry.pr,
+          title: entry.title,
+          icons: rowIcons(`batch-${repo.id}-${i}`, entry, t),
+          chips: entry.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t), t)),
+          submitter: entry.submitter,
+        }),
       ),
     )
     .child(
@@ -1120,40 +1165,28 @@ function postVerifyView(post, t) {
     );
 }
 
-function numberedTitle(prefix, item, t) {
-  return h_flex()
-    .gap(6)
-    .items_start()
-    .when(prefix != null, (el) => el.child(div().w(18).flex_none().text_right().text_color(t.dim).child(String(prefix))))
-    .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${item.pr}`))
-    .child(div().flex_1().min_w(0).whitespace_normal().child(item.title));
-}
-
 function waitingRow(repo, item, index, t) {
-  const tags = [
-    ...item.marks.map((mark) => ({ text: mark.text, color: toneColor(mark.tone, t) })),
-    ...(item.ciPending ? [{ text: item.label, color: t.ansi3 }] : []),
-    ...(item.note ? [{ text: item.note, color: t.dim }] : []),
+  const id = `queued-${repo.id}-${index}`;
+  const chips = [
+    ...item.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t), t)),
+    ...(item.ciPending ? [chip(item.label, t.ansi3, t)] : []),
+    ...(item.note ? [chip(item.note, t.dim, t)] : []),
   ];
-  return hoverRow(v_flex().id(`queued-${repo.id}-${index}`).gap(2).px(6).py(2), t)
-    .child(
-      h_flex()
-        .gap(6)
-        .items_baseline()
-        .child(div().w(18).flex_none().text_right().text_size(12).text_color(t.dim).child(String(item.position)))
-        .child(div().flex_none().whitespace_nowrap().font_semibold().text_color(t.accent).child(`#${item.pr}`))
-        .child(div().flex_1().min_w(0).truncate().child(item.title))
-        .children(tags.map((tag) => div().flex_none().text_size(11).text_color(tag.color).child(tag.text)))
-        .when(Boolean(item.wait), (el) => el.child(timeCell(item.wait, t)))
-        .children(rowIcons(`queued-${repo.id}-${index}`, item, t)),
-    )
-    .when(Boolean(item.submitter), (el) => el.child(div().pl(24).child(submitterLine(item.submitter, t))));
+  return gridRow(hoverRow(h_flex().id(id).px(6).py(2), t), t, {
+    index: item.position,
+    pr: item.pr,
+    title: item.title,
+    time: timeCell(item.wait ?? "", t),
+    icons: rowIcons(id, item, t),
+    chips,
+    submitter: item.submitter,
+  });
 }
 
 function unknownRow(item, t) {
-  return v_flex()
-    .gap(3)
-    .px(6)
-    .child(numberedTitle(null, item, t))
-    .child(h_flex().gap(5).flex_wrap().child(chip(item.reason ? `${item.state} · ${item.reason}` : item.state, t.ansi3)));
+  return gridRow(h_flex().px(6).py(2), t, {
+    pr: item.pr,
+    title: item.title,
+    chips: [chip(item.reason ? `${item.state} · ${item.reason}` : item.state, t.ansi3, t)],
+  });
 }
