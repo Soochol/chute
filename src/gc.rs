@@ -518,6 +518,24 @@ mod tests {
             }
         }
 
+        /// Registers a detached slot worktree without opening the slot's lock file here: a
+        /// child another test thread forks keeps an open lock file's lock until it execs, and
+        /// the sweep would then skip the slot.
+        fn add_slot_worktree(&self, name: crate::gitops::SlotName) -> PathBuf {
+            let path = Gitops::new(&self.ext, &self.home, &self.info).slot_path(name);
+            let at = path.to_str().unwrap();
+            self.repo.git(&[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                "--no-checkout",
+                at,
+                "HEAD",
+            ]);
+            path
+        }
+
         fn rules(&self) -> Rules {
             Rules {
                 retention: Retention {
@@ -895,12 +913,10 @@ mod tests {
     #[test]
     fn surplus_slots_go_with_their_worktree_registration_and_the_rest_stay() {
         let w = World::new();
-        let gitops = Gitops::new(&w.ext, &w.home, &w.info);
-        for k in 1..=4 {
-            let name = crate::gitops::SlotName::Preflight(k);
-            gitops.lock_slot(name).unwrap().unwrap().open().unwrap();
-        }
-        let slot = |k: u32| gitops.slot_path(crate::gitops::SlotName::Preflight(k));
+        let slots: Vec<PathBuf> = (1..=4)
+            .map(|k| w.add_slot_worktree(crate::gitops::SlotName::Preflight(k)))
+            .collect();
+        let slot = |k: usize| &slots[k - 1];
         fs::write(slot(3).join("big.bin"), vec![0u8; 5000]).unwrap();
 
         let gone = w.sweep(&w.rules());
@@ -921,16 +937,14 @@ mod tests {
     #[test]
     fn a_dry_run_reports_a_surplus_slots_size_and_keeps_it() {
         let w = World::new();
-        let gitops = Gitops::new(&w.ext, &w.home, &w.info);
-        let name = crate::gitops::SlotName::Preflight(3);
-        gitops.lock_slot(name).unwrap().unwrap().open().unwrap();
-        fs::write(gitops.slot_path(name).join("big.bin"), vec![0u8; 5000]).unwrap();
+        let slot = w.add_slot_worktree(crate::gitops::SlotName::Preflight(3));
+        fs::write(slot.join("big.bin"), vec![0u8; 5000]).unwrap();
 
         let swept = sweep(&w.site(), &w.rules(), EpochMs::now(), true);
 
         assert_eq!(swept.items.len(), 1);
         assert!(swept.bytes() >= 5000);
-        assert!(gitops.slot_path(name).exists());
+        assert!(slot.exists());
     }
 
     #[test]
