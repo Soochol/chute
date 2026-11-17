@@ -270,8 +270,8 @@ chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어
 ```
 chute 결과 merged slug=acme/widget at=1763270000123 pr=14 head=1a2b3c4d5e6f batch=b20261116-140000 commit=9f8e7d6a5b4c PR 14: 기본 브랜치에 머지됐다.
 chute 결과 bounced slug=acme/widget at=1763270000123 pr=15 head=1a2b3c4d5e6f reason=verify mode=combo partners=12,13 attempts=1 budget=3 to=lap/t4 delivered=sent report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/1.md PR 15: 반송했다 검증 실패. 1/3번째. 작업자에게 반송 줄을 보냈다.
-chute 결과 bounced slug=acme/widget at=1763270050000 pr=15 head=1a2b3c4d5e6f reason=verify mode=solo attempts=2 budget=3 to=lap/t4 delivered=unreachable report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/2.md PR 15: 작업자에게 닿지 않아 반송을 이 터미널로 보낸다. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다.
-chute 결과 removed slug=acme/widget at=1763270060000 pr=15 head=1a2b3c4d5e6f reason=budget attempts=3 budget=3 report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/3.md PR 15: 반송 한도 3번을 넘어 큐에서 뺐다. 다시 넣으려면 다시 submit한다.
+chute 결과 bounced slug=acme/widget at=1763270050000 pr=15 head=1a2b3c4d5e6f reason=verify mode=solo attempts=2 budget=3 to=lap/t4 delivered=unreachable report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/2.md PR 15: 반송했다 검증 실패. 2/3번째. 작업자에게 닿지 않아 반송을 이 터미널로 보낸다. 닿지 않은 까닭: 작업자 터미널이 없다. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다.
+chute 결과 removed slug=acme/widget at=1763270060000 pr=15 head=1a2b3c4d5e6f reason=budget attempts=3 budget=3 report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/3.md PR 15: 반송 한도 3번을 넘어 큐에서 뺐다. 다시 넣으려면 다시 submit한다. 같은 방식으로 바로 다시 submit하지 말고 원인을 먼저 본다.
 chute 결과 halted slug=acme/widget at=1763270100456 base=9f8e7d6a5b4c step=test pushed_by_chute=yes rechecked=yes log=/home/me/.local/state/chute/repos/acme__widget/batches/b20261116-141000/verify-3/test.1.log suspect=15 큐가 멈췄다. 복구 PR을 chute submit --repair로 넣는다.
 ```
 

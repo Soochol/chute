@@ -5,7 +5,7 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use chute::model::{BounceReason, HumanReason, ItemState};
+use chute::model::{BounceReason, ItemState};
 use queue_kit::{World, item, stderr};
 use serde_json::Value;
 use support::Reply;
@@ -29,7 +29,7 @@ fn notified(w: &World) -> Vec<Value> {
 }
 
 #[test]
-fn giveup_sends_the_pr_to_a_human_and_records_the_reason() {
+fn giveup_takes_the_pr_out_of_the_queue_and_records_the_reason() {
     let w = World::new();
     w.seed(vec![item(12, ItemState::Bounced(BounceReason::Conflict))]);
 
@@ -38,16 +38,16 @@ fn giveup_sends_the_pr_to_a_human_and_records_the_reason() {
         &["giveup", "12", "--reason", "충돌을 풀 수 없다"],
     );
 
-    assert!(stdout.contains("사람 차례로 넘겼다: #12"), "{stdout}");
+    assert!(stdout.contains("큐에서 뺐다: #12"), "{stdout}");
     assert!(stdout.contains("충돌을 풀 수 없다"), "{stdout}");
-    let entry = w.entry(12).unwrap();
-    assert_eq!(entry["state"], "needs_human");
-    assert_eq!(entry["state_reason"], "gave_up");
+    assert!(w.entry(12).is_none());
     let events = history(&w);
     assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0]["event"], "gave_up");
+    assert_eq!(events[0]["event"], "removed");
     assert_eq!(events[0]["pr"], 12);
-    assert_eq!(events[0]["reason"], "충돌을 풀 수 없다");
+    assert_eq!(events[0]["reason"], "gave_up");
+    assert_eq!(events[0]["detail"], "충돌을 풀 수 없다");
+    assert!(events[0]["report"].is_null(), "{events:?}");
     assert!(events[0]["at_ms"].as_u64().unwrap() > 0, "{events:?}");
 }
 
@@ -78,7 +78,7 @@ fn giveup_works_from_outside_the_repository_with_the_repo_flag() {
         &["giveup", "12", "--reason", "필요 없어졌다", "--repo", &repo],
     );
 
-    assert_eq!(w.entry(12).unwrap()["state_reason"], "gave_up");
+    assert!(w.entry(12).is_none());
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn giveup_without_a_number_gives_up_the_pr_of_the_current_branch() {
 
     w.ok(w.repo.path(), &["giveup", "--reason", "막혔다"]);
 
-    assert_eq!(w.entry(12).unwrap()["state_reason"], "gave_up");
+    assert!(w.entry(12).is_none());
     assert_eq!(
         w.sb.fake("gh").calls(),
         [vec!["pr", "view", "--json", "number"]]
@@ -98,12 +98,9 @@ fn giveup_without_a_number_gives_up_the_pr_of_the_current_branch() {
 }
 
 #[test]
-fn giveup_refuses_a_pr_in_a_batch_or_already_with_a_human() {
+fn giveup_refuses_a_pr_in_a_batch_and_a_pr_that_is_not_in_the_queue() {
     let w = World::new();
-    w.seed(vec![
-        item(12, ItemState::InBatch),
-        item(13, ItemState::NeedsHuman(HumanReason::Budget)),
-    ]);
+    w.seed(vec![item(12, ItemState::InBatch)]);
 
     let out = w.chute(w.repo.path(), &["giveup", "12", "--reason", "x"]);
     assert_eq!(out.status.code(), Some(1));
@@ -111,10 +108,9 @@ fn giveup_refuses_a_pr_in_a_batch_or_already_with_a_human() {
 
     let out = w.chute(w.repo.path(), &["giveup", "13", "--reason", "x"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stderr(&out).contains("이미 사람 차례"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("큐에 없다"), "{}", stderr(&out));
 
     assert_eq!(w.entry(12).unwrap()["state"], "in_batch");
-    assert_eq!(w.entry(13).unwrap()["state_reason"], "budget");
     assert!(history(&w).is_empty());
 }
 
@@ -134,12 +130,7 @@ fn giveup_dropping_many_prs_at_once_loses_none_and_records_each_reason() {
         assert!(out.status.success(), "{}", stderr(&out));
     }
 
-    assert!(
-        w.state()
-            .queue
-            .iter()
-            .all(|i| i.state == ItemState::NeedsHuman(HumanReason::GaveUp))
-    );
+    assert!(w.state().queue.is_empty());
     assert_eq!(history(&w).len(), 10);
 }
 
@@ -175,7 +166,7 @@ fn a_reason_that_starts_with_a_hyphen_needs_the_equals_form_and_never_swallows_a
 
     let reasons: Vec<String> = history(&w)
         .iter()
-        .map(|e| e["reason"].as_str().unwrap().to_owned())
+        .map(|e| e["detail"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(reasons, ["-1 retries left", "--force"]);
 }
@@ -205,7 +196,7 @@ fn without_a_number_and_with_the_repo_flag_gh_runs_in_that_repository() {
     );
 
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(w.entry(12).unwrap()["state_reason"], "gave_up");
+    assert!(w.entry(12).is_none());
 }
 
 #[test]
@@ -242,14 +233,11 @@ fn a_history_line_that_cannot_be_written_only_warns_after_the_state_moved() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(
-        w.state().queue[0].state,
-        ItemState::NeedsHuman(HumanReason::GaveUp)
-    );
+    assert!(w.state().queue.is_empty());
 }
 
 #[test]
-fn giveup_without_a_number_on_another_pc_finds_the_pr_here_and_sends_the_hub_item_to_a_human() {
+fn giveup_without_a_number_on_another_pc_finds_the_pr_here_and_takes_the_hub_item_out() {
     let net = forward_kit::net();
     let (a, b) = (net.node("a"), net.node("b"));
     forward_kit::seed(b, vec![item(12, ItemState::Queued(None))]);
@@ -265,12 +253,9 @@ fn giveup_without_a_number_on_another_pc_finds_the_pr_here_and_sends_the_hub_ite
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(
         forward_kit::out(&out),
-        "사람 차례로 넘겼다: #12 (포기: 충돌을 풀 수 없다)\n"
+        "큐에서 뺐다: #12 (포기: 충돌을 풀 수 없다). submit한 터미널에는 알리지 못했다. `chute events`에 남겼다\n"
     );
-    assert_eq!(
-        forward_kit::state(b).queue[0].state,
-        ItemState::NeedsHuman(HumanReason::GaveUp)
-    );
+    assert!(forward_kit::state(b).queue.is_empty());
     let history = fs::read_to_string(forward_kit::store(b).dir().join("history.jsonl")).unwrap();
     assert!(history.contains("충돌을 풀 수 없다"), "{history}");
     assert_eq!(forward_kit::state_file(a), a_before);
@@ -286,10 +271,7 @@ fn giveup_with_a_number_on_another_pc_does_not_ask_github() {
 
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(a.sb.fake("gh").calls().is_empty());
-    assert_eq!(
-        forward_kit::state(b).queue[0].state,
-        ItemState::NeedsHuman(HumanReason::GaveUp)
-    );
+    assert!(forward_kit::state(b).queue.is_empty());
 }
 
 #[test]
@@ -345,7 +327,7 @@ fn giveup_on_another_pc_forwards_a_reason_that_starts_with_a_hyphen_as_a_value()
 }
 
 #[test]
-fn giveup_notify_tells_the_submitter_a_human_line_with_the_reason() {
+fn giveup_notify_tells_the_submitter_a_removed_line_with_the_reason() {
     let w = World::new();
     let mut queued = item(12, ItemState::Bounced(BounceReason::Conflict));
     queued.submitter = Some(chute::model::Agent {
@@ -365,10 +347,11 @@ fn giveup_notify_tells_the_submitter_a_human_line_with_the_reason() {
     );
     w.sb.fake("hc").respond("send t1orch *", Reply::ok(""));
 
-    w.ok(
+    let told = w.ok(
         w.repo.path(),
         &["giveup", "12", "--reason", "충돌을 풀 수 없다"],
     );
+    assert!(told.contains("submit한 터미널에 알렸다"), "{told}");
     w.ok(w.repo.path(), &["giveup", "13", "--reason", "필요 없다"]);
 
     let sends: Vec<Vec<String>> =
@@ -380,11 +363,11 @@ fn giveup_notify_tells_the_submitter_a_human_line_with_the_reason() {
     assert_eq!(sends.len(), 1, "{sends:?}");
     assert_eq!(sends[0][1], "t1orch");
     assert!(
-        sends[0][2].starts_with("chute 결과 human slug=acme/widget at="),
+        sends[0][2].starts_with("chute 결과 removed slug=acme/widget at="),
         "{}",
         sends[0][2]
     );
-    for part in [" pr=12 ", " reason=gave_up ", "충돌을 풀 수 없다"] {
+    for part in [" pr=12 ", " head=", " reason=gave_up ", "충돌을 풀 수 없다"] {
         assert!(sends[0][2].contains(part), "{part}: {}", sends[0][2]);
     }
     let recorded: Vec<(String, String)> = notified(&w)
@@ -396,7 +379,7 @@ fn giveup_notify_tells_the_submitter_a_human_line_with_the_reason() {
             )
         })
         .collect();
-    let expected = [("human", "sent"), ("human", "no_terminal")]
+    let expected = [("removed", "sent"), ("removed", "no_terminal")]
         .map(|(kind, delivered)| (kind.to_owned(), delivered.to_owned()));
     assert_eq!(recorded, expected);
 }

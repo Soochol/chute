@@ -9,24 +9,39 @@ use crate::feedback::{
 };
 use crate::machine::Machines;
 use crate::model::{
-    Agent, BatchId, BounceReason, Delivered, EpochMs, Event, EventKind, Failure, HumanReason,
-    MachineId, Mode, NotifyKind, PrNumber, RepoInfo, ResumedBy, Sha, Slug, TerminalId, VerifyMode,
+    Agent, BatchId, BounceReason, Delivered, EpochMs, Event, EventKind, Failure, MachineId, Mode,
+    NotifyKind, PrNumber, RepoInfo, ResumedBy, Sha, Slug, TerminalId, VerifyMode,
 };
 use crate::store::RepoStore;
 
 const SHA_LEN: usize = 12;
 const DETAIL_CHARS: usize = 200;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BounceDelivery {
     Sent,
     Spawned,
+    /// There was no worker to take the bounce, so the line goes to the submitter.
+    Unreachable(String),
+}
+
+/// Why a PR left the queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Removal {
+    Budget {
+        attempts: u32,
+        budget: u32,
+        report: Option<PathBuf>,
+    },
+    GaveUp {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitingWhy {
     Bounced,
-    Human,
+    Removed,
     Dropped,
     Closed,
 }
@@ -52,10 +67,10 @@ pub enum Line {
         delivered: BounceDelivery,
         report: Option<PathBuf>,
     },
-    Human {
+    Removed {
         pr: PrNumber,
-        reason: HumanReason,
-        detail: Option<String>,
+        head: Sha,
+        removal: Removal,
     },
     Halted {
         base: Sha,
@@ -122,7 +137,7 @@ impl Line {
         match self {
             Line::Merged { .. } => NotifyKind::Merged,
             Line::Bounced { .. } => NotifyKind::Bounced,
-            Line::Human { .. } => NotifyKind::Human,
+            Line::Removed { .. } => NotifyKind::Removed,
             Line::Halted { .. } => NotifyKind::Halted,
             Line::Resumed { .. } => NotifyKind::Resumed,
             Line::Reverted { .. } => NotifyKind::Reverted,
@@ -137,7 +152,7 @@ impl Line {
         match self {
             Line::Merged { pr, .. }
             | Line::Bounced { pr, .. }
-            | Line::Human { pr, .. }
+            | Line::Removed { pr, .. }
             | Line::Waiting { pr, .. } => Some(*pr),
             Line::Resumed { pr, .. } | Line::PostFailed { pr, .. } | Line::PostFixed { pr, .. } => {
                 *pr
@@ -220,31 +235,57 @@ impl Line {
                     match delivered {
                         BounceDelivery::Sent => "sent",
                         BounceDelivery::Spawned => "spawned",
+                        BounceDelivery::Unreachable(_) => "unreachable",
                     },
                 );
                 if let Some(report) = report {
                     keys.path("report", report);
                 }
-                format!(
-                    "PR {}: 반송했다({}). {attempts}/{budget}번째. 작업자에게 반송 줄을 보냈다.",
-                    pr.0,
-                    bounce_label(*reason)
-                )
-            }
-            Line::Human { pr, reason, detail } => {
-                keys.put("pr", pr.0);
-                keys.put("reason", human_word(*reason));
-                let why = match reason {
-                    HumanReason::Budget => "재시도 예산을 모두 써서",
-                    HumanReason::Unreachable => "작업자에게 반송을 전달하지 못해서",
-                    HumanReason::GaveUp => "포기해서",
-                };
-                let mut text = format!("PR {}: {why} 사람 차례가 됐다.", pr.0);
-                if let Some(detail) = detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-                    let detail: String = detail.chars().take(DETAIL_CHARS).collect();
-                    text.push_str(&format!(" 이유: {detail}"));
+                let label = bounce_label(*reason);
+                match delivered {
+                    BounceDelivery::Unreachable(why) => format!(
+                        "PR {}: 반송했다({label}). {attempts}/{budget}번째. 작업자에게 닿지 않아 반송을 이 터미널로 보낸다. 닿지 않은 까닭: {}. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다.",
+                        pr.0,
+                        shortened(why)
+                    ),
+                    BounceDelivery::Sent | BounceDelivery::Spawned => format!(
+                        "PR {}: 반송했다({label}). {attempts}/{budget}번째. 작업자에게 반송 줄을 보냈다.",
+                        pr.0
+                    ),
                 }
-                text
+            }
+            Line::Removed { pr, head, removal } => {
+                keys.put("pr", pr.0);
+                keys.sha("head", head);
+                match removal {
+                    Removal::Budget {
+                        attempts,
+                        budget,
+                        report,
+                    } => {
+                        keys.put("reason", "budget");
+                        keys.put("attempts", attempts);
+                        keys.put("budget", budget);
+                        if let Some(report) = report {
+                            keys.path("report", report);
+                        }
+                        format!(
+                            "PR {}: 반송 한도 {budget}번을 넘어 큐에서 뺐다. 다시 넣으려면 다시 submit한다. 같은 방식으로 바로 다시 submit하지 말고 원인을 먼저 본다.",
+                            pr.0
+                        )
+                    }
+                    Removal::GaveUp { reason } => {
+                        keys.put("reason", "gave_up");
+                        let mut text = format!(
+                            "PR {}: 작업자가 포기해 큐에서 뺐다. 다시 넣으려면 다시 submit한다.",
+                            pr.0
+                        );
+                        if !reason.trim().is_empty() {
+                            text.push_str(&format!(" 이유: {}", shortened(reason)));
+                        }
+                        text
+                    }
+                }
             }
             Line::Halted {
                 base,
@@ -306,7 +347,7 @@ impl Line {
                     "why",
                     match why {
                         WaitingWhy::Bounced => "bounced",
-                        WaitingWhy::Human => "human",
+                        WaitingWhy::Removed => "removed",
                         WaitingWhy::Dropped => "dropped",
                         WaitingWhy::Closed => "closed",
                     },
@@ -401,6 +442,7 @@ fn kind_word(kind: NotifyKind) -> &'static str {
         NotifyKind::Merged => "merged",
         NotifyKind::Bounced => "bounced",
         NotifyKind::Human => "human",
+        NotifyKind::Removed => "removed",
         NotifyKind::Halted => "halted",
         NotifyKind::Resumed => "resumed",
         NotifyKind::Reverted => "reverted",
@@ -431,12 +473,8 @@ fn bounce_label(reason: BounceReason) -> &'static str {
     }
 }
 
-fn human_word(reason: HumanReason) -> &'static str {
-    match reason {
-        HumanReason::Budget => "budget",
-        HumanReason::Unreachable => "unreachable",
-        HumanReason::GaveUp => "gave_up",
-    }
+fn shortened(text: &str) -> String {
+    text.trim().chars().take(DETAIL_CHARS).collect()
 }
 
 fn mode_word(mode: Mode) -> &'static str {
@@ -750,10 +788,14 @@ mod tests {
                 delivered: BounceDelivery::Spawned,
                 report: Some("/state/reports/pr-15/report.md".into()),
             },
-            Line::Human {
+            Line::Removed {
                 pr: pr(16),
-                reason: HumanReason::GaveUp,
-                detail: Some("이유: `rm -rf`; $(x) \"끝\"".into()),
+                head: sha("1a2b3c4d5e6f7a8b"),
+                removal: Removal::Budget {
+                    attempts: 3,
+                    budget: 3,
+                    report: Some("/state/reports/pr-16/report.md".into()),
+                },
             },
             Line::Halted {
                 base: sha("9f8e7d6a5b4c3d2e"),
@@ -840,7 +882,12 @@ mod tests {
                     "report",
                 ],
             ),
-            ("human", &["slug", "at", "pr", "reason"]),
+            (
+                "removed",
+                &[
+                    "slug", "at", "pr", "head", "reason", "attempts", "budget", "report",
+                ],
+            ),
             (
                 "halted",
                 &[
@@ -918,9 +965,87 @@ mod tests {
             assert!(!sentence.is_empty(), "{text}");
             assert!(!sentence[0].contains('='), "{text}");
         }
-        let human = lines[2].render(&slug(), EpochMs(5), false);
-        assert!(human.contains("reason=gave_up"), "{human}");
-        assert!(human.contains("끝"), "{human}");
+        let removed = lines[2].render(&slug(), EpochMs(5), false);
+        assert!(removed.contains(" reason=budget "), "{removed}");
+        assert!(
+            removed.contains(" report=/state/reports/pr-16/report.md "),
+            "{removed}"
+        );
+    }
+
+    #[test]
+    fn a_removal_for_giving_up_carries_the_reason_in_the_sentence_and_no_report_keys() {
+        let gave_up = Line::Removed {
+            pr: pr(16),
+            head: sha("1a2b3c4d5e6f7a8b"),
+            removal: Removal::GaveUp {
+                reason: "이유: `rm -rf`; $(x) \"끝\"".into(),
+            },
+        };
+        let text = gave_up.render(&slug(), EpochMs(5), false);
+        assert_eq!(
+            key_names(&text),
+            ["slug", "at", "pr", "head", "reason"],
+            "{text}"
+        );
+        assert!(text.contains(" reason=gave_up "), "{text}");
+        assert!(text.contains("큐에서 뺐다"), "{text}");
+        assert!(text.contains("끝"), "{text}");
+        assert!(!text.contains('`') && !text.contains("$("), "{text}");
+        assert_eq!(gave_up.kind(), NotifyKind::Removed);
+        assert_eq!(gave_up.pr(), Some(pr(16)));
+    }
+
+    #[test]
+    fn a_budget_removal_without_a_report_drops_only_the_report_key() {
+        let line = Line::Removed {
+            pr: pr(16),
+            head: sha("1a2b3c4d5e6f7a8b"),
+            removal: Removal::Budget {
+                attempts: 3,
+                budget: 3,
+                report: None,
+            },
+        };
+        let text = line.render(&slug(), EpochMs(5), false);
+        assert_eq!(
+            key_names(&text),
+            ["slug", "at", "pr", "head", "reason", "attempts", "budget"],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_bounce_says_so_in_delivered_and_keeps_the_report() {
+        let bounced = |report: Option<&str>| Line::Bounced {
+            pr: pr(15),
+            head: sha("1a2b3c4d5e6f7a8b"),
+            reason: BounceReason::Conflict,
+            mode: None,
+            partners: Vec::new(),
+            attempts: 2,
+            budget: 3,
+            to: Some(TerminalId("t1orch".into())),
+            delivered: BounceDelivery::Unreachable("작업자 터미널이 없다".into()),
+            report: report.map(Into::into),
+        };
+        let text =
+            bounced(Some("/state/reports/pr-15/report.md")).render(&slug(), EpochMs(5), false);
+        assert!(text.contains(" delivered=unreachable "), "{text}");
+        assert!(text.contains(" to=t1orch "), "{text}");
+        assert!(
+            text.contains(" report=/state/reports/pr-15/report.md "),
+            "{text}"
+        );
+        assert!(
+            text.contains("닿지 않은 까닭: 작업자 터미널이 없다"),
+            "{text}"
+        );
+        let without = bounced(None).render(&slug(), EpochMs(5), false);
+        assert!(
+            !key_names(&without).contains(&"report".to_owned()),
+            "{without}"
+        );
     }
 
     #[test]

@@ -419,3 +419,34 @@ fn a_hub_followed_after_it_moved_is_named_as_it_is_now_even_when_it_fails() {
     assert_eq!(v["hub"]["machine_id"], lap.id.as_str());
     assert_eq!(v["hub"]["machine"], "lappy");
 }
+
+#[test]
+fn history_lines_of_an_older_chute_and_removed_events_do_not_break_status_and_reset_the_bounce_count()
+ {
+    let net = net();
+    let hub = net.node("hub");
+    let dir = hub.sb.chute_home().join("repos").join("acme__widget");
+    let state = serde_json::json!({
+        "queue": [], "batch": null, "blocked": null,
+        "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let lines = [
+        r#"{"at_ms":1,"event":"needs_human","pr":5,"reason":"budget","detail":null}"#,
+        r#"{"at_ms":2,"event":"gave_up","pr":6,"reason":"그만둔다"}"#,
+        r#"{"at_ms":3,"event":"notified","kind":"human","pr":5,"to":"t1orch","delivered":"sent"}"#,
+        r#"{"at_ms":4,"event":"bounced","pr":7,"batch":null,"reason":"verify","attempts":1}"#,
+        r#"{"at_ms":5,"event":"bounced","pr":7,"batch":null,"reason":"verify","attempts":2,"unreachable":"작업자 터미널이 없다"}"#,
+        r#"{"at_ms":6,"event":"removed","pr":7,"reason":"budget","detail":"반송 한도 2번을 넘었다","report":"/r/7.md"}"#,
+        r#"{"at_ms":7,"event":"bounced","pr":7,"batch":null,"reason":"verify","attempts":1}"#,
+        r#"{"at_ms":8,"event":"merged","pr":7,"batch":"b0","commit":"abc1234","submitted_ms":6}"#,
+    ];
+    fs::write(dir.join("history.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let view = status(hub, &[]);
+
+    let shown = view["recent_merged"].as_array().unwrap();
+    assert_eq!(shown.len(), 1, "{view}");
+    assert_eq!(shown[0]["pr"], 7);
+    assert_eq!(shown[0]["bounces"], 1);
+}

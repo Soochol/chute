@@ -10,8 +10,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::model::{
-    BatchId, BatchRecord, DaemonInfo, Event, HubConfig, MachineId, PrNumber, RepoInfo,
-    RevertRecord, Slug, State,
+    BatchId, BatchRecord, DaemonInfo, EpochMs, Event, EventKind, HubConfig, MachineId, PrNumber,
+    RemovedReason, RepoInfo, RevertRecord, Slug, State,
 };
 
 #[derive(Clone, Debug)]
@@ -148,16 +148,73 @@ impl RepoStore {
 
     /// A snapshot of `state.json` without the lock. Writers rename into place, so a reader
     /// sees either the old or the new file. A missing file is the empty state; a corrupt one is an error.
+    /// Items an older chute left on a human's turn are not in the snapshot.
     pub fn load(&self) -> Result<State> {
-        Ok(read_json(&self.dir.join(STATE_FILE))?.unwrap_or_default())
+        Ok(self.read_state()?.0)
     }
 
     pub fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let _lock = self.lock(LOCK_FILE)?;
-        let mut state = self.load()?;
+        let (mut state, old_human_items) = self.read_state()?;
         let value = change(&mut state)?;
+        self.record_old_human_items_removed(&old_human_items)?;
         write_json_atomic(&self.dir.join(STATE_FILE), &state)?;
         Ok(value)
+    }
+
+    fn read_state(&self) -> Result<(State, Vec<OldHumanItem>)> {
+        let path = self.dir.join(STATE_FILE);
+        let corrupt = || {
+            format!(
+                "파일이 깨졌다: {}. 고치거나 지운 뒤 다시 실행한다",
+                path.display()
+            )
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(e).with_context(|| format!("읽지 못했다: {}", path.display())),
+        };
+        let mut value: serde_json::Value = serde_json::from_str(&text).with_context(corrupt)?;
+        let old = take_old_human_items(&mut value);
+        let state = serde_json::from_value(value).with_context(corrupt)?;
+        Ok((state, old))
+    }
+
+    /// The write that drops the items is the caller's. A crash between the two leaves them in
+    /// `state.json` for the next write, which skips the ones already recorded.
+    fn record_old_human_items_removed(&self, items: &[OldHumanItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let recorded: Vec<PrNumber> = self
+            .history()?
+            .events
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::Removed {
+                    pr,
+                    reason: RemovedReason::Upgrade,
+                    ..
+                } => Some(pr),
+                _ => None,
+            })
+            .collect();
+        for item in items.iter().filter(|i| !recorded.contains(&i.pr)) {
+            self.append_history(&Event {
+                at_ms: EpochMs::now(),
+                kind: EventKind::Removed {
+                    pr: item.pr,
+                    reason: RemovedReason::Upgrade,
+                    detail: Some(match &item.reason {
+                        Some(reason) => format!("옛 chute가 사람 차례({reason})로 둔 항목"),
+                        None => "옛 chute가 사람 차례로 둔 항목".to_owned(),
+                    }),
+                    report: None,
+                },
+            })?;
+        }
+        Ok(())
     }
 
     /// Appends one line. If an earlier write was cut short, the new line still starts on its own line.
@@ -347,6 +404,30 @@ impl RepoStore {
             .with_context(|| format!("잠그지 못했다: {}", path.display()))?;
         Ok(FileLock { _file: file })
     }
+}
+
+/// An item an older chute left on a human's turn, which `ItemState` no longer has.
+struct OldHumanItem {
+    pr: PrNumber,
+    reason: Option<String>,
+}
+
+fn take_old_human_items(state: &mut serde_json::Value) -> Vec<OldHumanItem> {
+    let Some(queue) = state.get_mut("queue").and_then(|q| q.as_array_mut()) else {
+        return Vec::new();
+    };
+    let is_old = |item: &serde_json::Value| item["state"] == "needs_human";
+    let mut old = Vec::new();
+    for item in queue.iter().filter(|i| is_old(i)) {
+        if let Some(pr) = item["pr"].as_u64() {
+            old.push(OldHumanItem {
+                pr: PrNumber(pr),
+                reason: item["state_reason"].as_str().map(str::to_owned),
+            });
+        }
+    }
+    queue.retain(|i| !is_old(i));
+    old
 }
 
 fn lock_error(e: io::Error, path: &Path) -> anyhow::Error {
@@ -588,6 +669,7 @@ mod tests {
                 batch: None,
                 reason: crate::model::BounceReason::Verify,
                 attempts: 1,
+                unreachable: None,
             },
         };
         store.append_history(&event(1)).unwrap();
@@ -608,6 +690,7 @@ mod tests {
                 batch: None,
                 reason: crate::model::BounceReason::Verify,
                 attempts: 1,
+                unreachable: None,
             },
         };
         store.append_history(&event(1)).unwrap();

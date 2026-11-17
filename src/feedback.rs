@@ -697,11 +697,11 @@ fn next_steps(
     let (fix, give_up) = match subject {
         Subject::Pr { .. } if require_head => (
             "고쳐서 커밋하고 push한 뒤 PR 번호와 새 HEAD를 보고한다. 이 저장소는 `require_head = true`라 submit하지 않는다.",
-            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. 사람 차례로 넘어간다.",
+            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. PR이 큐에서 빠지고 submit한 터미널에 알린다.",
         ),
         Subject::Pr { .. } => (
             "고쳐서 커밋하고 push한 뒤 `chute submit`을 실행한다.",
-            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. 사람 차례로 넘어간다.",
+            "못 풀겠으면 `chute giveup --reason \"<이유>\"`를 실행한다. `--reason` 값에 막힌 까닭을 따옴표로 묶어 적는다. PR이 큐에서 빠지고 submit한 터미널에 알린다.",
         ),
         Subject::Commit { .. } if require_head => (
             "고쳐서 커밋한 뒤 `chute preflight`를 다시 실행한다. 통과하면 push하고 PR 번호와 새 HEAD를 보고한다. 이 저장소는 `require_head = true`라 submit하지 않는다.",

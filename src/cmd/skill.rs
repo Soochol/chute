@@ -103,9 +103,7 @@ mod tests {
 
     #[test]
     fn manual_tells_agents_what_humans_run() {
-        for name in [
-            "approve", "retry", "drop", "revert", "up", "down", "install",
-        ] {
+        for name in ["approve", "drop", "revert", "up", "down", "install"] {
             assert!(MANUAL.contains(&format!("`chute {name}")), "{name}");
         }
     }
@@ -118,12 +116,12 @@ mod tests {
 
     #[test]
     fn manual_says_nothing_is_respawned_by_default() {
-        assert!(MANUAL.contains("기본 설정에서는 chute가 새 에이전트를 띄우지 않고"));
+        assert!(MANUAL.contains("기본 설정에서는 chute가 새 에이전트를 띄우지 않는다"));
         assert!(!MANUAL.contains("기본 설정에서는 이 에이전트가"));
     }
 
     const NOTICE_KINDS: [&str; 8] = [
-        "merged", "bounced", "human", "halted", "resumed", "reverted", "waiting", "flaky",
+        "merged", "bounced", "removed", "halted", "resumed", "reverted", "waiting", "flaky",
     ];
 
     #[test]

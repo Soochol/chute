@@ -247,7 +247,6 @@ pub enum ItemState {
     Queued(Option<QueuedReason>),
     InBatch,
     Bounced(BounceReason),
-    NeedsHuman(HumanReason),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +265,8 @@ pub enum BounceReason {
     Ci,
 }
 
+/// Why an old chute put a PR on a human's turn. Only `history.jsonl` lines and old
+/// `state.json` items still carry it; nothing writes it any more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanReason {
@@ -276,12 +277,20 @@ pub enum HumanReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RemovedReason {
+    Budget,
+    GaveUp,
+    /// An item an older chute had put on a human's turn, taken out when the state was first rewritten.
+    Upgrade,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum StateName {
     AwaitingApproval,
     Queued,
     InBatch,
     Bounced,
-    NeedsHuman,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,7 +298,6 @@ enum StateName {
 enum AnyReason {
     Queued(QueuedReason),
     Bounce(BounceReason),
-    Human(HumanReason),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -309,7 +317,6 @@ impl TryFrom<RawItemState> for ItemState {
             (StateName::Queued, Some(R::Queued(r))) => Ok(ItemState::Queued(Some(r))),
             (StateName::InBatch, None) => Ok(ItemState::InBatch),
             (StateName::Bounced, Some(R::Bounce(r))) => Ok(ItemState::Bounced(r)),
-            (StateName::NeedsHuman, Some(R::Human(r))) => Ok(ItemState::NeedsHuman(r)),
             (state, reason) => Err(format!("상태 {state:?}에 사유 {reason:?}가 올 수 없다")),
         }
     }
@@ -322,7 +329,6 @@ impl From<ItemState> for RawItemState {
             ItemState::Queued(r) => (StateName::Queued, r.map(AnyReason::Queued)),
             ItemState::InBatch => (StateName::InBatch, None),
             ItemState::Bounced(r) => (StateName::Bounced, Some(AnyReason::Bounce(r))),
-            ItemState::NeedsHuman(r) => (StateName::NeedsHuman, Some(AnyReason::Human(r))),
         };
         RawItemState {
             state,
@@ -876,6 +882,9 @@ pub enum EventKind {
         batch: Option<BatchId>,
         reason: BounceReason,
         attempts: u32,
+        /// Why the worker could not be reached, so the bounce went to the submitter instead.
+        #[serde(default)]
+        unreachable: Option<String>,
     },
     Flaky {
         batch: BatchId,
@@ -906,6 +915,12 @@ pub enum EventKind {
         pr: PrNumber,
         reason: HumanReason,
         detail: Option<String>,
+    },
+    Removed {
+        pr: PrNumber,
+        reason: RemovedReason,
+        detail: Option<String>,
+        report: Option<PathBuf>,
     },
     Blocked {
         reason: BlockReason,
@@ -971,6 +986,7 @@ pub enum NotifyKind {
     Merged,
     Bounced,
     Human,
+    Removed,
     Halted,
     Resumed,
     Reverted,
@@ -1329,9 +1345,6 @@ mod tests {
             ItemState::Bounced(BounceReason::Timeout),
             ItemState::Bounced(BounceReason::HeadChanged),
             ItemState::Bounced(BounceReason::Ci),
-            ItemState::NeedsHuman(HumanReason::Budget),
-            ItemState::NeedsHuman(HumanReason::Unreachable),
-            ItemState::NeedsHuman(HumanReason::GaveUp),
         ];
         for state in expected {
             assert!(states.contains(&state), "fixture에 {state:?}가 없다");
@@ -1626,12 +1639,49 @@ mod tests {
     }
 
     #[test]
+    fn a_bounced_event_without_the_unreachable_field_reads_and_the_removed_event_round_trips() {
+        let old: Event = serde_json::from_str(
+            r#"{"at_ms":1,"event":"bounced","pr":2,"batch":null,"reason":"ci","attempts":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.kind,
+            EventKind::Bounced {
+                pr: PrNumber(2),
+                batch: None,
+                reason: BounceReason::Ci,
+                attempts: 1,
+                unreachable: None,
+            }
+        );
+        let removed = Event {
+            at_ms: EpochMs(3),
+            kind: EventKind::Removed {
+                pr: PrNumber(4),
+                reason: RemovedReason::Upgrade,
+                detail: Some("옛 항목".into()),
+                report: Some("/r.md".into()),
+            },
+        };
+        let text = serde_json::to_string(&removed).unwrap();
+        assert!(text.contains(r#""event":"removed""#) && text.contains(r#""reason":"upgrade""#));
+        assert_eq!(serde_json::from_str::<Event>(&text).unwrap(), removed);
+        for line in [
+            r#"{"at_ms":1,"event":"needs_human","pr":5,"reason":"gave_up","detail":null}"#,
+            r#"{"at_ms":1,"event":"gave_up","pr":5,"reason":"x"}"#,
+            r#"{"at_ms":1,"event":"notified","kind":"human","pr":5,"to":null,"delivered":"no_terminal"}"#,
+        ] {
+            serde_json::from_str::<Event>(line).unwrap();
+        }
+    }
+
+    #[test]
     fn item_state_rejects_impossible_reason() {
         let parse = |v: Value| serde_json::from_value::<ItemState>(v);
         assert!(parse(json!({"state": "bounced", "state_reason": null})).is_err());
         assert!(parse(json!({"state": "bounced", "state_reason": "budget"})).is_err());
         assert!(parse(json!({"state": "in_batch", "state_reason": "verify"})).is_err());
-        assert!(parse(json!({"state": "needs_human", "state_reason": "conflict"})).is_err());
+        assert!(parse(json!({"state": "needs_human", "state_reason": "budget"})).is_err());
         assert_eq!(
             parse(json!({"state": "bounced", "state_reason": "head_changed"})).unwrap(),
             ItemState::Bounced(BounceReason::HeadChanged)

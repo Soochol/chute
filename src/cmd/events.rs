@@ -7,7 +7,7 @@ use super::batches::short;
 use super::{Ctx, run_on_hub};
 use crate::model::{
     BounceReason, Delivered, EpochMs, Event, EventKind, HumanReason, NotifyKind, PrNumber,
-    ProbeEvidence, ResumedBy, VerifiedBy,
+    ProbeEvidence, RemovedReason, ResumedBy, VerifiedBy,
 };
 
 const DEFAULT_LIMIT: u64 = 500;
@@ -111,6 +111,7 @@ fn involves(kind: &EventKind, target: PrNumber) -> bool {
         | EventKind::GaveUp { pr, .. }
         | EventKind::Closed { pr }
         | EventKind::NeedsHuman { pr, .. }
+        | EventKind::Removed { pr, .. }
         | EventKind::Submitted { pr, .. }
         | EventKind::Dropped { pr } => *pr == target,
         EventKind::Notified { pr, .. } | EventKind::Resumed { pr, .. } => *pr == Some(target),
@@ -186,12 +187,16 @@ fn describe(kind: &EventKind) -> String {
             batch,
             reason,
             attempts,
+            unreachable,
         } => {
             let batch = batch
                 .as_ref()
                 .map_or(String::new(), |b| format!(" · batch {}", b.0));
+            let unreachable = unreachable.as_deref().map_or(String::new(), |why| {
+                format!(" · 작업자에게 닿지 않아 submit한 터미널로 보냄: {why}")
+            });
             format!(
-                "{pr} 반송됨 · 이유 {} · {attempts}번째{batch}",
+                "{pr} 반송됨 · 이유 {} · {attempts}번째{batch}{unreachable}",
                 bounce_reason(*reason)
             )
         }
@@ -243,6 +248,23 @@ fn describe(kind: &EventKind) -> String {
                 .as_deref()
                 .map_or(String::new(), |d| format!(" · {d}"));
             format!("{pr} 사람 차례 · 이유 {}{detail}", human_reason(*reason))
+        }
+        EventKind::Removed {
+            pr,
+            reason,
+            detail,
+            report,
+        } => {
+            let detail = detail
+                .as_deref()
+                .map_or(String::new(), |d| format!(" · {d}"));
+            let report = report
+                .as_ref()
+                .map_or(String::new(), |r| format!(" · 보고서 {}", r.display()));
+            format!(
+                "{pr} 큐에서 빠짐 · 이유 {}{detail}{report}",
+                removed_reason(*reason)
+            )
         }
         EventKind::Blocked { base, .. } => {
             format!("큐 멈춤 · 기준 {}이 깨졌다", short(base))
@@ -399,11 +421,20 @@ fn human_reason(reason: HumanReason) -> &'static str {
     }
 }
 
+fn removed_reason(reason: RemovedReason) -> &'static str {
+    match reason {
+        RemovedReason::Budget => "반송 한도 초과",
+        RemovedReason::GaveUp => "작업자가 포기",
+        RemovedReason::Upgrade => "옛 사람 차례 항목 정리",
+    }
+}
+
 fn notify_kind(kind: NotifyKind) -> &'static str {
     match kind {
         NotifyKind::Merged => "머지",
         NotifyKind::Bounced => "반송",
         NotifyKind::Human => "사람 차례",
+        NotifyKind::Removed => "큐에서 빠짐",
         NotifyKind::Halted => "멈춤",
         NotifyKind::Resumed => "재개",
         NotifyKind::Reverted => "되돌림",
@@ -681,6 +712,7 @@ mod tests {
                 batch: None,
                 reason: BounceReason::Conflict,
                 attempts: 2,
+                unreachable: None,
             },
             EventKind::Flaky {
                 batch: batch.clone(),

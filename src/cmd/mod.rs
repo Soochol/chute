@@ -14,7 +14,6 @@ pub mod hub;
 pub mod init;
 pub mod install;
 pub mod preflight;
-pub mod retry;
 pub mod revert;
 pub mod skill;
 pub mod status;

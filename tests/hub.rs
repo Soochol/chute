@@ -650,7 +650,7 @@ fn three_items(c: &Node) -> Value {
     serde_json::json!({
         "queue": [
             item_json(1, "queued", Value::Null, agent_json(Some(&c.id))),
-            item_json(2, "needs_human", Value::from("gave_up"), agent_json(Some(&c.id))),
+            item_json(2, "bounced", Value::from("conflict"), agent_json(Some(&c.id))),
             item_json(3, "queued", Value::Null, agent_json(None)),
         ],
         "batch": null, "blocked": null, "verified_bases": [], "preflights": {}, "warnings": []

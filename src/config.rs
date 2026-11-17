@@ -559,7 +559,7 @@ pub fn draft(verify_run: &str) -> String {
     format!(
         r#"# chute 설정. 기본 브랜치에 올라간 이 파일을 읽는다.
 approval = "agent"      # "agent"면 자동 머지, "human"이면 승인 버튼을 기다린다
-budget = 3              # 연속 반송 한도. 넘으면 사람 차례로 간다
+budget = 3              # 연속 반송 한도. 넘으면 큐에서 빼고 submit한 터미널에 알린다
 max_batch = 8           # 한 batch의 PR 수 상한
 serialize = false       # true면 검증을 한 번에 하나만 돈다
 require_ci = false      # true면 GitHub check가 통과한 PR만 batch에 넣는다
@@ -572,7 +572,7 @@ reuse_hours = 24        # 통과 기록을 다시 쓸 수 있는 시간(시간 �
 reuse_other_machines = false  # true면 다른 PC의 통과 기록도 env_check 결과가 같을 때 다시 쓴다
 post_verify_interval = 0  # [[post_verify]] 검사를 시작하는 최소 간격(분). 0이면 머지로 기본 브랜치가 움직인 뒤 지금 검사가 끝나는 대로 돈다
 post_verify_hold = false  # true면 검사가 실패한 동안 실패한 단계의 paths에 해당하는 PR을 batch에 넣지 않는다
-# 에이전트가 없을 때 띄울 명령. 비어 있으면 띄우지 않고 사람 차례로 넘긴다.
+# 에이전트가 없을 때 띄울 명령. 비어 있으면 띄우지 않고 반송을 submit한 터미널로 보낸다.
 # 값을 넣으면 그 명령으로 새 에이전트를 띄운다.
 # 주의: --dangerously-skip-permissions를 넣으면 새 에이전트가 권한 확인 없이 명령을 실행한다.
 respawn = []
@@ -924,7 +924,7 @@ probe = "cargo test {tests} -- --exact"
         let at = lines.iter().position(|l| l.starts_with("respawn")).unwrap();
         let comment = &lines[at - 3..at];
         assert!(comment.iter().all(|l| l.starts_with('#')), "{comment:?}");
-        assert!(comment[0].contains("비어 있으면 띄우지 않고 사람 차례로 넘긴다"));
+        assert!(comment[0].contains("비어 있으면 띄우지 않고 반송을 submit한 터미널로 보낸다"));
         assert!(comment[1].contains("값을 넣으면 그 명령으로 새 에이전트를 띄운다"));
         assert!(
             comment[2].contains("--dangerously-skip-permissions")

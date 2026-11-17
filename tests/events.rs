@@ -312,3 +312,65 @@ fn events_on_another_pc_say_so_when_the_hub_is_down_or_this_is_not_the_hub() {
     forward_kit::assert_unreachable_hub(&net, &["events"]);
     forward_kit::assert_not_hub_answer(&net, &["events"]);
 }
+
+const OLD_AND_NEW_LINES: [&str; 8] = [
+    r#"{"at_ms":1,"event":"needs_human","pr":5,"reason":"budget","detail":"재시도 예산 3번을 모두 썼다"}"#,
+    r#"{"at_ms":2,"event":"gave_up","pr":6,"reason":"충돌을 풀 수 없다"}"#,
+    r#"{"at_ms":3,"event":"notified","kind":"human","pr":5,"to":"t1orch","delivered":"sent"}"#,
+    r#"{"at_ms":4,"event":"removed","pr":7,"reason":"budget","detail":"반송 한도 3번을 넘었다","report":"/state/reports/pr-7/3.md"}"#,
+    r#"{"at_ms":5,"event":"removed","pr":8,"reason":"gave_up","detail":"그만둔다","report":null}"#,
+    r#"{"at_ms":6,"event":"removed","pr":9,"reason":"upgrade","detail":"옛 chute가 사람 차례(budget)로 둔 항목","report":null}"#,
+    r#"{"at_ms":7,"event":"bounced","pr":10,"batch":null,"reason":"verify","attempts":2,"unreachable":"작업자 터미널이 없다"}"#,
+    r#"{"at_ms":8,"event":"notified","kind":"removed","pr":7,"to":"t1orch","delivered":"sent"}"#,
+];
+
+#[test]
+fn events_show_the_lines_an_older_chute_wrote_next_to_the_removed_and_unreachable_ones() {
+    let (net, hub) = hub();
+    let node = net.node(hub);
+    let path = store(node).dir().join("history.jsonl");
+    std::fs::write(&path, OLD_AND_NEW_LINES.join("\n") + "\n").unwrap();
+
+    let json = node.chute(BIN, &["events", "--json"]);
+    let text = node.chute(BIN, &["events"]);
+
+    assert_eq!(json.status.code(), Some(0), "{}", err(&json));
+    assert_eq!(ats(&json_lines(&json)), [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(text.status.code(), Some(0), "{}", err(&text));
+    assert!(!err(&text).contains("읽지 못한 줄"), "{}", err(&text));
+    let shown = out(&text);
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(lines.len(), 8, "{shown}");
+    for (line, needed) in lines.iter().zip([
+        &["#5", "사람 차례"][..],
+        &["#6", "포기됨", "충돌을 풀 수 없다"],
+        &["사람 차례"],
+        &[
+            "#7",
+            "큐에서 빠짐",
+            "반송 한도 초과",
+            "/state/reports/pr-7/3.md",
+        ],
+        &["#8", "큐에서 빠짐", "작업자가 포기", "그만둔다"],
+        &["#9", "큐에서 빠짐", "옛 사람 차례 항목 정리"],
+        &["#10", "반송됨", "닿지 않아", "작업자 터미널이 없다"],
+        &["큐에서 빠짐"],
+    ]) {
+        for part in needed {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+}
+
+#[test]
+fn events_pr_finds_a_removed_event_by_its_pr() {
+    let (net, hub) = hub();
+    let node = net.node(hub);
+    let path = store(node).dir().join("history.jsonl");
+    std::fs::write(&path, OLD_AND_NEW_LINES.join("\n") + "\n").unwrap();
+
+    let output = node.chute(BIN, &["events", "--json", "--pr", "7"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", err(&output));
+    assert_eq!(ats(&json_lines(&output)), [4, 8]);
+}
