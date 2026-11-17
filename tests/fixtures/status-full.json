@@ -79,7 +79,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 10,
@@ -110,7 +111,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 11,
@@ -134,7 +136,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 15,
@@ -168,7 +171,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": 1794721500000
     },
     {
       "pr": 14,
@@ -199,7 +203,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": 1794722400000
     },
     {
       "pr": 16,
@@ -230,7 +235,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": 1794722700000
     },
     {
       "pr": 18,
@@ -261,7 +267,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": 1794723000000
     },
     {
       "pr": 17,
@@ -287,7 +294,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": 1794723300000
     },
     {
       "pr": 12,
@@ -321,7 +329,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 13,
@@ -347,7 +356,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 19,
@@ -376,7 +386,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 20,
@@ -395,7 +406,8 @@
       "submitter": null,
       "priority": true,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 21,
@@ -424,7 +436,8 @@
       "submitter": null,
       "priority": false,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 22,
@@ -457,7 +470,8 @@
       },
       "priority": false,
       "after": [],
-      "repair": true
+      "repair": true,
+      "bounced_ms": null
     },
     {
       "pr": 23,
@@ -490,7 +504,8 @@
       },
       "priority": true,
       "after": [],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     },
     {
       "pr": 24,
@@ -526,7 +541,8 @@
         12,
         22
       ],
-      "repair": false
+      "repair": false,
+      "bounced_ms": null
     }
   ],
   "today": {
@@ -567,21 +583,24 @@
       "title": "feat: 큐 상태 전이 추가",
       "batch": "b20261115-150000",
       "merged_ms": 1794722690000,
-      "bounces": 1
+      "bounces": 1,
+      "submitted_ms": 1794721190000
     },
     {
       "pr": 7,
       "title": "fix: 잠금 해제 순서를 고친다",
       "batch": "b20261115-150000",
       "merged_ms": 1794722680000,
-      "bounces": 0
+      "bounces": 0,
+      "submitted_ms": 1794721180000
     },
     {
       "pr": 6,
       "title": null,
       "batch": "b20261115-143000",
       "merged_ms": 1794720890000,
-      "bounces": 0
+      "bounces": 0,
+      "submitted_ms": 1794719390000
     }
   ],
   "warnings": [

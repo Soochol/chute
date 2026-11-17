@@ -42,10 +42,13 @@ const WARNING_TITLE = table({
 
 const SECTION_ORDER = ["alerts", "human", "batch", "waiting", "bounced", "unknown"];
 
+// These four keep their head line when empty; `alerts` and `unknown` appear only with something to show.
+const ALWAYS_SHOWN = new Set(["human", "batch", "waiting", "bounced"]);
+
 const SECTION_TITLE = {
   alerts: "Alerts",
   human: "Needs you",
-  batch: "Verifying",
+  batch: "Current batch",
   waiting: "Queued",
   bounced: "Bounced",
   unknown: "Unknown state",
@@ -212,7 +215,7 @@ function actionsOf(item, repoPath) {
     }));
 }
 
-function cardOf(item, repoPath, slug) {
+function cardOf(item, repoPath, slug, now) {
   const card = {
     key: `${repoPath}#${item.pr}`,
     pr: item.pr,
@@ -225,6 +228,8 @@ function cardOf(item, repoPath, slug) {
     actions: actionsOf(item, repoPath),
     marks: marksOf(item),
     submitter: submitterOf(item),
+    wait: item.state === "bounced" ? "" : waitOf(item, now),
+    ago: item.state === "bounced" && Number.isFinite(item.bounced_ms) ? formatAgo(now - item.bounced_ms) : "",
   };
   card.report = card.failure?.report ? { label: "Report", path: card.failure.report } : null;
   if (item.state === "awaiting_approval") {
@@ -303,6 +308,19 @@ export function formatAgo(ms) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+// Whole minutes, so a value polled every 15 seconds doesn't flicker: `<1m`, `3m`, `2h 5m`, `2h`, `3d`.
+export function formatWait(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "<1m";
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+const waitOf = (item, now) => (Number.isFinite(item.submitted_ms) ? `waiting ${formatWait(now - item.submitted_ms)}` : "");
+
 const SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 export function pullUrl(slug, pr) {
@@ -325,18 +343,24 @@ export function usualSeconds(recent) {
 const RECENT_MERGED_SHOWN = 5;
 
 function recentMergedOf(view, slug, now) {
-  const row = (pr, title, bounces, at) => ({
-    pr: prOf(pr),
-    title: str(title),
-    bounces: Number.isSafeInteger(bounces) && bounces > 0 ? bounces : 0,
-    ago: Number.isFinite(at) ? formatAgo(now - at) : "",
-    url: pullUrl(slug, pr),
-  });
+  const row = (pr, title, bounces, at, submitted) => {
+    const ago = Number.isFinite(at) ? formatAgo(now - at) : "";
+    const took = Number.isFinite(at) && Number.isFinite(submitted) && submitted <= at ? formatDuration((at - submitted) / 1000) : "";
+    return {
+      pr: prOf(pr),
+      title: str(title),
+      bounces: Number.isSafeInteger(bounces) && bounces > 0 ? bounces : 0,
+      ago,
+      took,
+      tip: ago ? `Merged ${ago}${clockText(at) ? ` · ${clockText(at)}` : ""}` : "",
+      url: pullUrl(slug, pr),
+    };
+  };
   if (Array.isArray(view.recent_merged)) {
     return view.recent_merged
       .filter(isObject)
       .slice(0, RECENT_MERGED_SHOWN)
-      .map((m) => row(m.pr, m.title, m.bounces, m.merged_ms));
+      .map((m) => row(m.pr, m.title, m.bounces, m.merged_ms, m.submitted_ms));
   }
   return list(view.recent)
     .filter(isObject)
@@ -652,6 +676,7 @@ function repoBoard(view, now) {
         note: item.state_reason && !ciPending ? item.state_reason : null,
         marks: marksOf(item),
         submitter: submitterOf(item),
+        wait: waitOf(item, now),
       });
     } else if (section === "unknown") {
       placed.unknown.push({
@@ -660,7 +685,7 @@ function repoBoard(view, now) {
         state: item.state ?? "(none)",
         reason: item.state_reason,
       });
-    } else placed[section].push(cardOf(item, path, slug));
+    } else placed[section].push(cardOf(item, path, slug, now));
   }
   const recent = recentMergedOf(view, slug, now);
   placed.alerts = alertsOf(view, queue, now, recent);
@@ -678,7 +703,7 @@ function repoBoard(view, now) {
     postVerify,
     recent,
     today: todayOf(view.today, chronicFlaky(view)),
-    sections: SECTION_ORDER.filter((id) => placed[id].length > 0).map((id) => ({
+    sections: SECTION_ORDER.filter((id) => ALWAYS_SHOWN.has(id) || placed[id].length > 0).map((id) => ({
       id,
       title: SECTION_TITLE[id],
       items: placed[id],

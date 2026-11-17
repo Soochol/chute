@@ -10,9 +10,9 @@ use crate::config::{self, Config};
 use crate::hub::{self, Route};
 use crate::machine::Machines;
 use crate::model::{
-    Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemView,
-    MachineId, MergedView, PostPhase, PostState, PrNumber, RecentBatch, RepoInfo, RepoView,
-    SchemaV1, StatusView, TerminalId, Today, VerifiedBy, Warning, WarningKind,
+    Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemState,
+    ItemView, MachineId, MergedView, PostPhase, PostState, PrNumber, QueueItem, RecentBatch,
+    RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, VerifiedBy, Warning, WarningKind,
 };
 use crate::queue;
 
@@ -353,6 +353,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
         });
     }
     let (today, recent, recent_merged) = summarize(&history.events, now);
+    let last_bounced = last_bounced_at(&history.events);
     Ok(StatusView {
         schema: SchemaV1,
         repo: RepoView {
@@ -380,6 +381,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
                     state.preflights.get(&item.branch),
                     item.agent.as_ref().map(agent_view),
                     item.submitter.as_ref().map(agent_view),
+                    bounced_ms(item, &last_bounced),
                 )
             })
             .collect(),
@@ -389,6 +391,25 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
         warnings,
         post_verify: state.post.clone(),
     })
+}
+
+/// When a bounced item last bounced; other states have no such time.
+fn bounced_ms(item: &QueueItem, last: &HashMap<PrNumber, EpochMs>) -> Option<EpochMs> {
+    match item.state {
+        ItemState::Bounced(_) => last.get(&item.pr).copied(),
+        _ => None,
+    }
+}
+
+/// The time of the latest `bounced` event of each PR.
+pub fn last_bounced_at(events: &[Event]) -> HashMap<PrNumber, EpochMs> {
+    let mut at = HashMap::new();
+    for event in events {
+        if let EventKind::Bounced { pr, .. } = &event.kind {
+            at.insert(*pr, event.at_ms);
+        }
+    }
+    at
 }
 
 pub fn summarize<Tz: TimeZone>(
@@ -411,13 +432,18 @@ pub fn summarize<Tz: TimeZone>(
         match &event.kind {
             EventKind::Bounced { pr, .. } => *bounces.entry(*pr).or_default() += 1,
             EventKind::Merged {
-                pr, batch, title, ..
+                pr,
+                batch,
+                title,
+                submitted_ms,
+                ..
             } => recent_merged.push(MergedView {
                 pr: *pr,
                 title: title.clone(),
                 batch: batch.clone(),
                 merged_ms: event.at_ms,
                 bounces: bounces.remove(pr).unwrap_or(0),
+                submitted_ms: Some(*submitted_ms),
             }),
             _ => {}
         }
@@ -828,6 +854,86 @@ mod tests {
             serde_json::to_value(&all[0]).unwrap()["title"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn recent_merged_carries_the_submit_time_of_the_merged_event() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
+        let events = vec![Event {
+            at_ms: at(&now, 10),
+            kind: EventKind::Merged {
+                pr: PrNumber(1),
+                batch: BatchId("b".into()),
+                commit: Sha::try_from("abc1234".to_owned()).unwrap(),
+                submitted_ms: at(&now, 25),
+                title: None,
+            },
+        }];
+        let (_, _, merged) = summarize(&events, &now);
+        assert_eq!(merged[0].submitted_ms, Some(at(&now, 25)));
+        assert_eq!(
+            serde_json::to_value(&merged[0]).unwrap()["submitted_ms"],
+            serde_json::json!(at(&now, 25).0)
+        );
+    }
+
+    fn queue_item(pr: u64, state: ItemState) -> QueueItem {
+        QueueItem {
+            pr: PrNumber(pr),
+            title: "t".into(),
+            branch: format!("b{pr}"),
+            head: Sha::try_from("abc1234".to_owned()).unwrap(),
+            state,
+            agent: None,
+            attempts: 0,
+            submitted_ms: EpochMs(1),
+            touches_config: false,
+            last_failure: None,
+            submitter: None,
+            priority: false,
+            after: Vec::new(),
+            repair: false,
+        }
+    }
+
+    #[test]
+    fn a_bounced_item_shows_its_latest_bounce_even_after_several() {
+        let bounce = |pr, ms| Event {
+            at_ms: EpochMs(ms),
+            kind: EventKind::Bounced {
+                pr: PrNumber(pr),
+                batch: None,
+                reason: BounceReason::Conflict,
+                attempts: 1,
+            },
+        };
+        let events = vec![bounce(1, 100), bounce(2, 150), bounce(1, 300)];
+        let last = last_bounced_at(&events);
+        let bounced = queue_item(1, ItemState::Bounced(BounceReason::HeadChanged));
+        assert_eq!(bounced_ms(&bounced, &last), Some(EpochMs(300)));
+    }
+
+    #[test]
+    fn only_a_bounced_item_has_a_bounce_time() {
+        let events = vec![Event {
+            at_ms: EpochMs(300),
+            kind: EventKind::Bounced {
+                pr: PrNumber(1),
+                batch: None,
+                reason: BounceReason::Conflict,
+                attempts: 1,
+            },
+        }];
+        let last = last_bounced_at(&events);
+        let queued = queue_item(1, ItemState::Queued(None));
+        assert_eq!(bounced_ms(&queued, &last), None);
+    }
+
+    #[test]
+    fn a_bounced_item_without_a_bounce_event_has_no_bounce_time() {
+        let last = last_bounced_at(&[]);
+        let bounced = queue_item(1, ItemState::Bounced(BounceReason::Verify));
+        assert_eq!(bounced_ms(&bounced, &last), None);
     }
 
     #[test]

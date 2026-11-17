@@ -1100,6 +1100,9 @@ pub struct ItemView {
     pub after: Vec<PrNumber>,
     #[serde(default)]
     pub repair: bool,
+    /// When a bounced item last bounced (`None` for other states).
+    #[serde(default)]
+    pub bounced_ms: Option<EpochMs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1143,6 +1146,8 @@ pub struct MergedView {
     pub batch: BatchId,
     pub merged_ms: EpochMs,
     pub bounces: u32,
+    #[serde(default)]
+    pub submitted_ms: Option<EpochMs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1161,6 +1166,7 @@ impl ItemView {
         preflight: Option<&PreflightRecord>,
         agent: Option<AgentView>,
         submitter: Option<AgentView>,
+        bounced_ms: Option<EpochMs>,
     ) -> ItemView {
         ItemView {
             pr: item.pr,
@@ -1186,6 +1192,7 @@ impl ItemView {
             priority: item.priority,
             after: item.after.clone(),
             repair: item.repair,
+            bounced_ms,
         }
     }
 }
@@ -1239,6 +1246,20 @@ mod tests {
         old.as_object_mut().unwrap().remove("recent_merged");
         let view: StatusView = serde_json::from_value(old).unwrap();
         assert!(view.recent_merged.is_empty());
+    }
+
+    #[test]
+    fn the_two_time_fields_are_none_in_the_status_of_a_chute_older_than_them() {
+        let mut old: Value = serde_json::from_str(FIXTURE).unwrap();
+        for m in old["recent_merged"].as_array_mut().unwrap() {
+            m.as_object_mut().unwrap().remove("submitted_ms");
+        }
+        for i in old["queue"].as_array_mut().unwrap() {
+            i.as_object_mut().unwrap().remove("bounced_ms");
+        }
+        let view: StatusView = serde_json::from_value(old).unwrap();
+        assert!(view.recent_merged.iter().all(|m| m.submitted_ms.is_none()));
+        assert!(view.queue.iter().all(|i| i.bounced_ms.is_none()));
     }
 
     #[test]

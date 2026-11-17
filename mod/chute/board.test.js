@@ -50,7 +50,7 @@ test("every fixture item lands in one of the six sections", () => {
   assert.equal(result.kind, "board");
   const repo = result.repos[0];
   assert.deepEqual(repo.sections.map((s) => s.id), ["alerts", "human", "batch", "waiting", "bounced"]);
-  assert.deepEqual(repo.sections.map((s) => s.title), ["Alerts", "Needs you", "Verifying", "Queued", "Bounced"]);
+  assert.deepEqual(repo.sections.map((s) => s.title), ["Alerts", "Needs you", "Current batch", "Queued", "Bounced"]);
   assert.deepEqual(prs(section(repo, "human")), [9, 10, 11, 21]);
   assert.deepEqual(section(repo, "batch").items[0].prs.map((p) => p.pr), [12, 13]);
   assert.deepEqual(prs(section(repo, "waiting")), [19, 20, 22, 23, 24]);
@@ -325,9 +325,9 @@ test("today is one line, and the expanded rows call the verify time a sum", () =
   assert.equal(only(data).today, null);
 });
 
-test("empty sections are not drawn", () => {
+test("empty alerts are not drawn", () => {
   const data = { ...clone(fixture), queue: [], batch: null, blocked: null, warnings: [], post_verify: {} };
-  assert.deepEqual(only(data).sections.map((s) => s.id), []);
+  assert.ok(!only(data).sections.some((s) => s.id === "alerts"));
 });
 
 test("several repos from --all, and a single object", () => {
@@ -647,7 +647,7 @@ test("the unknown section comes after bounced, in submission order, with title a
     itemOf(15),
   );
   const repo = only(data);
-  assert.deepEqual(repo.sections.map((s) => s.id), ["bounced", "unknown"]);
+  assert.deepEqual(repo.sections.map((s) => s.id), ["human", "batch", "waiting", "bounced", "unknown"]);
   assert.equal(section(repo, "unknown").title, "Unknown state");
   assert.deepEqual(section(repo, "unknown").items.map((i) => [i.pr, i.title, i.state, i.reason]), [
     [30, "첫째", "(none)", null],
@@ -662,7 +662,7 @@ test("array-wrapped states are unknown, not routed as the word inside", () => {
     { ...itemOf(20), pr: 42, state: [["queued"]] },
   );
   const repo = only(data);
-  assert.deepEqual(repo.sections.map((s) => s.id), ["unknown"]);
+  assert.deepEqual(repo.sections.filter((s) => s.items.length > 0).map((s) => s.id), ["unknown"]);
   assert.deepEqual(
     section(repo, "unknown").items.map((i) => i.state).sort(),
     ['["awaiting_approval"]', '["needs_human"]', '[["queued"]]'],
@@ -1322,7 +1322,7 @@ test("recent merges: five from recent_merged, with titles, bounce counts and a G
   data.recent_merged = Array.from({ length: 7 }, (_, i) => ({ pr: 20 - i, title: `제목 ${i}`, batch: "b", merged_ms: NOW - 60_000 * (i + 1), bounces: i === 1 ? 2 : 0 }));
   const recent = only(data).recent;
   assert.equal(recent.length, 5);
-  assert.deepEqual(recent[1], { pr: 19, title: "제목 1", bounces: 2, ago: "2m ago", url: "https://github.com/Soochol/chute/pull/19" });
+  assert.deepEqual({ ...recent[1], tip: undefined }, { pr: 19, title: "제목 1", bounces: 2, ago: "2m ago", took: "", tip: undefined, url: "https://github.com/Soochol/chute/pull/19" });
   assert.deepEqual(only([fixture]).recent.map((m) => [m.pr, m.title, m.bounces]), [
     [8, "feat: 큐 상태 전이 추가", 1],
     [7, "fix: 잠금 해제 순서를 고친다", 0],
@@ -1633,4 +1633,86 @@ test("clock texts are local hh:mm and a full local time", () => {
   assert.equal(clockText(at), "09:04");
   assert.equal(clockExact(at), "2026-11-17 09:04:31");
   assert.equal(clockText(NaN), "");
+});
+
+const MIN = 60_000;
+const itemAt = (pr, state, patch = {}) => ({ ...itemOf(pr), state, ...patch });
+const waitTexts = (data, id) => section(only(data), id).items.map((item) => item.wait);
+
+test("a queued row says how long it has waited, in whole minutes", () => {
+  const cases = [
+    [10_000, "waiting <1m"],
+    [3 * MIN + 59_000, "waiting 3m"],
+    [125 * MIN, "waiting 2h 5m"],
+    [120 * MIN, "waiting 2h"],
+    [3 * 24 * 60 * MIN + 5 * MIN, "waiting 3d"],
+  ];
+  for (const [age, text] of cases) {
+    const item = { ...itemOf(19), submitted_ms: NOW - age };
+    assert.deepEqual(waitTexts(queueOnly(item), "waiting"), [text]);
+  }
+});
+
+test("a queued row without a submit time has an empty wait", () => {
+  const item = { ...itemOf(19), submitted_ms: null };
+  assert.deepEqual(waitTexts(queueOnly(item), "waiting"), [""]);
+});
+
+test("a needs-you card waits from the first submit, and is empty without one", () => {
+  const card = { ...itemOf(9), submitted_ms: NOW - 12 * MIN };
+  assert.deepEqual(waitTexts(queueOnly(card), "human"), ["waiting 12m"]);
+  assert.deepEqual(waitTexts(queueOnly({ ...card, submitted_ms: undefined }), "human"), [""]);
+});
+
+test("a bounced row's ago comes from bounced_ms, not from last_failure", () => {
+  const bounced = { ...itemOf(15), bounced_ms: NOW - 12 * MIN };
+  assert.equal(section(only(queueOnly(bounced)), "bounced").items[0].ago, "12m ago");
+  const none = { ...itemOf(15), bounced_ms: null };
+  assert.ok(none.last_failure);
+  assert.equal(section(only(queueOnly(none)), "bounced").items[0].ago, "");
+});
+
+test("recent merges show the time from submit to merge, with the merge time in the tooltip", () => {
+  const merged_ms = NOW - 41 * MIN;
+  const data = { ...clone(fixture), recent_merged: [{ pr: 1, title: "x", batch: "b", merged_ms, bounces: 0, submitted_ms: merged_ms - 18 * MIN - 4000 }] };
+  const [row] = only(data).recent;
+  assert.equal(row.took, "18m 4s");
+  assert.ok(row.tip.startsWith("Merged 41m ago · "));
+  assert.match(row.tip, /· \d\d:\d\d$/);
+});
+
+test("recent merges with a missing or impossible submit time have an empty duration but keep the tooltip", () => {
+  const merged_ms = NOW - 41 * MIN;
+  const base = { pr: 1, title: "x", batch: "b", merged_ms, bounces: 0 };
+  const data = {
+    ...clone(fixture),
+    recent_merged: [base, { ...base, submitted_ms: null }, { ...base, submitted_ms: merged_ms + 1 }],
+  };
+  for (const row of only(data).recent) {
+    assert.equal(row.took, "");
+    assert.ok(row.tip.startsWith("Merged 41m ago"));
+  }
+});
+
+test("recent rows built from the old recent list have no duration", () => {
+  const data = clone(fixture);
+  delete data.recent_merged;
+  const rows = only(data).recent;
+  assert.ok(rows.length > 0);
+  for (const row of rows) assert.equal(row.took, "");
+});
+
+test("an empty queue keeps four section heads and no alerts or unknown", () => {
+  const repo = only(queueOnly());
+  assert.deepEqual(repo.sections.map((s) => s.id), ["human", "batch", "waiting", "bounced"]);
+  for (const s of repo.sections) assert.deepEqual(s.items, []);
+});
+
+test("empty section heads don't change the overview numbers", () => {
+  const empty = overview(board(queueOnly()));
+  assert.deepEqual(empty, { grade: "ok", issues: 0, running: 0, repos: 1 });
+});
+
+test("a repo whose hub can't be reached draws no section heads", () => {
+  assert.deepEqual(only(unreachable).sections, []);
 });
