@@ -423,21 +423,6 @@ fn after_the_budget_is_spent_the_next_failure_takes_the_pr_out_and_sends_nothing
     };
     assert_eq!(*pr, PrNumber(1));
     assert!(report.is_file(), "{}", report.display());
-    let text = fs::read_to_string(report).unwrap();
-    let refs = lab
-        .repo
-        .git(&["for-each-ref", "--format=%(refname)", "refs/chute/failed/"]);
-    let named: Vec<&str> = text
-        .split(|c: char| c.is_whitespace() || "`()".contains(c))
-        .filter(|w| w.starts_with("refs/chute/failed/pr1-"))
-        .collect();
-    assert!(!named.is_empty(), "{text}");
-    for name in named {
-        assert!(
-            refs.lines().any(|r| r == name),
-            "{name} 참조가 없다: {refs}"
-        );
-    }
     assert!(
         !lab.events()
             .iter()

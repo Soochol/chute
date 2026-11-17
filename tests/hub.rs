@@ -1069,3 +1069,36 @@ fn take_records_an_item_an_older_chute_left_on_a_humans_turn_instead_of_dropping
         "the old hub's history is copied, not written again"
     );
 }
+
+#[test]
+fn take_keeps_one_upgrade_event_when_both_pcs_hold_the_same_old_item() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let old = item_json(7, "needs_human", Value::from("budget"), agent_json(None));
+    let state = serde_json::json!({
+        "queue": [old], "batch": null, "blocked": null,
+        "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    for node in [a, b] {
+        let path = home_of(node).repo(&slug()).dir().join("state.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, state.to_string()).unwrap();
+    }
+
+    ok(&take(b, "a"));
+
+    let upgrades = history_of(b)
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                chute::model::EventKind::Removed {
+                    reason: chute::model::RemovedReason::Upgrade,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(upgrades, 1);
+}

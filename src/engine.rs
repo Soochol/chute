@@ -534,21 +534,7 @@ impl Engine {
     }
 
     fn prune_failed_refs(&self) -> Result<()> {
-        let mut queued: BTreeSet<u64> = self.store.load()?.queue.iter().map(|i| i.pr.0).collect();
-        queued.extend(
-            self.store
-                .history()?
-                .events
-                .iter()
-                .filter_map(|e| match &e.kind {
-                    EventKind::Removed {
-                        pr,
-                        reason: RemovedReason::Budget,
-                        ..
-                    } => Some(pr.0),
-                    _ => None,
-                }),
-        );
+        let queued: BTreeSet<u64> = self.store.load()?.queue.iter().map(|i| i.pr.0).collect();
         let listed = self
             .ext
             .git(
@@ -1329,44 +1315,42 @@ impl Run<'_> {
         } else {
             (engine.store.update(record)?, None)
         };
+        if let Recorded::OverBudget(gone) = &failed {
+            let at = engine.history_at(EventKind::Removed {
+                pr,
+                reason: RemovedReason::Budget,
+                detail: Some(format!("반송 한도 {budget}번을 넘었다")),
+                report: Some(written.md.clone()),
+            })?;
+            let removal = Removal::Budget {
+                attempts: gone.attempts,
+                budget,
+                report: Some(written.md.clone()),
+            };
+            engine.tell_removed(gone, removal, at);
+            self.tell_waiters(pr, WaitingWhy::Removed, at);
+        }
         self.bounced.push(pr);
         self.conflicted.remove(&pr);
         self.save_record()?;
-        match failed {
-            Recorded::Bounced(reason) => {
-                let at = engine.history_at(EventKind::Bounced {
-                    pr,
-                    batch: Some(self.id().clone()),
+        if let Recorded::Bounced(reason) = failed {
+            let at = engine.history_at(EventKind::Bounced {
+                pr,
+                batch: Some(self.id().clone()),
+                reason,
+                attempts: item.attempts + 1,
+                unreachable: delivery.as_ref().and_then(unreachable_of),
+            })?;
+            if let Some(delivery) = &delivery {
+                let told = Told {
                     reason,
+                    failure: Some(&written.doc.failure),
                     attempts: item.attempts + 1,
-                    unreachable: delivery.as_ref().and_then(unreachable_of),
-                })?;
-                if let Some(delivery) = &delivery {
-                    let told = Told {
-                        reason,
-                        failure: Some(&written.doc.failure),
-                        attempts: item.attempts + 1,
-                        report: Some(&written.md),
-                    };
-                    self.tell_bounce(&item, told, delivery, at);
-                }
-                self.tell_waiters(pr, WaitingWhy::Bounced, at);
-            }
-            Recorded::OverBudget(gone) => {
-                let at = engine.history_at(EventKind::Removed {
-                    pr,
-                    reason: RemovedReason::Budget,
-                    detail: Some(format!("반송 한도 {budget}번을 넘었다")),
-                    report: Some(written.md.clone()),
-                })?;
-                let removal = Removal::Budget {
-                    attempts: gone.attempts,
-                    budget,
-                    report: Some(written.md.clone()),
+                    report: Some(&written.md),
                 };
-                engine.tell_removed(&gone, removal, at);
-                self.tell_waiters(pr, WaitingWhy::Removed, at);
+                self.tell_bounce(&item, told, delivery, at);
             }
+            self.tell_waiters(pr, WaitingWhy::Bounced, at);
         }
         Ok(())
     }

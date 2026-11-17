@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use super::{Ctx, FORWARD_TIMEOUT, Refusal, finish};
 use crate::hub;
 use crate::machine::{self, Machines};
-use crate::model::{BatchRecord, Event, HubView, MachineId, RevertRecord, State};
+use crate::model::{
+    BatchRecord, Event, EventKind, HubView, MachineId, PrNumber, RemovedReason, RevertRecord, State,
+};
 use crate::store::RepoStore;
 
 #[derive(clap::Args, Debug)]
@@ -396,9 +398,27 @@ fn import_state(store: &RepoStore, state: State) -> Result<()> {
     })
 }
 
+fn upgraded_pr(event: &Event) -> Option<PrNumber> {
+    match &event.kind {
+        EventKind::Removed {
+            pr,
+            reason: RemovedReason::Upgrade,
+            ..
+        } => Some(*pr),
+        _ => None,
+    }
+}
+
 fn import_records(store: &RepoStore, history: &[Event], batches: &[HandoverBatch]) -> Result<()> {
     let mut unmatched = store.history()?.events;
+    let mut upgraded: Vec<PrNumber> = unmatched.iter().filter_map(upgraded_pr).collect();
     for event in history {
+        if let Some(pr) = upgraded_pr(event) {
+            if upgraded.contains(&pr) {
+                continue;
+            }
+            upgraded.push(pr);
+        }
         match unmatched.iter().position(|e| e == event) {
             Some(i) => {
                 unmatched.remove(i);
