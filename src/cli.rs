@@ -65,6 +65,8 @@ pub enum Command {
     Revert(cmd::revert::Args),
     /// mod와 Codex 스킬 파일을 설치한다
     Install(cmd::install::Args),
+    /// `chute install --layout`이 쓴 탭 막대 mod와 레이아웃을 지우고 main 레이아웃으로 돌아간다
+    Uninstall(cmd::uninstall::Args),
     /// 이 저장소의 허브(대기열을 가진 머신)를 보거나 정한다
     Hub(cmd::hub::Args),
     /// 다른 머신의 허브가 보고서 묶음을 넘길 때 쓴다. 사람이 쓰지 않는다
@@ -145,6 +147,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Revert(args) => cmd::revert::run(args, ctx),
         Command::Hub(args) => cmd::hub::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),
+        Command::Uninstall(args) => cmd::uninstall::run(args, ctx),
         Command::Guard(args) => cmd::guard::run(args, ctx),
         Command::Deliver(args) => cmd::deliver::run(args, ctx),
     }

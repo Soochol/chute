@@ -247,3 +247,147 @@ fn a_blocked_target_exits_2_and_installs_the_rest() {
     assert!(herdr_home(&sb).join("mods/chute/mod.json").is_file());
     assert!(String::from_utf8_lossy(&out.stdout).contains("실패했다"));
 }
+
+fn with_herdr_defaults(sb: &Sandbox) {
+    let base = herdr_home(sb);
+    fs::create_dir_all(base.join("layouts")).unwrap();
+    fs::create_dir_all(base.join("mods/tabs")).unwrap();
+    fs::write(
+        base.join("layouts/main.json"),
+        repo_file("tests/fixtures/herdr-main-layout.json"),
+    )
+    .unwrap();
+    fs::write(
+        base.join("mods/tabs/main.js"),
+        repo_file("tests/fixtures/herdr-tabs-main.js"),
+    )
+    .unwrap();
+}
+
+fn layout_install(sb: &Sandbox) -> Output {
+    sb.command(env!("CARGO_BIN_EXE_chute"))
+        .args(["install", "--layout"])
+        .current_dir(sb.root())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn the_layout_option_is_off_by_default() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    with_herdr_defaults(&sb);
+    stdout(&install(&sb));
+    assert!(!herdr_home(&sb).join("layouts/chute.json").exists());
+    assert!(!herdr_home(&sb).join("mods/chute-tabs").exists());
+}
+
+#[test]
+fn layout_installs_the_copies_and_switches_to_the_chute_layout() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    with_herdr_defaults(&sb);
+    let herdr_app = sb.fake("herdr-app");
+    herdr_app.respond("do layout.switch *", support::Reply::ok("{}"));
+    let out = sb
+        .command(env!("CARGO_BIN_EXE_chute"))
+        .args(["install", "--layout"])
+        .env("CHUTE_HERDR_APP", herdr_app.path())
+        .current_dir(sb.root())
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    let base = herdr_home(&sb);
+    assert!(base.join("layouts/chute.json").is_file(), "{text}");
+    for name in ["main.js", "chute.js", "mod.json"] {
+        assert!(base.join("mods/chute-tabs").join(name).is_file(), "{name}");
+    }
+    assert_eq!(
+        fs::read_to_string(base.join("mods/chute-tabs/chute.js")).unwrap(),
+        repo_file("mod/chute-tabs/chute.js")
+    );
+    assert!(text.contains("layout:chute"), "{text}");
+    assert_eq!(
+        herdr_app.calls(),
+        [["do", "layout.switch", r#"{"name":"chute"}"#]]
+    );
+}
+
+#[test]
+fn layout_install_succeeds_without_a_running_herdr_and_says_how_to_switch() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    with_herdr_defaults(&sb);
+    let herdr_app = sb.fake("herdr-app");
+    herdr_app.respond("do *", support::Reply::ok("").code(1).stderr("no window"));
+    let out = sb
+        .command(env!("CARGO_BIN_EXE_chute"))
+        .args(["install", "--layout"])
+        .env("CHUTE_HERDR_APP", herdr_app.path())
+        .current_dir(sb.root())
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    assert!(
+        text.contains("설치는 끝났다") && text.contains("layout.switch"),
+        "{text}"
+    );
+    assert!(herdr_home(&sb).join("layouts/chute.json").is_file());
+}
+
+#[test]
+fn layout_install_with_a_changed_herdr_original_exits_2_and_writes_nothing() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    with_herdr_defaults(&sb);
+    fs::write(herdr_home(&sb).join("mods/tabs/main.js"), "// new herdr\n").unwrap();
+    let out = layout_install(&sb);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!herdr_home(&sb).join("layouts/chute.json").exists());
+    assert!(!herdr_home(&sb).join("mods/chute-tabs").exists());
+}
+
+#[test]
+fn uninstall_needs_the_layout_option() {
+    let sb = Sandbox::new();
+    let out = sb
+        .command(env!("CARGO_BIN_EXE_chute"))
+        .arg("uninstall")
+        .current_dir(sb.root())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--layout"));
+}
+
+#[test]
+fn uninstall_layout_removes_what_install_layout_wrote() {
+    let sb = Sandbox::new();
+    prepare_full_home(&sb);
+    with_herdr_defaults(&sb);
+    let herdr_app = sb.fake("herdr-app");
+    herdr_app
+        .respond("do layout.switch *", support::Reply::ok("{}"))
+        .respond("status", support::Reply::ok(r#"{"layout":"chute"}"#));
+    let run = |args: &[&str]| {
+        sb.command(env!("CARGO_BIN_EXE_chute"))
+            .args(args)
+            .env("CHUTE_HERDR_APP", herdr_app.path())
+            .current_dir(sb.root())
+            .output()
+            .unwrap()
+    };
+    stdout(&run(&["install", "--layout"]));
+    let out = run(&["uninstall", "--layout"]);
+    stdout(&out);
+    let base = herdr_home(&sb);
+    assert!(!base.join("layouts/chute.json").exists());
+    assert!(!base.join("mods/chute-tabs").exists());
+    assert!(base.join("layouts/main.json").is_file() && base.join("mods/tabs/main.js").is_file());
+    assert!(
+        herdr_app
+            .calls()
+            .iter()
+            .any(|c| c == &["do", "layout.switch", r#"{"name":"main"}"#])
+    );
+}

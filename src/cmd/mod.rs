@@ -19,6 +19,7 @@ pub mod revert;
 pub mod skill;
 pub mod status;
 pub mod submit;
+pub mod uninstall;
 pub mod up;
 
 use std::io::Write;
