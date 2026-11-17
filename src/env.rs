@@ -60,14 +60,22 @@ pub fn record_within(
             .take_while(|_| !cancel.is_cancelled())
             .map(|(n, run)| {
                 let log = log_dir.join(format!("env-{}.log", n + 1));
-                check(dir, run, &log, timeout, cancel)
+                check(ext, dir, run, &log, timeout, cancel)
             })
             .collect(),
     }
 }
 
-fn check(dir: &Path, run: &str, log: &Path, timeout: Duration, cancel: &Cancel) -> EnvCheck {
-    let (ok, note) = match verify::run_command(dir, &capped(run), log, timeout, cancel) {
+fn check(
+    ext: &Ext,
+    dir: &Path,
+    run: &str,
+    log: &Path,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> EnvCheck {
+    let ran = verify::run_command(dir, &capped(run), log, timeout, ext.clock(), cancel);
+    let (ok, note) = match ran {
         Ok(End::Passed) => (true, None),
         Ok(End::Failed(verify::Cause::TimedOut)) => (
             false,
@@ -190,8 +198,19 @@ fn result_of(env: &EnvRecord, run: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
     use crate::testkit::Sandbox;
     use std::time::Instant;
+
+    /// Only catches a hang: a wait that gives up fails the test instead of deciding its outcome.
+    const STUCK: Duration = Duration::from_secs(30);
+
+    fn wait_until(ready: impl Fn() -> bool) {
+        let give_up = Instant::now() + STUCK;
+        while !ready() && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn commands(list: &[&str]) -> Vec<String> {
         list.iter().map(|c| (*c).to_owned()).collect()
@@ -291,16 +310,33 @@ mod tests {
     #[test]
     fn a_check_that_outlasts_the_limit_is_cut_and_the_next_one_still_runs() {
         let f = fixture();
-        let started = Instant::now();
-        let env = env_of(
-            &f,
-            &["echo start; sleep 30", "echo after"],
-            Duration::from_millis(300),
+        let clock = Clock::frozen();
+        let ext = f.ext.clone().with_clock(clock.clone());
+        let first_log = f.logs.join("env-1.log");
+        let env = std::thread::scope(|s| {
+            let run = s.spawn(|| {
+                record_within(
+                    &ext,
+                    &f.dir,
+                    &f.logs,
+                    &commands(&["echo start; sleep 30", "echo after"]),
+                    Duration::from_secs(3600),
+                    &Cancel::new(),
+                )
+            });
+            // The limit is read before the check starts, so once `start` shows, one jump past it
+            // cuts the first check and the second check's limit is read from the moved clock.
+            wait_until(|| fs::read_to_string(&first_log).is_ok_and(|log| log.contains("start")));
+            clock.advance(Duration::from_secs(2 * 3600));
+            run.join().unwrap()
+        });
+        assert!(!env.checks[0].ok, "{:?}", env.checks);
+        assert!(
+            env.checks[0].output.starts_with("start"),
+            "{:?}",
+            env.checks
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(!env.checks[0].ok);
-        assert!(env.checks[0].output.starts_with("start"));
-        assert_eq!(env.checks[1].output, "after");
+        assert_eq!(env.checks[1].output, "after", "{:?}", env.checks);
     }
 
     #[test]
@@ -341,8 +377,9 @@ mod tests {
         let f = fixture();
         let cancel = Cancel::new();
         let stopper = cancel.clone();
+        let mark = f.dir.join("running");
         let thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            wait_until(|| mark.exists());
             stopper.cancel();
         });
         let started = Instant::now();
@@ -350,13 +387,13 @@ mod tests {
             &f.ext,
             &f.dir,
             &f.logs,
-            &commands(&["sleep 20", "echo never"]),
+            &commands(&["touch running; sleep 20", "echo never"]),
             CHECK_TIMEOUT,
             &cancel,
         );
         thread.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert_eq!(env.checks.len(), 1);
+        assert_eq!(env.checks.len(), 1, "{:?}", env.checks);
         assert!(!env.checks[0].ok);
     }
 

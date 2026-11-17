@@ -158,6 +158,10 @@ impl Ext {
         self
     }
 
+    pub fn clock(&self) -> &Clock {
+        &self.clock
+    }
+
     pub fn program(&self, tool: Tool) -> &Path {
         match tool {
             Tool::Git => &self.git,
