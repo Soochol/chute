@@ -27,7 +27,7 @@ struct Rule {
     name: &'static str,
     scope: Scope,
     fix: &'static str,
-    find: fn(&str) -> Vec<usize>,
+    find: fn(&str, &str) -> Vec<usize>,
 }
 
 const TIME_FIX: &str = "`wait_until`로 관찰할 수 있는 상태를 기다린다. 시간 판정은 `Clock::frozen()`과 `advance`로 한다. \
@@ -90,29 +90,31 @@ fn re(pattern: &'static str) -> Regex {
     Regex::new(pattern).unwrap()
 }
 
-fn find_sleep(text: &str) -> Vec<usize> {
+fn find_sleep(text: &str, file: &str) -> Vec<usize> {
     static QUALIFIED: LazyLock<Regex> = LazyLock::new(|| re(r"\bthread\s*::\s*sleep\s*\("));
     static IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-        re(r"\buse\s+std\s*::\s*thread\s*::\s*(?:sleep\b|\{[^}]*\bsleep\b[^}]*\})")
+        re(
+            r"\buse\s+std\s*::\s*(?:thread\s*::\s*(?:sleep\b|\{[^}]*\bsleep\b[^}]*\})|\{[^;]*\bthread\s*::\s*(?:sleep\b|\{[^}]*\bsleep\b[^}]*\}))",
+        )
     });
     static BARE: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|[^:\w.])(sleep\s*\()"));
     let mut found: Vec<usize> = QUALIFIED.find_iter(text).map(|m| m.start()).collect();
-    if IMPORT.is_match(text) {
+    if IMPORT.is_match(file) {
         found.extend(BARE.captures_iter(text).map(|c| c.get(1).unwrap().start()));
     }
     found.sort_unstable();
     found
 }
 
-fn find_instant_now(text: &str) -> Vec<usize> {
+fn find_instant_now(text: &str, _file: &str) -> Vec<usize> {
     static NOW: LazyLock<Regex> = LazyLock::new(|| re(r"\bInstant\s*::\s*now\s*\("));
     NOW.find_iter(text).map(|m| m.start()).collect()
 }
 
-fn find_short_duration(text: &str) -> Vec<usize> {
+fn find_short_duration(text: &str, _file: &str) -> Vec<usize> {
     static SHORT: LazyLock<Regex> = LazyLock::new(|| {
         re(
-            r"(advance\s*\(\s*)?\bDuration\s*::\s*(?:from_millis|from_micros|from_nanos|from_secs_f32|from_secs_f64)\s*\(",
+            r"(\badvance\s*\(\s*)?\bDuration\s*::\s*(?:from_millis|from_micros|from_nanos|from_secs_f32|from_secs_f64)\s*\(",
         )
     });
     SHORT
@@ -122,34 +124,37 @@ fn find_short_duration(text: &str) -> Vec<usize> {
         .collect()
 }
 
-fn find_ignore(text: &str) -> Vec<usize> {
+fn find_ignore(text: &str, file: &str) -> Vec<usize> {
     static ANY: LazyLock<Regex> = LazyLock::new(|| re(r"#\[\s*ignore"));
     static CHILD_ENTRY: LazyLock<Regex> =
         LazyLock::new(|| re(r#"^#\[\s*ignore\s*=\s*"run as a child process by (\w+)"\s*\]"#));
+    static NEXT_FN: LazyLock<Regex> = LazyLock::new(|| re(r"\bfn\s+(\w+)"));
     ANY.find_iter(text)
         .filter(|m| {
             let Some(entry) = CHILD_ENTRY.captures(&text[m.start()..]) else {
                 return true;
             };
-            let declared = Regex::new(&format!(r"\bfn\s+{}\b", &entry[1])).unwrap();
-            !declared.is_match(text)
+            let name = &entry[1];
+            let declared = Regex::new(&format!(r"\bfn\s+{name}\b")).unwrap();
+            let next_fn = NEXT_FN.captures(&text[m.end()..]);
+            !declared.is_match(file) || next_fn.is_some_and(|c| &c[1] == name)
         })
         .map(|m| m.start())
         .collect()
 }
 
-fn find_process_env(text: &str) -> Vec<usize> {
+fn find_process_env(text: &str, _file: &str) -> Vec<usize> {
     static ENV: LazyLock<Regex> =
         LazyLock::new(|| re(r"\b(?:set_var|remove_var|set_current_dir)\s*\("));
     ENV.find_iter(text).map(|m| m.start()).collect()
 }
 
-fn find_spawn(text: &str) -> Vec<usize> {
+fn find_spawn(text: &str, _file: &str) -> Vec<usize> {
     static SPAWN: LazyLock<Regex> = LazyLock::new(|| re(r"\.\s*spawn\s*\(\s*\)"));
     SPAWN.find_iter(text).map(|m| m.start()).collect()
 }
 
-fn find_process_start(text: &str) -> Vec<usize> {
+fn find_process_start(text: &str, _file: &str) -> Vec<usize> {
     static NAMES: LazyLock<Regex> = LazyLock::new(|| re(r"\b(?:Command|Sandbox|TestRepo)\b"));
     static SPAWN_CALL: LazyLock<Regex> =
         LazyLock::new(|| re(r"(?:^|[^.\w:])((?:\w+\s*::\s*)*)(spawn\s*\()"));
@@ -186,16 +191,17 @@ fn split_code(path: &str, text: &str) -> Result<Parts, String> {
     }
     static TEST_MOD_OPEN: LazyLock<Regex> =
         LazyLock::new(|| re(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"));
+    static CFG_TEST: LazyLock<Regex> = LazyLock::new(|| re(r"^#\[cfg\((?:all\()?test\b"));
     static ITEM_START: LazyLock<Regex> = LazyLock::new(|| {
         re(
-            r"^(?:pub|fn|struct|enum|impl|const|static|use|trait|type|mod|macro_rules!|extern|unsafe|async)\b",
+            r"^(?:(?:pub|fn|struct|enum|impl|const|static|use|trait|type|mod|extern|unsafe|async)\b|\w+!\s*[{(])",
         )
     });
     let (mut test, mut product) = (Vec::new(), Vec::new());
     let (mut in_region, mut cfg_test_pending) = (false, false);
     for (index, line) in text.split('\n').enumerate() {
         if line.starts_with("#[") {
-            cfg_test_pending |= line.starts_with("#[cfg(test)]");
+            cfg_test_pending |= CFG_TEST.is_match(line);
         } else if ITEM_START.is_match(line) {
             if cfg_test_pending && TEST_MOD_OPEN.is_match(line) {
                 in_region = true;
@@ -240,7 +246,7 @@ fn find_violations(rule: &Rule, sources: &[(String, String)]) -> Result<Found, S
         let Some(scoped) = scoped_text(rule, path, &parts) else {
             continue;
         };
-        let lines: Vec<usize> = (rule.find)(scoped)
+        let lines: Vec<usize> = (rule.find)(scoped, text)
             .into_iter()
             .map(|offset| line_of(scoped, offset))
             .collect();
@@ -582,6 +588,55 @@ fn inline_test_modules_are_test_code_and_the_rest_of_the_file_is_product() {
     let text = "fn a() { Instant::now(); }\n\n#[cfg(test)]\nmod tests {\n    fn t() { Instant::now(); }\n}\n";
     assert_eq!(lines_found("instant-now", "src/a.rs", text), [5]);
     assert_eq!(lines_found("product-instant-now", "src/a.rs", text), [1]);
+}
+
+#[test]
+fn a_sleep_import_outside_the_test_module_still_applies_to_it() {
+    let text =
+        "use std::thread::sleep;\n\n#[cfg(test)]\nmod tests {\n    fn t() { sleep(d); }\n}\n";
+    assert_eq!(lines_found("sleep", "src/a.rs", text), [5]);
+    let entry = "#[cfg(test)]\nmod tests {\n    #[ignore = \"run as a child process by parent\"]\n    fn child() {}\n}\n";
+    assert_eq!(lines_found("ignore", "src/a.rs", entry), [3]);
+}
+
+#[test]
+fn cfg_test_variants_and_macro_items_after_a_test_module_are_classified() {
+    let text =
+        "#[cfg(all(test, unix))]\nmod probe {\n    fn t() { sleep(d); Instant::now(); }\n}\n";
+    assert_eq!(lines_found("instant-now", "src/a.rs", text), [3]);
+    assert!(lines_found("product-instant-now", "src/a.rs", text).is_empty());
+    let err = split_code(
+        "src/a.rs",
+        "#[cfg(test)]\nmod tests {\n}\nthread_local! {\n    static A: u8 = 0;\n}\n",
+    )
+    .err()
+    .unwrap();
+    assert!(err.starts_with("src/a.rs:4:"), "{err}");
+}
+
+#[test]
+fn nested_std_imports_of_sleep_apply_and_lookalike_advance_names_do_not_exempt() {
+    assert_eq!(
+        in_test_file(
+            "sleep",
+            "use std::{thread::sleep, time::Duration};\nsleep(d);"
+        ),
+        [2]
+    );
+    assert_eq!(
+        in_test_file("sleep", "use std::{io, thread::{self, sleep}};\nsleep(d);"),
+        [2]
+    );
+    assert_eq!(
+        in_test_file("short-duration", "fake_advance(Duration::from_millis(5));"),
+        [1]
+    );
+}
+
+#[test]
+fn an_ignored_fn_named_as_its_own_parent_is_not_a_child_entry() {
+    let text = "#[ignore = \"run as a child process by flaky\"]\nfn flaky() {}\n";
+    assert_eq!(in_test_file("ignore", text), [1]);
 }
 
 #[test]
