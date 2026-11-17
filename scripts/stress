@@ -45,7 +45,7 @@ bin_args=()
 
 number_arg() {
   local name=$1 value=$2 min=$3
-  [[ $value =~ ^[0-9]+$ ]] && ((value >= min)) || die "$name에는 $min 이상의 정수를 준다: '$value'"
+  [[ $value =~ ^[0-9]+$ ]] && ((10#$value >= min)) || die "$name에는 $min 이상의 정수를 준다: '$value'"
 }
 
 while (($#)); do
@@ -78,13 +78,16 @@ done
 number_arg --hogs "$hogs" 0
 number_arg --jobs "$jobs" 1
 number_arg --rounds "$rounds" 1
+hogs=$((10#$hogs))
+jobs=$((10#$jobs))
+rounds=$((10#$rounds))
 command -v jq >/dev/null || die "jq가 필요하다"
 
 hog_pid=
 test_pids=()
 
 kill_session() {
-  kill -"$1" -- "-$2" 2>/dev/null
+  pkill -"$1" -s "$2" 2>/dev/null
 }
 
 cleanup() {
@@ -153,8 +156,10 @@ for ((round = 1; round <= rounds; round++)); do
     done
     for i in "${!test_pids[@]}"; do
       total=$((total + 1))
-      if ! wait "${test_pids[$i]}"; then
-        code=$?
+      wait "${test_pids[$i]}"
+      code=$?
+      kill_session KILL "${test_pids[$i]}"
+      if ((code != 0)); then
         failed_runs=$((failed_runs + 1))
         echo "$code" >"${run_logs[$i]}.exit"
       fi
@@ -188,7 +193,7 @@ if [[ -n $failed_names ]]; then
     echo "  $name: $count회"
   done <<<"$failed_names"
 fi
-((unnamed > 0)) && echo "시험 이름 없이 실패한 실행: $unnamed회 (충돌이나 신호. 로그의 .exit 파일에 종료 코드)"
+((unnamed > 0)) && echo "시험 이름을 뽑지 못한 실패: $unnamed회 (충돌, 신호, 또는 -q 같은 출력 형식. 로그의 .exit 파일에 종료 코드)"
 echo "로그 폴더: $log_dir"
 
 ((failed_runs == 0))
