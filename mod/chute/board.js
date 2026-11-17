@@ -13,43 +13,68 @@ const ACTIONS_OF_STATE = table({
   needs_human: ["retry", "drop"],
 });
 
-const ACTION_LABEL = table({ approve: "승인", retry: "다시 시도", drop: "빼기" });
+const ACTION_LABEL = table({ approve: "Approve", retry: "Retry", drop: "Drop" });
+
+// The one place that turns a meaning into a theme token name; `main.js` reads `theme()[name]`.
+const TONE_TOKEN = table({
+  ok: "ansi2",
+  error: "ansi1",
+  working: "working",
+  human: "blocked",
+  warn: "ansi3",
+  waiting: "muted",
+});
+
+export const toneToken = (tone) => TONE_TOKEN[tone] ?? "dim";
+
+// Mirrors `WarningKind` in src/model.rs.
+const WARNING_TITLE = table({
+  not_merged: "Not merged",
+  no_checks: "No checks",
+  config: "Can't read config",
+  history: "Can't read history",
+  engine: "Engine problem",
+  hub: "Hub problem",
+  flaky_chronic: "Chronic flaky test",
+  gc: "Cleanup incomplete",
+  post: "Post-merge check couldn't run",
+});
 
 const SECTION_ORDER = ["alerts", "human", "batch", "waiting", "bounced", "unknown"];
 
 const SECTION_TITLE = {
-  alerts: "멈춤·경고",
-  human: "사람 차례",
-  batch: "검증 중",
-  waiting: "대기",
-  bounced: "반송",
-  unknown: "알 수 없는 상태",
+  alerts: "Alerts",
+  human: "Needs you",
+  batch: "Verifying",
+  waiting: "Queued",
+  bounced: "Bounced",
+  unknown: "Unknown state",
 };
 
 const HUMAN_REASON = table({
-  budget: "재시도 예산을 다 썼다",
-  unreachable: "에이전트에게 전달하지 못했다",
-  gave_up: "에이전트가 포기를 선언했다",
+  budget: "Out of retries",
+  unreachable: "Couldn't reach the agent",
+  gave_up: "Agent gave up",
 });
 
 const BOUNCE_REASON = table({
-  conflict: "충돌",
-  verify: "검증 실패",
-  timeout: "시간 초과",
-  head_changed: "HEAD 변경",
-  ci: "CI 실패",
+  conflict: "Conflict",
+  verify: "Verification failed",
+  timeout: "Timed out",
+  head_changed: "HEAD changed",
+  ci: "CI failed",
 });
 
-const FAILURE_MODE = table({ solo: "단독", combo: "조합" });
-const PHASE = table({ building: "합치는 중", verifying: "검증 중", bisecting: "이분 탐색 중", pushing: "push 중" });
-const APPROVAL = table({ agent: "에이전트 신뢰", human: "사람 확인" });
-const BLOCK_REASON = table({ base_broken: "기준 커밋이 검증에 실패해 큐가 멈췄다" });
+const FAILURE_MODE = table({ solo: "Solo", combo: "Combined" });
+const PHASE = table({ building: "Building", verifying: "Verifying", bisecting: "Bisecting", pushing: "Pushing" });
+const APPROVAL = table({ agent: "Agent trusted", human: "Human review" });
+const BLOCK_REASON = table({ base_broken: "Queue stopped: base commit failed verification" });
 const PREFLIGHT = table({
-  pass: { text: "preflight 통과", tone: "ok" },
-  fail: { text: "preflight 실패", tone: "error" },
-  conflict: { text: "preflight 충돌", tone: "error" },
-  base_broken: { text: "preflight 기준 깨짐", tone: "error" },
-  skipped: { text: "preflight 생략", tone: "muted" },
+  pass: { text: "Preflight passed", tone: "ok" },
+  fail: { text: "Preflight failed", tone: "error" },
+  conflict: { text: "Preflight conflict", tone: "error" },
+  base_broken: { text: "Preflight: base broken", tone: "error" },
+  skipped: { text: "Preflight skipped", tone: "muted" },
 });
 
 const plain = (v) => {
@@ -57,7 +82,7 @@ const plain = (v) => {
   try {
     return JSON.stringify(v) ?? "";
   } catch {
-    return "(표시할 수 없는 값)";
+    return "(can't display)";
   }
 };
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -83,16 +108,16 @@ export const causeText = (cause) =>
   firstLine(typeof cause === "string" ? cause : typeof cause?.message === "string" ? cause.message : "");
 
 export const failureText = (r) =>
-  firstLine(r.stderr) || firstLine(r.stdout) || (Number.isInteger(r.code) ? `종료 코드 ${r.code}` : "비정상 종료");
+  firstLine(r.stderr) || firstLine(r.stdout) || (Number.isInteger(r.code) ? `Exit code ${r.code}` : "Exited abnormally");
 
 export function formatDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";
   const s = Math.round(seconds);
-  if (s < 60) return `${s}초`;
+  if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
-  if (m < 60) return s % 60 ? `${m}분 ${s % 60}초` : `${m}분`;
+  if (m < 60) return s % 60 ? `${m}m ${s % 60}s` : `${m}m`;
   const h = Math.floor(m / 60);
-  return m % 60 ? `${h}시간 ${m % 60}분` : `${h}시간`;
+  return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
 }
 
 // Mirrors `Sha` in src/model.rs: lowercase hex, 4 to 64 characters.
@@ -120,10 +145,10 @@ function agentOf(agent) {
 
 function marksOf(item) {
   const marks = [];
-  if (item.priority === true) marks.push({ kind: "priority", text: "급함", tone: "warn" });
-  if (item.repair === true) marks.push({ kind: "repair", text: "복구", tone: "error" });
+  if (item.priority === true) marks.push({ kind: "priority", text: "Urgent", tone: "warn" });
+  if (item.repair === true) marks.push({ kind: "repair", text: "Repair", tone: "error" });
   const after = [...new Set(list(item.after).filter((pr) => Number.isSafeInteger(pr) && pr > 0))];
-  if (after.length > 0) marks.push({ kind: "after", text: `${after.map((pr) => `#${pr}`).join(", ")} 뒤`, tone: "muted" });
+  if (after.length > 0) marks.push({ kind: "after", text: `after ${after.map((pr) => `#${pr}`).join(", ")}`, tone: "muted" });
   return marks;
 }
 
@@ -140,7 +165,7 @@ function hubOf(hub) {
     local,
     reachable: h.reachable !== false,
     error: str(h.error),
-    label: local ? "이 PC" : str(h.host) || str(h.machine) || "알 수 없는 허브",
+    label: local ? "this PC" : str(h.host) || str(h.machine) || "unknown hub",
     machine: local ? null : str(h.machine) || null,
   };
 }
@@ -164,12 +189,12 @@ function failureOf(item) {
 
 function preflightOf(item) {
   const record = item.preflight;
-  if (!isObject(record)) return { text: "preflight 없음", tone: "muted", stale: false };
+  if (!isObject(record)) return { text: "No preflight", tone: "muted", stale: false };
   const result = rawText(record.result) ?? "?";
-  const known = PREFLIGHT[result] ?? { text: `preflight ${result}`, tone: "muted" };
+  const known = PREFLIGHT[result] ?? { text: `Preflight ${result}`, tone: "muted" };
   const stale = record.head !== item.head;
   return {
-    text: stale ? `${known.text} (이전 HEAD)` : known.text,
+    text: stale ? `${known.text} (old HEAD)` : known.text,
     tone: stale ? "muted" : known.tone,
     stale,
   };
@@ -200,36 +225,36 @@ function cardOf(item, repoPath) {
     marks: marksOf(item),
     submitter: submitterOf(item),
   };
-  card.report = card.failure?.report ? { label: "보고서", path: card.failure.report } : null;
+  card.report = card.failure?.report ? { label: "Report", path: card.failure.report } : null;
   if (item.state === "awaiting_approval") {
-    card.reason = "승인 대기";
+    card.reason = "Awaiting approval";
     card.preflight = preflightOf(item);
-    card.config = item.touches_config === true ? "chute.toml 변경" : "chute.toml 변경 없음";
+    card.config = item.touches_config === true ? "chute.toml changed" : "chute.toml unchanged";
     card.configChanged = item.touches_config === true;
-    card.approvalBlocked = safeHeadOf(item) ? null : "HEAD를 알 수 없어 승인할 수 없다";
+    card.approvalBlocked = safeHeadOf(item) ? null : "Can't approve: HEAD unknown";
   } else if (item.state === "needs_human") {
-    card.reason = named(HUMAN_REASON, item.state_reason) ?? "사람 차례";
+    card.reason = named(HUMAN_REASON, item.state_reason) ?? "Needs you";
   } else if (item.state === "bounced") {
-    card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind || null) ?? "사유 없음";
+    card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind || null) ?? "No reason";
     card.headline = card.failure?.mode ? `${card.reason} · ${card.failure.mode}` : card.reason;
   }
   return card;
 }
 
-const REPAIR_STATE = table({ queued: "검증 대기", in_batch: "검증 중" });
+const REPAIR_STATE = table({ queued: "queued", in_batch: "verifying" });
 
 function repairFacts(queue) {
   return queue
     .filter((item) => item.repair === true)
-    .map((item) => `복구 PR #${item.pr} ${REPAIR_STATE[item.state] ?? "처리 필요"}`);
+    .map((item) => `Repair PR #${item.pr} ${REPAIR_STATE[item.state] ?? "needs attention"}`);
 }
 
 function haltFacts(blocked, queue) {
   const facts = [];
-  if (str(blocked.step)) facts.push(`실패한 단계 ${blocked.step}`);
-  if (blocked.pushed_by_chute === true) facts.push("chute가 push한 커밋");
-  else if (blocked.pushed_by_chute === false) facts.push("chute가 push하지 않은 커밋");
-  if (blocked.rechecked === true) facts.push("다시 검증했다");
+  if (str(blocked.step)) facts.push(`Failed step ${blocked.step}`);
+  if (blocked.pushed_by_chute === true) facts.push("Commit pushed by chute");
+  else if (blocked.pushed_by_chute === false) facts.push("Commit not pushed by chute");
+  if (blocked.rechecked === true) facts.push("Rechecked");
   return [...facts, ...repairFacts(queue)];
 }
 
@@ -239,25 +264,27 @@ function alertsOf(view, queue, now, merged) {
     const blocked = isObject(view.blocked) ? view.blocked : { reason: view.blocked };
     const reason = rawText(blocked.reason) ?? "";
     const parts = [];
-    if (str(blocked.base)) parts.push(`기준 ${blocked.base}`);
-    if (Number.isFinite(blocked.since_ms) && now >= blocked.since_ms) parts.push(`${formatDuration((now - blocked.since_ms) / 1000)} 전부터`);
+    if (str(blocked.base)) parts.push(`base ${blocked.base}`);
+    if (Number.isFinite(blocked.since_ms) && now >= blocked.since_ms) parts.push(`for ${formatDuration((now - blocked.since_ms) / 1000)}`);
     alerts.push({
       kind: "blocked",
       tone: "error",
-      text: BLOCK_REASON[reason] ?? `큐가 멈췄다: ${reason || "사유 모름"}`,
+      text: BLOCK_REASON[reason] ?? `Queue stopped: ${reason || "unknown reason"}`,
       detail: parts.join(" · "),
       facts: haltFacts(blocked, queue),
-      files: [fileOf("로그", blocked.log)].filter(Boolean),
+      files: [fileOf("Log", blocked.log)].filter(Boolean),
       log: str(blocked.log) || null,
     });
   }
   if (isObject(view.daemon) && view.daemon.running === false) {
-    alerts.push({ kind: "daemon", tone: "error", text: "데몬이 꺼져 있다", detail: "`chute up`으로 켠다", facts: [], files: [], log: null });
+    alerts.push({ kind: "daemon", tone: "error", text: "Daemon is off", detail: "Run `chute up` to start it.", facts: [], files: [], log: null });
   }
   alerts.push(...postVerifyAlerts(view.post_verify, now, merged));
   for (const warning of list(view.warnings)) {
-    const words = typeof warning === "string" ? [warning] : [warning?.message, warning?.kind];
-    alerts.push({ kind: "warning", tone: "warn", text: words.map((w) => str(w).trim()).find(Boolean) ?? "경고", detail: "", facts: [], files: [], log: null });
+    const message = typeof warning === "string" ? warning : warning?.message;
+    const kind = typeof warning === "string" ? "" : str(warning?.kind);
+    const title = kind ? WARNING_TITLE[kind] ?? "Warning" : "Warning";
+    alerts.push({ kind: "warning", tone: "warn", text: title, detail: str(message).trim(), facts: [], files: [], log: null });
   }
   return alerts;
 }
@@ -267,12 +294,12 @@ const shortSha = (v) => str(v).slice(0, 7);
 export function formatAgo(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "";
   const s = Math.floor(ms / 1000);
-  if (s < 60) return "방금";
+  if (s < 60) return "just now";
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}분 전`;
+  if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h}시간 전`;
-  return `${Math.floor(h / 24)}일 전`;
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 const SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -324,22 +351,22 @@ function postVerifyAlerts(post, now, merged) {
   const culprit = isObject(red.culprit) ? red.culprit : null;
   const culpritTitle = culprit ? merged.find((m) => m.pr === culprit.pr)?.title : "";
   const facts = [];
-  if (culprit && Number.isSafeInteger(culprit.pr)) facts.push(`원인 #${culprit.pr}${culpritTitle ? ` ${culpritTitle}` : ""}`);
-  else if (culprit) facts.push(`원인 커밋 ${shortSha(culprit.commit)}`);
-  else facts.push("원인 머지를 찾지 못했다");
+  if (culprit && Number.isSafeInteger(culprit.pr)) facts.push(`Culprit #${culprit.pr}${culpritTitle ? ` ${culpritTitle}` : ""}`);
+  else if (culprit) facts.push(`Culprit commit ${shortSha(culprit.commit)}`);
+  else facts.push("Culprit merge not found");
   const tests = list(red.tests).filter((t) => typeof t === "string" && t);
-  if (tests.length > 0) facts.push(`실패한 시험 ${tests.join(", ")}`);
-  if (str(red.last_green)) facts.push(`마지막 통과 ${shortSha(red.last_green)}`);
-  if (red.holding === true) facts.push("관련 PR은 고칠 때까지 기다린다");
-  if (culprit && str(culprit.batch)) facts.push(`되돌리려면 chute revert ${culprit.batch}`);
+  if (tests.length > 0) facts.push(`Failed tests ${tests.join(", ")}`);
+  if (str(red.last_green)) facts.push(`Last green ${shortSha(red.last_green)}`);
+  if (red.holding === true) facts.push("Related PRs wait until it's fixed");
+  if (culprit && str(culprit.batch)) facts.push(`To undo: chute revert ${culprit.batch}`);
   const parts = [shortSha(red.commit)];
-  if (Number.isFinite(red.since_ms) && now >= red.since_ms) parts.push(`${formatDuration((now - red.since_ms) / 1000)} 전부터`);
-  const files = [fileOf("보고서", red.report), fileOf("로그", red.log)].filter(Boolean);
+  if (Number.isFinite(red.since_ms) && now >= red.since_ms) parts.push(`for ${formatDuration((now - red.since_ms) / 1000)}`);
+  const files = [fileOf("Report", red.report), fileOf("Log", red.log)].filter(Boolean);
   return [
     {
       kind: "post_verify",
       tone: "error",
-      text: `머지 뒤 검사가 실패했다 · ${str(red.step) || "?"}`,
+      text: `Post-merge check failed · ${str(red.step) || "?"}`,
       detail: parts.join(" · "),
       facts,
       files,
@@ -360,7 +387,7 @@ function postVerifyOf(post, now) {
     run: run
       ? {
           commit: shortSha(run.commit),
-          label: run.phase === "searching" ? "범인 찾는 중" : "검사 중",
+          label: run.phase === "searching" ? "Finding culprit" : "Checking",
           step: str(run.step) || null,
           waitingMachine: run.waiting_machine === true,
           elapsed: Number.isFinite(run.started_ms) ? formatDuration(Math.max(0, (now - run.started_ms) / 1000)) : null,
@@ -387,7 +414,7 @@ function batchOf(batch, members, now, usualS) {
   const step = str(b.step) || null;
   const steps = list(b.steps).filter((name) => typeof name === "string" && name);
   const at = step ? steps.indexOf(step) : -1;
-  const stepText = step && at >= 0 ? `${step} ${at + 1}/${steps.length}단계` : step;
+  const stepText = step && at >= 0 ? `${step} ${at + 1}/${steps.length}` : step;
   const elapsedS = Number.isFinite(b.started_ms) ? Math.max(0, (now - b.started_ms) / 1000) : null;
   const timed = usualS != null && usualS > 0 && elapsedS != null;
   return [
@@ -397,10 +424,10 @@ function batchOf(batch, members, now, usualS) {
       step,
       stepText,
       waitingMachine: b.waiting_machine === true,
-      reused: b.reused === "preflight" || b.reused === "batch" ? `${b.reused}의 통과 결과를 다시 씀` : null,
-      round: Number.isFinite(b.round) && b.round > 0 ? `${b.round}번째 검증` : null,
+      reused: b.reused === "preflight" || b.reused === "batch" ? `Reused ${b.reused} pass` : null,
+      round: Number.isFinite(b.round) && b.round > 0 ? `Round ${b.round}` : null,
       elapsed: elapsedS != null ? formatDuration(elapsedS) : null,
-      usual: usualS != null ? `평소 ${formatDuration(usualS)}` : null,
+      usual: usualS != null ? `usually ${formatDuration(usualS)}` : null,
       progress: timed ? Math.min(1, elapsedS / usualS) : null,
       longer: timed && elapsedS > usualS,
     },
@@ -413,15 +440,15 @@ const chronicFlaky = (view) =>
 function todayOf(today, chronic) {
   if (!isObject(today)) return null;
   return {
-    line: `머지 ${num(today.merged)} · 반송 ${num(today.bounced)} · 중앙값 ${formatDuration(today.median_lead_s)}`,
+    line: `${num(today.merged)} merged · ${num(today.bounced)} bounced · median ${formatDuration(today.median_lead_s)}`,
     details: [
-      { key: "flaky", label: "flaky", value: num(today.flaky), note: chronic ? "만성" : null },
-      { key: "batches", label: "batch", value: num(today.batches) },
+      { key: "flaky", label: "Flaky", value: num(today.flaky), note: chronic ? "chronic" : null },
+      { key: "batches", label: "Batches", value: num(today.batches) },
       {
         key: "verify",
-        label: "검증 시간 합계",
+        label: "Total verify time",
         value: formatDuration(today.verify_s),
-        hint: Number.isFinite(today.batches) ? `(batch ${today.batches}개를 더한 시간)` : null,
+        hint: Number.isFinite(today.batches) ? `(sum of ${today.batches} ${today.batches === 1 ? "batch" : "batches"})` : null,
       },
     ],
   };
@@ -436,25 +463,25 @@ const bySubmission = (a, b) => {
   return p === q ? 0 : p ? -1 : 1;
 };
 
-const BLOCK_SHORT = table({ base_broken: "기준 커밋이 검증에 실패했다" });
+const BLOCK_SHORT = table({ base_broken: "base failed verification" });
 
 function statusLineOf(view, queue, batch) {
   const red = isObject(view.post_verify) && isObject(view.post_verify.red) ? view.post_verify.red : null;
   if (view.blocked) {
     const reason = rawText(isObject(view.blocked) ? view.blocked.reason : view.blocked) ?? "";
-    return { tone: "error", text: `멈춤 · ${BLOCK_SHORT[reason] ?? (reason || "사유 모름")}` };
+    return { tone: "error", text: `Stopped · ${BLOCK_SHORT[reason] ?? (reason || "unknown reason")}` };
   }
-  if (red) return { tone: "error", text: `머지 뒤 검사 실패 · ${str(red.step) || "?"}` };
-  if (isObject(view.daemon) && view.daemon.running === false) return { tone: "error", text: "데몬이 꺼져 있다" };
+  if (red) return { tone: "error", text: `Post-merge check failed · ${str(red.step) || "?"}` };
+  if (isObject(view.daemon) && view.daemon.running === false) return { tone: "error", text: "Daemon is off" };
   const human = queue.filter((item) => item.state === "awaiting_approval" || item.state === "needs_human").length;
-  if (human > 0) return { tone: "human", text: `사람 차례 ${human}건` };
+  if (human > 0) return { tone: "human", text: `Needs you · ${human}` };
   if (batch) {
-    if (batch.waitingMachine) return { tone: "working", text: "PC 자리 기다리는 중" };
-    return { tone: "working", text: batch.stepText ? `검증 중 · ${batch.stepText}` : "검증 중" };
+    if (batch.waitingMachine) return { tone: "working", text: "Waiting for a slot" };
+    return { tone: "working", text: batch.stepText ? `Verifying · ${batch.stepText}` : "Verifying" };
   }
   const waiting = queue.filter((item) => item.state === "queued").length;
-  if (waiting > 0) return { tone: "waiting", text: `대기 ${waiting}건` };
-  return { tone: "ok", text: "정상 · 대기 없음" };
+  if (waiting > 0) return { tone: "waiting", text: `Queued · ${waiting}` };
+  return { tone: "ok", text: "All clear" };
 }
 
 function noticesOf(view, queue, alerts) {
@@ -472,15 +499,15 @@ function noticesOf(view, queue, alerts) {
   for (const item of queue) {
     const head = str(item.head);
     if (item.state === "awaiting_approval") {
-      notices.push({ key: `approval:${item.pr}:${head}`, level: "warning", body: `#${item.pr} 승인 대기 · ${str(item.title)}`, file: null });
+      notices.push({ key: `approval:${item.pr}:${head}`, level: "warning", body: `#${item.pr} awaiting approval · ${str(item.title)}`, file: null });
     } else if (item.state === "needs_human") {
-      const reason = named(HUMAN_REASON, item.state_reason) ?? "사람 차례";
+      const reason = named(HUMAN_REASON, item.state_reason) ?? "Needs you";
       const report = str(item.last_failure?.report);
       notices.push({
         key: `human:${item.pr}:${item.state_reason ?? ""}`,
         level: "warning",
-        body: `#${item.pr} 사람 차례 · ${reason}`,
-        file: report ? { label: "보고서", path: report } : null,
+        body: `#${item.pr} needs you · ${reason}`,
+        file: report ? { label: "Report", path: report } : null,
       });
     }
   }
@@ -517,7 +544,7 @@ export const needsClock = (board) =>
 function repoBoard(view, now) {
   const repo = isObject(view.repo) ? view.repo : {};
   const path = str(repo.path);
-  const slug = str(repo.slug) || "(이름 없는 저장소)";
+  const slug = str(repo.slug) || "(unnamed repo)";
   const hub = hubOf(view.hub);
   const base = {
     id: path || slug,
@@ -534,7 +561,7 @@ function repoBoard(view, now) {
     return {
       ...base,
       approval: null,
-      status: { tone: "error", text: "허브에 닿지 않는다" },
+      status: { tone: "error", text: "Hub unreachable" },
       sections: [],
     };
   }
@@ -554,7 +581,7 @@ function repoBoard(view, now) {
         title: str(item.title),
         position: placed.waiting.length + 1,
         ciPending,
-        label: ciPending ? "CI 대기" : "대기",
+        label: ciPending ? "Waiting on CI" : "Queued",
         note: item.state_reason && !ciPending ? item.state_reason : null,
         marks: marksOf(item),
         submitter: submitterOf(item),
@@ -563,7 +590,7 @@ function repoBoard(view, now) {
       placed.unknown.push({
         pr: item.pr,
         title: str(item.title),
-        state: item.state ?? "(없음)",
+        state: item.state ?? "(none)",
         reason: item.state_reason,
       });
     } else placed[section].push(cardOf(item, path));
@@ -588,7 +615,7 @@ function repoBoard(view, now) {
   };
 }
 
-const failed = (detail) => ({ kind: "failed", title: "상태를 읽지 못했다", detail, hint: "" });
+const failed = (detail) => ({ kind: "failed", title: "Couldn't read status", detail, hint: "" });
 
 export function interpret(run, clock = Date.now()) {
   const now = Number.isFinite(clock) ? clock : Date.now();
@@ -596,9 +623,9 @@ export function interpret(run, clock = Date.now()) {
   if (r.spawnError != null) {
     return {
       kind: "missing",
-      title: "chute를 실행할 수 없다",
+      title: "Can't run chute",
       detail: firstLine(r.spawnError),
-      hint: "저장소에서 `cargo install --path .`을 실행하거나 target/release/chute를 PATH에 둔다. Herdr가 찾지 못하면 mod의 props `bin`에 실행 파일 경로를 준다.",
+      hint: "Run `cargo install --path .` in the repository, or put target/release/chute on PATH. If Herdr can't find it, set the mod's `bin` prop to the executable path.",
     };
   }
   if (r.code !== 0) return failed(failureText(r));
@@ -608,17 +635,18 @@ export function interpret(run, clock = Date.now()) {
     data = JSON.parse(str(r.stdout));
   } catch {
     const excerpt = firstLine(r.stdout).slice(0, 120);
-    return failed(`chute status가 JSON이 아닌 출력을 냈다${excerpt ? `: ${excerpt}` : ""}`);
+    return failed(`chute status printed non-JSON output${excerpt ? `: ${excerpt}` : ""}`);
   }
   const views = (Array.isArray(data) ? data : [data]).filter(isObject);
   if (Array.isArray(data) && data.length === 0) {
     return {
       kind: "empty",
-      title: "등록된 저장소가 없다",
+      title: "No repositories",
       detail: "",
-      hint: "저장소에서 `chute init`을 실행한다.",
+      hint: "Run `chute init` in a repository.",
     };
   }
-  if (views.length === 0) return failed("chute status의 출력이 저장소 상태가 아니다");
+  if (views.length === 0) return failed("chute status output isn't repository state")
+;
   return { kind: "board", repos: views.map((view) => repoBoard(view, now)) };
 }
