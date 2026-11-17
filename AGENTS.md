@@ -28,6 +28,8 @@ cargo test
 
 시험은 사용자의 환경에 닿지 않는다.
 
+시험을 쓰거나 고치기 전에 `docs/testing.md`를 읽는다.
+
 - `CHUTE_HOME`과 `HOME`은 임시 폴더다. 단위 시험은 `crate::testkit`, 통합 시험은 `mod support;`(`tests/support/mod.rs`)의 `Sandbox`를 쓴다.
 - `gh`와 `hc`는 `Sandbox::fake`가 만드는 가짜다. 원격은 `TestRepo`가 만드는 로컬 bare 저장소다.
 - 실제 hc 코어, Herdr 창, 사용자의 홈 폴더, GitHub에 쓰지 않는다.
