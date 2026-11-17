@@ -1156,3 +1156,27 @@ fn a_probe_that_names_nothing_at_the_tip_either_is_judged_as_before() {
     assert_eq!(red.tests, ["broken_test"]);
     assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
 }
+
+#[test]
+fn a_commit_that_fails_only_some_of_the_tips_tests_is_not_the_same_failure() {
+    let lab = probe_lab(
+        "if [ -e svc/A ]; then echo 'FAILED a_test'; f=1; fi\nif [ -e svc/B ]; then echo 'FAILED b_test'; f=1; fi\n[ -z \"$f\" ] || exit 1",
+        "for t in \"$@\"; do\n  if [ \"$t\" = a_test ] && [ -e svc/A ]; then echo 'FAILED a_test'; f=1; fi\n  if [ \"$t\" = b_test ] && [ -e svc/B ]; then echo 'FAILED b_test'; f=1; fi\ndone\n[ -z \"$f\" ] || exit 1",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(
+        &lab,
+        &[(1, "f1.txt"), (2, "svc/A"), (3, "svc/B"), (4, "g.txt")],
+    );
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["a_test", "b_test"]);
+    assert!(
+        red.culprit.is_none(),
+        "a_test만 깨진 커밋을 범인으로 가리지 않는다: {:?}",
+        red.culprit
+    );
+}
