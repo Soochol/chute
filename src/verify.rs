@@ -28,6 +28,8 @@ const GROUP_POLL: Duration = Duration::from_millis(10);
 
 const KILL_WAIT: Duration = Duration::from_secs(1);
 
+/// Linux refuses a single `sh -c` argument of 128 KiB or more.
+const MAX_ARG_BYTES: usize = 128 * 1024;
 const SCAN_BYTES: u64 = 16 * 1024 * 1024;
 const TAIL_LINES: usize = 40;
 const TAIL_BYTES: usize = 8 * 1024;
@@ -308,7 +310,10 @@ impl Ctx<'_> {
 
     fn probe_step(&self, step: &VerifyStep, tests: &[String]) -> Option<VerifyStep> {
         let probe = step.probe.as_ref().filter(|_| self.opts.rerun_with_probe)?;
-        if tests.iter().any(|test| test.contains('\0')) {
+        if tests
+            .iter()
+            .any(|test| test.contains(['\0', char::REPLACEMENT_CHARACTER]))
+        {
             return None;
         }
         let slots = probe.matches(PROBE_PLACEHOLDER).count().max(1);
@@ -316,8 +321,12 @@ impl Ctx<'_> {
         if taken.len() != tests.len() {
             return None;
         }
+        let run = probe.replace(PROBE_PLACEHOLDER, &quoted);
+        if run.len() >= MAX_ARG_BYTES {
+            return None;
+        }
         Some(VerifyStep {
-            run: probe.replace(PROBE_PLACEHOLDER, &quoted),
+            run,
             ..step.clone()
         })
     }

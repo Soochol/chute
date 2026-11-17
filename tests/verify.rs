@@ -367,6 +367,38 @@ fn a_probe_with_the_tests_twice_does_not_outgrow_the_argument_limit() {
 }
 
 #[test]
+fn a_name_that_is_not_utf8_makes_the_rerun_whole() {
+    let rig = Rig::new();
+    let run = "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; printf 'test a\\377b ... FAILED\\n'; exit 1";
+    let cfg = probed(
+        &rig,
+        run,
+        "echo probe >> '@M@/probe'; echo {tests} > /dev/null",
+    );
+
+    passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+    assert!(!rig.mark("probe").exists());
+}
+
+#[test]
+fn a_probe_command_that_outgrows_the_argument_limit_makes_the_rerun_whole() {
+    let rig = Rig::new();
+    let run = "echo run >> '@M@/full'; [ -e '@M@/seen' ] && exit 0; touch '@M@/seen'; i=0; while [ $i -lt 900 ]; do printf 'test padding_padding_padding_padding_padding_padding_%05d ... FAILED\\n' $i; i=$((i+1)); done; exit 1";
+    let probe = format!(
+        "echo probe >> '@M@/probe'; : {{tests}} # {}",
+        "x".repeat(90_000)
+    );
+    let cfg = probed(&rig, run, &probe);
+
+    passed(rig.run(&cfg, &with_probe_rerun()));
+
+    assert_eq!(count_lines(&rig.mark("full")), 2);
+    assert!(!rig.mark("probe").exists());
+}
+
+#[test]
 fn a_first_attempt_that_names_no_test_is_rerun_whole_even_with_a_probe() {
     let rig = Rig::new();
     let run =
