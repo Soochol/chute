@@ -252,6 +252,7 @@ struct RawPostStep {
     #[serde(default = "default_timeout")]
     timeout: u64,
     failed: Option<String>,
+    probe: Option<String>,
     paths: Option<Vec<String>>,
 }
 
@@ -472,7 +473,7 @@ impl From<RawPostStep> for RawStepParts {
             run: step.run,
             timeout: step.timeout,
             failed: step.failed,
-            probe: None,
+            probe: step.probe,
             paths: step.paths,
         }
     }
@@ -605,7 +606,7 @@ timeout = 3600          # 초
 # paths = ["src/", "Cargo.toml"]   # 바뀐 파일이 이 접두어로 시작할 때만 이 단계를 돈다. 비우면 안 된다
 
 # 머지 뒤에 기본 브랜치에서 돌릴 단계. [[verify]]보다 느려 batch가 기다리기 싫은 단계를 둔다.
-# 모양은 [[verify]]와 같고(probe는 없다), 단계 이름은 [[verify]]와 겹치면 안 된다.
+# 모양은 [[verify]]와 같고, 단계 이름은 [[verify]]와 겹치면 안 된다. probe가 있으면 한 번 실패한 단계는 실패한 시험만 probe로 다시 돈다.
 # [[post_verify]]
 # name = "e2e"
 # run = "npm run e2e"
@@ -977,6 +978,16 @@ probe = "cargo test {tests} -- --exact"
     }
 
     #[test]
+    fn a_post_verify_step_takes_a_probe() {
+        let text = format!("{MINIMAL}{POST}probe = \"npm run e2e -- {{tests}}\"\n");
+        let post = Config::parse(&text).unwrap().post.unwrap();
+        assert_eq!(
+            post.steps.first().probe.as_deref(),
+            Some("npm run e2e -- {tests}")
+        );
+    }
+
+    #[test]
     fn the_interval_and_the_hold_are_read_and_need_a_post_verify_step() {
         let text = format!("post_verify_interval = 15\npost_verify_hold = true\n{MINIMAL}{POST}");
         let post = Config::parse(&text).unwrap().post.unwrap();
@@ -999,18 +1010,20 @@ probe = "cargo test {tests} -- --exact"
     }
 
     #[test]
-    fn a_post_verify_step_is_checked_like_a_verify_step_and_takes_no_probe() {
+    fn a_post_verify_step_is_checked_like_a_verify_step() {
         for bad in [
             "timeout = 0\n",
             "paths = []\n",
             "failed = 'x('\n",
-            "probe = \"t {tests}\"\n",
+            "probe = \"t\"\n",
         ] {
             assert!(
                 Config::parse(&format!("{MINIMAL}{POST}{bad}")).is_err(),
                 "{bad}"
             );
         }
+        let e = Config::parse(&format!("{MINIMAL}{POST}probe = \"t\"\n")).unwrap_err();
+        assert!(e.to_string().contains("{tests} 자리가 없다"), "{e}");
         let blank = "[[post_verify]]\nname = \"x\"\nrun = \" \"\n";
         assert!(Config::parse(&format!("{MINIMAL}{blank}")).is_err());
     }

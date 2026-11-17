@@ -15,7 +15,8 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
 use nix::unistd::Pid;
 
-use crate::config::{Config, VerifyStep};
+use crate::config::{Config, PROBE_PLACEHOLDER, VerifyStep};
+use crate::flaky;
 use crate::model::{EpochMs, NonEmpty};
 use crate::pc_limit::{self, Wait};
 use crate::store::RepoStore;
@@ -27,6 +28,8 @@ const GROUP_POLL: Duration = Duration::from_millis(10);
 
 const KILL_WAIT: Duration = Duration::from_secs(1);
 
+/// Linux refuses a single `sh -c` argument of 128 KiB or more.
+const MAX_ARG_BYTES: usize = 128 * 1024;
 const SCAN_BYTES: u64 = 16 * 1024 * 1024;
 const TAIL_LINES: usize = 40;
 const TAIL_BYTES: usize = 8 * 1024;
@@ -51,6 +54,7 @@ impl Cancel {
 
 pub struct Options<'a> {
     pub rerun_on_exit_failure: bool,
+    pub rerun_with_probe: bool,
     pub cancel: Cancel,
     pub kill_grace: Duration,
     /// Passed to the steps as `CHUTE_CACHE_DIR`; created before the first step.
@@ -70,6 +74,7 @@ impl Default for Options<'_> {
     fn default() -> Self {
         Options {
             rerun_on_exit_failure: true,
+            rerun_with_probe: false,
             cancel: Cancel::new(),
             kill_grace: Duration::from_secs(5),
             cache_dir: None,
@@ -280,16 +285,50 @@ impl Ctx<'_> {
         if !self.opts.rerun_on_exit_failure || cause == Cause::TimedOut {
             return Ok(StepEnd::Failed(failure(step, cause, first_log)?));
         }
-        match self.attempt(step, &second_log)? {
+        let first_tests = failed_tests(step, &read_window(&first_log)?);
+        let probe = self.probe_step(step, &first_tests);
+        match self.attempt(probe.as_ref().unwrap_or(step), &second_log)? {
             End::Passed => Ok(StepEnd::Passed {
                 flaky: Some(FlakyStep {
                     step: step.name.clone(),
-                    tests: failed_tests(step, &read_window(&first_log)?),
+                    tests: first_tests,
                 }),
             }),
             End::Cancelled => Ok(StepEnd::Cancelled),
-            End::Failed(cause) => Ok(StepEnd::Failed(failure(step, cause, second_log)?)),
+            End::Failed(cause) => {
+                let mut failed = failure(step, cause, second_log)?;
+                if probe.is_some()
+                    && matches!(failed.detail, Detail::Tail(_))
+                    && let Some(tests) = NonEmpty::new(first_tests)
+                {
+                    failed.detail = Detail::Tests(tests);
+                }
+                Ok(StepEnd::Failed(failed))
+            }
         }
+    }
+
+    fn probe_step(&self, step: &VerifyStep, tests: &[String]) -> Option<VerifyStep> {
+        let probe = step.probe.as_ref().filter(|_| self.opts.rerun_with_probe)?;
+        if tests
+            .iter()
+            .any(|test| test.contains(['\0', char::REPLACEMENT_CHARACTER]))
+        {
+            return None;
+        }
+        let slots = probe.matches(PROBE_PLACEHOLDER).count().max(1);
+        let (quoted, taken) = flaky::quote_within(tests, flaky::MAX_TESTS_BYTES / slots)?;
+        if taken.len() != tests.len() {
+            return None;
+        }
+        let run = probe.replace(PROBE_PLACEHOLDER, &quoted);
+        if run.len() >= MAX_ARG_BYTES {
+            return None;
+        }
+        Some(VerifyStep {
+            run,
+            ..step.clone()
+        })
     }
 
     fn attempt(&self, step: &VerifyStep, log: &Path) -> Result<End> {

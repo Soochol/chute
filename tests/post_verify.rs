@@ -721,3 +721,140 @@ fn a_range_where_nothing_fails_like_the_tip_names_no_culprit_and_checks_each_com
         "같은 커밋을 두 번 검사하지 않는다"
     );
 }
+
+const PROBE_STEP: &str = "[[post_verify]]\nname = \"slow\"\nrun = \"sh @ROOT@/post.sh\"\ntimeout = 60\nfailed = 'FAILED (\\S+)'\nprobe = \"sh @ROOT@/probe.sh {tests}\"\n";
+
+/// `post_lab` with a probe whose script is `probe_body`. It logs its arguments first.
+fn probe_lab(body: &str, probe_body: &str, top: &str) -> Lab {
+    let lab = post_lab(body, top, PROBE_STEP);
+    let root = lab.sb.root().to_string_lossy().into_owned();
+    let script = lab.sb.root().join("post.sh");
+    let text = fs::read_to_string(&script)
+        .unwrap()
+        .replace("@ROOT@", &root);
+    fs::write(&script, text).unwrap();
+    fs::write(
+        lab.sb.root().join("probe.sh"),
+        format!("echo \"$@\" >> '{root}/probe-args.log'\n{probe_body}\n"),
+    )
+    .unwrap();
+    lab
+}
+
+fn lines_of(lab: &Lab, file: &str) -> Vec<String> {
+    fs::read_to_string(lab.sb.root().join(file))
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+const FAIL_ONCE: &str = "m='@ROOT@/post-marker'\nif [ ! -e \"$m\" ]; then touch \"$m\"; echo 'FAILED wobbly_test'; exit 1; fi";
+
+#[test]
+fn a_failed_step_is_rerun_as_its_probe_on_the_failed_tests_and_a_passing_probe_is_a_flake() {
+    let lab = probe_lab(FAIL_ONCE, "exit 0", "");
+    let tip = lab.origin_main();
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+
+    assert_eq!(lines_of(&lab, "probe-args.log"), ["wobbly_test"]);
+    assert_eq!(
+        lines_of(&lab, "post-runs.log"),
+        std::slice::from_ref(&tip),
+        "단계 전체는 한 번만 돈다"
+    );
+    let flaky: Vec<_> = events_of(&lab, |e| matches!(e, EventKind::Flaky { .. }))
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Flaky {
+                batch, step, tests, ..
+            } => Some((batch.0, step, tests)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        flaky,
+        [(
+            format!("post-{}", &tip[..12]),
+            "slow".to_owned(),
+            vec!["wobbly_test".to_owned()]
+        )]
+    );
+    let state = lab.state().post;
+    assert_eq!(state.last_green.unwrap().commit.as_str(), tip);
+    assert!(state.red.is_none());
+}
+
+#[test]
+fn a_probe_that_fails_too_is_a_real_failure_and_the_search_reruns_by_probe_as_well() {
+    let lab = probe_lab(
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi",
+        "echo 'FAILED broken_test'; exit 1",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    for (n, file) in [(1, "a.txt"), (2, "svc/BREAK"), (3, "c.txt")] {
+        let head = lab.push_pr_branch(n, &[(file, "x\n")]);
+        lab.queue_pr(n, &head, Some(lab.agent()), chute::model::Approval::Agent);
+    }
+    merged(&lab);
+    let tip = lab.origin_main();
+    let merges = lab.merge_commits_on_main();
+    let green_run = lines_of(&lab, "post-runs.log").len();
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    assert_eq!(
+        lines_of(&lab, "post-runs.log")[green_run..],
+        [tip, merges[0].clone(), merges[1].clone()],
+        "단계 전체는 커밋마다 한 번씩만 돈다"
+    );
+    assert_eq!(
+        lines_of(&lab, "probe-args.log"),
+        ["broken_test", "broken_test"],
+        "tip과 실패한 가운데 커밋에서 probe가 돌았다"
+    );
+    let red = lab.state().post.red.expect("실패가 남아야 한다");
+    assert_eq!(red.step, "slow");
+    assert_eq!(red.tests, ["broken_test"]);
+    assert!(red.log.to_string_lossy().ends_with("slow.2.log"));
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
+    assert!(events_of(&lab, |e| matches!(e, EventKind::Flaky { .. })).is_empty());
+}
+
+#[test]
+fn a_failure_that_names_no_test_is_rerun_whole_even_when_the_step_has_a_probe() {
+    let lab = probe_lab(
+        "m='@ROOT@/post-marker'\nif [ ! -e \"$m\" ]; then touch \"$m\"; echo boom; exit 1; fi",
+        "exit 1",
+        "",
+    );
+    let tip = lab.origin_main();
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+
+    assert_eq!(lines_of(&lab, "post-runs.log"), [tip.clone(), tip]);
+    assert!(lines_of(&lab, "probe-args.log").is_empty());
+    let flaky = events_of(&lab, |e| matches!(e, EventKind::Flaky { .. }));
+    assert_eq!(flaky.len(), 1);
+}
+
+#[test]
+fn flakes_in_the_check_after_the_merge_pile_up_into_a_chronic_warning_without_telling_anyone() {
+    let lab = probe_lab(
+        "h=$(git rev-parse HEAD)\nm=\"@ROOT@/seen-$h\"\nif [ ! -e \"$m\" ]; then touch \"$m\"; echo 'FAILED wobbly_test'; exit 1; fi",
+        "exit 0",
+        "[flaky]\nchronic = 2\n",
+    );
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    assert!(lab.state().warnings.is_empty(), "한 번은 만성이 아니다");
+
+    merge(&lab, 1, &[("a.txt", "a\n")]);
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+
+    let warnings = lab.state().warnings;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].kind, chute::model::WarningKind::FlakyChronic);
+    assert!(warnings[0].message.contains("wobbly_test"), "{warnings:?}");
+    assert!(lab.hc_calls("send").is_empty(), "알림은 보내지 않는다");
+}
