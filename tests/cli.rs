@@ -458,7 +458,7 @@ fn status_shows_queue_items_from_the_state_folder() {
             "attempts": 1, "budget": 5, "submitted_ms": 10, "touches_config": true,
             "preflight": {"result": "pass", "head": "abc1234"},
             "last_failure": {"kind": "verify", "mode": "solo", "summary": "test 실패", "report": "/r/1.md"},
-            "submitter": null, "priority": false, "after": [], "repair": false
+            "submitter": null, "priority": false, "after": [], "repair": false, "bounced_ms": null
         })
     );
 }
