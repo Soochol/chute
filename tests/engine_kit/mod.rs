@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chute::engine::{Clock, Engine, Timing};
+use chute::clock::Clock;
+use chute::engine::{Engine, Timing};
 use chute::ext::Ext;
 use chute::model::{
     Agent, Approval, Batch, BatchId, BounceReason, EpochMs, EventKind, ItemState, Phase, PrNumber,

@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod clock;
 pub mod cmd;
 pub mod config;
 pub mod env;
