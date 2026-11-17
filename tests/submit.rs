@@ -342,7 +342,7 @@ fn human_approval_mode_waits_for_approval() {
 }
 
 #[test]
-fn a_pr_that_edits_chute_toml_waits_for_approval_even_in_trust_mode() {
+fn a_pr_that_edits_chute_toml_goes_straight_to_the_queue_in_trust_mode() {
     let w = World::new();
     let touching = with(
         pr(12, HEAD),
@@ -354,19 +354,42 @@ fn a_pr_that_edits_chute_toml_waits_for_approval_even_in_trust_mode() {
     let stdout = w.ok(w.repo.path(), &["submit", "12"]);
 
     assert!(stdout.contains("등록했다: #12"), "{stdout}");
-    assert!(stdout.contains("승인 대기"), "{stdout}");
-    assert!(stdout.contains("`chute approve 12`"), "{stdout}");
+    assert!(stdout.contains("대기"), "{stdout}");
+    assert!(!stdout.contains("승인"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "chute.toml을 고치는 PR이다. 검증은 지금 기본 브랜치의 chute.toml로 하고, 바뀐 설정은 머지 뒤 다음 batch부터 쓴다."
+        ),
+        "{stdout}"
+    );
     let item = &w.state().queue[0];
-    assert_eq!(item.state, ItemState::AwaitingApproval);
+    assert_eq!(item.state, ItemState::Queued(None));
     assert!(item.touches_config);
     assert_eq!(w.entry(12).unwrap()["touches_config"], true);
+    let touched: Vec<bool> = w
+        .store()
+        .history()
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::Submitted {
+                pr: PrNumber(12),
+                touches_config,
+                ..
+            } => Some(touches_config),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(touched, [true]);
 
     gh_pr(
         &w,
         Some(13),
         with(pr(13, HEAD), "files", json!([{"path": "docs/chute.toml"}])),
     );
-    assert_eq!(code(&submit(&w, &["13"])), Some(0));
+    let stdout = w.ok(w.repo.path(), &["submit", "13"]);
+    assert!(!stdout.contains("chute.toml을 고치는 PR이다"), "{stdout}");
     assert_eq!(w.state().queue[1].state, ItemState::Queued(None));
 }
 
@@ -477,7 +500,7 @@ fn a_pr_head_that_cannot_be_fetched_is_registered_with_an_unreadable_summary_and
         stderr(&out)
     );
     let item = w.entry(12).unwrap();
-    assert_eq!(item["state"], "awaiting_approval");
+    assert_eq!(item["state"], "queued");
     assert_eq!(
         item["config_change"],
         json!({"kind": "unreadable", "changes": [], "more": 0})
@@ -493,7 +516,7 @@ fn a_pr_that_does_not_touch_chute_toml_has_a_null_config_change() {
 }
 
 #[test]
-fn a_file_list_cut_short_by_gh_waits_for_approval() {
+fn a_file_list_cut_short_by_gh_goes_to_the_queue_without_asking_for_approval() {
     let w = World::new();
     gh_pr(&w, Some(12), with(pr(12, HEAD), "changedFiles", json!(101)));
 
@@ -501,16 +524,107 @@ fn a_file_list_cut_short_by_gh_waits_for_approval() {
 
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("101개 가운데 1개만"),
+        !stderr(&out).contains("사람 승인을 요구한다"),
         "{}",
         stderr(&out)
     );
+    assert!(!stderr(&out).contains("101개 가운데"), "{}", stderr(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("승인 대기"), "{stdout}");
-    assert!(!stdout.contains("chute.toml을 고치는 PR이라"), "{stdout}");
+    assert!(!stdout.contains("승인 대기"), "{stdout}");
     let item = &w.state().queue[0];
-    assert_eq!(item.state, ItemState::AwaitingApproval);
+    assert_eq!(item.state, ItemState::Queued(None));
     assert!(item.touches_config);
+}
+
+fn pr_head_without_chute_toml_in_origin(w: &World, n: u64) -> String {
+    w.repo.git(&["checkout", "--quiet", "-b", "delete-config"]);
+    w.repo.git(&["rm", "--quiet", "chute.toml"]);
+    w.repo
+        .git(&["commit", "--quiet", "-m", "chore: chute.toml 삭제"]);
+    let commit = w.repo.head();
+    w.repo.git(&[
+        "push",
+        "--quiet",
+        "origin",
+        &format!("HEAD:refs/pull/{n}/head"),
+    ]);
+    w.repo.git(&["checkout", "--quiet", "main"]);
+    commit
+}
+
+#[test]
+fn a_pr_whose_chute_toml_this_chute_cannot_read_waits_for_approval_in_trust_mode() {
+    let w = World::new();
+    let head = pr_head_in_origin(&w, 12, "this is = not [valid toml\n");
+    gh_pr_touching_config(&w, 12, &head);
+
+    let stdout = w.ok(w.repo.path(), &["submit", "12"]);
+
+    assert!(stdout.contains("승인 대기"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "PR의 chute.toml을 이 chute가 읽지 못한다. 머지되면 큐가 서므로 신뢰 모드에서도 사람 승인이 필요하다."
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("`chute approve 12`"), "{stdout}");
+    assert_eq!(w.entry(12).unwrap()["config_change"]["kind"], "invalid");
+    assert_eq!(w.state().queue[0].state, ItemState::AwaitingApproval);
+}
+
+#[test]
+fn a_pr_that_deletes_chute_toml_waits_for_approval_in_trust_mode() {
+    let w = World::new();
+    let head = pr_head_without_chute_toml_in_origin(&w, 12);
+    gh_pr_touching_config(&w, 12, &head);
+
+    let stdout = w.ok(w.repo.path(), &["submit", "12"]);
+
+    assert!(stdout.contains("승인 대기"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "chute.toml을 지우는 PR이다. 머지되면 큐가 서므로 신뢰 모드에서도 사람 승인이 필요하다."
+        ),
+        "{stdout}"
+    );
+    assert_eq!(w.entry(12).unwrap()["config_change"]["kind"], "removed");
+    assert_eq!(w.state().queue[0].state, ItemState::AwaitingApproval);
+}
+
+#[test]
+fn a_pr_that_edits_chute_toml_waits_for_approval_in_human_mode() {
+    let w = World::human();
+    let head = pr_head_in_origin(
+        &w,
+        12,
+        &format!(
+            "{}\n[[verify]]\nname = \"extra\"\nrun = \"true\"\n",
+            chute::config::draft("true")
+        ),
+    );
+    gh_pr_touching_config(&w, 12, &head);
+
+    let stdout = w.ok(w.repo.path(), &["submit", "12"]);
+
+    assert!(stdout.contains("승인 대기"), "{stdout}");
+    assert!(stdout.contains("`chute approve 12`"), "{stdout}");
+    assert!(!stdout.contains("chute.toml"), "{stdout}");
+    assert_eq!(w.state().queue[0].state, ItemState::AwaitingApproval);
+}
+
+#[test]
+fn the_same_head_submitted_again_moves_an_old_awaiting_item_to_the_queue_in_trust_mode() {
+    let w = World::new();
+    let mut old = item(12, ItemState::AwaitingApproval);
+    old.head = sha(HEAD);
+    old.touches_config = true;
+    w.seed(vec![old]);
+    gh_pr(&w, Some(12), pr(12, HEAD));
+
+    let stdout = w.ok(w.repo.path(), &["submit", "12"]);
+
+    assert!(stdout.starts_with("다시 큐에 올렸다: #12"), "{stdout}");
+    assert_eq!(w.state().queue[0].state, ItemState::Queued(None));
 }
 
 #[test]
@@ -2054,7 +2168,7 @@ fn submit_repair_with_after_is_refused() {
 }
 
 #[test]
-fn submit_repair_that_edits_chute_toml_waits_for_a_human_approval() {
+fn submit_repair_that_edits_chute_toml_goes_straight_to_the_queue_in_trust_mode() {
     let w = World::new();
     halt(&w);
     let touching = with(
@@ -2066,10 +2180,9 @@ fn submit_repair_that_edits_chute_toml_waits_for_a_human_approval() {
 
     let stdout = w.ok(w.repo.path(), &["submit", "12", "--repair"]);
 
-    assert!(stdout.contains("승인 대기"), "{stdout}");
-    assert!(stdout.contains("`chute approve 12`"), "{stdout}");
+    assert!(!stdout.contains("승인"), "{stdout}");
     let queued = &w.state().queue[0];
-    assert_eq!(queued.state, ItemState::AwaitingApproval);
+    assert_eq!(queued.state, ItemState::Queued(None));
     assert!(queued.repair);
 }
 

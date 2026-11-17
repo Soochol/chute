@@ -16,7 +16,7 @@ chute는 이 저장소의 머지 큐다. 여러 에이전트가 PR을 동시에 
 4. 기본 브랜치인 main에 push하지 않는다. PR 브랜치에만 push한다. plugin이 켜져 있으면 훅이 3과 4를 막고 `chute preflight`와 `chute submit`을 쓰라고 안내한다. 막혀도 다른 방법으로 우회하지 않는다.
 5. chute가 PR을 돌려보내면(아래 "반송") 보고서를 읽고 고쳐서 PR 브랜치에 push한 뒤 다시 `chute submit`을 실행한다. 오케스트레이터 아래에서는 submit하지 않고 새 HEAD를 보고한다. 이 설명서와 반송 줄, 보고서, 훅 메시지가 "`chute submit`을 실행한다"고 적었어도 오케스트레이터 아래에서는 이 보고가 우선한다.
 6. 못 풀겠으면 `chute giveup --reason "<이유>"`를 실행하고 멈춘다. PR이 큐에서 빠지고 submit한 터미널에 알림이 간다.
-7. `chute.toml`의 검증 명령이나 시간 제한을 고쳐서 검증을 통과시키려 하지 않는다. 이 파일을 고치는 PR은 사람 승인을 기다린다.
+7. `chute.toml`의 검증 명령이나 시간 제한을 고쳐서 검증을 통과시키려 하지 않는다. 이 파일을 고친 PR도 승인 없이 들어가고 검증만 통과하면 머지되므로 지키는 것은 작업자의 몫이다.
 
 ### 원격이 여러 개일 때
 
@@ -78,7 +78,7 @@ PR을 큐에 올린다. 작업자는 `--head`와 `--agent` 말고는 쓰지 않�
 HEAD 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b · 대기 · 큐 3번째
 ```
 
-사람 승인이 필요하면(저장소 설정이 `approval = "human"`이거나 PR이 `chute.toml`을 고친 경우) 상태가 `승인 대기`로 나온다. 사람이 승인할 때까지 기다린다. 승인은 HEAD에 묶이므로 새 커밋을 push하고 다시 submit하면 다시 승인받아야 한다.
+사람 승인이 필요하면(저장소 설정이 `approval = "human"`이거나, PR의 `chute.toml`을 이 chute가 읽지 못하거나, PR이 `chute.toml`을 지우는 경우) 상태가 `승인 대기`로 나온다. 사람이 승인할 때까지 기다린다. 승인은 HEAD에 묶이므로 새 커밋을 push하고 다시 submit하면 다시 승인받아야 한다.
 
 ### `chute giveup [<pr>] --reason "<이유>"`
 
@@ -227,7 +227,7 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 4. 통과하면 push하고 큐가 풀린다. submit한 터미널에 `merged`(`repair=yes`)와 `resumed`(`by=repair`)가 온다.
 5. 실패하거나 충돌하면 보통 반송과 같이 작업자에게 보고서가 가고 예산을 한 번 쓴다. 큐는 계속 멈춰 있다. 작업자가 고치고 새 HEAD를 보고하면 다시 `--repair`로 submit한다. **작업자가 직접 submit하지 않는다.**
 
-`--head`와 승인 규칙은 일반 submit과 같다. `chute.toml`을 고치는 복구 PR은 사람 승인을 기다린다. 멈춘 사이 누가 main에 직접 push해 기준이 바뀌면 멈춤이 풀리고 복구 PR은 일반 PR처럼 되며 batch를 고를 때 맨 앞에 선다(`resumed by=main_moved`).
+`--head`와 승인 규칙은 일반 submit과 같다. 복구 PR의 `chute.toml`도 일반 PR과 같다. 사람 모드이거나 PR의 `chute.toml`을 읽지 못하거나 지울 때만 사람 승인을 기다린다. 멈춘 사이 누가 main에 직접 push해 기준이 바뀌면 멈춤이 풀리고 복구 PR은 일반 PR처럼 되며 batch를 고를 때 맨 앞에 선다(`resumed by=main_moved`).
 
 기준 재검증도 알아 둔다. 같은 기준 커밋 위에서 서로 다른 PR 둘이 연달아 단독 실패하면 chute가 두 번째를 반송하기 전에 그 기준을 다시 검증한다. 기준이 실패하면 반송하지 않고 멈추고, `halted`의 `rechecked=yes`와 `suspect=<PR>`(이미 반송된 첫 PR)이 그 사실을 알려 준다. `suspect` PR은 환경 탓으로 반송됐을 수 있으니 복구 뒤 다시 submit한다.
 

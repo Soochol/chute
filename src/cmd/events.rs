@@ -275,6 +275,7 @@ fn describe(kind: &EventKind) -> String {
             priority,
             after,
             repair,
+            touches_config,
         } => {
             let mut marks = String::new();
             if *priority {
@@ -285,6 +286,9 @@ fn describe(kind: &EventKind) -> String {
             }
             if *repair {
                 marks.push_str(" · 복구");
+            }
+            if *touches_config {
+                marks.push_str(" · chute.toml 변경");
             }
             format!("{pr} 큐에 올림 · HEAD {}{marks}", short(head))
         }
@@ -752,6 +756,7 @@ mod tests {
                 priority: true,
                 after: vec![PrNumber(2)],
                 repair: true,
+                touches_config: true,
             },
             EventKind::Dropped { pr: PrNumber(1) },
             EventKind::Notified {
@@ -818,6 +823,33 @@ mod tests {
             render(&event, &Utc),
             "2023-11-14 22:13:20  #14 머지됨 · batch b1 · 커밋 9f8e7d6"
         );
+    }
+
+    #[test]
+    fn a_submission_that_touches_chute_toml_says_so() {
+        let submitted = |touches_config| EventKind::Submitted {
+            pr: PrNumber(5),
+            head: sha("abcdef123456"),
+            priority: false,
+            after: vec![],
+            repair: false,
+            touches_config,
+        };
+        assert_eq!(
+            describe(&submitted(true)),
+            "#5 큐에 올림 · HEAD abcdef1 · chute.toml 변경"
+        );
+        assert_eq!(describe(&submitted(false)), "#5 큐에 올림 · HEAD abcdef1");
+    }
+
+    #[test]
+    fn a_submitted_line_from_before_the_field_existed_reads_as_not_touching_chute_toml() {
+        let old = r#"{"at_ms":1,"event":"submitted","pr":5,"head":"abcdef123456","priority":false,"after":[],"repair":false}"#;
+        let event: Event = serde_json::from_str(old).unwrap();
+        match event.kind {
+            EventKind::Submitted { touches_config, .. } => assert!(!touches_config),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

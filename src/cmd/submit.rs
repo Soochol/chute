@@ -11,8 +11,8 @@ use crate::ext::Ext;
 use crate::hub::{self, Forwarded, Route};
 use crate::machine;
 use crate::model::{
-    Agent, ConfigChange, ConfigChangeKind, EpochMs, Event, EventKind, ItemState, MachineId,
-    PrNumber, RepoInfo, Sha, TerminalId,
+    Agent, Approval, ConfigChange, ConfigChangeKind, EpochMs, Event, EventKind, ItemState,
+    MachineId, PrNumber, RepoInfo, Sha, TerminalId,
 };
 use crate::queue::{self, Change, Submission};
 use crate::store::RepoStore;
@@ -123,13 +123,6 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
     };
 
     let config_edit = pr.config_edit();
-    if config_edit == ConfigEdit::Unknown {
-        eprintln!(
-            "경고: 바뀐 파일 {}개 가운데 {}개만 읽었다. chute.toml을 고치는지 알 수 없어 사람 승인을 요구한다",
-            pr.changed_files,
-            pr.files.len()
-        );
-    }
     let config_change =
         (config_edit != ConfigEdit::No).then(|| summarize_config_change(ctx, &info, &pr));
     let submission = Submission {
@@ -140,7 +133,7 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
         agent,
         submitter,
         touches_config: config_edit != ConfigEdit::No,
-        config_change,
+        config_change: config_change.clone(),
         approval: config.approval,
         priority: args.priority,
         after,
@@ -165,6 +158,7 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
             args.priority,
             kept_after,
             args.repair,
+            config_edit != ConfigEdit::No,
         );
     }
     if let Err(e) = super::up::ensure_daemon(ctx, &info, &store) {
@@ -181,7 +175,12 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", render(&report, config_edit == ConfigEdit::Yes));
+        let notes = Notes {
+            config_kind: config_change.as_ref().map(|c| c.kind),
+            edits_config: config_edit == ConfigEdit::Yes,
+            approval: config.approval,
+        };
+        print!("{}", render(&report, &notes));
     }
     Ok(None)
 }
@@ -255,6 +254,7 @@ fn record_submitted(
     priority: bool,
     after: Vec<PrNumber>,
     repair: bool,
+    touches_config: bool,
 ) {
     let recorded = store.append_history(&Event {
         at_ms: EpochMs::now(),
@@ -264,6 +264,7 @@ fn record_submitted(
             priority,
             after,
             repair,
+            touches_config,
         },
     });
     if let Err(e) = recorded {
@@ -385,7 +386,13 @@ struct Report {
     change: Change,
 }
 
-fn render(report: &Report, touches_config: bool) -> String {
+struct Notes {
+    config_kind: Option<ConfigChangeKind>,
+    edits_config: bool,
+    approval: Approval,
+}
+
+fn render(report: &Report, notes: &Notes) -> String {
     let headline = match (report.change, report.state) {
         (Change::Added, _) => "등록했다",
         (Change::Requeued, ItemState::AwaitingApproval) => "HEAD가 바뀌어 다시 승인을 기다린다",
@@ -402,13 +409,27 @@ fn render(report: &Report, touches_config: bool) -> String {
         report.position
     );
     if report.state == ItemState::AwaitingApproval {
-        if touches_config {
-            text.push_str("chute.toml을 고치는 PR이라 신뢰 모드에서도 사람 승인이 필요하다.\n");
+        match notes.config_kind {
+            Some(ConfigChangeKind::Invalid) => text.push_str(
+                "PR의 chute.toml을 이 chute가 읽지 못한다. 머지되면 큐가 서므로 신뢰 모드에서도 사람 승인이 필요하다.\n",
+            ),
+            Some(ConfigChangeKind::Removed) => text.push_str(
+                "chute.toml을 지우는 PR이다. 머지되면 큐가 서므로 신뢰 모드에서도 사람 승인이 필요하다.\n",
+            ),
+            _ => {}
         }
         text.push_str(&format!(
             "사람이 승인해야 큐에 들어간다. Herdr 현황판의 승인 버튼이나 `chute approve {}`로 한다.\n",
             report.pr.0
         ));
+    }
+    if matches!(report.state, ItemState::Queued(_))
+        && notes.edits_config
+        && notes.approval == Approval::Agent
+    {
+        text.push_str(
+            "chute.toml을 고치는 PR이다. 검증은 지금 기본 브랜치의 chute.toml로 하고, 바뀐 설정은 머지 뒤 다음 batch부터 쓴다.\n",
+        );
     }
     text
 }
@@ -723,39 +744,87 @@ mod tests {
         }
     }
 
+    fn notes(approval: Approval, kind: Option<ConfigChangeKind>, edits_config: bool) -> Notes {
+        Notes {
+            config_kind: kind,
+            edits_config,
+            approval,
+        }
+    }
+
+    fn plain() -> Notes {
+        notes(Approval::Agent, None, false)
+    }
+
     #[test]
     fn the_text_says_what_happened_and_what_to_do_next() {
-        let queued = render(&report(ItemState::Queued(None), Change::Added, 3), false);
+        let queued = render(&report(ItemState::Queued(None), Change::Added, 3), &plain());
         assert_eq!(queued, "등록했다: #12\nHEAD 12e5678 · 대기 · 큐 3번째\n");
 
-        let waiting = render(&report(ItemState::AwaitingApproval, Change::Added, 1), true);
-        assert!(waiting.contains("chute.toml을 고치는 PR"), "{waiting}");
-        assert!(waiting.contains("`chute approve 12`"), "{waiting}");
-        let plain = render(
+        let waiting = render(
             &report(ItemState::AwaitingApproval, Change::Added, 1),
-            false,
+            &notes(Approval::Human, Some(ConfigChangeKind::Edited), true),
         );
-        assert!(!plain.contains("chute.toml을"), "{plain}");
+        assert!(waiting.contains("`chute approve 12`"), "{waiting}");
+        assert!(!waiting.contains("chute.toml"), "{waiting}");
 
         let back = render(
             &report(ItemState::AwaitingApproval, Change::Requeued, 1),
-            false,
+            &plain(),
         );
         assert!(
             back.starts_with("HEAD가 바뀌어 다시 승인을 기다린다: #12"),
             "{back}"
         );
-        let requeued = render(&report(ItemState::Queued(None), Change::Requeued, 1), false);
+        let requeued = render(
+            &report(ItemState::Queued(None), Change::Requeued, 1),
+            &plain(),
+        );
         assert!(requeued.starts_with("다시 큐에 올렸다: #12"), "{requeued}");
 
         let same = render(
             &report(ItemState::Queued(None), Change::Unchanged, 1),
-            false,
+            &plain(),
         );
         assert!(
             same.starts_with("이미 등록돼 있고 바뀐 것이 없다: #12"),
             "{same}"
         );
+    }
+
+    #[test]
+    fn the_waiting_reason_follows_the_config_change_kind() {
+        let waiting = report(ItemState::AwaitingApproval, Change::Added, 1);
+        let invalid = render(
+            &waiting,
+            &notes(Approval::Agent, Some(ConfigChangeKind::Invalid), true),
+        );
+        assert!(
+            invalid.contains("PR의 chute.toml을 이 chute가 읽지 못한다. 머지되면 큐가 서므로 신뢰 모드에서도 사람 승인이 필요하다."),
+            "{invalid}"
+        );
+        let removed = render(
+            &waiting,
+            &notes(Approval::Agent, Some(ConfigChangeKind::Removed), true),
+        );
+        assert!(
+            removed.contains("chute.toml을 지우는 PR이다. 머지되면 큐가 서므로 신뢰 모드에서도 사람 승인이 필요하다."),
+            "{removed}"
+        );
+        assert!(removed.contains("`chute approve 12`"), "{removed}");
+    }
+
+    #[test]
+    fn a_queued_config_edit_says_which_config_validates_it() {
+        let queued = report(ItemState::Queued(None), Change::Added, 1);
+        let line = "chute.toml을 고치는 PR이다. 검증은 지금 기본 브랜치의 chute.toml로 하고, 바뀐 설정은 머지 뒤 다음 batch부터 쓴다.";
+        let edited = render(
+            &queued,
+            &notes(Approval::Agent, Some(ConfigChangeKind::Edited), true),
+        );
+        assert!(edited.ends_with(&format!("{line}\n")), "{edited}");
+        let unknown = render(&queued, &notes(Approval::Agent, None, false));
+        assert!(!unknown.contains("chute.toml"), "{unknown}");
     }
 
     #[test]
