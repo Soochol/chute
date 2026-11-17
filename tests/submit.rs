@@ -386,8 +386,6 @@ fn git_in(
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-/// Creates a commit on top of origin's `main` with `chute.toml` replaced, inside the bare
-/// origin only, and points `refs/pull/<n>/head` at it. The work clone never has its objects.
 fn pr_head_in_origin(w: &World, n: u64, chute_toml: &str) -> String {
     let origin = w.repo.origin();
     let scratch = w.sb.root().join(format!("pr-{n}"));

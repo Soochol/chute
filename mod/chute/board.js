@@ -262,7 +262,6 @@ const NOTE = table({
 });
 const NO_SUMMARY = { text: "No change summary. Check the diff.", tone: "waiting" };
 
-// Lines under a config-change card: one per change, or one sentence when the status carries no changes to list.
 export function changeSummary(item) {
   if (item.touches_config !== true) return [];
   const change = configChangeOf(item);
@@ -279,7 +278,6 @@ export function changeSummary(item) {
 
 const CONFIG_EDIT = new Set(["edited", "added", "removed", "invalid"]);
 
-// Reason is picked from the repo's approval setting, `touches_config` and the change summary kind.
 export function questionOf(item, approval) {
   const touches = item.touches_config === true;
   const kind = configChangeOf(item)?.kind ?? null;
@@ -302,7 +300,6 @@ function targetOf(path) {
   return { key: path.slice(0, 2).join("\u0000"), text: path.slice(0, 2).join(".") };
 }
 
-// Maps PR number to the notice for each awaiting item that edits the same chute.toml target as another one.
 export function overlapNotes(items) {
   const awaiting = items
     .filter((item) => item.state === "awaiting_approval" && Number.isSafeInteger(item.pr))

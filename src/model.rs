@@ -372,12 +372,10 @@ pub struct QueueItem {
     pub config_change: Option<ConfigChange>,
 }
 
-/// Display-only summary of what a PR does to `chute.toml`. Nothing decides on it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigChange {
     pub kind: ConfigChangeKind,
     pub changes: Vec<ConfigDelta>,
-    /// Changes left out because there were more than 20.
     #[serde(default)]
     pub more: u32,
 }

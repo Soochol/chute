@@ -441,7 +441,6 @@ fn summarize_config_change(ctx: &Ctx, info: &RepoInfo, pr: &Pr) -> ConfigChange 
     }
 }
 
-/// Returns `chute.toml` at the merge base and at the PR head. `None` means the file is absent.
 fn read_config_texts(
     ctx: &Ctx,
     info: &RepoInfo,

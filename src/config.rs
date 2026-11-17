@@ -618,8 +618,6 @@ pub const MAX_DELTAS: usize = 20;
 const MAX_VALUE_CHARS: usize = 500;
 const STEP_SECTIONS: [&str; 2] = ["verify", "post_verify"];
 
-/// Summarises what a PR does to `chute.toml`. `base` is the file at the merge base and `pr` the
-/// file at the PR head; `None` means the file does not exist there.
 pub fn summarize_change(base: Option<&str>, pr: Option<&str>) -> ConfigChange {
     let summary = |kind| ConfigChange {
         kind,
@@ -695,8 +693,6 @@ fn diff_tables(path: &mut Vec<String>, before: &Table, after: &Table, out: &mut 
     }
 }
 
-/// Steps pair by `name`. When any step on either side has no name or repeats one, both sides
-/// pair by position and are labelled like `verify[2]`.
 fn diff_steps(section: &str, before: &[Value], after: &[Value], out: &mut Vec<ConfigDelta>) {
     let named = |steps: &[Value]| -> Option<Vec<String>> {
         let names: Option<Vec<String>> = steps
@@ -751,7 +747,6 @@ fn diff_steps(section: &str, before: &[Value], after: &[Value], out: &mut Vec<Co
     }
 }
 
-/// TOML inline notation for a value, cut to `MAX_VALUE_CHARS` characters.
 fn inline(value: &Value) -> String {
     let mut text = String::new();
     write_inline(value, &mut text);
