@@ -15,6 +15,7 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
 use nix::unistd::Pid;
 
+use crate::clock::Clock;
 use crate::config::{Config, PROBE_PLACEHOLDER, VerifyStep};
 use crate::flaky;
 use crate::model::{EpochMs, NonEmpty};
@@ -356,7 +357,13 @@ impl Ctx<'_> {
             .process_group(0)
             .spawn()
             .with_context(|| format!("검증 단계 {:?}를 띄우지 못했다", step.name))?;
-        let end = wait(&mut child, &step.name, step.timeout, &self.opts.cancel);
+        let end = wait(
+            &mut child,
+            &step.name,
+            Instant::now().checked_add(step.timeout),
+            &Clock::System,
+            &self.opts.cancel,
+        );
         terminate(&child, self.opts.kill_grace);
         end
     }
@@ -367,9 +374,11 @@ pub fn run_command(
     run: &str,
     log: &Path,
     timeout: Duration,
+    clock: &Clock,
     cancel: &Cancel,
 ) -> Result<End> {
     let out = create_fresh_log(log)?;
+    let deadline = clock.now().checked_add(timeout);
     let err = out
         .try_clone()
         .with_context(|| format!("로그 파일을 복제하지 못했다: {}", log.display()))?;
@@ -383,17 +392,22 @@ pub fn run_command(
         .process_group(0)
         .spawn()
         .with_context(|| format!("명령 {run:?}을 띄우지 못했다"))?;
-    let end = wait(&mut child, run, timeout, cancel);
+    let end = wait(&mut child, run, deadline, clock, cancel);
     terminate(&child, Duration::from_secs(1));
     end
 }
 
-fn wait(child: &mut Child, name: &str, timeout: Duration, cancel: &Cancel) -> Result<End> {
+fn wait(
+    child: &mut Child,
+    name: &str,
+    deadline: Option<Instant>,
+    clock: &Clock,
+    cancel: &Cancel,
+) -> Result<End> {
     let leader = Pid::from_raw(child.id() as i32);
     // WNOWAIT leaves the exited leader unreaped so that its pid, which `terminate` signals as a
     // group id, cannot be reused before the SIGTERM.
     let exited = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-    let deadline = Instant::now().checked_add(timeout);
     let mut pause = Duration::from_millis(1);
     loop {
         match waitid(Id::Pid(leader), exited) {
@@ -429,7 +443,7 @@ fn wait(child: &mut Child, name: &str, timeout: Duration, cancel: &Cancel) -> Re
         if cancel.is_cancelled() {
             return Ok(End::Cancelled);
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if deadline.is_some_and(|deadline| clock.now() >= deadline) {
             return Ok(End::Failed(Cause::TimedOut));
         }
         thread::sleep(pause);
