@@ -145,6 +145,7 @@ pub fn item(pr: u64, state: ItemState) -> QueueItem {
         priority: false,
         after: Vec::new(),
         repair: false,
+        config_change: None,
     }
 }
 

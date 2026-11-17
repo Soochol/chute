@@ -80,7 +80,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794721800000
+      "bounced_ms": 1794721800000,
+      "config_change": null
     },
     {
       "pr": 10,
@@ -112,7 +113,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794722100000
+      "bounced_ms": 1794722100000,
+      "config_change": null
     },
     {
       "pr": 11,
@@ -137,7 +139,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794722400000
+      "bounced_ms": 1794722400000,
+      "config_change": null
     },
     {
       "pr": 15,
@@ -172,7 +175,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794721500000
+      "bounced_ms": 1794721500000,
+      "config_change": null
     },
     {
       "pr": 14,
@@ -204,7 +208,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794722400000
+      "bounced_ms": 1794722400000,
+      "config_change": null
     },
     {
       "pr": 16,
@@ -236,7 +241,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794722700000
+      "bounced_ms": 1794722700000,
+      "config_change": null
     },
     {
       "pr": 18,
@@ -268,7 +274,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794723000000
+      "bounced_ms": 1794723000000,
+      "config_change": null
     },
     {
       "pr": 17,
@@ -295,7 +302,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": 1794723300000
+      "bounced_ms": 1794723300000,
+      "config_change": null
     },
     {
       "pr": 12,
@@ -330,7 +338,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     },
     {
       "pr": 13,
@@ -357,7 +366,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     },
     {
       "pr": 19,
@@ -387,7 +397,8 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     },
     {
       "pr": 20,
@@ -407,7 +418,8 @@
       "priority": true,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     },
     {
       "pr": 21,
@@ -437,7 +449,37 @@
       "priority": false,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": {
+        "kind": "edited",
+        "changes": [
+          {
+            "op": "added",
+            "path": ["verify", "account-server-test"],
+            "before": null,
+            "after": "{ name = \"account-server-test\", run = \"cargo test -p server\" }"
+          },
+          {
+            "op": "changed",
+            "path": ["verify", "clippy", "run"],
+            "before": "\"cargo clippy\"",
+            "after": "\"cargo clippy --all-targets -- -D warnings\""
+          },
+          {
+            "op": "changed",
+            "path": ["budget"],
+            "before": "3",
+            "after": "5"
+          },
+          {
+            "op": "reordered",
+            "path": ["verify"],
+            "before": null,
+            "after": null
+          }
+        ],
+        "more": 0
+      }
     },
     {
       "pr": 22,
@@ -471,7 +513,8 @@
       "priority": false,
       "after": [],
       "repair": true,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     },
     {
       "pr": 23,
@@ -505,7 +548,8 @@
       "priority": true,
       "after": [],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     },
     {
       "pr": 24,
@@ -542,7 +586,8 @@
         22
       ],
       "repair": false,
-      "bounced_ms": null
+      "bounced_ms": null,
+      "config_change": null
     }
   ],
   "today": {

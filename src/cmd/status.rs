@@ -899,6 +899,7 @@ mod tests {
             priority: false,
             after: Vec::new(),
             repair: false,
+            config_change: None,
         }
     }
 

@@ -11,7 +11,8 @@ use crate::ext::Ext;
 use crate::hub::{self, Forwarded, Route};
 use crate::machine;
 use crate::model::{
-    Agent, EpochMs, Event, EventKind, ItemState, MachineId, PrNumber, RepoInfo, Sha, TerminalId,
+    Agent, ConfigChange, ConfigChangeKind, EpochMs, Event, EventKind, ItemState, MachineId,
+    PrNumber, RepoInfo, Sha, TerminalId,
 };
 use crate::queue::{self, Change, Submission};
 use crate::store::RepoStore;
@@ -129,6 +130,8 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
             pr.files.len()
         );
     }
+    let config_change =
+        (config_edit != ConfigEdit::No).then(|| summarize_config_change(ctx, &info, &pr));
     let submission = Submission {
         pr: pr.number,
         title: pr.title,
@@ -137,6 +140,7 @@ fn submit(args: &Args, ctx: &Ctx) -> Result<Option<Forwarded>> {
         agent,
         submitter,
         touches_config: config_edit != ConfigEdit::No,
+        config_change,
         approval: config.approval,
         priority: args.priority,
         after,
@@ -418,6 +422,89 @@ fn load_default_branch_config(ctx: &Ctx, info: &RepoInfo) -> Result<Config> {
         ))
         .into()
     })
+}
+
+fn summarize_config_change(ctx: &Ctx, info: &RepoInfo, pr: &Pr) -> ConfigChange {
+    match read_config_texts(ctx, info, pr) {
+        Ok((base, head)) => config::summarize_change(base.as_deref(), head.as_deref()),
+        Err(e) => {
+            eprintln!(
+                "경고: {}의 chute.toml 변경 요약을 만들지 못했다. 요약 없이 등록한다: {e:#}",
+                pr.number
+            );
+            ConfigChange {
+                kind: ConfigChangeKind::Unreadable,
+                changes: Vec::new(),
+                more: 0,
+            }
+        }
+    }
+}
+
+/// Returns `chute.toml` at the merge base and at the PR head. `None` means the file is absent.
+fn read_config_texts(
+    ctx: &Ctx,
+    info: &RepoInfo,
+    pr: &Pr,
+) -> Result<(Option<String>, Option<String>)> {
+    let repo = info.path.as_path();
+    let head = pr.head_ref_oid.as_str();
+    if !has_commit(&ctx.ext, repo, head)? {
+        let spec = format!("refs/pull/{}/head", pr.number.0);
+        ctx.ext
+            .git(
+                repo,
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--refmap=",
+                    info.remote_name.as_str(),
+                    spec.as_str(),
+                ],
+            )?
+            .ok()
+            .with_context(|| format!("{spec}를 가져오지 못했다"))?;
+        if !has_commit(&ctx.ext, repo, head)? {
+            bail!("{spec}를 가져왔지만 PR HEAD {head}가 없다");
+        }
+    }
+    let base_ref = format!("refs/remotes/{}/{}", info.remote_name, info.default_branch);
+    let base = ctx
+        .ext
+        .git(repo, ["merge-base", base_ref.as_str(), head])?
+        .ok()
+        .with_context(|| format!("{base_ref}와 PR HEAD의 공통 조상을 찾지 못했다"))?;
+    let base = base.trim();
+    Ok((
+        read_file_at(&ctx.ext, repo, base)?,
+        read_file_at(&ctx.ext, repo, head)?,
+    ))
+}
+
+fn has_commit(ext: &Ext, repo: &Path, sha: &str) -> Result<bool> {
+    let spec = format!("{sha}^{{commit}}");
+    Ok(ext.git(repo, ["cat-file", "-e", spec.as_str()])?.success())
+}
+
+fn read_file_at(ext: &Ext, repo: &Path, commit: &str) -> Result<Option<String>> {
+    let listed = ext
+        .git(
+            repo,
+            ["ls-tree", "--name-only", commit, "--", config::FILE_NAME],
+        )?
+        .ok()
+        .with_context(|| format!("{commit}의 파일 목록을 읽지 못했다"))?;
+    if listed.trim().is_empty() {
+        return Ok(None);
+    }
+    let spec = format!("{commit}:{}", config::FILE_NAME);
+    let text = ext
+        .git(repo, ["--no-replace-objects", "show", spec.as_str()])?
+        .ok()
+        .with_context(|| format!("{spec}를 읽지 못했다"))?;
+    Ok(Some(text))
 }
 
 const PR_FIELDS: &str =
