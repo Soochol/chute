@@ -1,9 +1,10 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{SigHandler, Signal, signal};
@@ -25,7 +26,6 @@ const BLOCKED_POLL: Duration = Duration::from_secs(15);
 const POST_POLL: Duration = Duration::from_secs(10);
 const ERROR_POLL: Duration = Duration::from_secs(10);
 const MAX_ERROR_POLL: Duration = Duration::from_secs(600);
-const STALE_STOP: Duration = Duration::from_secs(2);
 const GC_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(clap::Args, Debug)]
@@ -82,6 +82,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         );
     }
     let (info, store) = ctx.registered_repo()?;
+    let left_before_lock = StopFile::read(&store);
     let Some(_lock) = store.try_lock_daemon()? else {
         eprintln!("chute: {}의 데몬이 이미 돌고 있다", info.slug);
         return Ok(ExitCode::SUCCESS);
@@ -95,7 +96,7 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         started_ms: EpochMs::now(),
     };
     doing(&store, &mut me, "시작하는 중");
-    remove_stale_stop(&store);
+    remove_stop_left_before(&store, left_before_lock.as_ref());
     super::up::clear_launch_marker(&store);
     let worktrees_root = feedback::worktrees_root(|key| std::env::var_os(key))?;
     let cancel = Cancel::new();
@@ -144,15 +145,31 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn remove_stale_stop(store: &RepoStore) {
-    let path = store.dir().join(STOP_FILE);
-    let stale = fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|at| SystemTime::now().duration_since(at).ok())
-        .is_some_and(|age| age > STALE_STOP);
-    if stale {
-        let _ = fs::remove_file(path);
+/// `chute down` writes the stop file only while a daemon holds the lock, so a file
+/// that was already there before this daemon took the lock was meant for an earlier one.
+#[derive(Debug, PartialEq, Eq)]
+struct StopFile {
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl StopFile {
+    fn read(store: &RepoStore) -> Option<Self> {
+        let meta = fs::metadata(store.dir().join(STOP_FILE)).ok()?;
+        Some(Self {
+            inode: meta.ino(),
+            len: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+fn remove_stop_left_before(store: &RepoStore, left_before_lock: Option<&StopFile>) {
+    if left_before_lock.is_some() && StopFile::read(store).as_ref() == left_before_lock {
+        let _ = fs::remove_file(store.dir().join(STOP_FILE));
     }
 }
 
@@ -375,6 +392,55 @@ mod tests {
 
         fs::write(store.dir().join(STOP_FILE), "so").unwrap();
         assert_eq!(requested_stop(&store), None);
+    }
+
+    #[test]
+    fn a_stop_file_that_was_there_before_the_lock_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Home::at(tmp.path()).repo(&Slug::new("acme", "widget").unwrap());
+        request_stop(&store, Stop::Now).unwrap();
+        let before = StopFile::read(&store);
+
+        remove_stop_left_before(&store, before.as_ref());
+
+        assert!(StopFile::read(&store).is_none());
+    }
+
+    #[test]
+    fn a_stop_file_that_appeared_after_the_lock_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Home::at(tmp.path()).repo(&Slug::new("acme", "widget").unwrap());
+        let before = StopFile::read(&store);
+        assert!(before.is_none());
+        request_stop(&store, Stop::Now).unwrap();
+
+        remove_stop_left_before(&store, before.as_ref());
+
+        assert_eq!(requested_stop(&store), Some(Stop::Now));
+    }
+
+    #[test]
+    fn a_stop_file_written_again_after_the_lock_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Home::at(tmp.path()).repo(&Slug::new("acme", "widget").unwrap());
+        request_stop(&store, Stop::Now).unwrap();
+        let before = StopFile::read(&store);
+        let path = store.dir().join(STOP_FILE);
+
+        let later = fs::metadata(&path).unwrap().modified().unwrap() + Duration::from_secs(5);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        remove_stop_left_before(&store, before.as_ref());
+        assert_eq!(requested_stop(&store), Some(Stop::Now));
+
+        let before = StopFile::read(&store);
+        request_stop(&store, Stop::AfterBatch).unwrap();
+        remove_stop_left_before(&store, before.as_ref());
+        assert_eq!(requested_stop(&store), Some(Stop::AfterBatch));
     }
 
     #[test]
