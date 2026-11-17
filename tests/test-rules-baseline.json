@@ -1,0 +1,64 @@
+{
+  "instant-now": {
+    "src/cmd/guard.rs": 1,
+    "src/env.rs": 4,
+    "src/ext.rs": 8,
+    "src/feedback/tests.rs": 1,
+    "src/gitops.rs": 6,
+    "tests/daemon.rs": 3,
+    "tests/down.rs": 2,
+    "tests/engine.rs": 8,
+    "tests/forward_kit/mod.rs": 2,
+    "tests/locks.rs": 2,
+    "tests/post_verify.rs": 2,
+    "tests/status.rs": 1,
+    "tests/verify.rs": 9
+  },
+  "product-instant-now": {
+    "src/cmd/daemon.rs": 5,
+    "src/cmd/down.rs": 2,
+    "src/engine.rs": 3,
+    "src/flaky.rs": 1,
+    "src/post.rs": 1,
+    "src/verify.rs": 5
+  },
+  "short-duration": {
+    "src/env.rs": 1,
+    "src/ext.rs": 6,
+    "src/gitops.rs": 7,
+    "tests/ci_gate.rs": 2,
+    "tests/daemon.rs": 2,
+    "tests/down.rs": 1,
+    "tests/engine.rs": 3,
+    "tests/engine_kit/mod.rs": 1,
+    "tests/forward_kit/mod.rs": 1,
+    "tests/locks.rs": 6,
+    "tests/post_verify.rs": 1,
+    "tests/preflight.rs": 2,
+    "tests/verify.rs": 10
+  },
+  "sleep": {
+    "src/env.rs": 1,
+    "src/ext.rs": 2,
+    "src/gitops.rs": 7,
+    "tests/daemon.rs": 2,
+    "tests/down.rs": 1,
+    "tests/engine.rs": 3,
+    "tests/forward_kit/mod.rs": 1,
+    "tests/locks.rs": 4,
+    "tests/post_verify.rs": 1,
+    "tests/preflight.rs": 2,
+    "tests/verify.rs": 3
+  },
+  "spawn": {
+    "src/gitops.rs": 1,
+    "tests/daemon.rs": 1,
+    "tests/engine.rs": 1,
+    "tests/forward_kit/mod.rs": 1,
+    "tests/install.rs": 1,
+    "tests/plugin.rs": 1,
+    "tests/preflight.rs": 3,
+    "tests/up.rs": 1,
+    "tests/verify.rs": 1
+  }
+}

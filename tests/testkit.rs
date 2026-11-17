@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chute::ext::{Ext, Tool};
 use serde_json::Value;
-use support::{Reply, Sandbox, TestRepo};
+use support::{Reply, Sandbox, TestRepo, fixed_wait, spawn, wait_until, wait_until_within};
 
 #[test]
 fn test_repo_has_a_bare_origin_and_pr_branches() {
@@ -150,4 +150,107 @@ fn sandbox_clears_every_git_variable_of_the_parent_but_keeps_its_own() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+#[test]
+fn wait_until_returns_as_soon_as_the_condition_holds() {
+    let mut calls = 0;
+    wait_until("세 번째 확인", || {
+        calls += 1;
+        calls == 3
+    });
+    assert_eq!(calls, 3);
+}
+
+#[test]
+fn wait_until_fails_naming_what_it_waited_for_when_the_limit_passes() {
+    let failure = std::panic::catch_unwind(|| {
+        wait_until_within(Duration::ZERO, "오지 않는 상태", || false);
+    })
+    .unwrap_err();
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("오지 않는 상태"), "{message}");
+}
+
+#[test]
+fn wait_until_checks_the_condition_once_even_when_the_limit_is_zero() {
+    wait_until_within(Duration::ZERO, "이미 참인 상태", || true);
+}
+
+#[test]
+fn fixed_wait_refuses_an_empty_or_blank_reason() {
+    for reason in ["", "   ", "\n\t"] {
+        assert!(
+            std::panic::catch_unwind(|| fixed_wait(0, reason)).is_err(),
+            "{reason:?}"
+        );
+    }
+    fixed_wait(0, "아무 일도 일어나지 않아야 한다");
+}
+
+fn is_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => false,
+        Ok(stat) => !stat
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .trim_start()
+            .starts_with('Z'),
+    }
+}
+
+#[test]
+fn dropping_spawned_kills_grandchildren_in_the_same_process_group() {
+    let mut command = std::process::Command::new("sh");
+    command
+        .args(["-c", "sleep 300 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped());
+    let mut child = spawn(&mut command);
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    let grandchild: u32 = line.trim().parse().unwrap();
+    assert!(is_alive(grandchild));
+    assert_eq!(child.try_wait().unwrap(), None);
+
+    drop(child);
+
+    wait_until("손자 프로세스가 사라진다", || {
+        !is_alive(grandchild)
+    });
+}
+
+#[test]
+fn spawned_starts_a_new_process_group_led_by_the_child() {
+    let mut command = std::process::Command::new("sh");
+    command
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
+    let child = spawn(&mut command);
+    let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child.id() as i32))).unwrap();
+    assert_eq!(pgid.as_raw() as u32, child.id());
+    assert_ne!(pgid, nix::unistd::getpgrp());
+}
+
+#[test]
+fn dropping_spawned_after_the_child_ended_does_not_fail() {
+    let mut command = std::process::Command::new("true");
+    let mut child = spawn(&mut command);
+    assert!(child.wait().unwrap().success());
+    drop(child);
+}
+
+#[test]
+fn spawned_gives_the_output_of_a_finished_child() {
+    let mut command = std::process::Command::new("sh");
+    command
+        .args(["-c", "echo done"])
+        .stdout(std::process::Stdio::piped());
+    let out = spawn(&mut command).wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
 }
