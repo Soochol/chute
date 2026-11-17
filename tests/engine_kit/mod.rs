@@ -473,6 +473,7 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null,"isDraft":%s,"baseRe
                     prs: taken,
                     phase: Phase::Verifying,
                     step: Some("check".into()),
+                    steps: Vec::new(),
                     round: 1,
                     started_ms: EpochMs::now(),
                     waiting_machine: false,

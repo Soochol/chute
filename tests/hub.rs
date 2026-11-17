@@ -640,6 +640,7 @@ fn events(n: u64) -> Vec<chute::model::Event> {
                 batch: BatchId("b0".to_owned()),
                 commit: Sha::try_from("abc1234".to_owned()).unwrap(),
                 submitted_ms: EpochMs(1),
+                title: None,
             },
         })
         .collect()

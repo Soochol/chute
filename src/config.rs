@@ -103,6 +103,15 @@ pub struct VerifyStep {
 }
 
 impl Config {
+    /// The verify steps a round over `changed` runs, in order.
+    pub fn steps_for(&self, changed: Option<&[String]>) -> Vec<String> {
+        self.verify
+            .iter()
+            .filter(|step| changed.is_none_or(|changed| step.runs_for(changed)))
+            .map(|step| step.name.clone())
+            .collect()
+    }
+
     pub fn skipped_steps(&self, changed: Option<&[String]>) -> Vec<String> {
         let Some(changed) = changed else {
             return Vec::new();
@@ -969,6 +978,15 @@ probe = "cargo test {tests} -- --exact"
             let err = Config::parse(&format!("reuse_hours = {hours}\n{MINIMAL}")).unwrap_err();
             assert!(format!("{err:#}").contains("reuse_hours"), "{err:#}");
         }
+    }
+
+    #[test]
+    fn batch_steps_leave_out_the_steps_paths_skips() {
+        let text = "[[verify]]\nname = \"a\"\nrun = \"x\"\n[[verify]]\nname = \"b\"\nrun = \"y\"\npaths = [\"src/\"]\n";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.steps_for(None), ["a", "b"]);
+        assert_eq!(c.steps_for(Some(&["docs/x.md".to_owned()])), ["a"]);
+        assert_eq!(c.steps_for(Some(&["src/x.rs".to_owned()])), ["a", "b"]);
     }
 
     #[test]
