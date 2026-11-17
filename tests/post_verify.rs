@@ -1180,3 +1180,23 @@ fn a_commit_that_fails_only_some_of_the_tips_tests_is_not_the_same_failure() {
         red.culprit
     );
 }
+
+#[test]
+fn a_failure_that_names_no_test_and_was_not_rerun_by_the_search_is_not_a_flake() {
+    let lab = probe_lab(
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi\nif [ -e svc/CRASH ]; then echo 'segmentation fault'; exit 1; fi",
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "svc/CRASH"), (2, "svc/BREAK"), (3, "c.txt")]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
+    assert!(
+        events_of(&lab, |e| matches!(e, EventKind::Flaky { .. })).is_empty(),
+        "다시 돌지 않은 실패는 흔들림이 아니다"
+    );
+}

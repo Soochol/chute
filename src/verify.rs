@@ -323,7 +323,6 @@ impl Ctx<'_> {
             .or_else(|| self.probe_step(step, &first_tests));
         match self.attempt(probe.as_ref().unwrap_or(step), &second_log)? {
             End::Passed => {
-                let named = !first_tests.is_empty();
                 let tests = match searched.filter(|_| by_wanted.is_some()) {
                     Some(w) => first_tests
                         .into_iter()
@@ -331,7 +330,7 @@ impl Ctx<'_> {
                         .collect(),
                     None => first_tests,
                 };
-                let flaky = (!named || !tests.is_empty()).then(|| FlakyStep {
+                let flaky = (by_wanted.is_none() || !tests.is_empty()).then(|| FlakyStep {
                     step: step.name.clone(),
                     tests,
                 });
