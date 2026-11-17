@@ -2,10 +2,17 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use tempfile::TempDir;
 
 pub const SANDBOX_MACHINE_ID: &str = "0000000000000000000000000000000a";
@@ -591,5 +598,76 @@ impl Node {
             .args(args)
             .output()
             .unwrap()
+    }
+}
+
+const WAIT_UNTIL_HANG_LIMIT: Duration = Duration::from_secs(60);
+const WAIT_UNTIL_POLL: Duration = Duration::from_millis(10);
+
+pub fn wait_until(what: &str, condition: impl FnMut() -> bool) {
+    wait_until_within(WAIT_UNTIL_HANG_LIMIT, what, condition);
+}
+
+pub fn wait_until_within(limit: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+    let give_up = Instant::now() + limit;
+    while !condition() {
+        assert!(
+            Instant::now() < give_up,
+            "{what}: {}초 안에 기다리던 상태가 오지 않았다",
+            limit.as_secs()
+        );
+        thread::sleep(WAIT_UNTIL_POLL);
+    }
+}
+
+pub fn fixed_wait(ms: u64, reason: &str) {
+    assert!(
+        !reason.trim().is_empty(),
+        "fixed_wait에는 기다리는 이유가 있어야 한다"
+    );
+    thread::sleep(Duration::from_millis(ms));
+}
+
+pub struct Spawned {
+    child: Option<Child>,
+    group: Pid,
+}
+
+pub fn spawn(command: &mut Command) -> Spawned {
+    command.process_group(0);
+    let child = command.spawn().expect("자식 프로세스를 띄우지 못했다");
+    let group = Pid::from_raw(child.id().try_into().unwrap());
+    Spawned {
+        child: Some(child),
+        group,
+    }
+}
+
+impl Spawned {
+    pub fn wait_with_output(mut self) -> io::Result<Output> {
+        self.child.take().unwrap().wait_with_output()
+    }
+}
+
+impl Deref for Spawned {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.child.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for Spawned {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child.as_mut().unwrap()
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = killpg(self.group, Signal::SIGKILL);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
     }
 }
