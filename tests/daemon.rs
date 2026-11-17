@@ -47,6 +47,15 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
+fn wait_for_daemon(lab: &Lab, daemon: &Daemon) {
+    wait_until("데몬이 뜨지 않았다", || {
+        lab.store
+            .daemon()
+            .unwrap()
+            .is_some_and(|info| info.pid == daemon.0.id())
+    });
+}
+
 fn exits(daemon: &mut Daemon) -> bool {
     daemon.0.try_wait().unwrap().is_some()
 }
@@ -68,9 +77,7 @@ fn is_gone(pid: i32) -> bool {
 fn a_second_daemon_ends_at_once_and_down_stops_the_first_after_its_batch() {
     let lab = Lab::new("");
     let mut first = start_daemon(&lab);
-    wait_until("데몬이 뜨지 않았다", || {
-        lab.store.daemon_running().unwrap()
-    });
+    wait_for_daemon(&lab, &first);
     let info = lab.store.daemon().unwrap().unwrap();
     assert_eq!(info.pid, first.0.id());
     assert!(info.doing.is_some());
@@ -174,9 +181,7 @@ fn a_stop_request_left_by_an_earlier_run_does_not_stop_the_new_daemon() {
         .unwrap();
 
     let mut daemon = start_daemon(&lab);
-    wait_until("데몬이 뜨지 않았다", || {
-        lab.store.daemon_running().unwrap()
-    });
+    wait_for_daemon(&lab, &daemon);
     thread::sleep(Duration::from_millis(600));
 
     assert!(!exits(&mut daemon));
@@ -192,9 +197,7 @@ fn up_starts_the_daemon_again_right_after_down() {
         .respond("run *", support::Reply::ok(r#"{"address":"t1dd"}"#));
     ok(chute(&lab, &["up"]).output().unwrap());
     let mut daemon = start_daemon(&lab);
-    wait_until("데몬이 뜨지 않았다", || {
-        lab.store.daemon_running().unwrap()
-    });
+    wait_for_daemon(&lab, &daemon);
     ok(chute(&lab, &["down", "--now"]).output().unwrap());
     wait_until("데몬이 멈추지 않았다", || exits(&mut daemon));
 

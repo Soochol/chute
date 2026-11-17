@@ -86,6 +86,15 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         eprintln!("chute: {}의 데몬이 이미 돌고 있다", info.slug);
         return Ok(ExitCode::SUCCESS);
     };
+    let mut me = DaemonInfo {
+        pid: std::process::id(),
+        terminal: ctx
+            .terminal()
+            .map(|t| crate::model::TerminalId(t.to_owned())),
+        doing: None,
+        started_ms: EpochMs::now(),
+    };
+    doing(&store, &mut me, "시작하는 중");
     remove_stale_stop(&store);
     super::up::clear_launch_marker(&store);
     let worktrees_root = feedback::worktrees_root(|key| std::env::var_os(key))?;
@@ -97,14 +106,6 @@ pub fn run(_args: Args, ctx: &Ctx) -> Result<ExitCode> {
         worktrees_root,
     )
     .with_cancel(cancel.clone());
-    let mut me = DaemonInfo {
-        pid: std::process::id(),
-        terminal: ctx
-            .terminal()
-            .map(|t| crate::model::TerminalId(t.to_owned())),
-        doing: None,
-        started_ms: EpochMs::now(),
-    };
     // SAFETY: the handler only stores into an atomic.
     unsafe {
         signal(Signal::SIGTERM, SigHandler::Handler(on_terminate))?;
