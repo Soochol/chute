@@ -624,7 +624,11 @@ mod tests {
             let call =
                 s.spawn(|| ext.call(Tool::Gh, None, ["pr", "view"], Duration::from_millis(200)));
             let escaped = wait_for(&ids, STUCK);
-            clock.advance(Duration::from_secs(1));
+            let give_up = Instant::now() + STUCK;
+            while !call.is_finished() && Instant::now() < give_up {
+                clock.advance(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(10));
+            }
             (escaped, call.join().unwrap())
         });
         assert!(escaped, "손자가 그룹을 벗어나지 못했다");
