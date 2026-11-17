@@ -534,7 +534,21 @@ impl Engine {
     }
 
     fn prune_failed_refs(&self) -> Result<()> {
-        let queued: BTreeSet<u64> = self.store.load()?.queue.iter().map(|i| i.pr.0).collect();
+        let mut queued: BTreeSet<u64> = self.store.load()?.queue.iter().map(|i| i.pr.0).collect();
+        queued.extend(
+            self.store
+                .history()?
+                .events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::Removed {
+                        pr,
+                        reason: RemovedReason::Budget,
+                        ..
+                    } => Some(pr.0),
+                    _ => None,
+                }),
+        );
         let listed = self
             .ext
             .git(

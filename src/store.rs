@@ -161,6 +161,14 @@ impl RepoStore {
         Ok(value)
     }
 
+    /// Takes items an older chute left on a human's turn out of `state.json` and records them.
+    pub fn settle_old_human_items(&self) -> Result<()> {
+        if self.read_state()?.1.is_empty() {
+            return Ok(());
+        }
+        self.update(|_| Ok(()))
+    }
+
     fn read_state(&self) -> Result<(State, Vec<OldHumanItem>)> {
         let path = self.dir.join(STATE_FILE);
         let corrupt = || {

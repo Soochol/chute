@@ -120,6 +120,7 @@ fn set_hub(args: &SetArgs, ctx: &Ctx) -> Result<()> {
         ))
         .into());
     }
+    store.settle_old_human_items()?;
     let state = store.load()?;
     if !state.queue.is_empty() || state.batch.is_some() {
         let what = match state.queue.len() {
@@ -238,6 +239,7 @@ fn export_hub(ctx: &Ctx) -> Result<()> {
         .into());
     }
     let me = machine::core(&ctx.ext)?.id;
+    store.settle_old_human_items()?;
     let mut state = store.load()?;
     for item in &mut state.queue {
         for agent in [&mut item.agent, &mut item.submitter].into_iter().flatten() {

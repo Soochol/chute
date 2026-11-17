@@ -1030,3 +1030,42 @@ fn take_run_again_refuses_when_the_old_hub_has_become_a_hub_again() {
     );
     assert_eq!(hub_of(a), None);
 }
+
+#[test]
+fn take_records_an_item_an_older_chute_left_on_a_humans_turn_instead_of_dropping_it_silently() {
+    let net = net(&["a", "b", "c"]);
+    net.connect_all();
+    let (a, b) = (net.node("a"), net.node("b"));
+    let path = home_of(a).repo(&slug()).dir().join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let old = item_json(7, "needs_human", Value::from("budget"), agent_json(None));
+    let state = serde_json::json!({
+        "queue": [old], "batch": null, "blocked": null,
+        "verified_bases": [], "preflights": {}, "warnings": []
+    });
+    std::fs::write(&path, state.to_string()).unwrap();
+
+    let out = take(b, "a");
+
+    ok(&out);
+    let upgrades = |node: &Node| {
+        history_of(node)
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    chute::model::EventKind::Removed {
+                        reason: chute::model::RemovedReason::Upgrade,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(upgrades(a), 1);
+    assert_eq!(
+        upgrades(b),
+        1,
+        "the old hub's history is copied, not written again"
+    );
+}
