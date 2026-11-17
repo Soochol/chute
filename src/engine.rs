@@ -2196,6 +2196,7 @@ mod tests {
             detail,
             log: "/logs/test.1.log".into(),
             confirmed: None,
+            named_by: None,
         }
     }
 

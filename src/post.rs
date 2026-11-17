@@ -245,6 +245,9 @@ impl PostVerifier {
     }
 
     fn current_steps(&self, scope: &Scope) -> NonEmpty<VerifyStep> {
+        if self.cancel.is_cancelled() {
+            return scope.post.steps.clone();
+        }
         let latest = self
             .gitops
             .fetch_base_tip()
@@ -422,9 +425,16 @@ impl PostVerifier {
 
     fn locate(&self, scope: &Scope, tip: &Sha, failure: &Failed) -> Result<Search> {
         let wanted = failure.tests();
+        let strict = failure
+            .confirmed
+            .as_ref()
+            .is_some_and(|both| !both.is_empty());
         let same = |other: &Failed| {
             other.step == failure.step && {
-                let seen = other.confirmed.clone().unwrap_or_else(|| other.tests());
+                let seen = match &other.confirmed {
+                    Some(both) if strict => both.clone(),
+                    _ => other.tests(),
+                };
                 wanted.iter().all(|test| seen.contains(test))
             }
         };
@@ -449,6 +459,7 @@ impl PostVerifier {
                 let search = Wanted {
                     step: &failure.step,
                     tests: &wanted,
+                    named_by: failure.named_by.as_deref(),
                 };
                 match self.check(scope, commit, PostPhase::Searching, Some(search))? {
                     Checked::Cancelled => return Ok(Search::Cancelled),

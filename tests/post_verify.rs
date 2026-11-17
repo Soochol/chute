@@ -1090,3 +1090,69 @@ fn the_search_of_fourteen_merges_runs_the_whole_step_five_times_and_the_probe_fi
     assert_eq!(red.tests, ["stale_test"]);
     assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(5)));
 }
+
+#[test]
+fn a_changed_failed_pattern_during_the_search_does_not_send_old_names_to_the_new_probe() {
+    let lab = plain_lab(
+        "while [ -e '@ROOT@/gate' ]; do sleep 0.05; done\nif [ -e svc/BREAK ]; then echo 'FAILED old:t1'; echo 'FAIL:t1'; exit 1; fi",
+    );
+    let root = lab.sb.root().to_string_lossy().into_owned();
+    fs::write(
+        lab.sb.root().join("probe.sh"),
+        format!("echo \"$@\" >> '{root}/probe-args.log'\nfor t in \"$@\"; do if [ \"$t\" = t1 ] && [ -e svc/BREAK ]; then echo 'FAIL:t1'; exit 1; fi; done\n"),
+    )
+    .unwrap();
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(
+        &lab,
+        &[(1, "a.txt"), (2, "svc/BREAK"), (3, "c.txt"), (4, "d.txt")],
+    );
+    fs::write(lab.sb.root().join("gate"), "").unwrap();
+    let green_run = lines_of(&lab, "post-runs.log").len();
+    let post = lab.post();
+
+    thread::scope(|scope| {
+        let run = scope.spawn(|| post.run_once().unwrap());
+        wait_until("the tip's step starts", || {
+            lines_of(&lab, "post-runs.log").len() == green_run + 1
+        });
+        let config = fs::read_to_string(lab.repo.path().join("chute.toml"))
+            .unwrap()
+            .replace(
+                "failed = 'FAILED (\\S+)'\n",
+                &format!("failed = 'FAIL:(\\S+)'\nprobe = \"sh {root}/probe.sh {{tests}}\"\n"),
+            );
+        lab.main_commit(&[("chute.toml", &config)], "chore: failed와 probe를 바꾼다");
+        fs::remove_file(lab.sb.root().join("gate")).unwrap();
+        assert_eq!(run.join().unwrap(), PostPass::Failed);
+    });
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["old:t1"]);
+    assert!(
+        red.culprit.is_none(),
+        "이름의 모양이 달라진 탐색은 범인을 가리지 못한다: {:?}",
+        red.culprit
+    );
+    assert!(
+        !lines_of(&lab, "probe-args.log").contains(&"old:t1".to_owned()),
+        "옛 모양의 이름을 새 probe에 넣지 않는다"
+    );
+}
+
+#[test]
+fn a_probe_that_names_nothing_at_the_tip_either_is_judged_as_before() {
+    let lab = probe_lab(
+        "if [ -e svc/BREAK ]; then echo 'FAILED broken_test'; exit 1; fi",
+        "if [ -e svc/BREAK ]; then echo 'error: 1 test failed'; exit 1; fi",
+        "",
+    );
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Passed);
+    queue_all(&lab, &[(1, "a.txt"), (2, "svc/BREAK"), (3, "c.txt")]);
+
+    assert_eq!(lab.post().run_once().unwrap(), PostPass::Failed);
+
+    let red = lab.state().post.red.unwrap();
+    assert_eq!(red.tests, ["broken_test"]);
+    assert_eq!(red.culprit.unwrap().pr, Some(PrNumber(2)));
+}

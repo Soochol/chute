@@ -76,6 +76,9 @@ pub struct Options<'a> {
 pub struct Wanted<'a> {
     pub step: &'a str,
     pub tests: &'a [String],
+    /// The `failed` pattern that named `tests`. A step whose pattern is another one does not
+    /// run `tests` by `probe`, since the names may not be the ones its `probe` takes.
+    pub named_by: Option<&'a str>,
 }
 
 impl Default for Options<'_> {
@@ -119,6 +122,8 @@ pub struct Failed {
     /// With `rerun_with_probe`, when the step failed twice: the tests that both attempts named.
     /// Empty when an attempt named none. `None` when the step was not run twice.
     pub confirmed: Option<Vec<String>>,
+    /// The `failed` pattern of the step, which named the tests.
+    pub named_by: Option<String>,
 }
 
 impl Failed {
@@ -310,7 +315,8 @@ impl Ctx<'_> {
         let searched = self
             .opts
             .wanted
-            .filter(|w| w.step == step.name && !w.tests.is_empty());
+            .filter(|w| w.step == step.name && !w.tests.is_empty())
+            .filter(|w| w.named_by == step.failed.as_ref().map(|re| re.as_str()));
         let by_wanted = searched.and_then(|w| self.probe_step(step, w.tests));
         let probe = by_wanted
             .clone()
@@ -514,6 +520,7 @@ fn failure(step: &VerifyStep, cause: Cause, log: PathBuf) -> Result<Failed> {
         detail,
         log,
         confirmed: None,
+        named_by: step.failed.as_ref().map(|re| re.as_str().to_owned()),
     })
 }
 
