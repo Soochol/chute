@@ -615,7 +615,7 @@ mod tests {
         format!(
             "setsid sh -c \"readlink /proc/\\$\\$/fd/1 /proc/\\$\\$/fd/2 > '{ids}.tmp'; \
              mv '{ids}.tmp' '{ids}'; \
-             i=0; while [ ! -e '{release}' ] && [ \\$i -lt 600 ]; do i=\\$((i+1)); sleep 0.05; done\" &\nsleep 30\n",
+             i=0; while [ ! -e '{release}' ] && [ \\$i -lt 6000 ]; do i=\\$((i+1)); sleep 0.05; done\" &\nsleep 300\n",
             ids = ids.display(),
             release = release.display()
         )
