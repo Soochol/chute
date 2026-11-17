@@ -103,7 +103,6 @@ pub struct VerifyStep {
 }
 
 impl Config {
-    /// The verify steps a round over `changed` runs, in order.
     pub fn steps_for(&self, changed: Option<&[String]>) -> Vec<String> {
         self.verify
             .iter()

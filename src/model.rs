@@ -569,8 +569,6 @@ pub struct Batch {
     pub prs: Vec<PrNumber>,
     pub phase: Phase,
     pub step: Option<String>,
-    /// The steps this verification round runs, in order, without the ones `paths` leaves out.
-    /// Empty until the first round starts.
     #[serde(default)]
     pub steps: Vec<String>,
     pub round: u32,
@@ -870,7 +868,6 @@ pub enum EventKind {
         batch: BatchId,
         commit: Sha,
         submitted_ms: EpochMs,
-        /// The queue item's title when it merged. Lines written before this field have none.
         #[serde(default)]
         title: Option<String>,
     },
@@ -1045,7 +1042,7 @@ pub struct StatusView {
     pub queue: Vec<ItemView>,
     pub today: Today,
     pub recent: Vec<RecentBatch>,
-    /// The last merged PRs, newest first. Absent from the output of an older chute.
+    /// Newest first.
     #[serde(default)]
     pub recent_merged: Vec<MergedView>,
     pub warnings: Vec<Warning>,
@@ -1142,11 +1139,9 @@ pub struct Today {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergedView {
     pub pr: PrNumber,
-    /// `None` for a PR merged before history kept titles.
     pub title: Option<String>,
     pub batch: BatchId,
     pub merged_ms: EpochMs,
-    /// How many times the PR was bounced before it merged.
     pub bounces: u32,
 }
 
