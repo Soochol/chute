@@ -240,7 +240,7 @@ fn export_hub(ctx: &Ctx) -> Result<()> {
     let me = machine::core(&ctx.ext)?.id;
     let mut state = store.load()?;
     for item in &mut state.queue {
-        if let Some(agent) = &mut item.agent {
+        for agent in [&mut item.agent, &mut item.submitter].into_iter().flatten() {
             agent.machine.get_or_insert_with(|| me.clone());
         }
     }

@@ -255,7 +255,7 @@ chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어
 | kind | 언제 | 키 | 할 일 |
 |---|---|---|---|
 | `merged` | PR이 머지됐다 | `pr`, `head`, `batch`, `commit`, `repair=yes`(복구 PR이면) | 작업을 마무리한다 |
-| `bounced` | 반송했다. 작업자와 같은 터미널이면 오지 않는다(`delivered=unreachable`은 같아도 온다) | `pr`, `head`, `reason`(`conflict`, `verify`, `timeout`, `head_changed`, `ci`), `mode`(`solo`, `combo`), `partners`, `attempts`, `budget`, `to`(작업자 주소), `delivered`(`sent`, `spawned`, `unreachable`), `report` | 작업자가 고치는 중이다. 새 HEAD 보고를 기다린다. `delivered=unreachable`이면 작업자에게 닿지 않아 이 줄이 반송 줄을 대신한다. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다 |
+| `bounced` | 반송했다. 작업자와 같은 터미널이면 오지 않는다(`delivered=unreachable`은 같아도 온다) | `pr`, `head`, `reason`(`conflict`, `verify`, `timeout`, `head_changed`, `ci`), `mode`(`solo`, `combo`), `partners`, `attempts`, `budget`, `to`(받는 터미널. `delivered=unreachable`이면 submit한 터미널), `delivered`(`sent`, `spawned`, `unreachable`), `report` | 작업자가 고치는 중이다. 새 HEAD 보고를 기다린다. `delivered=unreachable`이면 작업자에게 닿지 않아 이 줄이 반송 줄을 대신한다. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다 |
 | `removed` | PR을 큐에서 뺐다. 작업자와 같은 터미널이어도 온다 | `pr`, `head`, `reason`(`budget`, `gave_up`), `attempts`, `budget`, `report`(`budget`일 때. 마지막 반송 보고서) | 위 "큐에서 빠졌다는 알림". 바로 다시 submit하지 않고 원인을 다시 보고 사용자(또는 오케스트레이터)에게 알린다 |
 | `halted` | 큐가 멈췄다 | `base`, `step`, `pushed_by_chute`(`yes`, `no`), `rechecked`(`yes`, `no`), `log`, `suspect` | 복구 PR을 만들게 한다 |
 | `resumed` | 멈춤이 풀렸다 | `base`, `by`(`repair`, `main_moved`), `pr`(복구 PR이면) | 다시 submit할 PR이 있는지 본다 |
@@ -270,7 +270,7 @@ chute 결과 <kind> slug=<owner/name> at=<epoch ms> <key>=<value> … <한국어
 ```
 chute 결과 merged slug=acme/widget at=1763270000123 pr=14 head=1a2b3c4d5e6f batch=b20261116-140000 commit=9f8e7d6a5b4c PR 14: 기본 브랜치에 머지됐다.
 chute 결과 bounced slug=acme/widget at=1763270000123 pr=15 head=1a2b3c4d5e6f reason=verify mode=combo partners=12,13 attempts=1 budget=3 to=lap/t4 delivered=sent report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/1.md PR 15: 반송했다 검증 실패. 1/3번째. 작업자에게 반송 줄을 보냈다.
-chute 결과 bounced slug=acme/widget at=1763270050000 pr=15 head=1a2b3c4d5e6f reason=verify mode=solo attempts=2 budget=3 to=lap/t4 delivered=unreachable report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/2.md PR 15: 반송했다 검증 실패. 2/3번째. 작업자에게 닿지 않아 반송을 이 터미널로 보낸다. 닿지 않은 까닭: 작업자 터미널이 없다. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다.
+chute 결과 bounced slug=acme/widget at=1763270050000 pr=15 head=1a2b3c4d5e6f reason=verify mode=solo attempts=2 budget=3 to=lap/t4 delivered=unreachable report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/2.md PR 15: 반송했다(검증 실패). 2/3번째. 작업자에게 닿지 않아 반송을 이 터미널로 보낸다. 닿지 않은 까닭: 작업자 터미널이 없다. 보고서를 작업자에게 넘기거나 고쳐서 다시 submit한다.
 chute 결과 removed slug=acme/widget at=1763270060000 pr=15 head=1a2b3c4d5e6f reason=budget attempts=3 budget=3 report=/home/me/.local/state/chute/repos/acme__widget/reports/pr-15/3.md PR 15: 반송 한도 3번을 넘어 큐에서 뺐다. 다시 넣으려면 다시 submit한다. 같은 방식으로 바로 다시 submit하지 말고 원인을 먼저 본다.
 chute 결과 halted slug=acme/widget at=1763270100456 base=9f8e7d6a5b4c step=test pushed_by_chute=yes rechecked=yes log=/home/me/.local/state/chute/repos/acme__widget/batches/b20261116-141000/verify-3/test.1.log suspect=15 큐가 멈췄다. 복구 PR을 chute submit --repair로 넣는다.
 ```

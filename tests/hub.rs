@@ -647,9 +647,11 @@ fn events(n: u64) -> Vec<chute::model::Event> {
 }
 
 fn three_items(c: &Node) -> Value {
+    let mut first = item_json(1, "queued", Value::Null, agent_json(Some(&c.id)));
+    first["submitter"] = agent_json(None);
     serde_json::json!({
         "queue": [
-            item_json(1, "queued", Value::Null, agent_json(Some(&c.id))),
+            first,
             item_json(2, "bounced", Value::from("conflict"), agent_json(Some(&c.id))),
             item_json(3, "queued", Value::Null, agent_json(None)),
         ],
@@ -676,6 +678,9 @@ fn with_a_filled_in(mut state: Value, a: &Node) -> Value {
     for item in state["queue"].as_array_mut().unwrap() {
         if item["agent"]["machine"].is_null() {
             item["agent"]["machine"] = Value::from(a.id.clone());
+        }
+        if item["submitter"]["terminal"].is_string() && item["submitter"]["machine"].is_null() {
+            item["submitter"]["machine"] = Value::from(a.id.clone());
         }
     }
     state
