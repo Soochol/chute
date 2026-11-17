@@ -231,11 +231,12 @@ const configChangeOf = (item) => {
 const STEP_SECTION = table({ verify: "", post_verify: "post-merge " });
 
 function changeLine(c) {
-  const [head, name, key] = c.path;
+  const [head, name] = c.path;
+  const key = c.path.slice(2).join(".");
   const prefix = STEP_SECTION[head];
   const label = c.path.join(".");
   const values = [c.before, c.after].filter((v) => v !== null);
-  const short = values.join("").length <= SHORT_VALUES;
+  const short = [...values.join("")].length <= SHORT_VALUES;
   const tip = values.length > 0 ? (c.op === "changed" ? `${c.before ?? ""} → ${c.after ?? ""}` : values[0]) : null;
   const line = (mark, text, tone, shown = false) => ({ mark, text, tone, tip: shown ? null : tip });
   if (c.op === "reordered") return line("~", `${prefix ?? ""}steps reordered`, "warn");
@@ -243,7 +244,7 @@ function changeLine(c) {
     if (c.op === "added") return line("+", `${prefix}step ${name}`, "ok");
     if (c.op === "removed") return line("−", `${prefix}step ${name}`, "error");
   }
-  if (prefix !== undefined && c.path.length === 3) {
+  if (prefix !== undefined && c.path.length >= 3) {
     const where = `${prefix}${name}`;
     if (c.op === "added") return line("+", short ? `${where}: ${key} = ${c.after ?? ""}` : `${where}: ${key} added`, "ok", short);
     if (c.op === "removed") return line("−", `${where}: ${key}`, "error");

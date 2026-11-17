@@ -8,6 +8,7 @@ import {
   actionArgs,
   badgeText,
   causeText,
+  changeSummary,
   diffNotices,
   formatAgo,
   formatDuration,
@@ -81,7 +82,7 @@ test("every state and reason in the fixture is covered", () => {
     ["human", "bounced"].flatMap((id) => section(repo, id).items.map((item) => [item.pr, item.reason])),
   );
   assert.deepEqual(reasons, {
-    21: "This PR may edit chute.toml, so a person must approve it.",
+    21: "This PR edits chute.toml, so a person must approve it.",
     9: "Verification failed",
     10: "Verification failed",
     11: "Conflict",
@@ -1852,4 +1853,15 @@ test("empty section heads don't change the overview numbers", () => {
 
 test("a repo whose hub can't be reached draws no section heads", () => {
   assert.deepEqual(only(unreachable).sections, []);
+});
+
+test("change lines: nested step keys keep the step wording and short values count characters", () => {
+  const item = (changes) => ({ touches_config: true, config_change: { kind: "edited", changes, more: 0 } });
+  const nested = changeSummary(
+    item([{ op: "changed", path: ["post_verify", "e2e", "env", "FOO"], before: "1", after: "2" }]),
+  );
+  assert.equal(nested[0].text, "post-merge e2e: env.FOO: 1 → 2");
+  const emoji = "😀".repeat(12);
+  const wide = changeSummary(item([{ op: "changed", path: ["budget"], before: emoji, after: "1" }]));
+  assert.equal(wide[0].text, `budget: ${emoji} → 1`);
 });
