@@ -372,6 +372,54 @@ fn init_leaves_agents_md_alone() {
 }
 
 #[test]
+fn init_setup_verifies_the_draft_and_prints_the_diff_without_touching_the_remote() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    let remote_before = repo.git(&["ls-remote", "--heads", "origin"]);
+
+    let stopped = chute(&sb, repo.path(), &["init", "--setup"]);
+    assert_eq!(stopped.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stopped.stderr).contains("--verify를 주거나"));
+
+    fs::remove_file(repo.path().join("chute.toml")).unwrap();
+    let stdout = ok(chute(
+        &sb,
+        repo.path(),
+        &[
+            "init",
+            "--setup",
+            "--verify",
+            "true",
+            "--verify",
+            "echo second",
+        ],
+    ));
+    assert!(stdout.contains("지침 파일: AGENTS.md"), "{stdout}");
+    assert!(stdout.contains("+++ b/chute.toml"), "{stdout}");
+    assert!(stdout.contains("+name = \"test-2\""), "{stdout}");
+    assert!(stdout.contains("+++ b/AGENTS.md"), "{stdout}");
+    assert!(
+        sb.chute_home()
+            .join("repos/acme__widget/setup.json")
+            .exists()
+    );
+    assert_eq!(repo.git(&["ls-remote", "--heads", "origin"]), remote_before);
+    assert!(!repo.path().join("AGENTS.md").exists());
+}
+
+#[test]
+fn init_setup_rejects_verify_without_setup_and_hides_setup_from_help() {
+    let sb = Sandbox::new();
+    let repo = TestRepo::new(&sb, "acme/widget");
+    let refused = chute(&sb, repo.path(), &["init", "--verify", "true"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--setup"));
+
+    let help = ok(chute(&sb, repo.path(), &["init", "--help"]));
+    assert!(!help.contains("--setup"), "{help}");
+}
+
+#[test]
 fn init_does_not_redraft_a_config_already_on_the_default_branch() {
     let sb = Sandbox::new();
     let repo = TestRepo::new(&sb, "acme/widget");

@@ -719,7 +719,7 @@ fn failed_ref_name(at: EpochMs, tree: &Sha) -> String {
     format!("{}{}-{tree}", gc::PREFLIGHT_REF_STEM, at.0)
 }
 
-fn log_dir(store: &RepoStore, head: &Sha, at: EpochMs) -> Result<PathBuf> {
+pub(crate) fn log_dir(store: &RepoStore, head: &Sha, at: EpochMs) -> Result<PathBuf> {
     let short = &head.as_str()[..head.as_str().len().min(12)];
     let dir = store
         .dir()
