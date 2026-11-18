@@ -989,8 +989,8 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary"]);
-    for (const key of ["daemon", "cells"]) CONTAINERS.add(key);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary", "todo", "item", "needs", "flaky", "messages", "stepBar", "retryDots"]);
+    CONTAINERS.add("daemon");
     const leaves = [];
     const walk = (value, path, key) => {
       if (value !== null && typeof value === "object") {
@@ -1424,8 +1424,8 @@ test("the status line takes the first matching row of the table, and only one", 
   data.daemon.running = false;
   assert.deepEqual(statusOf(data), { tone: "error", text: "Daemon is off" });
   data.daemon.running = true;
-  assert.deepEqual(statusOf(data), { tone: "human", text: "Needs you · 1" });
-  data.queue = data.queue.filter((item) => item.state !== "awaiting_approval");
+  assert.deepEqual(statusOf(data), { tone: "human", text: "Needs you · 4" });
+  data.queue = data.queue.filter((item) => item.state !== "awaiting_approval" && item.state !== "bounced");
   assert.deepEqual(statusOf(data), { tone: "working", text: "Verifying · test 3/3" });
   data.batch.step = "fmt";
   assert.equal(statusOf(data).text, "Verifying · fmt 1/3");
@@ -1705,8 +1705,8 @@ test("overview: issues are human turns, error alerts and unreachable hubs; warn 
 });
 
 test("overview text uses singular and plural", () => {
-  assert.deepEqual(overviewText({ repos: 1, running: 1, issues: 1 }), ["1 repo", "1 running", "1 issue"]);
-  assert.deepEqual(overviewText({ repos: 2, running: 0, issues: 0 }), ["2 repos", "0 running", "0 issues"]);
+  assert.deepEqual(overviewText({ repos: 1, running: 1, issues: 1 }), ["1 repo", "1 running", "1 to do"]);
+  assert.deepEqual(overviewText({ repos: 2, running: 0, issues: 0 }), ["2 repos", "0 running", "0 to do"]);
 });
 
 test("active: a batch or a running post-merge check is active, otherwise not", () => {
@@ -1906,6 +1906,184 @@ test("change lines: nested step keys keep the step wording and short values coun
   assert.equal(wide[0].text, `budget: ${emoji} → 1`);
 });
 
+const todoBounce = (pr, patch = {}) => ({
+  ...itemOf(9),
+  pr,
+  submitted_ms: 1_000 + pr,
+  attempts: 1,
+  budget: 3,
+  agent: { terminal: `t${pr}`, name: `w${pr}`, alive: true },
+  ...patch,
+});
+const todoRepo = (slug, items, mutate = () => {}) => tonedRepo(slug, (d) => { d.queue = items; mutate(d); });
+const approvalItem = (pr) => ({ ...itemOf(21), pr, submitted_ms: 1_000 + pr });
+const todoKinds = (data) => board(data).todo.map((entry) => entry.kind);
+const bouncedOf = (data) => section(only(data), "bounced").items;
+
+test("todo: a stopped queue, a failed post-merge check, a stopped daemon with a queue, an unreachable hub and approvals are to-dos", () => {
+  const stoppedQueue = board([stopped("o/a")]);
+  assert.deepEqual(stoppedQueue.todo.map((e) => [e.kind, e.repoId, e.repoName, e.tone]), [["blocked", "/r/o/a", "a", "error"]]);
+  assert.equal(stoppedQueue.todo[0].item, section(stoppedQueue.repos[0], "alerts").items[0]);
+
+  const red = tonedRepo("o/b", (d) => { d.post_verify = { red: clone(fixture.post_verify.red) }; });
+  assert.deepEqual(todoKinds([red]), ["post_verify"]);
+
+  const daemonOff = board([todoRepo("o/c", [itemOf(20)], (d) => { d.daemon = { running: false }; })]);
+  assert.deepEqual(daemonOff.todo.map((e) => e.kind), ["daemon"]);
+  assert.equal(daemonOff.todo[0].item.kind, "daemon");
+
+  const hub = interpret(ok(unreachable), NOW);
+  assert.deepEqual(hub.todo.map((e) => [e.kind, e.tone, e.item.text]), [["hub", "error", "Hub unreachable"]]);
+  assert.ok(hub.todo[0].item.detail.length > 0);
+
+  const approval = board([humanTurn("o/h")]);
+  assert.deepEqual(approval.todo.map((e) => [e.kind, e.tone]), [["approval", "human"]]);
+  assert.equal(approval.todo[0].item, section(approval.repos[0], "human").items[0]);
+
+  const idleDaemon = tonedRepo("o/i", (d) => { d.daemon = { running: false }; });
+  const warned = tonedRepo("o/w", (d) => {
+    d.warnings = [{ kind: "config", message: "x" }, { kind: "flaky_chronic", message: "y", at_ms: 1 }];
+  });
+  assert.deepEqual(board([idleDaemon, warned]).todo, []);
+
+  const all = board([stopped("o/a"), red, humanTurn("o/h"), unreachable]);
+  assert.equal(new Set(all.todo.map((e) => e.key)).size, all.todo.length);
+});
+
+test("todo: a bounce whose worker is gone or that has one retry left is a to-do, other bounces are not", () => {
+  const needs = (patch) => bouncedOf(todoRepo("o/n", [todoBounce(30, patch)]))[0].needs;
+  const gone = { kind: "worker_gone", text: "Worker exited" };
+  const last = { kind: "last_retry", text: "1 retry left" };
+  assert.deepEqual(needs({ agent: { terminal: "t1", name: "w", alive: false } }), [gone]);
+  assert.deepEqual(needs({ agent: null }), [gone]);
+  assert.deepEqual(needs({ attempts: 3 }), [last]);
+  assert.deepEqual(needs({ attempts: 3, agent: { terminal: "t1", alive: false } }), [gone, last]);
+  assert.deepEqual(needs({}), []);
+
+  const mixed = todoRepo("o/m", [
+    todoBounce(31, { agent: { terminal: "t1", alive: false } }),
+    todoBounce(32, { agent: undefined }),
+    todoBounce(33, { attempts: 3 }),
+    todoBounce(34),
+  ]);
+  const read = board([mixed]);
+  const cards = section(read.repos[0], "bounced").items;
+  assert.deepEqual(read.todo.map((e) => e.item.pr), [31, 32, 33]);
+  assert.ok(read.todo.every((e) => e.kind === "bounce" && e.item === cards.find((c) => c.pr === e.item.pr)));
+  assert.deepEqual(cards.map((c) => c.needs.length > 0), [true, true, true, false]);
+});
+
+test("todo: errors first, then approvals, then bounces with a gone worker, then bounces on their last retry, each by repo order", () => {
+  const gone = (pr) => todoBounce(pr, { agent: { terminal: "t1", alive: false } });
+  const last = (pr) => todoBounce(pr, { attempts: 3 });
+  const x = todoRepo("o/x", [approvalItem(40), last(41)]);
+  const y = todoRepo("o/y", [approvalItem(42), gone(43), last(44)], (d) => { d.blocked = { reason: "base_broken", since_ms: 1 }; });
+  const order = (data) => board(data).todo.map((e) => [e.kind, e.repoId, e.item.pr ?? null]);
+  assert.deepEqual(order([x, y]), [
+    ["blocked", "/r/o/y", null],
+    ["approval", "/r/o/x", 40],
+    ["approval", "/r/o/y", 42],
+    ["bounce", "/r/o/y", 43],
+    ["bounce", "/r/o/x", 41],
+    ["bounce", "/r/o/y", 44],
+  ]);
+  assert.deepEqual(order([y, x]).map(([kind, repo]) => `${kind}${repo.slice(-1)}`), ["blockedy", "approvaly", "approvalx", "bouncey", "bouncey", "bouncex"]);
+});
+
+test("retries left: budget - attempts + 1, at least 1, and null for a broken attempts or budget", () => {
+  const left = (attempts, budget) => bouncedOf(todoRepo("o/l", [todoBounce(50, { attempts, budget })]))[0].left;
+  assert.equal(left(0, 3), 4);
+  assert.equal(left(2, 3), 2);
+  assert.equal(left(3, 3), 1);
+  assert.equal(left(5, 3), 1);
+  for (const odd of [-1, 1.5, "3", null, undefined]) {
+    assert.equal(left(odd, 3), null, `attempts ${JSON.stringify(odd)}`);
+    assert.equal(left(1, odd), null, `budget ${JSON.stringify(odd)}`);
+  }
+  assert.equal(left(0, 0), null);
+});
+
+test("overview issues are the number of to-dos", () => {
+  const bounce = todoRepo("o/b", [todoBounce(60, { attempts: 3 })]);
+  const one = board([bounce]);
+  assert.equal(overview(one).issues, 1);
+  assert.equal(overview(one).grade, "attention");
+  const many = board([bounce, humanTurn("o/h"), stopped("o/s"), idle("o/i"), unreachable]);
+  assert.equal(many.todo.length, 4);
+  assert.equal(overview(many).issues, many.todo.length);
+});
+
+test("the status line counts to-do bounces as needing you", () => {
+  const both = todoRepo("o/a", [approvalItem(70), todoBounce(71, { attempts: 3 })]);
+  assert.deepEqual(only(both).status, { tone: "human", text: "Needs you · 2" });
+  const calm = only(todoRepo("o/c", [todoBounce(72)]));
+  assert.ok(!calm.status.text.startsWith("Needs you"), calm.status.text);
+  assert.equal(calm.status.tone, "ok");
+});
+
+test("chronic flaky warnings fold into one line with the count, the latest time and the messages", () => {
+  const data = quiet();
+  data.warnings = [
+    { kind: "flaky_chronic", message: "a::slow flaked 3 times", pr: null, at_ms: NOW - 600_000 },
+    { kind: "flaky_chronic", message: "b::slow flaked 4 times", pr: null, at_ms: NOW - 120_000 },
+    { kind: "config", message: "other", pr: null, at_ms: NOW - 1_000 },
+    { kind: "flaky_chronic", message: "c::slow flaked 5 times", pr: null, at_ms: NOW - 3_600_000 },
+  ];
+  const repo = only(data);
+  assert.deepEqual(repo.flaky, { count: 3, ago: "2m ago", messages: ["a::slow flaked 3 times", "b::slow flaked 4 times", "c::slow flaked 5 times"] });
+  assert.deepEqual(section(repo, "alerts").items.map((a) => a.text), ["Chronic flaky test", "Chronic flaky test", "Can't read config", "Chronic flaky test"]);
+  data.warnings = Array.from({ length: 200_000 }, (_, i) => ({ kind: "flaky_chronic", message: "m", at_ms: NOW - i }));
+  assert.equal(only(data).flaky.count, 200_000);
+  data.warnings = [{ kind: "flaky_chronic", message: "d::slow" }];
+  assert.deepEqual(only(data).flaky, { count: 1, ago: "", messages: ["d::slow"] });
+  data.warnings = [{ kind: "config", message: "x" }];
+  assert.equal(only(data).flaky, null);
+  assert.equal(only([fixture]).flaky, null);
+  assert.equal(only(unreachable).flaky, null);
+});
+
+test("a quiet repo has nothing to do, no alerts, no batch, queue or running post-merge check", () => {
+  assert.equal(only(quiet()).quiet, true);
+  const breaks = {
+    blocked: (d) => { d.blocked = { reason: "base_broken", since_ms: 1 }; },
+    "failed post-merge check": (d) => { d.post_verify = { red: clone(fixture.post_verify.red) }; },
+    "running post-merge check": (d) => { d.post_verify = { run: { commit: "abcdef1", started_ms: 1, phase: "checking" } }; },
+    "other warning": (d) => { d.warnings = [{ kind: "config", message: "x" }]; },
+    "chronic flaky": (d) => { d.warnings = [{ kind: "flaky_chronic", message: "x" }]; },
+    batch: (d) => { d.batch = clone(fixture.batch); },
+    queued: (d) => { d.queue = [itemOf(20)]; },
+    bounced: (d) => { d.queue = [itemOf(9)]; },
+    approval: (d) => { d.queue = [itemOf(21)]; },
+    "unknown state": (d) => { d.queue = [{ ...itemOf(20), state: "weird" }]; },
+    "stopped daemon with a queue": (d) => { d.daemon = { running: false }; d.queue = [itemOf(20)]; },
+  };
+  for (const [name, change] of Object.entries(breaks)) {
+    const data = quiet();
+    change(data);
+    assert.equal(only(data).quiet, false, name);
+  }
+  const green = quiet();
+  green.post_verify = { last_green: { commit: "abcdef1234", at_ms: NOW - 60_000 } };
+  assert.equal(only(green).quiet, true);
+  const resting = quiet();
+  resting.daemon = { running: false };
+  assert.equal(only(resting).quiet, true);
+  assert.equal(only(unreachable).quiet, false);
+});
+
+test("the folded summary of an all-clear repo names today's merges and the last merge", () => {
+  const summary = (patch) => only({ ...quiet(), ...patch }).summary;
+  const merged = [{ pr: 105, title: "t", bounces: 0, merged_ms: NOW - 600_000 }];
+  assert.equal(summary({ today: { merged: 1 }, recent_merged: merged }), "All clear · 1 merged today · #105 10m ago");
+  assert.equal(summary({ today: undefined, recent_merged: merged }), "All clear · #105 10m ago");
+  assert.equal(summary({ today: { merged: "1" }, recent_merged: merged }), "All clear · #105 10m ago");
+  assert.equal(summary({ today: { merged: 0 }, recent_merged: [] }), "All clear · 0 merged today");
+  assert.equal(summary({ today: undefined, recent_merged: [] }), "All clear");
+  const stoppedView = { ...quiet(), blocked: { reason: "base_broken", since_ms: 1 }, today: { merged: 1 }, recent_merged: merged };
+  assert.equal(only(stoppedView).summary, "Stopped · base failed verification");
+  assert.equal(only(unreachable).summary, "Hub unreachable");
+});
+
 const queuedItem = () => itemOf(fixture.queue.find((i) => i.state === "queued").pr);
 const bouncedItem = () => itemOf(fixture.queue.find((i) => i.state === "bounced").pr);
 const stoppedDaemon = (slug, ...items) => tonedRepo(slug, (d) => { d.daemon = { running: false }; d.queue = items; });
@@ -1961,24 +2139,8 @@ test("the daemon is running, idle with an empty queue, off only with a queue, an
   }
 });
 
-test("count cells are batch, queued, bounced and merged today", () => {
-  const repo = only([fixture]);
-  assert.deepEqual(repo.cells.map((c) => c.key), ["batch", "queued", "bounced", "merged"]);
-  assert.deepEqual(repo.cells.map((c) => c.label), ["Batch", "Queued", "Bounced", "Merged today"]);
-  assert.deepEqual(repo.cells.map((c) => c.value), [fixture.batch.prs.length, 5, 8, fixture.today.merged]);
-
-  const withToday = (today) => only(tonedRepo("o/t", (d) => { d.today = today; })).cells.at(-1).value;
-  assert.equal(withToday({ merged: 0 }), 0);
-  assert.equal(withToday({ merged: 3 }), 3);
-  for (const odd of [undefined, null, {}, { merged: "7" }, { merged: 1.5 }, { merged: null }, { merged: [] }, "x"]) {
-    assert.equal(withToday(odd), null, JSON.stringify(odd));
-  }
-  assert.deepEqual(only(queueOnly()).cells.map((c) => c.value), [0, 0, 0, fixture.today.merged]);
-});
-
-test("a repo whose hub is unreachable has no count cells and an unknown daemon", () => {
+test("a repo whose hub is unreachable has an unknown daemon", () => {
   const repo = only(unreachable);
-  assert.equal(repo.cells, null);
   assert.equal(repo.daemon.state, "unknown");
 });
 

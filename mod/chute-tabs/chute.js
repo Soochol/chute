@@ -10,7 +10,7 @@ export function chuteTip(status) {
   if (!status) return "chute board is closed";
   const parts = [`${status.repos ?? "?"} repos`];
   if (status.running) parts.push(`${status.running} running`);
-  parts.push(`${status.issues ?? 0} issues`);
+  parts.push(`${status.issues ?? 0} to do`);
   return parts.join(" · ");
 }
 

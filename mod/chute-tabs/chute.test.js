@@ -126,6 +126,6 @@ test("the dot follows the board grade and falls back to muted", () => {
 
 test("the tooltip summarises the board", () => {
   assert.equal(chuteTip(null), "chute board is closed");
-  assert.equal(chuteTip({ repos: 2, running: 1, issues: 3 }), "2 repos · 1 running · 3 issues");
-  assert.equal(chuteTip({}), "? repos · 0 issues");
+  assert.equal(chuteTip({ repos: 2, running: 1, issues: 3 }), "2 repos · 1 running · 3 to do");
+  assert.equal(chuteTip({}), "? repos · 0 to do");
 });

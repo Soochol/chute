@@ -375,8 +375,22 @@ function cardOf(item, repoPath, slug, now, approval) {
   } else if (item.state === "bounced") {
     card.reason = named(BOUNCE_REASON, item.state_reason) ?? named(BOUNCE_REASON, card.failure?.kind || null) ?? "No reason";
     card.headline = card.failure?.mode ? `${card.reason} · ${card.failure.mode}` : card.reason;
+    card.left = retriesLeft(item.attempts, item.budget);
+    card.needs = needsOf(card.agent, card.left);
   }
   return card;
+}
+
+const retriesLeft = (attempts, budget) =>
+  Number.isSafeInteger(attempts) && attempts >= 0 && Number.isSafeInteger(budget) && budget > 0
+    ? Math.max(1, budget - attempts + 1)
+    : null;
+
+function needsOf(agent, left) {
+  const needs = [];
+  if (!agent || agent.alive !== true) needs.push({ kind: "worker_gone", text: "Worker exited" });
+  if (left === 1) needs.push({ kind: "last_retry", text: "1 retry left" });
+  return needs;
 }
 
 const REPAIR_STATE = table({ queued: "queued", in_batch: "verifying" });
@@ -616,14 +630,24 @@ function batchOf(batch, members, now, usualS, slug) {
 const chronicFlaky = (view) =>
   list(view.warnings).some((warning) => isObject(warning) && warning.kind === "flaky_chronic");
 
-function cellsOf(placed, today) {
-  const merged = isObject(today) && Number.isInteger(today.merged) ? today.merged : null;
-  return [
-    { key: "batch", label: "Batch", value: placed.batch[0]?.prs.length ?? 0 },
-    { key: "queued", label: "Queued", value: placed.waiting.length },
-    { key: "bounced", label: "Bounced", value: placed.bounced.length },
-    { key: "merged", label: "Merged today", value: merged },
-  ];
+function flakyOf(view, now) {
+  const found = list(view.warnings).filter((warning) => isObject(warning) && warning.kind === "flaky_chronic");
+  if (found.length === 0) return null;
+  const latest = found.reduce((best, warning) => (Number.isFinite(warning.at_ms) && warning.at_ms > best ? warning.at_ms : best), -Infinity);
+  return {
+    count: found.length,
+    ago: latest === -Infinity ? "" : formatAgo(now - latest),
+    messages: found.map((warning) => str(warning.message).trim()),
+  };
+}
+
+function summaryOf(status, today, recent) {
+  if (status.tone !== "ok") return status.text;
+  const parts = [status.text];
+  if (isObject(today) && Number.isSafeInteger(today.merged) && today.merged >= 0) parts.push(`${today.merged} merged today`);
+  const last = recent[0];
+  if (last && last.pr !== "?") parts.push([`#${last.pr}`, last.ago].filter(Boolean).join(" "));
+  return parts.join(" · ");
 }
 
 function todayOf(today, chronic) {
@@ -654,7 +678,7 @@ const bySubmission = (a, b) => {
 
 const BLOCK_SHORT = table({ base_broken: "base failed verification" });
 
-function statusLineOf(view, queue, batch) {
+function statusLineOf(view, queue, batch, bounceTodos) {
   const red = isObject(view.post_verify) && isObject(view.post_verify.red) ? view.post_verify.red : null;
   if (view.blocked) {
     const reason = rawText(isObject(view.blocked) ? view.blocked.reason : view.blocked) ?? "";
@@ -662,7 +686,7 @@ function statusLineOf(view, queue, batch) {
   }
   if (red) return { tone: "error", text: `Post-merge check failed · ${str(red.step) || "?"}` };
   if (daemonIsOff(view, queue)) return { tone: "error", text: "Daemon is off" };
-  const human = queue.filter((item) => item.state === "awaiting_approval").length;
+  const human = queue.filter((item) => item.state === "awaiting_approval").length + bounceTodos;
   if (human > 0) return { tone: "human", text: `Needs you · ${human}` };
   if (batch) {
     if (batch.waitingMachine) return { tone: "working", text: "Waiting for a slot" };
@@ -771,22 +795,16 @@ export function overview(board) {
   if (board?.kind === "empty") return { grade: "ok", issues: 0, running: 0, repos: 0 };
   if (board?.kind !== "board") return null;
   const grades = board.repos.map((repo) => OVERALL[repo.status.tone] ?? "ok");
-  const issues = board.repos.reduce((sum, repo) => {
-    if (!repo.hub.reachable) return sum + 1;
-    const human = repo.sections.find((s) => s.id === "human")?.items.length ?? 0;
-    const alerts = repo.sections.find((s) => s.id === "alerts")?.items.filter((a) => a.tone === "error").length ?? 0;
-    return sum + human + alerts;
-  }, 0);
   return {
     grade: URGENCY.find((g) => grades.includes(g)) ?? "ok",
-    issues,
+    issues: board.todo.length,
     running: grades.filter((g) => g === "running").length,
     repos: board.repos.length,
   };
 }
 
 export const overviewText = (o) =>
-  [`${o.repos} ${o.repos === 1 ? "repo" : "repos"}`, `${o.running} running`, `${o.issues} ${o.issues === 1 ? "issue" : "issues"}`];
+  [`${o.repos} ${o.repos === 1 ? "repo" : "repos"}`, `${o.running} running`, `${o.issues} to do`];
 
 function repoBoard(view, now) {
   const repo = isObject(view.repo) ? view.repo : {};
@@ -802,19 +820,17 @@ function repoBoard(view, now) {
     notices: [],
     problems: [],
     daemon: DAEMON_UNKNOWN,
-    cells: null,
+    flaky: null,
+    quiet: false,
+    summary: "",
     active: false,
     postVerify: null,
     recent: [],
     today: null,
   };
   if (!hub.reachable) {
-    return {
-      ...base,
-      approval: null,
-      status: { tone: "error", text: "Hub unreachable" },
-      sections: [],
-    };
+    const status = { tone: "error", text: "Hub unreachable" };
+    return { ...base, approval: null, status, summary: status.text, sections: [] };
   }
   const queue = list(view.queue)
     .filter(isObject)
@@ -856,12 +872,16 @@ function repoBoard(view, now) {
 
   const notices = noticesOf(view, queue, placed.alerts);
   const postVerify = postVerifyOf(view.post_verify, now);
+  const status = statusLineOf(view, queue, placed.batch[0] ?? null, placed.bounced.filter((card) => card.needs.length > 0).length);
+  const quiet = SECTION_ORDER.every((id) => placed[id].length === 0) && postVerify?.run == null;
   return {
     ...base,
     approval: named(APPROVAL, view.approval),
-    status: statusLineOf(view, queue, placed.batch[0] ?? null),
+    status,
+    summary: summaryOf(status, view.today, recent),
+    flaky: flakyOf(view, now),
+    quiet,
     daemon: daemonOf(view, queue),
-    cells: cellsOf(placed, view.today),
     notices,
     problems: [...notices.map((n) => n.key), ...(placed.alerts.some((a) => a.kind === "daemon") ? [DAEMON_OFF_KEY] : [])],
     active: placed.batch.length > 0 || postVerify?.run != null,
@@ -875,6 +895,33 @@ function repoBoard(view, now) {
     })),
   };
 }
+
+const TODO_ALERTS = new Set(["blocked", "post_verify", "daemon"]);
+
+function todoOf(repos) {
+  const errors = [];
+  const approvals = [];
+  const gone = [];
+  const last = [];
+  repos.forEach((repo, r) => {
+    const entry = (kind, tone, item, i) => ({ key: `${r}:${repo.id}:${kind}:${i}`, kind, repoId: repo.id, repoName: repo.name, tone, item });
+    if (!repo.hub.reachable) {
+      errors.push(entry("hub", "error", { text: "Hub unreachable", detail: repo.hub.error }, 0));
+      return;
+    }
+    const items = (id) => repo.sections.find((s) => s.id === id)?.items ?? [];
+    items("alerts").forEach((alert, i) => {
+      if (TODO_ALERTS.has(alert.kind)) errors.push(entry(alert.kind, alert.tone, alert, i));
+    });
+    items("human").forEach((card, i) => approvals.push(entry("approval", "human", card, i)));
+    items("bounced").forEach((card, i) => {
+      if (card.needs.length > 0) (card.needs[0].kind === "worker_gone" ? gone : last).push(entry("bounce", "human", card, i));
+    });
+  });
+  return [...errors, ...approvals, ...gone, ...last];
+}
+
+export const FLAKY_ALERT_TEXT = WARNING_TITLE.flaky_chronic;
 
 const failed = (detail) => ({ kind: "failed", title: "Couldn't read status", detail, hint: "" });
 
@@ -910,5 +957,5 @@ export function interpret(run, clock = Date.now()) {
   if (views.length === 0) return failed("chute status output isn't repository state")
 ;
   const repos = views.map((view) => repoBoard(view, now)).sort((a, b) => gradeOf(a.status.tone) - gradeOf(b.status.tone));
-  return { kind: "board", repos };
+  return { kind: "board", repos, todo: todoOf(repos) };
 }

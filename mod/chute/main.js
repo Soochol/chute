@@ -18,6 +18,7 @@ import {
   watchFolder,
 } from "herdr";
 import {
+  FLAKY_ALERT_TEXT,
   LOCAL_POLL_MS,
   REMOTE_POLL_MS,
   badgeText,
@@ -51,6 +52,7 @@ const CARD_ALPHA = 0.12;
 const CHIP_ALPHA = 0.14;
 const ICON_SIZE = 20;
 const CARD_SYMBOL = { error: "✕", warn: "△" };
+const NEED_TONE = { worker_gone: "error", last_retry: "warn" };
 const foldKey = (repoId) => `chute.fold.${repoId}`;
 const todayKey = (repoId) => `chute.today.${repoId}`;
 
@@ -131,6 +133,8 @@ export default class Chute extends View {
     remember(OLD_FOLD_KEY, false);
     this.folds = new Map();
     this.moreOpen = new Set();
+    this.quietOpen = new Set();
+    this.flakyOpen = new Set();
     this.readAt = null;
     this.shared = null;
     this.opened = new Set();
@@ -298,7 +302,16 @@ export default class Chute extends View {
     return fold.saved && !fold.auto;
   }
 
+  isShut(repo) {
+    return repo.quiet ? !this.quietOpen.has(repo.id) : this.isFolded(repo.id);
+  }
+
   toggleRepo(repo, cx) {
+    if (repo.quiet) {
+      if (!this.quietOpen.delete(repo.id)) this.quietOpen.add(repo.id);
+      cx.notify();
+      return;
+    }
     const fold = this.foldOf(repo.id);
     Object.assign(fold, toggleFold(fold));
     remember(foldKey(repo.id), fold.saved);
@@ -308,13 +321,23 @@ export default class Chute extends View {
   // Folds every repo, or opens every repo when none is open.
   foldAll(cx) {
     if (this.board?.kind !== "board") return;
-    const fold = this.board.repos.some((repo) => !this.isFolded(repo.id));
+    const fold = this.board.repos.some((repo) => !this.isShut(repo));
     for (const repo of this.board.repos) {
+      if (repo.quiet) {
+        if (fold) this.quietOpen.delete(repo.id);
+        else this.quietOpen.add(repo.id);
+        continue;
+      }
       const state = this.foldOf(repo.id);
       state.saved = fold;
       state.auto = false;
       remember(foldKey(repo.id), fold);
     }
+    cx.notify();
+  }
+
+  toggleFlaky(repo, cx) {
+    if (!this.flakyOpen.delete(repo.id)) this.flakyOpen.add(repo.id);
     cx.notify();
   }
 
@@ -462,7 +485,7 @@ export default class Chute extends View {
           : el;
       })
       .when(this.overlay === null && this.board?.kind === "board", (el) => {
-        const open = this.board.repos.some((repo) => !this.isFolded(repo.id));
+        const open = this.board.repos.some((repo) => !this.isShut(repo));
         return el.child(iconButton("chute-fold", open ? "▾" : "▸", t, (cx) => this.foldAll(cx), open ? "Collapse all" : "Expand all"));
       })
       .when(node !== null, (el) =>
@@ -475,13 +498,14 @@ export default class Chute extends View {
 
   summaryView(t) {
     const value = overview(this.result ? this.board : null);
-    const left = h_flex().flex_1().min_w(0).gap(4).text_size(11).text_color(t.dim);
+    const left = h_flex().flex_1().min_w(0).gap(6).text_size(11).text_color(t.dim);
     if (!value) return left;
-    const [repos, running, issues] = overviewText(value);
-    const issueColor = value.grade === "failed" ? t.ansi1 : value.grade === "attention" ? t.blocked : t.dim;
+    const [repos, running, todo] = overviewText(value);
+    const todoColor = value.grade === "failed" ? t.ansi1 : t.blocked;
+    const calm = value.running === 0 && value.issues === 0;
     return left
-      .child(div().min_w(0).truncate().child(`${repos} · ${running}`))
-      .child(div().flex_none().whitespace_nowrap().text_color(value.issues > 0 ? issueColor : t.dim).child(`· ${issues}`))
+      .when(value.issues > 0, (el) => el.child(chip(todo, todoColor, t)))
+      .when(!this.narrow, (el) => el.child(div().min_w(0).truncate().child(`${repos} · ${calm ? "all clear" : running}`)))
       .child(div().flex_1())
       .when(this.readAt !== null, (el) =>
         el.child(
@@ -497,21 +521,52 @@ export default class Chute extends View {
       return [h_flex().gap(8).text_color(t.dim).child(div().frames(SPINNER, 90)).child("Loading")];
     }
     if (body.kind !== "board") return [notice(body, t)];
-    return body.repos.map((repo) => this.repoView(repo, t));
+    const lifted = new Set(body.todo.map((entry) => entry.item));
+    const todo = body.todo.length > 0 ? [this.todoView(body, t)] : [];
+    return [...todo, ...body.repos.map((repo) => this.repoView(repo, t, lifted))];
   }
 
-  repoView(repo, t) {
-    const folded = this.isFolded(repo.id);
+  todoView(body, t) {
+    const named = body.repos.length > 1;
+    const repoOf = new Map(body.repos.map((repo) => [repo.id, repo]));
+    const owner = new Map(body.repos.flatMap((repo) => repo.sections.flatMap((section) => section.items.map((item) => [item, repo]))));
+    return v_flex()
+      .gap(8)
+      .child(sectionTitle("Needs you", body.todo.length, t))
+      .children(
+        body.todo.map((entry) => {
+          const repo = owner.get(entry.item) ?? repoOf.get(entry.repoId);
+          const card =
+            entry.kind === "approval"
+              ? this.humanCard(repo, entry.item, t)
+              : entry.kind === "bounce"
+                ? this.bouncedRow(repo, entry.item, t)
+                : this.alertCard(repo, { kind: entry.kind, tone: entry.tone, facts: [], files: [], ...entry.item }, t);
+          return v_flex()
+            .id(`todo-${entry.key}`)
+            .gap(3)
+            .when(named, (el) => el.child(div().px(6).text_size(11).text_color(t.dim).child(entry.repoName)))
+            .child(card);
+        }),
+      );
+  }
+
+  repoView(repo, t, lifted) {
+    const folded = this.isShut(repo);
     const view = v_flex().gap(6).child(this.repoHead(repo, folded, t));
     if (folded) return view;
-    const filled = repo.sections.filter((section) => section.items.length > 0);
-    const empty = repo.sections.filter((section) => section.items.length === 0);
+    const drawn = (section) =>
+      section.id === "human"
+        ? false
+        : section.id === "alerts"
+          ? section.items.some((alert) => !lifted.has(alert))
+          : section.items.length > 0;
+    const filled = repo.sections.filter(drawn);
+    const empty = repo.sections.filter((section) => section.id !== "human" && section.items.length === 0);
     return v_flex()
       .gap(12)
       .child(
-        view
-          .when(repo.cells !== null, (el) => el.child(cellsView(repo.cells, t)))
-          .when(!repo.hub.reachable, (el) =>
+        view.when(!repo.hub.reachable, (el) =>
           el.child(
             v_flex()
               .gap(2)
@@ -523,16 +578,17 @@ export default class Chute extends View {
           ),
         ),
       )
-      .children(filled.map((section) => this.sectionView(repo, section, t)))
+      .children(filled.map((section) => this.sectionView(repo, section, t, lifted)))
       .when(Boolean(repo.postVerify), (el) => el.child(postVerifyView(repo.postVerify, t)))
       .when(repo.recent.length > 0, (el) => el.child(this.recentView(repo, t)))
       .when(Boolean(repo.today), (el) => el.child(this.todayView(repo, t)))
-      .when(empty.length > 0, (el) => el.child(emptyLine(empty, t)));
+      .when(empty.length > 0 && !repo.quiet, (el) => el.child(emptyLine(empty, t)));
   }
 
   repoHead(repo, folded, t) {
     const approval = repo.approval ? ` · ${repo.approval}` : "";
     const color = toneColor(repo.status.tone, t);
+    const status = folded || repo.quiet ? repo.summary : repo.status.text;
     return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx))
       .items_center()
       .child(chevron(t, folded ? "▸" : "▾"))
@@ -557,34 +613,75 @@ export default class Chute extends View {
           .min_w(0)
           .gap(6)
           .items_center()
-          .tooltip(repo.status.text)
+          .tooltip(status)
           .child(
             div()
               .min_w(0)
               .truncate()
               .text_size(12)
               .text_color(repo.status.tone === "waiting" ? t.muted : repo.status.tone === "ok" ? t.foreground : color)
-              .child(repo.status.text),
+              .child(status),
           ),
       );
   }
 
-  sectionView(repo, section, t) {
+  sectionView(repo, section, t, lifted) {
     const items = section.items;
+    if (section.id === "alerts") {
+      const cards = items.filter((alert) => !lifted.has(alert) && !(alert.kind === "warning" && alert.text === FLAKY_ALERT_TEXT));
+      return v_flex()
+        .gap(8)
+        .children(cards.map((alert) => this.alertCard(repo, alert, t)))
+        .when(repo.flaky !== null, (el) => el.child(this.flakyLine(repo, t)));
+    }
     const rows = {
-      alerts: (item) => this.alertCard(repo, item, t),
-      human: (item) => this.humanCard(repo, item, t),
       batch: (item) => batchView(repo, item, t, this.narrow),
       waiting: (item, i) => waitingRow(repo, item, i, t, this.narrow),
-      bounced: (item) => this.bouncedRow(repo, item, t),
+      bounced: (item) => (lifted.has(item) ? underNeedsYou(item, t) : this.bouncedRow(repo, item, t)),
       unknown: (item) => unknownRow(item, t, this.narrow),
     };
-    const lead = section.id === "alerts" ? [] : [sectionTitle(section.title, section.id === "batch" ? null : items.length, t)];
     if (section.id === "batch") return v_flex().gap(6).children(items.map((item) => rows.batch(item)));
     return v_flex()
-      .gap(section.id === "alerts" ? 8 : 4)
-      .children(lead)
+      .gap(4)
+      .child(sectionTitle(section.title, items.length, t))
       .children(items.map((item, i) => rows[section.id](item, i)));
+  }
+
+  flakyLine(repo, t) {
+    const flaky = repo.flaky;
+    const open = this.flakyOpen.has(repo.id);
+    return v_flex()
+      .gap(2)
+      .child(
+        linkRow(`flaky-${repo.id}`, t, (cx) => this.toggleFlaky(repo, cx))
+          .items_center()
+          .child(div().flex_none().text_color(t.ansi3).child(CARD_SYMBOL.warn))
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(12)
+              .text_color(t.muted)
+              .child(`${flaky.count} chronic flaky ${flaky.count === 1 ? "test" : "tests"}`),
+          )
+          .when(Boolean(flaky.ago), (el) =>
+            el.child(mono(div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim)).child(flaky.ago)),
+          ),
+      )
+      .when(open, (el) =>
+        el.child(
+          v_flex()
+            .gap(3)
+            .pl(24)
+            .pr(6)
+            .children(
+              flaky.messages
+                .filter(Boolean)
+                .map((message) => div().text_size(12).text_color(t.muted).whitespace_normal().child(message)),
+            ),
+        ),
+      );
   }
 
   alertCard(repo, alert, t) {
@@ -711,7 +808,11 @@ export default class Chute extends View {
       title: card.title,
       time: timeCell(card.ago ?? "", t),
       icons: rowIcons(id, card, t, (file) => this.openFile(file, repo.hub.machine)),
-      chips: [chip(card.headline, t.ansi1, t), h_flex().flex_none().gap(6).items_center().child(workerLine(card.agent, t)).child(retries)],
+      chips: [
+        chip(card.headline, t.ansi1, t),
+        ...card.needs.map((need) => chip(need.text, toneColor(NEED_TONE[need.kind], t), t)),
+        h_flex().flex_none().gap(6).items_center().child(workerLine(card.agent, t)).child(retries),
+      ],
     });
   }
 
@@ -882,25 +983,8 @@ const emptyLine = (sections, t) =>
     .whitespace_normal()
     .child(`Empty: ${sections.map((section) => section.title).join(" · ")}`);
 
-const cellsView = (cells, t) =>
-  h_flex()
-    .gap(6)
-    .px(6)
-    .children(
-      cells.map((cell) =>
-        v_flex()
-          .id(`cell-${cell.key}`)
-          .flex_1()
-          .min_w(0)
-          .items_center()
-          .child(
-            mono(div().whitespace_nowrap().text_size(15).font_semibold())
-              .text_color(cell.value ? t.foreground : t.dim)
-              .child(cell.value === null ? "—" : String(cell.value)),
-          )
-          .child(div().max_w_full().truncate().text_size(11).text_color(t.dim).child(cell.label)),
-      ),
-    );
+const underNeedsYou = (card, t) =>
+  div().px(6).py(2).text_size(12).text_color(t.dim).child(`#${card.pr} is under Needs you`);
 
 // The time at the right end of a row: it never pushes the title out, and it keeps its place when empty.
 const timeCell = (text, t) =>
