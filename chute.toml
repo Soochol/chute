@@ -16,11 +16,11 @@ failed = '✖ (.+) \(\d[\d.]*ms\)'
 
 [[verify]]
 name = "clippy"
-run = "cargo clippy --all-targets -- -D warnings"
+run = "cargo clippy -j 8 --all-targets -- -D warnings"
 timeout = 1800
 
 [[verify]]
 name = "test"
-run = "cargo test"
+run = "cargo test -j 8 -- --test-threads=8"
 timeout = 1800
 failed = 'test (\S+) \.\.\. FAILED'

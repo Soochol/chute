@@ -11,8 +11,8 @@ PR을 올리기 전에 네 명령이 모두 통과해야 한다. 저장소 루�
 ```sh
 cargo fmt --check
 node --test mod/*/*.test.js
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy -j 8 --all-targets -- -D warnings
+cargo test -j 8 -- --test-threads=8
 ```
 
 ## 코드 규칙
