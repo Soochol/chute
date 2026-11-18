@@ -17,8 +17,8 @@ use crate::gitops::FAILED_REF_PREFIX;
 use crate::hub::{ForwardErrorKind, exec_on_input};
 use crate::machine::{self, Machine};
 use crate::model::{
-    Agent, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner, PrNumber,
-    QueueItem, RepoInfo, Sha, Slug, StepFailure, TerminalId, VerifyMode,
+    Agent, BaseCheck, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner,
+    PrNumber, QueueItem, RepoInfo, Sha, Slug, SoloEvidence, StepFailure, TerminalId, VerifyMode,
 };
 use crate::repo;
 use crate::store::RepoStore;
@@ -895,6 +895,80 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
     out.push(String::new());
 }
 
+fn render_solo_scope(
+    out: &mut Vec<String>,
+    this: &str,
+    evidence: Option<&SoloEvidence>,
+    timed_out: bool,
+) {
+    let Some(evidence) = evidence else {
+        out.push(format!(
+            "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 같은 단계가 실패했다"
+        ));
+        return;
+    };
+    let runs = evidence.runs;
+    let (result, count) = if timed_out {
+        ("시간 초과로 끝났다", "시간 초과")
+    } else {
+        ("실패했다", "실패")
+    };
+    out.push(format!(
+        "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 {result}({runs}번 돌려 {runs}번 {count})"
+    ));
+    out.push(match evidence.base {
+        Some(BaseCheck::RanInThisBatch) => "- 기준 브랜치: 이 batch에서 돌려 통과했다".to_owned(),
+        Some(BaseCheck::VerifiedEarlier) => {
+            "- 기준 브랜치: chute가 앞서 검증한 커밋이라 이 batch에서는 돌리지 않았다".to_owned()
+        }
+        None => "- 기준 브랜치: 확인하지 않았다".to_owned(),
+    });
+    if evidence.attempts.iter().all(Vec::is_empty) {
+        out.push("- 장부: 실패한 시험 이름을 뽑지 못해 확인하지 않았다".to_owned());
+    } else if evidence.ledger_tests.is_empty() {
+        out.push(format!(
+            "- 장부: 최근 {}일 장부에 이 단계의 흔들림 기록이 있는 실패 시험은 없다",
+            evidence.ledger_days
+        ));
+    } else {
+        let names: Vec<String> = evidence.ledger_tests.iter().map(|t| code_span(t)).collect();
+        out.push(format!(
+            "- 장부: 최근 {}일 장부에 이 단계의 흔들림 기록이 있는 실패 시험: {}",
+            evidence.ledger_days,
+            names.join(", ")
+        ));
+    }
+    if evidence.attempts.len() < 2 {
+        return;
+    }
+    if evidence.attempts.iter().any(Vec::is_empty) {
+        out.push(format!(
+            "- 시도별 실패 시험({n}번 시도): 시험 이름을 뽑지 못한 시도가 있어 서로 비교하지 못했다",
+            n = evidence.attempts.len()
+        ));
+        return;
+    }
+    let same = evidence
+        .attempts
+        .windows(2)
+        .all(|pair| pair[0].len() == pair[1].len() && pair[0].iter().all(|t| pair[1].contains(t)));
+    if same {
+        out.push(format!(
+            "- 시도별 실패 시험({}번 시도): 모든 시도에서 같았다",
+            evidence.attempts.len()
+        ));
+        return;
+    }
+    out.push(format!(
+        "- 시도별 실패 시험({}번 시도): 서로 달랐다",
+        evidence.attempts.len()
+    ));
+    for (i, tests) in evidence.attempts.iter().enumerate() {
+        let names: Vec<String> = tests.iter().map(|t| code_span(t)).collect();
+        out.push(format!("  - {}번째 시도: {}", i + 1, names.join(", ")));
+    }
+}
+
 fn render_step(
     out: &mut Vec<String>,
     subject: &Subject,
@@ -924,9 +998,7 @@ fn render_step(
         out.push("- 결과: 실패".to_owned());
     }
     match &step.mode {
-        VerifyMode::Solo => out.push(format!(
-            "- 범위: 단독. 기준 브랜치에 {this}만 얹어도 같은 단계가 실패한다. {this}의 변경이 원인이다"
-        )),
+        VerifyMode::Solo => render_solo_scope(out, this, step.evidence.as_deref(), timed_out),
         VerifyMode::Combo { .. } => out.push(format!(
             "- 범위: 조합. 기준 브랜치에 {this}만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다"
         )),

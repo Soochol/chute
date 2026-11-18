@@ -86,6 +86,7 @@ impl World {
             failed_tests: Vec::new(),
             log,
             tree: Sha::try_from(self.tree.clone()).unwrap(),
+            evidence: None,
         })
     }
 

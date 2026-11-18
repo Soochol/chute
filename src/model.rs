@@ -555,6 +555,27 @@ pub struct StepFailure {
     pub failed_tests: Vec<String>,
     pub log: PathBuf,
     pub tree: Sha,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Box<SoloEvidence>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoloEvidence {
+    #[serde(default)]
+    pub base: Option<BaseCheck>,
+    pub runs: u32,
+    pub attempts: Vec<Vec<String>>,
+    #[serde(default)]
+    pub ledger_days: u32,
+    #[serde(default)]
+    pub ledger_tests: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseCheck {
+    RanInThisBatch,
+    VerifiedEarlier,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1835,6 +1856,7 @@ mod tests {
             failed_tests: vec!["a::b".into()],
             log: "/s/log".into(),
             tree: sha("abc1234"),
+            evidence: None,
         };
         let failures = [
             Failure::Conflict {

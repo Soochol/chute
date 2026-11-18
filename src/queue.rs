@@ -1106,6 +1106,7 @@ mod tests {
             failed_tests: vec![],
             log: "/log".into(),
             tree: sha("abc1234"),
+            evidence: None,
         };
         let failure = match kind {
             FailureKind::Conflict => Failure::Conflict {

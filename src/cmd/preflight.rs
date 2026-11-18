@@ -708,6 +708,7 @@ fn step_failure(failed: &verify::Failed, mode: VerifyMode, tree: &Sha) -> Failur
         },
         log: failed.log.clone(),
         tree: tree.clone(),
+        evidence: None,
     };
     match failed.cause {
         Cause::TimedOut => Failure::Timeout(step),
