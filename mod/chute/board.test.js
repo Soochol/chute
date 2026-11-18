@@ -2032,6 +2032,8 @@ test("chronic flaky warnings fold into one line with the count, the latest time 
   const repo = only(data);
   assert.deepEqual(repo.flaky, { count: 3, ago: "2m ago", messages: ["a::slow flaked 3 times", "b::slow flaked 4 times", "c::slow flaked 5 times"] });
   assert.deepEqual(section(repo, "alerts").items.map((a) => a.text), ["Chronic flaky test", "Chronic flaky test", "Can't read config", "Chronic flaky test"]);
+  data.warnings = Array.from({ length: 200_000 }, (_, i) => ({ kind: "flaky_chronic", message: "m", at_ms: NOW - i }));
+  assert.equal(only(data).flaky.count, 200_000);
   data.warnings = [{ kind: "flaky_chronic", message: "d::slow" }];
   assert.deepEqual(only(data).flaky, { count: 1, ago: "", messages: ["d::slow"] });
   data.warnings = [{ kind: "config", message: "x" }];

@@ -633,10 +633,10 @@ const chronicFlaky = (view) =>
 function flakyOf(view, now) {
   const found = list(view.warnings).filter((warning) => isObject(warning) && warning.kind === "flaky_chronic");
   if (found.length === 0) return null;
-  const times = found.map((warning) => warning.at_ms).filter(Number.isFinite);
+  const latest = found.reduce((best, warning) => (Number.isFinite(warning.at_ms) && warning.at_ms > best ? warning.at_ms : best), -Infinity);
   return {
     count: found.length,
-    ago: times.length > 0 ? formatAgo(now - Math.max(...times)) : "",
+    ago: latest === -Infinity ? "" : formatAgo(now - latest),
     messages: found.map((warning) => str(warning.message).trim()),
   };
 }

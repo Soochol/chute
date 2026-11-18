@@ -529,12 +529,13 @@ export default class Chute extends View {
   todoView(body, t) {
     const named = body.repos.length > 1;
     const repoOf = new Map(body.repos.map((repo) => [repo.id, repo]));
+    const owner = new Map(body.repos.flatMap((repo) => repo.sections.flatMap((section) => section.items.map((item) => [item, repo]))));
     return v_flex()
       .gap(8)
       .child(sectionTitle("Needs you", body.todo.length, t))
       .children(
         body.todo.map((entry) => {
-          const repo = repoOf.get(entry.repoId);
+          const repo = owner.get(entry.item) ?? repoOf.get(entry.repoId);
           const card =
             entry.kind === "approval"
               ? this.humanCard(repo, entry.item, t)
