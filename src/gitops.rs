@@ -855,7 +855,6 @@ impl Slot {
         self.head()
     }
 
-    /// The content of `path` in `rev`, or `None` when `rev` has no such file.
     pub fn read_file(&self, rev: &Sha, path: &str) -> Result<Option<Vec<u8>>> {
         let spec = format!("{rev}:{path}");
         if !self.git(&["cat-file", "-e", &spec])?.success() {
@@ -868,7 +867,6 @@ impl Slot {
         Ok(Some(out.stdout))
     }
 
-    /// The tip of `refs/heads/<branch>` on the remote, or `None` when the branch is not there.
     pub fn remote_branch_tip(&self, branch: &str) -> Result<Option<Sha>> {
         let git = &self.lock.git;
         let out = self.run(&[
@@ -1550,8 +1548,6 @@ mod tests {
             Some(first.clone())
         );
 
-        // A branch that exists is not replaced by a push that expects it absent, or to hold
-        // another commit.
         assert!(slot.push_branch(&second, "setup", None).is_err());
         assert!(slot.push_branch(&second, "setup", Some(&second)).is_err());
         assert_eq!(branch_tip(&w), first.as_str());

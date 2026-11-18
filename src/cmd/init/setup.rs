@@ -29,10 +29,7 @@ pub(super) struct Ready {
     pub base: Sha,
     pub commit: Sha,
     pub instructions: instructions::Chosen,
-    /// What the setup commit adds to the default branch: `chute.toml` and, when it changes, the
-    /// instructions file.
     pub files: Vec<(String, Vec<u8>)>,
-    /// The tree the verification passed on, which the merge must reproduce.
     pub tree: Sha,
     pub steps: Vec<String>,
     pub max_parallel: u32,
@@ -70,8 +67,6 @@ fn run_at(
     }
 }
 
-/// Steps 0 to 5. A default branch that moves under the run sends it back to step 0, at most
-/// `MAX_ATTEMPTS` times. The person's answer holds only for the diff they saw.
 fn drive(
     args: &Args,
     ctx: &Ctx,
@@ -459,7 +454,6 @@ mod tests {
             self.go(args, None, now)
         }
 
-        /// `tty` is the answer a person types, or `None` when there is no terminal.
         fn go(&self, args: &Args, tty: Option<&str>, now: EpochMs) -> Ran {
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let mut input = tty.unwrap_or("").as_bytes();
@@ -526,7 +520,6 @@ mod tests {
             self.repo.git(&full)
         }
 
-        /// A commit on the remote, on a side branch, for a hook to move the default branch to.
         fn pending_main(&self, path: &str, content: &str) -> String {
             let main = self.origin_main();
             self.repo.git(&["fetch", "--quiet", "origin"]);
@@ -630,7 +623,6 @@ esac
         state
     }
 
-    /// A `git` that writes each call to a log and then runs the real one.
     fn install_logging_git(sb: &Sandbox) -> PathBuf {
         let real = std::process::Command::new("sh")
             .args(["-c", "command -v git"])
@@ -1136,8 +1128,6 @@ esac
         assert_eq!(w.gh_called("pr merge"), 0, "{:?}", w.gh_calls());
     }
 
-    /// Runs with `--yes` while `pr view` reports a closed PR: the branch and the PR exist on the
-    /// remote afterwards and the default branch is untouched.
     fn leave_an_open_pr(w: &World, verify: &[&str]) -> String {
         let main = w.origin_main();
         w.gh_knob("state", "CLOSED");
@@ -1330,8 +1320,6 @@ esac
         assert_eq!(w.gh_called("pr merge"), 0);
     }
 
-    /// Pushes a commit on top of `setup` to the setup branch, as someone else could. The
-    /// untracked draft is moved aside while git switches branches.
     fn push_on_top_of(w: &World, setup: &str, path: &str, content: &str) -> String {
         let draft = w.work_config();
         let aside = w.sb.root().join("draft-aside");

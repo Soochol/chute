@@ -1,6 +1,3 @@
-//! Steps 4 and 5 of `chute init --setup`: publish the setup branch and PR, then merge it into the
-//! default branch the way the queue does, without going through the queue.
-
 use std::fs;
 use std::io::{BufRead, Write};
 
@@ -15,8 +12,6 @@ use crate::model::{PrNumber, RepoInfo, Sha};
 
 pub(super) const BRANCH: &str = "chute/setup";
 
-/// Whether a person can answer, and where the answer comes from. Both are injected so tests do
-/// not need a terminal.
 pub(super) struct Console<'a> {
     pub tty: bool,
     pub input: &'a mut dyn BufRead,
@@ -44,9 +39,7 @@ pub(super) struct OpenPr {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Landed {
     Merged,
-    /// The default branch got a `chute.toml` meanwhile; only the registration is left.
     AlreadyConfigured,
-    /// The default branch moved after the verification, so the run starts over.
     Moved,
 }
 
@@ -117,8 +110,6 @@ pub(super) fn find_open_pr(ctx: &Ctx, info: &RepoInfo) -> Result<Option<OpenPr>>
     }
 }
 
-/// Publishes the setup commit and merges it. The checks of the merge all run in `conditions`,
-/// right before the push.
 pub(super) fn land(
     ctx: &Ctx,
     ready: &Ready,
@@ -218,8 +209,6 @@ fn finish(slot: &Slot, ready: &Ready, merged: &Sha, out: &mut dyn Write) -> Resu
     Ok(())
 }
 
-/// Brings the remote to a setup branch and an open PR whose head holds the setup content, and
-/// returns that head with the PR number.
 fn publish(
     ctx: &Ctx,
     slot: &Slot,
@@ -313,8 +302,6 @@ pub(super) enum Verdict {
     Moved,
 }
 
-/// Every condition for the merge, checked in one place against a freshly fetched default branch.
-/// An error here means the merge must not happen.
 pub(super) fn conditions(
     ctx: &Ctx,
     slot: &Slot,
@@ -324,14 +311,12 @@ pub(super) fn conditions(
 ) -> Result<Verdict> {
     let info = &ready.info;
     let base = slot.fetch_base()?;
-    // 1. The default branch has no chute.toml yet.
     if slot.read_file(&base, config::FILE_NAME)?.is_some() {
         return Ok(Verdict::AlreadyConfigured);
     }
     if base != ready.base {
         return Ok(Verdict::Moved);
     }
-    // 2. The PR is open, aimed at the default branch, and comes from the setup branch here.
     let viewed = ctx.ext.gh(
         &info.path,
         [
@@ -364,13 +349,11 @@ pub(super) fn conditions(
             "PR {pr}의 head가 이 저장소의 {BRANCH}가 아니다"
         )));
     }
-    // 3. The PR head is the commit that was confirmed.
     if slot.fetch_pr_head(pr, commit)? != crate::gitops::PrHead::Unchanged {
         return Err(refuse(format!(
             "PR {pr}의 HEAD가 확인한 setup 커밋 {commit}과 다르다"
         )));
     }
-    // 4. The PR changes chute.toml and the instructions line, and nothing else.
     let changed = slot.changed_since_fork(&base, commit)?;
     let instructions = &ready.instructions;
     let mut expected: Vec<(&str, &[u8])> = Vec::new();
