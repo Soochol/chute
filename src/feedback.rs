@@ -896,7 +896,12 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
 }
 
 /// States what chute observed about a solo failure. It does not say who caused it.
-fn render_solo_scope(out: &mut Vec<String>, this: &str, evidence: Option<&SoloEvidence>) {
+fn render_solo_scope(
+    out: &mut Vec<String>,
+    this: &str,
+    evidence: Option<&SoloEvidence>,
+    timed_out: bool,
+) {
     let Some(evidence) = evidence else {
         out.push(format!(
             "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 같은 단계가 실패했다"
@@ -904,8 +909,13 @@ fn render_solo_scope(out: &mut Vec<String>, this: &str, evidence: Option<&SoloEv
         return;
     };
     let runs = evidence.runs;
+    let (result, count) = if timed_out {
+        ("시간 초과로 끝났다", "시간 초과")
+    } else {
+        ("실패했다", "실패")
+    };
     out.push(format!(
-        "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 실패했다({runs}번 돌려 {runs}번 실패)"
+        "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 {result}({runs}번 돌려 {runs}번 {count})"
     ));
     out.push(match evidence.base {
         Some(BaseCheck::RanInThisBatch) => "- 기준 브랜치: 이 batch에서 돌려 통과했다".to_owned(),
@@ -914,7 +924,9 @@ fn render_solo_scope(out: &mut Vec<String>, this: &str, evidence: Option<&SoloEv
         }
         None => "- 기준 브랜치: 확인하지 않았다".to_owned(),
     });
-    if evidence.ledger_tests.is_empty() {
+    if evidence.attempts.iter().all(Vec::is_empty) {
+        out.push("- 장부: 실패한 시험 이름을 뽑지 못해 확인하지 않았다".to_owned());
+    } else if evidence.ledger_tests.is_empty() {
         out.push(format!(
             "- 장부: 최근 {}일 장부에 이 단계의 흔들림 기록이 있는 실패 시험은 없다",
             evidence.ledger_days
@@ -987,7 +999,7 @@ fn render_step(
         out.push("- 결과: 실패".to_owned());
     }
     match &step.mode {
-        VerifyMode::Solo => render_solo_scope(out, this, step.evidence.as_deref()),
+        VerifyMode::Solo => render_solo_scope(out, this, step.evidence.as_deref(), timed_out),
         VerifyMode::Combo { .. } => out.push(format!(
             "- 범위: 조합. 기준 브랜치에 {this}만 얹으면 통과하지만, 아래 PR과 함께이면 실패한다"
         )),

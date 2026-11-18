@@ -4514,3 +4514,47 @@ fn a_report_json_and_a_state_without_the_evidence_field_still_load() {
     let text = serde_json::to_string(&with).unwrap();
     assert_eq!(serde_json::from_str::<Failure>(&text).unwrap(), with);
 }
+
+#[test]
+fn a_solo_report_does_not_claim_a_ledger_check_when_no_test_was_named() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+
+    let md = solo_report_md(
+        &lab,
+        &[],
+        Some(evidence(Some(BaseCheck::RanInThisBatch), &[&[]], &[])),
+    );
+
+    assert!(
+        md.contains("- 장부: 실패한 시험 이름을 뽑지 못해 확인하지 않았다"),
+        "{md}"
+    );
+    assert!(!md.contains("실패 시험은 없다"), "{md}");
+}
+
+#[test]
+fn a_timed_out_solo_report_says_timeout_not_failure_in_the_scope_line() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let item = lab.item(12, "feat/b");
+    let failure = Failure::Timeout(StepFailure {
+        evidence: Some(Box::new(evidence(
+            Some(BaseCheck::RanInThisBatch),
+            &[&[]],
+            &[],
+        ))),
+        ..lab.step(VerifyMode::Solo, &[], lab.log("hang\n"))
+    });
+
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+
+    let md = read(&written.md);
+    assert!(
+        md.contains("트리에서 시간 초과로 끝났다(1번 돌려 1번 시간 초과)"),
+        "{md}"
+    );
+}

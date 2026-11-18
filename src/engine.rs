@@ -933,9 +933,17 @@ struct Run<'e> {
     reran: BTreeSet<PrNumber>,
     rerunning: Option<Rerunning>,
     /// The tests each earlier run of a rerun PR's failed step named.
-    earlier_attempts: BTreeMap<PrNumber, Vec<Vec<String>>>,
+    earlier_attempts: BTreeMap<PrNumber, EarlierRun>,
     /// Bases this batch ran and found sound.
     bases_ran: BTreeSet<Sha>,
+}
+
+/// The failed verification that made chute run a PR again, as far as a report may count it: only
+/// a later failure of the same step on the same base continues it.
+struct EarlierRun {
+    step: String,
+    base: Sha,
+    attempts: Vec<Vec<String>>,
 }
 
 /// The result of checking a base: how it was found sound, or why it is broken.
@@ -1678,6 +1686,7 @@ impl Run<'_> {
         let commits: BTreeMap<PrNumber, Sha> = b.landing.iter().cloned().collect();
         if pushed {
             self.record.pushed.push(b.tip.clone());
+            self.bases_ran.insert(b.tip.clone());
         }
         for (pr, commit) in &b.landing {
             let item = &self.items[pr];
@@ -1779,10 +1788,11 @@ impl Run<'_> {
                 }
             }
         };
-        if let Blame::Solo { .. } = &blame
+        if let Blame::Solo { base } = &blame
             && let Some((signal, tests)) = self.rerun_signal(pr, &failed)?
         {
-            return self.rerun(pr, &failed, signal, tests, &tip);
+            let base = base.clone();
+            return self.rerun(pr, &failed, signal, tests, &tip, base);
         }
         let mut base_check = None;
         if !self.repairing {
@@ -1794,7 +1804,7 @@ impl Run<'_> {
             }
         }
         let evidence = match &blame {
-            Blame::Solo { .. } => Some(self.solo_evidence(pr, &failed, base_check)?),
+            Blame::Solo { base } => Some(self.solo_evidence(pr, base, &failed, base_check)?),
             Blame::Combo(_) => None,
         };
         let item = self.items[&pr].clone();
@@ -1824,27 +1834,34 @@ impl Run<'_> {
     fn solo_evidence(
         &self,
         pr: PrNumber,
+        base_of_failure: &Sha,
         failed: &Failed,
         base: Option<BaseCheck>,
     ) -> Result<SoloEvidence> {
-        let mut attempts = self.earlier_attempts.get(&pr).cloned().unwrap_or_default();
+        let earlier = self
+            .earlier_attempts
+            .get(&pr)
+            .filter(|e| e.step == failed.step && e.base == *base_of_failure);
+        let mut attempts = earlier.map(|e| e.attempts.clone()).unwrap_or_default();
         attempts.extend(attempts_of(failed));
+        let mut named: Vec<String> = Vec::new();
+        for test in attempts.iter().flatten() {
+            if !named.contains(test) {
+                named.push(test.clone());
+            }
+        }
         let ledger_days = self.config.flaky.chronic_days;
         let ledger_tests = flaky::ledger_tests(
             &self.engine.store.history()?.events,
             EpochMs::now(),
             ledger_days,
             &failed.step,
-            &failed.tests(),
+            &named,
             None,
         );
         Ok(SoloEvidence {
             base,
-            runs: if self.earlier_attempts.contains_key(&pr) {
-                2
-            } else {
-                1
-            },
+            runs: if earlier.is_some() { 2 } else { 1 },
             attempts,
             ledger_days,
             ledger_tests,
@@ -1875,9 +1892,17 @@ impl Run<'_> {
         signal: RerunSignal,
         tests: Vec<String>,
         failed_tree: &Sha,
+        base: Sha,
     ) -> Result<()> {
         self.reran.insert(pr);
-        self.earlier_attempts.insert(pr, attempts_of(failed));
+        self.earlier_attempts.insert(
+            pr,
+            EarlierRun {
+                step: failed.step.clone(),
+                base,
+                attempts: attempts_of(failed),
+            },
+        );
         self.record.reruns.push(Rerun {
             pr,
             step: failed.step.clone(),
