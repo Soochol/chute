@@ -570,9 +570,6 @@ export default class Chute extends View {
             v_flex()
               .gap(2)
               .pl(24)
-              .when(Boolean(repo.hub.error), (box) =>
-                box.child(div().text_size(12).text_color(t.muted).whitespace_normal().child(repo.hub.error)),
-              )
               .child(div().text_size(12).text_color(t.dim).child(`Retrying every ${REMOTE_POLL_MS / 1000}s`)),
           ),
         ),
