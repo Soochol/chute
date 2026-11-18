@@ -377,8 +377,21 @@ function cardOf(item, repoPath, slug, now, approval) {
     card.headline = card.failure?.mode ? `${card.reason} · ${card.failure.mode}` : card.reason;
     card.left = retriesLeft(item.attempts, item.budget);
     card.needs = needsOf(card.agent, card.left);
+    card.summaryLine = firstLine(card.failure?.summary) || null;
+    card.retryDots = retryDotsOf(item.attempts, item.budget, card.left);
   }
   return card;
+}
+
+function retryDotsOf(attempts, budget, left) {
+  if (!Number.isInteger(budget) || budget < 1 || budget > 10) return null;
+  if (!Number.isInteger(attempts) || attempts < 0 || left == null) return null;
+  return {
+    total: budget,
+    used: Math.min(attempts, budget),
+    tone: left === 1 ? "warn" : "dim",
+    tip: `Bounced ${attempts} of ${budget} · ${left} ${left === 1 ? "retry" : "retries"} left`,
+  };
 }
 
 const retriesLeft = (attempts, budget) =>

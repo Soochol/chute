@@ -801,8 +801,32 @@ export default class Chute extends View {
     const row = card.report
       ? linkRow(id, t, () => this.openFile(card.report, repo.hub.machine))
       : hoverRow(h_flex().id(id).px(6).py(4), t);
-    const retries = div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`Retries ${card.retries}`);
+    const dots = card.retryDots;
+    const retries = dots
+      ? h_flex()
+          .id(`retries-${card.key}`)
+          .flex_none()
+          .gap(3)
+          .items_center()
+          .tooltip(dots.tip)
+          .children(
+            Array.from({ length: dots.total }, (_, i) =>
+              div().w(7).h(7).rounded(4).flex_none().bg(i < dots.used ? toneColor(dots.tone, t) : t.border),
+            ),
+          )
+      : div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`Retries ${card.retries}`);
+    const note = card.summaryLine
+      ? div()
+          .id(`note-${card.key}`)
+          .min_w(0)
+          .truncate()
+          .text_size(12)
+          .text_color(t.muted)
+          .tooltip(card.failure.summary)
+          .child(card.summaryLine)
+      : null;
     return gridRow(row, t, {
+      note,
       narrow: this.narrow,
       pr: card.pr,
       title: card.title,
@@ -1085,6 +1109,7 @@ function gridRow(row, t, spec) {
           .child(div().flex_1().min_w(0).when(hasChips, (el) => el.child(chipRow(spec.chips.map((c) => c.min_w(0).flex_shrink(1))))))
           .child(aside()),
       )
+      .when(Boolean(spec.note), (el) => el.child(spec.note))
       .when(submitter, (el) => el.child(submitterLine(spec.submitter, t)));
     return row
       .gap(6)
@@ -1099,6 +1124,7 @@ function gridRow(row, t, spec) {
     .gap(3)
     .child(div().whitespace_normal().child(spec.title))
     .when(hasChips, (el) => el.child(chipRow(spec.chips)))
+    .when(Boolean(spec.note), (el) => el.child(spec.note))
     .when(submitter, (el) => el.child(submitterLine(spec.submitter, t)));
   return row.gap(6).items_start().child(indexCell()).child(prCell(spec.pr, t)).child(body).child(aside());
 }
@@ -1267,17 +1293,27 @@ function postVerifyView(post, t) {
     .child(sectionTitle("Post-merge", null, t))
     .when(Boolean(post.green), (el) => el.child(row("✓", t[toneToken("ok")], `${post.green.commit} passed`, post.green.ago)))
     .when(Boolean(run), (el) =>
-      el.child(
-        row(
-          "◌",
-          t.working,
-          run.waitingMachine
-            ? `${run.commit} waiting for a slot`
+      el
+        .child(
+          row(
+            "◌",
+            t.working,
+            run.waitingMachine
+              ? `${run.commit} waiting for a slot`
 
-            : `${run.commit} ${run.label}${run.step ? ` · ${run.step}` : ""}`,
-          run.elapsed,
+              : `${run.commit} ${run.label}${run.step ? ` · ${run.step}` : ""}`,
+            run.elapsed,
+          ),
+        )
+        .child(
+          div()
+            .ml(24)
+            .mr(6)
+            .h(4)
+            .rounded(2)
+            .bg(run.waitingMachine ? t.muted : t.working)
+            .when(!run.waitingMachine, (bar) => bar.loop("opacity", { from: 1, to: 0.35, period: 1600 })),
         ),
-      ),
     );
 }
 
