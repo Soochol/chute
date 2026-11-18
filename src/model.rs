@@ -850,6 +850,25 @@ pub struct Flaky {
     pub tree: Sha,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerunSignal {
+    /// The two attempts of the failed step named tests that share none.
+    DifferentTests,
+    /// Every test that failed twice has a flaky record of another batch.
+    KnownFlaky,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rerun {
+    pub pr: PrNumber,
+    pub step: String,
+    /// The verification round whose failure caused the rerun. The rerun is the next round.
+    pub failed_round: u32,
+    pub signal: RerunSignal,
+    pub tests: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedStep {
     pub round: u32,
@@ -877,6 +896,8 @@ pub struct BatchRecord {
     pub env: Option<EnvRecord>,
     #[serde(default)]
     pub reused: Vec<Reused>,
+    #[serde(default)]
+    pub reruns: Vec<Rerun>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

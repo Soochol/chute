@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use chute::engine::{Pass, Summary};
 use chute::model::{
-    Approval, BlockReason, BounceReason, EpochMs, EventKind, Failure, ItemState, PrNumber,
-    ProbeEvidence, RemovedReason, SkippedStep, StatusView, VerifyMode, WarningKind,
+    Approval, BatchId, BlockReason, BounceReason, EpochMs, Event, EventKind, Failure, ItemState,
+    PrNumber, ProbeEvidence, RemovedReason, Rerun, RerunSignal, SkippedStep, StatusView,
+    VerifyMode, WarningKind,
 };
 use chute::queue;
 use engine_kit::Lab;
@@ -896,6 +897,7 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
             verifications: 0,
             skipped: Vec::new(),
             reused: Vec::new(),
+            reruns: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1201,6 +1203,7 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
             verifications: 3,
             skipped: Vec::new(),
             reused: Vec::new(),
+            reruns: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1264,6 +1267,7 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
             verifications: 0,
             skipped: Vec::new(),
             reused: Vec::new(),
+            reruns: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1306,6 +1310,7 @@ fn batch_record(
         verifications: 0,
         skipped: Vec::new(),
         reused: Vec::new(),
+        reruns: Vec::new(),
         env: None,
     }
 }
@@ -2703,7 +2708,11 @@ fn queue_for_worker(lab: &Lab, n: u64) {
 }
 
 fn halted_lab() -> Lab {
-    let lab = Lab::new(BROKEN_BASE);
+    halted_lab_running(BROKEN_BASE)
+}
+
+fn halted_lab_running(verify_body: &str) -> Lab {
+    let lab = Lab::new(verify_body);
     lab.main_commit(&[("BASEBAD", "")], "feat: broken");
     queue_for_worker(&lab, 1);
     let head = lab.push_pr_branch(2, &[("f2.txt", "x\n")]);
@@ -3125,4 +3134,221 @@ fn checking_a_base_runs_every_step_even_when_paths_would_skip_it() {
     let blocked = lab.state().blocked.expect("저장소가 멈춘다");
     assert_eq!(blocked.reason, BlockReason::BaseBroken);
     assert!(lab.bounced_events().is_empty());
+}
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn scripted_failures(runs: &[&[&str]]) -> String {
+    let mut script = String::from(
+        "c='@ROOT@/runs'; n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\ncase $n in\n",
+    );
+    for (n, tests) in runs.iter().enumerate() {
+        let lines: Vec<String> = tests.iter().map(|t| format!("FAILED {t}")).collect();
+        let text = if lines.is_empty() {
+            "boom".to_owned()
+        } else {
+            lines.join("\\n")
+        };
+        script.push_str(&format!("{}) fail \"$(printf '{text}')\";;\n", n + 1));
+    }
+    script.push_str("esac");
+    script
+}
+
+fn flaky_events(lab: &Lab) -> Vec<(String, Vec<String>)> {
+    lab.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::Flaky { step, tests, .. } => Some((step, tests)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn recorded_as_flaky_by_another_batch(lab: &Lab, days_ago: u64, test: &str) {
+    lab.store
+        .append_history(&Event {
+            at_ms: EpochMs(EpochMs::now().0 - days_ago * DAY_MS),
+            kind: EventKind::Flaky {
+                batch: BatchId("b-earlier".into()),
+                step: "check".into(),
+                tests: vec![test.to_owned()],
+                tree: engine_kit::sha(&"a".repeat(40)),
+            },
+        })
+        .unwrap();
+}
+
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_owned()).collect()
+}
+
+#[test]
+fn a_solo_failure_whose_attempts_name_different_tests_is_verified_again_and_merges() {
+    let lab = Lab::new(&scripted_failures(&[&["test_a"], &["test_b"]]));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(summary.bounced.is_empty());
+    assert_eq!(
+        flaky_events(&lab),
+        [("check".to_owned(), strings(&["test_a", "test_b"]))]
+    );
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(
+        record.reruns,
+        [Rerun {
+            pr: PrNumber(1),
+            step: "check".into(),
+            failed_round: 1,
+            signal: RerunSignal::DifferentTests,
+            tests: strings(&["test_a", "test_b"]),
+        }]
+    );
+    assert_eq!(record.verifications, 2);
+    assert_eq!(record.flaky.len(), 1);
+    assert!(lab.bounced_events().is_empty());
+    assert!(lab.lines_sent_to("t1rs").is_empty());
+    lab.assert_every_pushed_commit_was_verified();
+}
+
+#[test]
+fn a_solo_failure_whose_attempts_name_different_tests_again_is_bounced_after_one_more_verification()
+{
+    let lab = Lab::new(&scripted_failures(&[
+        &["test_a"],
+        &["test_b"],
+        &["test_c"],
+        &["test_d"],
+    ]));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    assert!(summary.merged.is_empty());
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(
+        record.verifications, 3,
+        "묶음, 다시 돈 검증, 반송 전의 기준 확인. 다시 돌린 것은 한 번뿐이다"
+    );
+    assert_eq!(record.reruns.len(), 1);
+    assert!(record.flaky.is_empty());
+    assert!(flaky_events(&lab).is_empty());
+    let Failure::Verify(step) = lab.item(1).unwrap().last_failure.unwrap().failure else {
+        panic!("검증 실패여야 한다");
+    };
+    assert_eq!(step.failed_tests, ["test_d"]);
+}
+
+#[test]
+fn a_solo_failure_of_a_test_another_batch_recorded_as_flaky_is_verified_again() {
+    let lab = Lab::build(
+        &scripted_failures(&[&["known_test"], &["known_test"]]),
+        "[flaky]\nchronic_days = 5\n",
+        60,
+    );
+    recorded_as_flaky_by_another_batch(&lab, 1, "known_test");
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert!(summary.bounced.is_empty());
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.reruns.len(), 1);
+    assert_eq!(record.reruns[0].signal, RerunSignal::KnownFlaky);
+    assert_eq!(record.reruns[0].tests, ["known_test"]);
+    assert_eq!(record.flaky.len(), 1);
+    assert_eq!(record.verifications, 2);
+}
+
+#[test]
+fn a_flaky_record_older_than_chronic_days_does_not_spare_the_pr() {
+    let lab = Lab::build(
+        &scripted_failures(&[&["known_test"], &["known_test"]]),
+        "[flaky]\nchronic_days = 5\n",
+        60,
+    );
+    recorded_as_flaky_by_another_batch(&lab, 6, "known_test");
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.reruns.is_empty());
+    assert_eq!(record.verifications, 2, "묶음과 기준 확인");
+}
+
+#[test]
+fn a_solo_failure_with_a_known_flaky_test_and_an_unknown_test_is_bounced() {
+    let lab = Lab::build(
+        &scripted_failures(&[
+            &["known_test", "unknown_test"],
+            &["known_test", "unknown_test"],
+        ]),
+        "[flaky]\nchronic_days = 5\n",
+        60,
+    );
+    recorded_as_flaky_by_another_batch(&lab, 1, "known_test");
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.reruns.is_empty());
+    assert_eq!(record.verifications, 2);
+}
+
+#[test]
+fn a_solo_failure_of_the_same_test_in_both_attempts_is_bounced_without_another_verification() {
+    let lab = Lab::new(&scripted_failures(&[&["bad_test"], &["bad_test"]]));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.reruns.is_empty());
+    assert_eq!(record.verifications, 2, "묶음과 기준 확인");
+    assert!(flaky_events(&lab).is_empty());
+}
+
+#[test]
+fn a_solo_failure_without_test_names_is_bounced_as_before() {
+    let lab = Lab::new(&scripted_failures(&[&[], &[]]));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.reruns.is_empty());
+    assert_eq!(record.verifications, 2, "묶음과 기준 확인");
+}
+
+#[test]
+fn a_repair_pr_whose_attempts_name_different_tests_is_verified_again_and_lifts_the_halt() {
+    let flaking = scripted_failures(&[&["test_a"], &["test_b"]]);
+    let lab = halted_lab_running(&format!(
+        "{BROKEN_BASE}\nif [ -e '@ROOT@/arm' ]; then\n{flaking}\nfi"
+    ));
+    fs::write(lab.sb.root().join("arm"), "").unwrap();
+    let head = lab.push_pr_branch_removing(3, "BASEBAD");
+    lab.queue_repair_by(3, &head, Some(lab.agent()), Some(lab.orchestrator()));
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[3]));
+    assert!(summary.bounced.is_empty());
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.reruns.len(), 1);
+    assert_eq!(record.reruns[0].pr, PrNumber(3));
+    assert_eq!(record.verifications, 2);
+    assert!(lab.state().blocked.is_none());
+    assert_eq!(lab.merged_prs(), [3]);
 }

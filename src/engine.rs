@@ -25,9 +25,9 @@ use crate::gitops::{
 use crate::model::{
     Agent, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs,
     Event, EventKind, Failure, Flaky, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
-    ProbeEvidence, QueueItem, QueuedReason, RemovedReason, RepoInfo, ResumedBy, Reused, Sha,
-    SkippedStep, State, StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode, Warning,
-    WarningKind,
+    ProbeEvidence, QueueItem, QueuedReason, RemovedReason, RepoInfo, Rerun, RerunSignal, ResumedBy,
+    Reused, Sha, SkippedStep, State, StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode,
+    Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, Removal, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
@@ -682,6 +682,7 @@ impl Engine {
                 env: None,
                 skipped: Vec::new(),
                 reused: Vec::new(),
+                reruns: Vec::new(),
             },
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
@@ -698,6 +699,8 @@ impl Engine {
             bisecting: false,
             verify_time: Duration::ZERO,
             repairing,
+            reran: BTreeSet::new(),
+            rerunning: None,
         };
         let result = run.execute(&taken);
         let only_deferred = run.only_deferred();
@@ -925,6 +928,13 @@ struct Run<'e> {
     bisecting: bool,
     verify_time: Duration,
     repairing: bool,
+    reran: BTreeSet<PrNumber>,
+    rerunning: Option<Rerunning>,
+}
+
+struct Rerunning {
+    step: FlakyStep,
+    failed_tree: Sha,
 }
 
 impl Run<'_> {
@@ -1431,8 +1441,12 @@ impl Run<'_> {
             if b.landing.is_empty() {
                 return self.land(&b);
             }
-            match self.verify(&b.tip, Scope::Changed, !self.bisecting)? {
+            let reusable = !self.bisecting && self.rerunning.is_none();
+            match self.verify(&b.tip, Scope::Changed, reusable)? {
                 Verdict::Pass => {
+                    if let Some(rerun) = self.rerunning.take() {
+                        self.record_flaky(vec![rerun.step], &rerun.failed_tree)?;
+                    }
                     if !self.all_still_fit(&b, &mut group)? {
                         continue;
                     }
@@ -1753,6 +1767,11 @@ impl Run<'_> {
                 }
             }
         };
+        if let Blame::Solo { .. } = &blame
+            && let Some((signal, tests)) = self.rerun_signal(pr, &failed)?
+        {
+            return self.rerun(pr, &failed, signal, tests, &tip);
+        }
         if !self.repairing {
             match &blame {
                 Blame::Solo { base } => self.confirm_solo_base(pr, base)?,
@@ -1781,6 +1800,52 @@ impl Run<'_> {
         let name = format!("pr{}-{}", pr.0, self.id().0);
         self.engine.gitops.set_failed_ref(&name, &tip)?;
         self.bounce(pr, failure, Some(&name))
+    }
+
+    fn rerun_signal(
+        &self,
+        pr: PrNumber,
+        failed: &Failed,
+    ) -> Result<Option<(RerunSignal, Vec<String>)>> {
+        if self.reran.contains(&pr) {
+            return Ok(None);
+        }
+        Ok(flaky::rerun_signal(
+            failed,
+            &self.engine.store.history()?.events,
+            EpochMs::now(),
+            self.config.flaky.chronic_days,
+            self.id(),
+        ))
+    }
+
+    fn rerun(
+        &mut self,
+        pr: PrNumber,
+        failed: &Failed,
+        signal: RerunSignal,
+        tests: Vec<String>,
+        failed_tree: &Sha,
+    ) -> Result<()> {
+        self.reran.insert(pr);
+        self.record.reruns.push(Rerun {
+            pr,
+            step: failed.step.clone(),
+            failed_round: self.record.verifications,
+            signal,
+            tests: tests.clone(),
+        });
+        self.save_record()?;
+        self.rerunning = Some(Rerunning {
+            step: FlakyStep {
+                step: failed.step.clone(),
+                tests,
+            },
+            failed_tree: failed_tree.clone(),
+        });
+        let result = self.solve(vec![pr]);
+        self.rerunning = None;
+        result
     }
 
     fn check_alone(&mut self, pr: PrNumber, base: &Sha) -> Result<Alone> {
@@ -2196,6 +2261,7 @@ mod tests {
             detail,
             log: "/logs/test.1.log".into(),
             confirmed: None,
+            first_attempt_tests: None,
             named_by: None,
         }
     }
