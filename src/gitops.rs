@@ -855,6 +855,52 @@ impl Slot {
         self.head()
     }
 
+    /// The content of `path` in `rev`, or `None` when `rev` has no such file.
+    pub fn read_file(&self, rev: &Sha, path: &str) -> Result<Option<Vec<u8>>> {
+        let spec = format!("{rev}:{path}");
+        if !self.git(&["cat-file", "-e", &spec])?.success() {
+            return Ok(None);
+        }
+        let out = self.git(&["cat-file", "blob", &spec])?;
+        if !out.success() {
+            bail!("{spec}를 읽지 못했다: {}", out.stderr_text().trim());
+        }
+        Ok(Some(out.stdout))
+    }
+
+    /// The tip of `refs/heads/<branch>` on the remote, or `None` when the branch is not there.
+    pub fn remote_branch_tip(&self, branch: &str) -> Result<Option<Sha>> {
+        let git = &self.lock.git;
+        let out = self.run(&[
+            "ls-remote",
+            "--heads",
+            &git.remote,
+            &format!("refs/heads/{branch}"),
+        ])?;
+        match out.split_whitespace().next() {
+            None => Ok(None),
+            Some(sha) => Sha::try_from(sha.to_owned())
+                .map(Some)
+                .map_err(|e| anyhow!(e)),
+        }
+    }
+
+    /// Pushes `commit` to `refs/heads/<branch>` on the remote. The push replaces the branch only
+    /// when it still holds `expected`, or does not exist when `expected` is `None`.
+    pub fn push_branch(&self, commit: &Sha, branch: &str, expected: Option<&Sha>) -> Result<()> {
+        let git = &self.lock.git;
+        let lease = format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            expected.map_or("", Sha::as_str)
+        );
+        let refspec = format!("{commit}:refs/heads/{branch}");
+        let out = self.git(&["push", "--quiet", &lease, &git.remote, &refspec])?;
+        if !out.success() {
+            bail!("{branch}를 push하지 못했다: {}", out.stderr_text().trim());
+        }
+        Ok(())
+    }
+
     pub fn is_ancestor(&self, commit: &Sha, of: &Sha) -> Result<bool> {
         let out = self.git(&["merge-base", "--is-ancestor", commit.as_str(), of.as_str()])?;
         match out.code {
@@ -1478,6 +1524,54 @@ mod tests {
         assert_eq!(slot.fetch_base().unwrap(), theirs);
         assert_eq!(slot.push(&merged.tip).unwrap(), PushOutcome::MainMoved);
         assert_eq!(w.origin_main(), theirs);
+    }
+
+    #[test]
+    fn push_branch_replaces_a_branch_only_while_it_holds_the_expected_commit() {
+        let w = World::new();
+        let first = w.open_pr(1, &[("a.txt", "a\n")]).head().clone();
+        let second = w.open_pr(2, &[("b.txt", "b\n")]).head().clone();
+        let slot = w.slot(SlotName::Batch);
+        slot.fetch_pr_head(PrNumber(1), &first).unwrap();
+        slot.fetch_pr_head(PrNumber(2), &second).unwrap();
+        let branch_tip = |w: &World| {
+            git(
+                &w.sb,
+                w.repo.origin(),
+                &["rev-parse", "--verify", "--quiet", "refs/heads/setup"],
+            )
+        };
+
+        assert_eq!(slot.remote_branch_tip("setup").unwrap(), None);
+        slot.push_branch(&first, "setup", None).unwrap();
+        assert_eq!(branch_tip(&w), first.as_str());
+        assert_eq!(
+            slot.remote_branch_tip("setup").unwrap(),
+            Some(first.clone())
+        );
+
+        // A branch that exists is not replaced by a push that expects it absent, or to hold
+        // another commit.
+        assert!(slot.push_branch(&second, "setup", None).is_err());
+        assert!(slot.push_branch(&second, "setup", Some(&second)).is_err());
+        assert_eq!(branch_tip(&w), first.as_str());
+
+        slot.push_branch(&second, "setup", Some(&first)).unwrap();
+        assert_eq!(branch_tip(&w), second.as_str());
+    }
+
+    #[test]
+    fn read_file_gives_the_content_of_a_path_in_a_commit_or_none() {
+        let w = World::new();
+        let head = w.open_pr(1, &[("a.txt", "a\n")]).head().clone();
+        let slot = w.slot(SlotName::Batch);
+        slot.fetch_pr_head(PrNumber(1), &head).unwrap();
+
+        assert_eq!(
+            slot.read_file(&head, "a.txt").unwrap(),
+            Some(b"a\n".to_vec())
+        );
+        assert_eq!(slot.read_file(&head, "missing.txt").unwrap(), None);
     }
 
     #[test]

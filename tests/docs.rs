@@ -113,6 +113,10 @@ fn manual_and_readme_quote_only_messages_the_code_prints() {
         " · 닿지 않음",
         "허브: 이 PC",
         "(연결됨)",
+        "`--yes`로 다시 실행한다",
+        "기본 브랜치에 chute.toml이 이미 있어 등록만 했다",
+        "--verify를 주거나 초안의 [[verify]]를 고친 뒤 다시 실행한다",
+        "작업 폴더의 chute.toml이 머지된 것과 같아 지웠다",
     ];
     let manual = manual();
     let readme = readme();
@@ -128,8 +132,41 @@ fn manual_and_readme_quote_only_messages_the_code_prints() {
     ] {
         assert!(manual.contains(text), "설명서에 `{text}`가 없다");
     }
+    for text in [
+        "`--yes`로 다시 실행한다",
+        "기본 브랜치에 chute.toml이 이미 있어 등록만 했다",
+        "--verify를 주거나 초안의 [[verify]]를 고친 뒤 다시 실행한다",
+    ] {
+        assert!(readme.contains(text), "README에 `{text}`가 없다");
+    }
     assert!(readme.contains("그 머신의 로그인 환경 PATH에 chute가 있는지 확인한다"));
     assert!(readme.contains("revert는 허브에서만 실행한다"));
+}
+
+#[test]
+fn readme_first_use_describes_init_setup_and_the_manual_keeps_it_a_human_command() {
+    let readme = readme();
+    let start = readme.find("## 처음 쓰기").expect("절이 없다");
+    let end = readme[start..]
+        .find("\n## ")
+        .map_or(readme.len(), |n| n + start);
+    let section = &readme[start..end];
+    for needed in [
+        "chute init --setup --verify",
+        "--instructions",
+        "--yes",
+        "chute/setup",
+        "다시 실행하면 이어 간다",
+        "옵션 없는 `chute init`은 그대로다",
+        "`gh pr merge`를 쓰지 않고",
+        "동의(터미널의 `y` 또는 `--yes`)를 받은 뒤 setup PR에 이 한 줄을 넣는다",
+    ] {
+        let found = section.contains(needed);
+        assert!(found, "처음 쓰기에 `{needed}`가 없다");
+    }
+    let manual = manual();
+    assert!(manual.contains("`chute init --setup`: 사람이"));
+    assert!(manual.contains("사용자가 명시적으로 시킬 때만 `--yes`와 함께 실행한다"));
 }
 
 #[test]

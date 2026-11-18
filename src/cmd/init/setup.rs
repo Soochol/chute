@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 
+use super::merge::{self, Console, Landed};
 use super::{
     Args, FALLBACK_VERIFY, announce_same_url_remotes, guess_verify, instructions, register,
 };
@@ -18,7 +19,7 @@ use crate::reuse;
 use crate::store::{RepoStore, SetupRecord};
 use crate::verify::{self, Cause, Detail, Failed, Options, Outcome};
 
-const COMMIT_MESSAGE: &str = "chute: 머지 큐 설정 추가";
+pub(super) const COMMIT_MESSAGE: &str = "chute: 머지 큐 설정 추가";
 const LOG_TAIL_LINES: usize = 20;
 const HOUR_MS: u64 = 60 * 60 * 1000;
 
@@ -28,30 +29,37 @@ pub(super) struct Ready {
     pub base: Sha,
     pub commit: Sha,
     pub instructions: instructions::Chosen,
+    /// What the setup commit adds to the default branch: `chute.toml` and, when it changes, the
+    /// instructions file.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// The tree the verification passed on, which the merge must reproduce.
+    pub tree: Sha,
+    pub steps: Vec<String>,
+    pub max_parallel: u32,
 }
+
+const MAX_ATTEMPTS: u32 = 3;
 
 pub(super) fn run(
     args: &Args,
     ctx: &Ctx,
+    console: &mut Console,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExitCode> {
-    run_at(args, ctx, out, err, EpochMs::now())
+    run_at(args, ctx, console, out, err, EpochMs::now())
 }
 
 fn run_at(
     args: &Args,
     ctx: &Ctx,
+    console: &mut Console,
     out: &mut dyn Write,
     err: &mut dyn Write,
     now: EpochMs,
 ) -> Result<ExitCode> {
-    match prepare(args, ctx, out, now) {
-        Ok(None) => Ok(ExitCode::SUCCESS),
-        Ok(Some(ready)) => {
-            show(ctx, &ready, out)?;
-            Ok(ExitCode::SUCCESS)
-        }
+    match drive(args, ctx, console, out, now) {
+        Ok(code) => Ok(code),
         Err(e) => match e.downcast::<Refusal>() {
             Ok(refusal) => {
                 writeln!(err, "chute: {refusal}")?;
@@ -62,19 +70,64 @@ fn run_at(
     }
 }
 
-fn show(ctx: &Ctx, ready: &Ready, out: &mut dyn Write) -> Result<()> {
+/// Steps 0 to 5. A default branch that moves under the run sends it back to step 0, at most
+/// `MAX_ATTEMPTS` times. The person's answer holds only for the diff they saw.
+fn drive(
+    args: &Args,
+    ctx: &Ctx,
+    console: &mut Console,
+    out: &mut dyn Write,
+    now: EpochMs,
+) -> Result<ExitCode> {
+    let mut confirmed: Option<String> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let Some(ready) = prepare(args, ctx, out, now)? else {
+            return Ok(ExitCode::SUCCESS);
+        };
+        let diff = show(ctx, &ready, out)?;
+        if !args.yes && !console.tty {
+            return Err(Refusal(
+                "터미널이 아니라 확인을 받을 수 없어 멈춘다. 위 diff를 확인한 뒤 `--yes`로 다시 실행한다"
+                    .into(),
+            )
+            .into());
+        }
+        let open = merge::find_open_pr(ctx, &ready.info)?;
+        if !args.yes && confirmed.as_deref() != Some(diff.as_str()) {
+            let target = format!("{}/{}", ready.info.remote_name, ready.info.default_branch);
+            match &open {
+                Some(pr) => writeln!(out, "열린 PR {}을 이어 쓴다.", pr.number)?,
+                None => writeln!(out, "PR을 새로 만든다.")?,
+            }
+            writeln!(
+                out,
+                "setup 브랜치 {}를 push하고 PR을 만들어 {target}에 바로 머지한다. 큐를 거치지 않는다.",
+                merge::BRANCH
+            )?;
+            if !console.confirm(out)? {
+                return Err(Refusal("확인하지 않아 아무것도 바꾸지 않았다".into()).into());
+            }
+            confirmed = Some(diff);
+        }
+        match merge::land(ctx, &ready, open, out)? {
+            Landed::Merged | Landed::AlreadyConfigured => return Ok(ExitCode::SUCCESS),
+            Landed::Moved => {}
+        }
+    }
+    Err(Refusal("기본 브랜치가 계속 바뀐다. 잠시 뒤 다시 실행한다".into()).into())
+}
+
+fn show(ctx: &Ctx, ready: &Ready, out: &mut dyn Write) -> Result<String> {
     writeln!(out)?;
     writeln!(out, "지침 파일: {}", ready.instructions.file)?;
     if ready.instructions.content.is_none() {
         writeln!(out, "지침 파일에 같은 줄이 이미 있어 바꾸지 않는다")?;
     }
     writeln!(out)?;
-    write!(
-        out,
-        "{}",
-        setup_diff(ctx, &ready.info.path, &ready.base, &ready.commit)?
-    )?;
-    Ok(())
+    let diff = setup_diff(ctx, &ready.info.path, &ready.base, &ready.commit)?;
+    write!(out, "{diff}")?;
+    writeln!(out)?;
+    Ok(diff)
 }
 
 pub(super) fn setup_diff(ctx: &Ctx, repo: &Path, base: &Sha, commit: &Sha) -> Result<String> {
@@ -127,11 +180,15 @@ pub(super) fn prepare(
     let slot = gitops.lock_preflight_slot(config.max_parallel)?.open()?;
     let draft = fs::read(&config_path)
         .with_context(|| format!("읽지 못했다: {}", config_path.display()))?;
-    let mut files = vec![(config::FILE_NAME, draft.as_slice())];
+    let mut files = vec![(config::FILE_NAME.to_owned(), draft)];
     if let Some(content) = &chosen.content {
-        files.push((chosen.file.as_str(), content.as_slice()));
+        files.push((chosen.file.clone(), content.clone()));
     }
-    let commit = slot.commit_files(&base, &files, COMMIT_MESSAGE)?;
+    let staged: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_slice()))
+        .collect();
+    let commit = slot.commit_files(&base, &staged, COMMIT_MESSAGE)?;
 
     let store = ctx.home.repo(&info.slug);
     let tree = slot.tree_of(&commit)?;
@@ -164,7 +221,7 @@ pub(super) fn prepare(
                 Outcome::Passed { flaky } if flaky.is_empty() => {
                     store.write_setup_record(&SetupRecord {
                         base: base.clone(),
-                        tree,
+                        tree: tree.clone(),
                         config: fingerprint,
                         at_ms: now,
                     })?;
@@ -188,6 +245,10 @@ pub(super) fn prepare(
         base,
         commit,
         instructions: chosen,
+        files,
+        tree,
+        steps: config.verify.iter().map(|step| step.name.clone()).collect(),
+        max_parallel: config.max_parallel,
     }))
 }
 
@@ -305,11 +366,13 @@ fn log_tail(log: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::cmd::init::AGENTS_LINE;
     use crate::ext::Ext;
+    use crate::gitops::Gitops;
+    use crate::model::PrNumber;
     use crate::model::Slug;
     use crate::store::Home;
     use crate::testkit::{Sandbox, TestRepo};
@@ -323,6 +386,8 @@ mod tests {
         ctx: Ctx,
         slug: Slug,
         counter: PathBuf,
+        gh_state: PathBuf,
+        git_log: PathBuf,
     }
 
     struct Ran {
@@ -338,6 +403,8 @@ mod tests {
         fn new() -> World {
             let sb = Sandbox::new();
             let repo = TestRepo::new(&sb, "acme/widget");
+            let gh_state = install_fake_gh(&sb, repo.origin());
+            let git_log = install_logging_git(&sb);
             let ctx = Ctx::new(
                 Home::at(sb.chute_home()),
                 Ext::from_vars(|k| sb.var(k)),
@@ -350,6 +417,8 @@ mod tests {
                 ctx,
                 slug: Slug::new("acme", "widget").unwrap(),
                 counter,
+                gh_state,
+                git_log,
             }
         }
 
@@ -375,12 +444,30 @@ mod tests {
                 setup: true,
                 verify: verify.iter().map(|run| (*run).to_owned()).collect(),
                 instructions: instructions.map(str::to_owned),
+                yes: false,
+            }
+        }
+
+        fn yes_args(verify: &[&str]) -> Args {
+            Args {
+                yes: true,
+                ..World::args(verify, None)
             }
         }
 
         fn exec_at(&self, args: &Args, now: EpochMs) -> Ran {
+            self.go(args, None, now)
+        }
+
+        /// `tty` is the answer a person types, or `None` when there is no terminal.
+        fn go(&self, args: &Args, tty: Option<&str>, now: EpochMs) -> Ran {
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = run_at(args, &self.ctx, &mut out, &mut err, now).unwrap();
+            let mut input = tty.unwrap_or("").as_bytes();
+            let mut console = Console {
+                tty: tty.is_some(),
+                input: &mut input,
+            };
+            let code = run_at(args, &self.ctx, &mut console, &mut out, &mut err, now).unwrap();
             let mut text = String::from_utf8(out).unwrap();
             text.push_str(&String::from_utf8(err).unwrap());
             Ran {
@@ -391,6 +478,70 @@ mod tests {
 
         fn exec(&self, verify: &[&str]) -> Ran {
             self.exec_at(&World::args(verify, None), NOW)
+        }
+
+        fn exec_yes(&self, verify: &[&str]) -> Ran {
+            self.exec_at(&World::yes_args(verify), NOW)
+        }
+
+        fn gh_calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.gh_state.join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn gh_called(&self, prefix: &str) -> usize {
+            self.gh_calls()
+                .iter()
+                .filter(|call| call.starts_with(prefix))
+                .count()
+        }
+
+        fn setup_branch_pushes(&self) -> usize {
+            std::fs::read_to_string(&self.git_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains(" push ") && line.contains(":refs/heads/chute/setup"))
+                .count()
+        }
+
+        fn gh_knob(&self, name: &str, value: &str) {
+            std::fs::write(self.gh_state.join(name), value).unwrap();
+        }
+
+        fn origin_ref(&self, name: &str) -> Option<String> {
+            let out = self.repo.git(&["ls-remote", "origin", name]);
+            out.split_whitespace().next().map(str::to_owned)
+        }
+
+        fn origin_main(&self) -> String {
+            self.origin_ref("refs/heads/main").unwrap()
+        }
+
+        fn origin_git(&self, args: &[&str]) -> String {
+            let mut full = vec!["--git-dir", self.repo.origin().to_str().unwrap()];
+            full.extend_from_slice(args);
+            self.repo.git(&full)
+        }
+
+        /// A commit on the remote, on a side branch, for a hook to move the default branch to.
+        fn pending_main(&self, path: &str, content: &str) -> String {
+            let main = self.origin_main();
+            self.repo.git(&["fetch", "--quiet", "origin"]);
+            self.repo.git(&["checkout", "--quiet", "-b", "side", &main]);
+            self.repo.commit_file(path, content, "chore: 시험용 커밋");
+            self.repo
+                .git(&["push", "--quiet", "origin", "side:refs/heads/pending"]);
+            let tip = self.repo.head();
+            self.repo.git(&["checkout", "--quiet", "main"]);
+            tip
+        }
+
+        fn merge_parents(&self, commit: &str) -> Vec<String> {
+            let line = self.origin_git(&["rev-list", "--parents", "-n", "1", commit]);
+            line.split_whitespace().skip(1).map(str::to_owned).collect()
         }
 
         fn prepare(&self, verify: &[&str], instructions: Option<&str>) -> Ready {
@@ -430,6 +581,74 @@ mod tests {
         }
     }
 
+    /// A `gh` that keeps its state in files and a bare remote, the way GitHub would: `pr create`
+    /// opens PR 1 and points `refs/pull/1/head` at the setup branch, which later pushes move too.
+    /// A file `on_<list|create|view>` in the state folder is run after that call; the knobs
+    /// `state` and `base` change what `pr view` answers, and `frozen` stops the pull ref following
+    /// the branch.
+    fn install_fake_gh(sb: &Sandbox, origin: &Path) -> PathBuf {
+        let state = sb.root().join("gh-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let body = r#"d='@STATE@'; o='@ORIGIN@'
+echo "$*" >> "$d/calls"
+g() { git --git-dir="$o" "$@"; }
+sync() {
+  n=$(cat "$d/pr" 2>/dev/null)
+  if [ -n "$n" ] && [ ! -f "$d/frozen" ]; then
+    g update-ref "refs/pull/$n/head" "$(g rev-parse refs/heads/chute/setup)"
+  fi
+}
+hook() { if [ -f "$d/on_$1" ]; then sh "$d/on_$1"; fi; }
+case "$1 $2" in
+'pr list')
+  sync
+  n=$(cat "$d/pr" 2>/dev/null)
+  if [ -n "$n" ]; then
+    printf '[{"number":%s,"headRefOid":"%s","isCrossRepository":false}]\n' "$n" "$(g rev-parse "refs/pull/$n/head")"
+  else
+    echo '[]'
+  fi
+  hook list ;;
+'pr create')
+  n=$(( $(cat "$d/count" 2>/dev/null || echo 0) + 1 ))
+  echo $n > "$d/count"; echo $n > "$d/pr"
+  g update-ref "refs/pull/$n/head" "$(g rev-parse refs/heads/chute/setup)"
+  echo "https://github.com/acme/widget/pull/$n"
+  hook create ;;
+'pr view')
+  sync
+  printf '{"state":"%s","baseRefName":"%s","headRefName":"chute/setup","isCrossRepository":false}\n' "$(cat "$d/state" 2>/dev/null || echo OPEN)" "$(cat "$d/base" 2>/dev/null || echo main)"
+  hook view ;;
+*)
+  echo "fake gh: $*" >&2
+  exit 97 ;;
+esac
+"#
+        .replace("@STATE@", &state.to_string_lossy())
+        .replace("@ORIGIN@", &origin.to_string_lossy());
+        sb.script("gh", &body);
+        state
+    }
+
+    /// A `git` that writes each call to a log and then runs the real one.
+    fn install_logging_git(sb: &Sandbox) -> PathBuf {
+        let real = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout;
+        let real = String::from_utf8(real).unwrap().trim().to_owned();
+        let log = sb.root().join("git-calls");
+        sb.script(
+            "git",
+            &format!(
+                "echo \" $*\" >> '{}'\nexec '{real}' \"$@\"\n",
+                log.display()
+            ),
+        );
+        log
+    }
+
     fn prepare(ctx: &Ctx, args: &Args) -> Result<Option<Ready>> {
         super::prepare(args, ctx, &mut Vec::new(), NOW)
     }
@@ -443,7 +662,7 @@ mod tests {
         let w = World::new();
         let (first, second) = (w.counting("first"), w.counting("second"));
         let ran = w.exec(&[&first, &second]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
 
         let written = std::fs::read_to_string(w.work_config()).unwrap();
         let config = Config::parse(&written).unwrap();
@@ -467,7 +686,7 @@ mod tests {
         let w = World::new();
         let only = w.counting("only");
         let ran = w.exec(&[&only]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
 
         let config = Config::parse(&std::fs::read_to_string(w.work_config()).unwrap()).unwrap();
         assert_eq!(config.verify.len(), 1);
@@ -496,7 +715,7 @@ mod tests {
         let mine = w.counting("mine");
         w.repo.write("chute.toml", &step("mine", &mine));
         let ran = w.exec(&[]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert_eq!(w.runs(), 1);
         assert!(w.record_file().exists());
     }
@@ -571,7 +790,7 @@ mod tests {
         let text = format!("# edited by hand\n{}", step("mine", &mine));
         w.repo.write("chute.toml", &text);
         let ran = w.exec(&[&mine]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert_eq!(std::fs::read(w.work_config()).unwrap(), text.as_bytes());
         assert_eq!(w.runs(), 1);
     }
@@ -601,7 +820,7 @@ mod tests {
         let w = World::new();
         let counted = w.counting("counted");
         let first = w.exec(&[&counted]);
-        assert_eq!(first.code, code(ExitCode::SUCCESS), "{}", first.text);
+        assert_eq!(first.code, code(ExitCode::from(REFUSED)), "{}", first.text);
         assert_eq!(w.runs(), 1);
 
         let ready = w.prepare(&[&counted], None);
@@ -618,7 +837,7 @@ mod tests {
         assert!(!record.config.is_empty());
 
         let again = w.exec(&[&counted]);
-        assert_eq!(again.code, code(ExitCode::SUCCESS), "{}", again.text);
+        assert_eq!(again.code, code(ExitCode::from(REFUSED)), "{}", again.text);
         assert_eq!(w.runs(), 1);
         assert!(
             again.text.contains("통과 기록을 다시 쓴다"),
@@ -641,7 +860,7 @@ mod tests {
 
         w.push_main("src.txt", "moved\n");
         let ran = w.exec(&[&counted]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert_eq!(w.runs(), 2);
     }
 
@@ -657,7 +876,7 @@ mod tests {
         assert_eq!(w.runs(), 1);
         let outside = EpochMs(NOW.0 + 25 * HOUR);
         let ran = w.exec_at(&World::args(&[&counted], None), outside);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert_eq!(w.runs(), 2);
     }
 
@@ -686,7 +905,7 @@ mod tests {
             ),
         );
         let ran = w.exec(&[]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert_eq!(w.runs(), 1);
     }
 
@@ -757,7 +976,7 @@ mod tests {
         let existing = format!("# rules\n{AGENTS_LINE}\nmore\n");
         w.push_main("AGENTS.md", &existing);
         let ran = w.exec(&[&counted]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert!(ran.text.contains("지침 파일: AGENTS.md"), "{}", ran.text);
         assert!(ran.text.contains("이미 있어 바꾸지 않는다"), "{}", ran.text);
 
@@ -773,7 +992,7 @@ mod tests {
         let counted = w.counting("counted");
         w.push_main("CLAUDE.md", "# claude\n");
         let ran = w.exec(&[&counted]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert!(ran.text.contains("지침 파일: CLAUDE.md"), "{}", ran.text);
 
         let ready = w.prepare(&[&counted], None);
@@ -790,7 +1009,7 @@ mod tests {
         let counted = w.counting("counted");
         w.push_main("AGENTS.md", "# rules\n");
         let ran = w.exec_at(&World::args(&[&counted], Some("./docs/ai.md")), NOW);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         assert!(ran.text.contains("지침 파일: docs/ai.md"), "{}", ran.text);
         let ready = w.prepare(&[&counted], Some("docs/ai.md"));
         assert_eq!(
@@ -899,12 +1118,470 @@ mod tests {
         let before = snapshot(&w);
 
         let ran = w.exec(&[&counted]);
-        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
         let after = snapshot(&w);
         assert_eq!(after[..2], before[..2]);
         assert_eq!(after[3..], before[3..]);
         assert_eq!(before[2], "A  staged.txt\n");
         assert_eq!(after[2], "A  staged.txt\n?? chute.toml\n");
         assert_eq!(w.repo.git(&["branch", "--list"]).trim().lines().count(), 2);
+    }
+
+    fn refused(ran: &Ran) {
+        assert_eq!(ran.code, code(ExitCode::from(REFUSED)), "{}", ran.text);
+    }
+
+    fn assert_no_gh_writes(w: &World) {
+        assert_eq!(w.gh_called("pr create"), 0, "{:?}", w.gh_calls());
+        assert_eq!(w.gh_called("pr merge"), 0, "{:?}", w.gh_calls());
+    }
+
+    /// Runs with `--yes` while `pr view` reports a closed PR: the branch and the PR exist on the
+    /// remote afterwards and the default branch is untouched.
+    fn leave_an_open_pr(w: &World, verify: &[&str]) -> String {
+        let main = w.origin_main();
+        w.gh_knob("state", "CLOSED");
+        let ran = w.exec_yes(verify);
+        refused(&ran);
+        assert!(ran.text.contains("열려 있지 않다"), "{}", ran.text);
+        w.gh_knob("state", "OPEN");
+        assert_eq!(w.origin_main(), main);
+        w.origin_ref("refs/heads/chute/setup").unwrap()
+    }
+
+    #[test]
+    fn without_a_terminal_and_without_yes_the_diff_and_the_yes_hint_are_printed_and_nothing_is_written()
+     {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let main = w.origin_main();
+        let ran = w.exec(&[&counted]);
+        refused(&ran);
+        assert!(ran.text.contains("+++ b/chute.toml"), "{}", ran.text);
+        assert!(ran.text.contains("`--yes`로 다시 실행한다"), "{}", ran.text);
+        assert_eq!(w.origin_ref("refs/heads/chute/setup"), None);
+        assert_eq!(w.origin_main(), main);
+        assert_eq!(w.gh_calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_terminal_answer_of_n_writes_nothing_outside_and_y_goes_the_whole_way() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let main = w.origin_main();
+        let no = w.go(&World::args(&[&counted], None), Some("n\n"), NOW);
+        refused(&no);
+        assert!(no.text.contains("[y/N]"), "{}", no.text);
+        assert!(no.text.contains("PR을 새로 만든다"), "{}", no.text);
+        assert_eq!(w.origin_ref("refs/heads/chute/setup"), None);
+        assert_eq!(w.origin_main(), main);
+        assert_no_gh_writes(&w);
+
+        let empty = w.go(&World::args(&[&counted], None), Some(""), NOW);
+        refused(&empty);
+        assert_eq!(w.origin_main(), main);
+
+        let yes = w.go(&World::args(&[&counted], None), Some("y\n"), NOW);
+        assert_eq!(yes.code, code(ExitCode::SUCCESS), "{}", yes.text);
+        assert_ne!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr create"), 1);
+    }
+
+    #[test]
+    fn yes_pushes_the_branch_opens_the_pr_and_merges_the_verified_tree_by_a_merge_commit() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.push_main("AGENTS.md", "# rules\n");
+        let before = w.origin_main();
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(!ran.text.contains("[y/N]"), "{}", ran.text);
+
+        let calls = w.gh_calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("pr create --base main --head chute/setup ")),
+            "{calls:?}"
+        );
+        assert_eq!(w.gh_called("pr merge"), 0, "{calls:?}");
+
+        let merged = w.origin_main();
+        let setup = w.origin_ref("refs/heads/chute/setup").unwrap();
+        assert_eq!(w.merge_parents(&merged), [before, setup]);
+        let record: SetupRecord =
+            serde_json::from_slice(&std::fs::read(w.record_file()).unwrap()).unwrap();
+        assert_eq!(
+            w.origin_git(&["rev-parse", &format!("{merged}^{{tree}}")])
+                .trim(),
+            record.tree.as_str()
+        );
+        let subject = w.origin_git(&["log", "-1", "--format=%B", &merged]);
+        assert!(
+            subject.starts_with(
+                "Merge pull request #1 from acme/chute/setup\n\nchute: 머지 큐 설정 추가"
+            ),
+            "{subject}"
+        );
+        assert_eq!(
+            w.origin_git(&["show", &format!("{merged}:AGENTS.md")]),
+            format!("# rules\n{AGENTS_LINE}\n")
+        );
+        assert!(!w.work_config().exists());
+        assert!(ran.text.contains("지웠다"), "{}", ran.text);
+        assert!(ran.text.contains("`git pull`"), "{}", ran.text);
+        assert!(ran.text.contains("chute install"), "{}", ran.text);
+        assert!(ran.text.contains("chute submit"), "{}", ran.text);
+    }
+
+    #[test]
+    fn a_work_config_that_differs_from_the_merged_one_is_kept() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let draft_edit = format!(
+            "echo '# edited after the confirmation' >> '{}'\n",
+            w.work_config().display()
+        );
+        w.gh_knob("on_view", &draft_edit);
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(w.work_config().exists());
+        assert!(ran.text.contains("달라 그대로 둔다"), "{}", ran.text);
+    }
+
+    #[test]
+    fn a_rerun_with_an_open_pr_of_the_same_content_neither_creates_nor_pushes_again() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        assert_eq!(w.gh_called("pr create"), 1);
+        assert_eq!(w.setup_branch_pushes(), 1);
+
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(w.gh_called("pr create"), 1);
+        assert_eq!(w.setup_branch_pushes(), 1);
+        assert!(ran.text.contains("내용이 같아 그대로 쓴다"), "{}", ran.text);
+        let merged = w.origin_main();
+        assert_eq!(w.merge_parents(&merged)[1], setup);
+        assert_eq!(w.gh_called("pr merge"), 0);
+    }
+
+    #[test]
+    fn a_rerun_after_the_draft_was_edited_pushes_a_new_commit_by_lease_to_the_same_pr() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let first = leave_an_open_pr(&w, &[&counted]);
+
+        let mut text = std::fs::read_to_string(w.work_config()).unwrap();
+        text.push_str("# edited\n");
+        std::fs::write(w.work_config(), text).unwrap();
+        let ran = w.exec_yes(&[]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+
+        assert_eq!(w.gh_called("pr create"), 1);
+        assert_eq!(w.setup_branch_pushes(), 2);
+        let log = std::fs::read_to_string(&w.git_log).unwrap();
+        assert!(
+            log.contains(&format!(
+                "--force-with-lease=refs/heads/chute/setup:{first} "
+            )),
+            "{log}"
+        );
+        let second = w.origin_ref("refs/heads/chute/setup").unwrap();
+        assert_ne!(second, first);
+        let merged = w.origin_main();
+        assert_eq!(w.merge_parents(&merged)[1], second);
+        assert!(
+            w.origin_git(&["log", "-1", "--format=%B", &merged])
+                .starts_with("Merge pull request #1 ")
+        );
+    }
+
+    #[test]
+    fn a_first_push_leases_on_the_branch_not_existing() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.exec_yes(&[&counted]);
+        let log = std::fs::read_to_string(&w.git_log).unwrap();
+        assert!(
+            log.contains("--force-with-lease=refs/heads/chute/setup: "),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_pull_ref_that_differs_from_the_confirmed_setup_commit_is_refused() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let main = w.origin_main();
+        w.gh_knob(
+            "on_view",
+            &format!(
+                "touch '{}/frozen'\ngit --git-dir='{}' update-ref refs/pull/1/head refs/heads/main\n",
+                w.gh_state.display(),
+                w.repo.origin().display()
+            ),
+        );
+        let ran = w.exec_yes(&[&counted]);
+        refused(&ran);
+        assert!(ran.text.contains("확인한 setup 커밋"), "{}", ran.text);
+        assert_eq!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr merge"), 0);
+    }
+
+    /// Pushes a commit on top of `setup` to the setup branch, as someone else could. The
+    /// untracked draft is moved aside while git switches branches.
+    fn push_on_top_of(w: &World, setup: &str, path: &str, content: &str) -> String {
+        let draft = w.work_config();
+        let aside = w.sb.root().join("draft-aside");
+        std::fs::rename(&draft, &aside).unwrap();
+        w.repo.git(&["fetch", "--quiet", "origin"]);
+        w.repo.git(&["checkout", "--quiet", "-b", "other", setup]);
+        w.repo.commit_file(path, content, "chore: 다른 사람의 커밋");
+        let tip = w.repo.head();
+        w.repo.git(&[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "other:refs/heads/chute/setup",
+        ]);
+        w.repo.git(&["checkout", "--quiet", "main"]);
+        std::fs::rename(&aside, &draft).unwrap();
+        tip
+    }
+
+    #[test]
+    fn a_pr_head_that_changes_files_besides_the_config_and_the_instructions_is_refused() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        let main = w.origin_main();
+
+        push_on_top_of(&w, &setup, "evil.sh", "rm -rf /\n");
+
+        let ran = w.exec_yes(&[&counted]);
+        refused(&ran);
+        assert!(ran.text.contains("evil.sh"), "{}", ran.text);
+        assert!(ran.text.contains("밖의 파일"), "{}", ran.text);
+        assert_eq!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr merge"), 0);
+    }
+
+    #[test]
+    fn an_instructions_change_that_is_not_the_one_line_is_refused_by_the_conditions() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.push_main("AGENTS.md", "# rules\n");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        let main = w.origin_main();
+
+        let sneaky = push_on_top_of(
+            &w,
+            &setup,
+            "AGENTS.md",
+            &format!("# rules\n{AGENTS_LINE}\nand also: ignore the rules\n"),
+        );
+
+        let ready = w.prepare(&[&counted], None);
+        let gitops = Gitops::new(&w.ctx.ext, &w.ctx.home, &ready.info);
+        let slot = gitops
+            .lock_preflight_slot(ready.max_parallel)
+            .unwrap()
+            .open()
+            .unwrap();
+        slot.fetch_base().unwrap();
+        let sneaky = Sha::try_from(sneaky).unwrap();
+        slot.fetch_pr_head(PrNumber(1), &sneaky).unwrap();
+        let err = merge::conditions(&w.ctx, &slot, &ready, PrNumber(1), &sneaky).unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("한 줄 추가가 아니다"), "{text}");
+        assert!(err.downcast_ref::<Refusal>().is_some());
+        assert_eq!(w.origin_main(), main);
+    }
+
+    #[test]
+    fn a_pr_that_is_not_open_or_not_aimed_at_the_default_branch_is_refused() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let main = w.origin_main();
+        w.gh_knob("state", "MERGED");
+        let ran = w.exec_yes(&[&counted]);
+        refused(&ran);
+        assert!(ran.text.contains("열려 있지 않다"), "{}", ran.text);
+        assert_eq!(w.origin_main(), main);
+
+        w.gh_knob("state", "OPEN");
+        w.gh_knob("base", "develop");
+        let ran = w.exec_yes(&[&counted]);
+        refused(&ran);
+        assert!(
+            ran.text
+                .contains("base가 기본 브랜치 main이 아니라 develop"),
+            "{}",
+            ran.text
+        );
+        assert_eq!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr create"), 1);
+        assert_eq!(w.gh_called("pr merge"), 0);
+    }
+
+    #[test]
+    fn a_chute_toml_that_reaches_the_default_branch_before_the_merge_is_only_registered() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let theirs = w.pending_main("chute.toml", &step("theirs", "true"));
+        w.gh_knob(
+            "on_create",
+            &format!(
+                "git --git-dir='{}' update-ref refs/heads/main refs/heads/pending\n",
+                w.repo.origin().display()
+            ),
+        );
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(
+            ran.text
+                .contains("기본 브랜치에 chute.toml이 이미 있어 등록만 했다"),
+            "{}",
+            ran.text
+        );
+        assert_eq!(w.origin_main(), theirs);
+        assert_eq!(w.gh_called("pr merge"), 0);
+        assert!(w.ctx.home.repo(&w.slug).info().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_default_branch_that_moved_after_the_verification_is_verified_again_and_merged_on_top() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let other = w.pending_main("other.txt", "someone else\n");
+        w.gh_knob(
+            "on_create",
+            &format!(
+                "git --git-dir='{}' update-ref refs/heads/main refs/heads/pending\n",
+                w.repo.origin().display()
+            ),
+        );
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert_eq!(w.runs(), 2);
+
+        let merged = w.origin_main();
+        let setup = w.origin_ref("refs/heads/chute/setup").unwrap();
+        assert_eq!(w.merge_parents(&merged), [other.clone(), setup]);
+        assert_eq!(
+            w.origin_git(&["show", &format!("{merged}:other.txt")]),
+            "someone else\n"
+        );
+        assert!(
+            w.origin_git(&["show", &format!("{merged}:chute.toml")])
+                .contains("test")
+        );
+        assert_eq!(w.gh_called("pr create"), 1);
+    }
+
+    #[test]
+    fn a_push_lost_to_a_moved_default_branch_starts_over_from_step_zero() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.pending_main("other.txt", "someone else\n");
+        w.gh_knob(
+            "on_view",
+            &format!(
+                "git --git-dir='{}' update-ref refs/heads/main refs/heads/pending\nrm \"$0\"\n",
+                w.repo.origin().display()
+            ),
+        );
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(ran.text.contains("처음부터 다시 판정한다"), "{}", ran.text);
+        assert_eq!(w.runs(), 2);
+        let merged = w.origin_main();
+        assert!(
+            w.origin_git(&["show", &format!("{merged}:other.txt")])
+                .contains("someone else")
+        );
+    }
+
+    #[test]
+    fn a_default_branch_that_keeps_moving_stops_the_run_after_three_attempts() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let bump = format!(
+            "o='{}'\nc=$(git --git-dir=$o commit-tree \"$(git --git-dir=$o rev-parse 'refs/heads/main^{{tree}}')\" -p refs/heads/main -m bump)\ngit --git-dir=$o update-ref refs/heads/main $c\n",
+            w.repo.origin().display()
+        );
+        w.gh_knob("on_list", &bump);
+        let ran = w.exec_yes(&[&counted]);
+        refused(&ran);
+        assert!(ran.text.contains("계속 바뀐다"), "{}", ran.text);
+        assert_eq!(w.runs(), 3);
+        assert_eq!(w.gh_called("pr merge"), 0);
+        assert!(w.work_config().exists());
+    }
+
+    #[test]
+    fn a_verification_that_fails_the_second_time_does_not_merge() {
+        let w = World::new();
+        let body = format!(
+            "if [ -f '{c}' ]; then echo second >> '{c}'; echo boom-again; exit 1; fi\necho first >> '{c}'\n",
+            c = w.counter.display()
+        );
+        let flaky = w.sb.script("once", &body).to_string_lossy().into_owned();
+        let pending = w.pending_main("other.txt", "x\n");
+        w.gh_knob(
+            "on_create",
+            &format!(
+                "git --git-dir='{}' update-ref refs/heads/main refs/heads/pending\n",
+                w.repo.origin().display()
+            ),
+        );
+        let ran = w.exec_yes(&[&flaky]);
+        refused(&ran);
+        assert!(ran.text.contains("boom-again"), "{}", ran.text);
+        assert!(w.runs() >= 2);
+        assert_eq!(w.origin_main(), pending);
+        assert_eq!(w.gh_called("pr merge"), 0);
+    }
+
+    #[test]
+    fn after_a_merge_the_same_command_only_registers() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        let merged = w.origin_main();
+        let calls = w.gh_calls().len();
+
+        let again = w.exec_yes(&[&counted]);
+        assert_eq!(again.code, code(ExitCode::SUCCESS), "{}", again.text);
+        assert!(
+            again
+                .text
+                .contains("기본 브랜치에 chute.toml이 이미 있어 등록만 했다"),
+            "{}",
+            again.text
+        );
+        assert_eq!(w.origin_main(), merged);
+        assert_eq!(w.gh_calls().len(), calls);
+        assert_eq!(w.runs(), 1);
+    }
+
+    #[test]
+    fn a_flaky_pass_still_merges_the_tree_it_passed_on_but_leaves_no_record() {
+        let w = World::new();
+        let body = format!(
+            "if [ -f '{c}.seen' ]; then echo ok >> '{c}'; exit 0; fi\ntouch '{c}.seen'\necho flake >> '{c}'\nexit 1\n",
+            c = w.counter.display()
+        );
+        let flaky = w.sb.script("flaky", &body).to_string_lossy().into_owned();
+        w.repo.write("chute.toml", &step("flaky", &flaky));
+        let before = w.origin_main();
+        let ran = w.exec_yes(&[]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(!w.record_file().exists());
+        assert_ne!(w.origin_main(), before);
     }
 }

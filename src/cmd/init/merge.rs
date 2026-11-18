@@ -1,0 +1,404 @@
+//! Steps 4 and 5 of `chute init --setup`: publish the setup branch and PR, then merge it into the
+//! default branch the way the queue does, without going through the queue.
+
+use std::fs;
+use std::io::{BufRead, Write};
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
+
+use super::setup::{COMMIT_MESSAGE, Ready};
+use crate::cmd::{Ctx, Refusal};
+use crate::config;
+use crate::gitops::{Gitops, ItemResult, MergeItem, PushOutcome, Slot};
+use crate::model::{PrNumber, RepoInfo, Sha};
+
+pub(super) const BRANCH: &str = "chute/setup";
+
+/// Whether a person can answer, and where the answer comes from. Both are injected so tests do
+/// not need a terminal.
+pub(super) struct Console<'a> {
+    pub tty: bool,
+    pub input: &'a mut dyn BufRead,
+}
+
+impl Console<'_> {
+    pub(super) fn confirm(&mut self, out: &mut dyn Write) -> Result<bool> {
+        write!(out, "계속한다 [y/N] ")?;
+        out.flush()?;
+        let mut answer = String::new();
+        self.input.read_line(&mut answer)?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OpenPr {
+    pub number: PrNumber,
+    pub head: Sha,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Landed {
+    Merged,
+    /// The default branch got a `chute.toml` meanwhile; only the registration is left.
+    AlreadyConfigured,
+    /// The default branch moved after the verification, so the run starts over.
+    Moved,
+}
+
+#[derive(Deserialize)]
+struct ListedPr {
+    number: u64,
+    #[serde(rename = "headRefOid")]
+    head: String,
+    #[serde(rename = "isCrossRepository")]
+    cross_repository: bool,
+}
+
+#[derive(Deserialize)]
+struct ViewedPr {
+    state: String,
+    #[serde(rename = "baseRefName")]
+    base: String,
+    #[serde(rename = "headRefName")]
+    head_name: String,
+    #[serde(rename = "isCrossRepository")]
+    cross_repository: bool,
+}
+
+fn refuse(message: String) -> anyhow::Error {
+    Refusal(message).into()
+}
+
+fn sha(text: String) -> Result<Sha> {
+    Sha::try_from(text).map_err(|e| anyhow!(e))
+}
+
+pub(super) fn find_open_pr(ctx: &Ctx, info: &RepoInfo) -> Result<Option<OpenPr>> {
+    let out = ctx.ext.gh(
+        &info.path,
+        [
+            "pr",
+            "list",
+            "--head",
+            BRANCH,
+            "--base",
+            &info.default_branch,
+            "--state",
+            "open",
+            "--json",
+            "number,headRefOid,isCrossRepository",
+        ],
+    )?;
+    let text = out.ok().context("열린 setup PR을 gh로 찾지 못했다")?;
+    let listed: Vec<ListedPr> =
+        serde_json::from_str(&text).context("gh pr list의 출력을 읽지 못했다")?;
+    let mut mine: Vec<ListedPr> = listed
+        .into_iter()
+        .filter(|pr| !pr.cross_repository)
+        .collect();
+    match mine.len() {
+        0 => Ok(None),
+        1 => {
+            let pr = mine.remove(0);
+            Ok(Some(OpenPr {
+                number: PrNumber(pr.number),
+                head: sha(pr.head)?,
+            }))
+        }
+        n => Err(refuse(format!(
+            "{BRANCH}에서 {}으로 가는 열린 PR이 {n}개다. 하나만 남기고 닫은 뒤 다시 실행한다",
+            info.default_branch
+        ))),
+    }
+}
+
+/// Publishes the setup commit and merges it. The checks of the merge all run in `conditions`,
+/// right before the push.
+pub(super) fn land(
+    ctx: &Ctx,
+    ready: &Ready,
+    existing: Option<OpenPr>,
+    out: &mut dyn Write,
+) -> Result<Landed> {
+    let gitops = Gitops::new(&ctx.ext, &ctx.home, &ready.info);
+    let slot = gitops.lock_preflight_slot(ready.max_parallel)?.open()?;
+    slot.fetch_base()?;
+    let (commit, pr) = publish(ctx, &slot, ready, existing, out)?;
+
+    let base = match conditions(ctx, &slot, ready, pr, &commit)? {
+        Verdict::Go(base) => base,
+        Verdict::AlreadyConfigured => {
+            writeln!(
+                out,
+                "기본 브랜치에 chute.toml이 이미 있어 등록만 했다: {}/{}",
+                ready.info.remote_name, ready.info.default_branch
+            )?;
+            return Ok(Landed::AlreadyConfigured);
+        }
+        Verdict::Moved => {
+            writeln!(out, "검증한 뒤 기본 브랜치가 움직여 처음부터 다시 판정한다")?;
+            return Ok(Landed::Moved);
+        }
+    };
+
+    let item = MergeItem::Pr {
+        pr,
+        branch: BRANCH.to_owned(),
+        title: COMMIT_MESSAGE.to_owned(),
+        head: commit.clone(),
+    };
+    let merged = slot.merge(&base, std::slice::from_ref(&item))?;
+    let merge_commit = match merged
+        .items
+        .into_iter()
+        .next()
+        .map(|outcome| outcome.result)
+    {
+        Some(ItemResult::Merged { commit }) => commit,
+        Some(ItemResult::Conflict(files)) => {
+            return Err(refuse(format!(
+                "{BRANCH}를 기본 브랜치와 합치지 못했다(충돌 {}개)",
+                files.len()
+            )));
+        }
+        Some(ItemResult::AlreadyMerged) | None => {
+            bail!("{BRANCH}가 이미 기본 브랜치에 들어 있는데 chute.toml이 없다")
+        }
+    };
+    if slot.tree_of(&merge_commit)? != ready.tree {
+        return Err(refuse(
+            "머지 결과의 트리가 검증한 트리와 다르다. 머지하지 않았다".into(),
+        ));
+    }
+    match slot.push(&merge_commit)? {
+        PushOutcome::MainMoved => {
+            writeln!(out, "검증한 뒤 기본 브랜치가 움직여 처음부터 다시 판정한다")?;
+            return Ok(Landed::Moved);
+        }
+        PushOutcome::Pushed => {}
+    }
+    writeln!(
+        out,
+        "머지했다: {}/{} {merge_commit} (PR {pr})",
+        ready.info.remote_name, ready.info.default_branch
+    )?;
+    finish(&slot, ready, &merge_commit, out)?;
+    Ok(Landed::Merged)
+}
+
+fn finish(slot: &Slot, ready: &Ready, merged: &Sha, out: &mut dyn Write) -> Result<()> {
+    let work = ready.info.path.join(config::FILE_NAME);
+    let landed = slot.read_file(merged, config::FILE_NAME)?;
+    match (fs::read(&work), landed) {
+        (Ok(mine), Some(landed)) if mine == landed => {
+            fs::remove_file(&work).with_context(|| format!("지우지 못했다: {}", work.display()))?;
+            writeln!(
+                out,
+                "작업 폴더의 chute.toml이 머지된 것과 같아 지웠다: {}",
+                work.display()
+            )?;
+        }
+        (Ok(_), _) => writeln!(
+            out,
+            "작업 폴더의 chute.toml이 머지된 것과 달라 그대로 둔다: {}",
+            work.display()
+        )?,
+        (Err(_), _) => {}
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "`git pull`로 기본 브랜치를 받는다. 다음은 `chute install`이다. 첫 `chute submit`이 데몬을 띄운다."
+    )?;
+    Ok(())
+}
+
+/// Brings the remote to a setup branch and an open PR whose head holds the setup content, and
+/// returns that head with the PR number.
+fn publish(
+    ctx: &Ctx,
+    slot: &Slot,
+    ready: &Ready,
+    existing: Option<OpenPr>,
+    out: &mut dyn Write,
+) -> Result<(Sha, PrNumber)> {
+    let repo = &ready.info.path;
+    if let Some(pr) = existing {
+        if slot.fetch_pr_head(pr.number, &pr.head)? != crate::gitops::PrHead::Unchanged {
+            return Err(refuse(format!(
+                "PR {}의 HEAD가 그 사이 바뀌었다. 다시 실행한다",
+                pr.number
+            )));
+        }
+        if has_setup_content(slot, ready, &pr.head)? {
+            writeln!(out, "열린 PR {}의 내용이 같아 그대로 쓴다", pr.number)?;
+            return Ok((pr.head, pr.number));
+        }
+        let commit = build(slot, ready)?;
+        slot.push_branch(&commit, BRANCH, Some(&pr.head))?;
+        writeln!(
+            out,
+            "PR {}의 {BRANCH}를 새 setup 커밋으로 고쳤다",
+            pr.number
+        )?;
+        return Ok((commit, pr.number));
+    }
+    let commit = build(slot, ready)?;
+    let tip = slot.remote_branch_tip(BRANCH)?;
+    slot.push_branch(&commit, BRANCH, tip.as_ref())?;
+    let steps = ready.steps.join(", ");
+    let body = format!(
+        "`chute init --setup`이 만들었다.\n\n검증한 단계: {steps}\n\n이 PR은 chute가 큐를 거치지 않고 기본 브랜치에 직접 머지한다."
+    );
+    let created = ctx.ext.gh(
+        repo,
+        [
+            "pr",
+            "create",
+            "--base",
+            &ready.info.default_branch,
+            "--head",
+            BRANCH,
+            "--title",
+            COMMIT_MESSAGE,
+            "--body",
+            &body,
+        ],
+    )?;
+    created.ok().context("setup PR을 만들지 못했다")?;
+    let Some(pr) = find_open_pr(ctx, &ready.info)? else {
+        bail!("PR을 만들었는데 열린 {BRANCH} PR이 보이지 않는다");
+    };
+    if pr.head != commit {
+        return Err(refuse(format!(
+            "PR {}의 HEAD가 방금 push한 setup 커밋과 다르다",
+            pr.number
+        )));
+    }
+    writeln!(out, "PR {}을 만들었다", pr.number)?;
+    Ok((commit, pr.number))
+}
+
+fn build(slot: &Slot, ready: &Ready) -> Result<Sha> {
+    let files: Vec<(&str, &[u8])> = ready
+        .files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_slice()))
+        .collect();
+    let commit = slot.commit_files(&ready.base, &files, COMMIT_MESSAGE)?;
+    if slot.tree_of(&commit)? != ready.tree {
+        bail!("다시 만든 setup 커밋의 트리가 검증한 트리와 다르다");
+    }
+    Ok(commit)
+}
+
+fn has_setup_content(slot: &Slot, ready: &Ready, head: &Sha) -> Result<bool> {
+    for (path, content) in &ready.files {
+        if slot.read_file(head, path)?.as_deref() != Some(content.as_slice()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Verdict {
+    Go(Sha),
+    AlreadyConfigured,
+    Moved,
+}
+
+/// Every condition for the merge, checked in one place against a freshly fetched default branch.
+/// An error here means the merge must not happen.
+pub(super) fn conditions(
+    ctx: &Ctx,
+    slot: &Slot,
+    ready: &Ready,
+    pr: PrNumber,
+    commit: &Sha,
+) -> Result<Verdict> {
+    let info = &ready.info;
+    let base = slot.fetch_base()?;
+    // 1. The default branch has no chute.toml yet.
+    if slot.read_file(&base, config::FILE_NAME)?.is_some() {
+        return Ok(Verdict::AlreadyConfigured);
+    }
+    if base != ready.base {
+        return Ok(Verdict::Moved);
+    }
+    // 2. The PR is open, aimed at the default branch, and comes from the setup branch here.
+    let viewed = ctx.ext.gh(
+        &info.path,
+        [
+            "pr",
+            "view",
+            &pr.0.to_string(),
+            "--json",
+            "state,baseRefName,headRefName,isCrossRepository",
+        ],
+    )?;
+    let viewed = viewed
+        .ok()
+        .with_context(|| format!("PR {pr}을 gh로 읽지 못했다"))?;
+    let viewed: ViewedPr =
+        serde_json::from_str(&viewed).context("gh pr view의 출력을 읽지 못했다")?;
+    if viewed.state != "OPEN" {
+        return Err(refuse(format!(
+            "PR {pr}이 열려 있지 않다({})",
+            viewed.state
+        )));
+    }
+    if viewed.base != info.default_branch {
+        return Err(refuse(format!(
+            "PR {pr}의 base가 기본 브랜치 {}이 아니라 {}이다",
+            info.default_branch, viewed.base
+        )));
+    }
+    if viewed.head_name != BRANCH || viewed.cross_repository {
+        return Err(refuse(format!(
+            "PR {pr}의 head가 이 저장소의 {BRANCH}가 아니다"
+        )));
+    }
+    // 3. The PR head is the commit that was confirmed.
+    if slot.fetch_pr_head(pr, commit)? != crate::gitops::PrHead::Unchanged {
+        return Err(refuse(format!(
+            "PR {pr}의 HEAD가 확인한 setup 커밋 {commit}과 다르다"
+        )));
+    }
+    // 4. The PR changes chute.toml and the instructions line, and nothing else.
+    let changed = slot.changed_since_fork(&base, commit)?;
+    let instructions = &ready.instructions;
+    let mut expected: Vec<(&str, &[u8])> = Vec::new();
+    for (path, content) in &ready.files {
+        expected.push((path.as_str(), content.as_slice()));
+    }
+    for path in &changed {
+        if !expected.iter().any(|(file, _)| file == path) {
+            return Err(refuse(format!(
+                "PR {pr}가 {}과 지침 파일 밖의 파일 {path}도 바꾼다. 머지하지 않았다",
+                config::FILE_NAME
+            )));
+        }
+    }
+    for (path, content) in expected {
+        if !changed.iter().any(|changed| changed == path) {
+            return Err(refuse(format!(
+                "PR {pr}가 {path}를 바꾸지 않는다. 머지하지 않았다"
+            )));
+        }
+        if slot.read_file(commit, path)?.as_deref() != Some(content) {
+            let what = if path == instructions.file {
+                "지침 파일의 변경이 chute 한 줄 추가가 아니다"
+            } else {
+                "chute.toml이 검증한 초안과 다르다"
+            };
+            return Err(refuse(format!("PR {pr}의 {path}: {what}. 머지하지 않았다")));
+        }
+    }
+    Ok(Verdict::Go(base))
+}

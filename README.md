@@ -81,10 +81,46 @@ cargo install --git https://github.com/Soochol/chute
 
 ## 처음 쓰기
 
+### 한 번에: `chute init --setup`
+
+대상 저장소의 clone에서 검증 명령을 주고 실행한다. 아래는 검증 명령이 둘인 예다.
+
+```sh
+chute init --setup --verify "pio run -e stm32_debug" --verify "python3 tests/test_gps_i2c3.py"
+```
+
+한 실행이 다섯 단계를 지난다.
+
+1. 저장소를 상태 폴더에 등록하고, 작업 폴더에 `chute.toml` 초안을 쓴다. `--verify`를 준 순서대로 `[[verify]]`가 된다. 하나면 단계 이름이 `test`이고, 여럿이면 `test-1`, `test-2`, …이다.
+2. 설정을 검사한다. `chute config-check`와 같은 검사이고, 초안의 안내 명령(`exit 1`로 끝나는 자리 표시)이 남아 있으면 멈춘다.
+3. 기본 브랜치 위에 setup 커밋을 만들어 실제로 검증한다. 큐의 batch와 같은 실행부라 `paths`가 있는 단계도 모두 돌고, 시간 제한과 `failed` 패턴도 같다. `[[post_verify]]`는 돌지 않는다. 통과 기록은 상태 폴더의 `setup.json`에 남아 같은 트리를 `reuse_hours` 안에 다시 검증하지 않는다.
+4. 바뀌는 내용(`chute.toml`과 지침 파일 한 줄)의 diff를 보이고 한 번 묻는다. 동의하면 `chute/setup` 브랜치를 push하고 PR을 만든다.
+5. 그 PR을 chute가 기본 브랜치에 바로 머지한다. 큐의 머지와 같은 방식이다. `gh pr merge`를 쓰지 않고, 검증한 트리가 그대로 들어갈 때만 push한다. 이 경로가 chute가 큐를 거치지 않고 기본 브랜치에 쓰는 유일한 경로다.
+
+옵션은 넷이다. 모두 `--setup`과 함께만 쓴다.
+
+| 옵션 | 뜻 |
+|---|---|
+| `--setup` | 위 다섯 단계를 한 번에 한다 |
+| `--verify <명령>` | 검증 명령. 여러 번 줄 수 있다. 없으면 초안을 쓰고 "--verify를 주거나 초안의 [[verify]]를 고친 뒤 다시 실행한다"고 멈춘다. 고친 초안이 이미 있으면 `--verify` 없이도 그 초안으로 간다 |
+| `--instructions <파일>` | 한 줄을 더할 지침 파일. 저장소 안의 상대 경로다. 없으면 기본 브랜치의 `AGENTS.md`, 없으면 `CLAUDE.md`, 둘 다 없으면 새 `AGENTS.md`다 |
+| `--yes` | 4단계의 확인을 묻지 않는다. 터미널이 아니면 필요하다. 터미널이 아니고 `--yes`도 없으면 diff를 출력하고 "`--yes`로 다시 실행한다"고 안내한 뒤 종료 코드 1로 멈춘다 |
+
+- 어느 단계에서 멈췄든 같은 명령을 다시 실행하면 이어 간다. 열린 `chute/setup` PR이 있고 내용이 같으면 PR을 새로 만들지 않고 브랜치도 다시 push하지 않는다. 초안을 고쳤으면 같은 PR에 새 커밋을 올린다.
+- 기본 브랜치에 `chute.toml`이 이미 있으면 `--setup`은 등록만 하고 "기본 브랜치에 chute.toml이 이미 있어 등록만 했다"고 알린다. 다른 PC는 이 명령이나 `chute init`으로 등록만 한다.
+- 머지한 뒤 작업 폴더의 `chute.toml`이 머지된 것과 같으면 지운다. `git pull`로 머지를 받는다. 다음은 `chute install`이고, 첫 `chute submit`이 데몬을 띄운다.
+- 옵션 없는 `chute init`은 그대로다. 초안을 쓰고 등록하고 지침 파일에 넣을 한 줄을 출력할 뿐 아무것도 올리지 않는다.
+- 대상 저장소의 기본 브랜치에 PR 필수나 리뷰 필수 같은 보호 규칙이 있으면 5단계의 push가 거절된다. 큐도 같은 조건에서 머지하지 못한다.
+- `chute init --setup`은 사람이 쓰는 명령이다.
+
+### 단계별로
+
+`chute init --setup`을 쓰지 않으면 다음 순서로 한다.
+
 1. 대상 저장소에서 `chute init`을 실행한다. `chute.toml` 초안을 쓰고 저장소를 상태 폴더에 등록한다.
 2. `chute.toml`의 `[[verify]]`를 이 저장소의 검사 명령으로 고치고 커밋해 기본 브랜치에 올린다. chute는 `<원격>/<기본 브랜치>`(원격이 하나뿐이면 보통 `origin/<기본 브랜치>`)에 올라간 `chute.toml`만 읽는다. git 원격이 여러 개인 저장소는 아래 "원격이 여러 개일 때"를 본다.
 3. `chute install`을 실행한다. Codex 스킬 파일(`~/.codex/skills/chute/SKILL.md`)과 현황판 mod(`~/.config/herdr-app/mods/chute/`)를 쓴다. `~/.codex`가 없으면 스킬을 건너뛰고, Herdr 홈이 없으면 mod를 건너뛴다. `HERDR_APP_HOME`이 있으면 그 아래에 mod를 쓴다. 다시 실행해도 같은 결과이고, 무엇을 썼고 무엇이 그대로인지 출력한다. Claude Code의 스킬과 훅은 위의 plugin이 준다.
-4. 대상 저장소의 `AGENTS.md`(또는 에이전트 지침 파일)에 한 줄을 넣는다. `chute init`과 `chute install`이 출력하는 문장이다. chute는 지침 파일과 herdr 템플릿을 고치지 않는다.
+4. 대상 저장소의 `AGENTS.md`(또는 에이전트 지침 파일)에 한 줄을 넣는다. `chute init`과 `chute install`이 출력하는 문장이다. chute는 지침 파일과 herdr 템플릿을 몰래 고치지 않는다. 옵션 없는 `chute init`과 `chute install`은 고치지 않는다. `chute init --setup`만 diff를 보여 동의(터미널의 `y` 또는 `--yes`)를 받은 뒤 setup PR에 이 한 줄을 넣는다.
    ```
    - 이 저장소의 PR은 chute로 머지한다. PR을 올리기 전에 `chute --skill`을 실행해 나온 절차를 따르고, `gh pr merge`나 기본 브랜치로의 직접 push는 하지 않는다.
    ```

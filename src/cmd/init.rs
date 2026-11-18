@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -11,19 +11,23 @@ use crate::model::RepoInfo;
 use crate::repo;
 
 mod instructions;
+mod merge;
 mod setup;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// 등록한 뒤 검증 명령으로 설정을 검사하고 이 PC에서 검증한다
-    #[arg(long, hide = true)]
+    /// 등록한 뒤 chute.toml을 검증하고, setup PR을 만들어 기본 브랜치에 chute가 직접 머지한다
+    #[arg(long)]
     pub setup: bool,
     /// --setup이 검증할 명령. 여러 번 줄 수 있다
-    #[arg(long, hide = true, requires = "setup", value_name = "명령")]
+    #[arg(long, requires = "setup", value_name = "명령")]
     pub verify: Vec<String>,
     /// --setup이 한 줄을 더할 지침 파일. 저장소 안의 상대 경로
-    #[arg(long, hide = true, requires = "setup", value_name = "파일")]
+    #[arg(long, requires = "setup", value_name = "파일")]
     pub instructions: Option<String>,
+    /// --setup에서 diff를 확인하지 않고 push, PR, 머지까지 간다. 터미널이 아니면 필요하다
+    #[arg(long, requires = "setup")]
+    pub yes: bool,
 }
 
 pub const AGENTS_LINE: &str = "- 이 저장소의 PR은 chute로 머지한다. PR을 올리기 전에 `chute --skill`을 실행해 나온 절차를 따르고, `gh pr merge`나 기본 브랜치로의 직접 push는 하지 않는다.";
@@ -33,7 +37,20 @@ pub(crate) const FALLBACK_VERIFY: &str =
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     if args.setup {
-        return setup::run(&args, ctx, &mut io::stdout(), &mut io::stderr());
+        let stdin = io::stdin();
+        let tty = stdin.is_terminal() && io::stdout().is_terminal();
+        let mut input = stdin.lock();
+        let mut console = merge::Console {
+            tty,
+            input: &mut input,
+        };
+        return setup::run(
+            &args,
+            ctx,
+            &mut console,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        );
     }
     let out = &mut io::stdout().lock();
     let dir = ctx.target_dir()?;
@@ -197,16 +214,29 @@ mod tests {
         let Some(crate::cli::Command::Init(args)) = cli.command else {
             panic!("not init");
         };
-        assert!(!args.setup && args.verify.is_empty() && args.instructions.is_none());
+        assert!(!args.setup && args.verify.is_empty() && args.instructions.is_none() && !args.yes);
     }
 
     #[test]
-    fn init_help_does_not_show_the_setup_options() {
+    fn yes_is_refused_without_setup_and_taken_with_it() {
+        let err = Cli::try_parse_from(["chute", "init", "--yes"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        let cli = Cli::try_parse_from(["chute", "init", "--setup", "--yes"]).unwrap();
+        let Some(crate::cli::Command::Init(args)) = cli.command else {
+            panic!("not init");
+        };
+        assert!(args.setup && args.yes);
+    }
+
+    #[test]
+    fn init_help_shows_the_setup_options_with_korean_descriptions() {
         let mut command = Cli::command();
         let init = command.find_subcommand_mut("init").unwrap();
         let help = init.render_long_help().to_string();
-        for hidden in ["--setup", "--verify", "--instructions"] {
-            assert!(!help.contains(hidden), "{hidden}: {help}");
+        for shown in ["--setup", "--verify", "--instructions", "--yes"] {
+            assert!(help.contains(shown), "{shown}: {help}");
         }
+        assert!(help.contains("setup PR"), "{help}");
+        assert!(help.contains("터미널이 아니면 필요하다"), "{help}");
     }
 }

@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// 저장소에 chute.toml 초안을 쓰고 상태 폴더에 등록한다
+    /// 저장소에 chute.toml 초안을 쓰고 상태 폴더에 등록한다. --setup이면 setup PR을 만들어 머지까지 한다
     Init(cmd::init::Args),
     /// 기본 브랜치 + 큐 + 지금 HEAD를 합쳐 이 PC에서 검증한다. 큐는 허브에서 읽는다
     Preflight(cmd::preflight::Args),

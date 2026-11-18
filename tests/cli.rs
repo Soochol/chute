@@ -372,7 +372,7 @@ fn init_leaves_agents_md_alone() {
 }
 
 #[test]
-fn init_setup_verifies_the_draft_and_prints_the_diff_without_touching_the_remote() {
+fn init_setup_without_a_terminal_or_yes_verifies_prints_the_diff_and_stops_before_the_remote() {
     let sb = Sandbox::new();
     let repo = TestRepo::new(&sb, "acme/widget");
     let remote_before = repo.git(&["ls-remote", "--heads", "origin"]);
@@ -382,7 +382,7 @@ fn init_setup_verifies_the_draft_and_prints_the_diff_without_touching_the_remote
     assert!(String::from_utf8_lossy(&stopped.stderr).contains("--verify를 주거나"));
 
     fs::remove_file(repo.path().join("chute.toml")).unwrap();
-    let stdout = ok(chute(
+    let out = chute(
         &sb,
         repo.path(),
         &[
@@ -393,7 +393,14 @@ fn init_setup_verifies_the_draft_and_prints_the_diff_without_touching_the_remote
             "--verify",
             "echo second",
         ],
-    ));
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`--yes`로 다시 실행한다"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(stdout.contains("지침 파일: AGENTS.md"), "{stdout}");
     assert!(stdout.contains("+++ b/chute.toml"), "{stdout}");
     assert!(stdout.contains("+name = \"test-2\""), "{stdout}");
@@ -408,15 +415,21 @@ fn init_setup_verifies_the_draft_and_prints_the_diff_without_touching_the_remote
 }
 
 #[test]
-fn init_setup_rejects_verify_without_setup_and_hides_setup_from_help() {
+fn init_setup_rejects_verify_and_yes_without_setup_and_lists_them_in_help() {
     let sb = Sandbox::new();
     let repo = TestRepo::new(&sb, "acme/widget");
     let refused = chute(&sb, repo.path(), &["init", "--verify", "true"]);
     assert_eq!(refused.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--setup"));
 
+    let refused = chute(&sb, repo.path(), &["init", "--yes"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--setup"));
+
     let help = ok(chute(&sb, repo.path(), &["init", "--help"]));
-    assert!(!help.contains("--setup"), "{help}");
+    for option in ["--setup", "--verify", "--instructions", "--yes"] {
+        assert!(help.contains(option), "{help}");
+    }
 }
 
 #[test]
