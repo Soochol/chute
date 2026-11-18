@@ -31,6 +31,8 @@ import {
   usualSeconds,
 } from "./board.js";
 
+import { NARROW_WIDTH, isNarrow } from "./board.js";
+
 const fixture = JSON.parse(readFileSync(new URL("../../tests/fixtures/status-full.json", import.meta.url), "utf8"));
 const NOW = fixture.batch.started_ms + 312_000;
 
@@ -2011,4 +2013,12 @@ test("tint gives #rrggbbaa for #rgb, #rrggbb and #rrggbbaa, and null for anythin
   }
   assert.equal(tint("#fff", NaN), null);
   assert.equal(tint("#fff", undefined), null);
+});
+
+test("isNarrow is true only for a finite width below NARROW_WIDTH", () => {
+  assert.equal(isNarrow(300), true);
+  assert.equal(isNarrow(NARROW_WIDTH - 1), true);
+  assert.equal(isNarrow(NARROW_WIDTH), false);
+  assert.equal(isNarrow(360), false);
+  for (const odd of [null, undefined, NaN, Infinity]) assert.equal(isNarrow(odd), false, String(odd));
 });
