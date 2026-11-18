@@ -479,6 +479,42 @@ test("bounced cards carry mode, summary, agent, retries and report path", () => 
   assert.equal(headChanged.reason, "HEAD changed");
 });
 
+const bouncedCard = (patch) => {
+  const item = { ...itemOf(15), ...patch };
+  return section(only(queueOnly(item)), "bounced").items[0];
+};
+
+test("a bounced card's summary line is the first non-empty line of last_failure.summary", () => {
+  const line = (summary) => bouncedCard({ last_failure: { kind: "verify", summary } }).summaryLine;
+  assert.equal(line("e2e failed: a.spec.ts:1\nsee the report"), "e2e failed: a.spec.ts:1");
+  assert.equal(line("\n  \n  conflict: src/a.rs  \nmore"), "conflict: src/a.rs");
+  assert.equal(line(""), null);
+  assert.equal(line("  \n "), null);
+  assert.equal(line(42), null);
+  assert.equal(line(undefined), null);
+  assert.equal(bouncedCard({ last_failure: null }).summaryLine, null);
+});
+
+test("retry dots: one per budget try, filled by attempts, warn on the last retry", () => {
+  const dots = (attempts, budget) => bouncedCard({ attempts, budget }).retryDots;
+  assert.deepEqual(dots(1, 3), { total: 3, used: 1, tone: "dim", tip: "Bounced 1 of 3 · 3 retries left" });
+  assert.deepEqual(dots(3, 3), { total: 3, used: 3, tone: "warn", tip: "Bounced 3 of 3 · 1 retry left" });
+  assert.equal(dots(5, 3).used, 3);
+});
+
+test("retry dots are absent for a budget outside 1 to 10 or a broken attempts count", () => {
+  for (const [budget, text] of [[0, "0"], [11, "11"], [1.5, "1.5"], ["3", "—"], [undefined, "—"]]) {
+    const card = bouncedCard({ attempts: 1, budget });
+    assert.equal(card.retryDots, null, `budget ${String(budget)}`);
+    assert.equal(card.retries, `1/${text}`);
+  }
+  for (const attempts of [-1, null]) {
+    const card = bouncedCard({ attempts, budget: 3 });
+    assert.equal(card.retryDots, null, `attempts ${String(attempts)}`);
+    assert.equal(card.retries, `${attempts === null ? "—" : attempts}/3`);
+  }
+});
+
 test("today is one line, and the expanded rows call the verify time a sum", () => {
   const today = only([fixture]).today;
   assert.deepEqual(today.parts, ["7 merged", "2 bounced", "median 6m 52s"]);
