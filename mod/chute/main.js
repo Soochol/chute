@@ -27,6 +27,7 @@ import {
   diffNotices,
   failureText,
   interpret,
+  isNarrow,
   needsClock,
   nextFold,
   overview,
@@ -111,6 +112,7 @@ export default class Chute extends View {
     const given = props() ?? {};
     this.file = typeof given.file === "string" && given.file ? given : null;
     this.overlay = typeof given.overlay === "string" ? given.overlay : null;
+    this.narrow = false;
     if (this.file) {
       this.loadFile(cx);
       return;
@@ -385,7 +387,13 @@ export default class Chute extends View {
       .border_1()
       .border_color(t.border)
       .text_color(t.foreground)
-      .text_size(13);
+      .text_size(13)
+      .on_size_change((size, cx) => {
+        const narrow = isNarrow(size.width);
+        if (narrow === this.narrow) return;
+        this.narrow = narrow;
+        cx.notify();
+      });
     if (this.file) return this.fileView(frame, t);
     const body = this.result ? interpret(this.result) : { kind: "loading" };
     return frame.child(this.headerView(t)).child(
@@ -566,10 +574,10 @@ export default class Chute extends View {
     const rows = {
       alerts: (item) => this.alertCard(repo, item, t),
       human: (item) => this.humanCard(repo, item, t),
-      batch: (item) => batchView(repo, item, t),
-      waiting: (item, i) => waitingRow(repo, item, i, t),
+      batch: (item) => batchView(repo, item, t, this.narrow),
+      waiting: (item, i) => waitingRow(repo, item, i, t, this.narrow),
       bounced: (item) => this.bouncedRow(repo, item, t),
-      unknown: (item) => unknownRow(item, t),
+      unknown: (item) => unknownRow(item, t, this.narrow),
     };
     const lead = section.id === "alerts" ? [] : [sectionTitle(section.title, section.id === "batch" ? null : items.length, t)];
     if (section.id === "batch") return v_flex().gap(6).children(items.map((item) => rows.batch(item)));
@@ -698,6 +706,7 @@ export default class Chute extends View {
       : hoverRow(h_flex().id(id).px(6).py(4), t);
     const retries = div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim).child(`Retries ${card.retries}`);
     return gridRow(row, t, {
+      narrow: this.narrow,
       pr: card.pr,
       title: card.title,
       time: timeCell(card.ago ?? "", t),
@@ -717,6 +726,7 @@ export default class Chute extends View {
           const id = `merged-${repo.id}-${i}`;
           const row = m.url ? linkRow(id, t, (cx) => cx.open_url(m.url)) : hoverRow(h_flex().id(id).px(6).py(4), t);
           return gridRow(row, t, {
+            narrow: this.narrow,
             pr: m.pr,
             title: m.title,
             time: timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
@@ -964,28 +974,49 @@ const chipRow = (children) => h_flex().gap(5).flex_wrap().items_center().childre
 
 // One grid for every PR row: index · PR · title (chips and submitter below it) · time and two icon slots.
 // `row` is the row's own element (id, hover, click); `spec.index` is empty for rows without a position.
+// When `spec.narrow`, the time and icons move to the line under the title, right-aligned beside the chips.
 function gridRow(row, t, spec) {
+  const aside = () =>
+    h_flex()
+      .flex_none()
+      .items_start()
+      .gap(2)
+      .child(spec.time ?? timeCell("", t))
+      .children(spec.icons ?? [iconSlot(), iconSlot()]);
+  const hasChips = Boolean(spec.chips?.length);
+  const submitter = Boolean(spec.submitter);
+  const indexCell = () =>
+    div().w(18).flex_none().text_right().text_size(12).text_color(t.dim).child(spec.index == null ? "" : String(spec.index));
+  if (spec.narrow) {
+    const body = v_flex()
+      .flex_1()
+      .min_w(0)
+      .gap(3)
+      .child(div().whitespace_normal().child(spec.title))
+      .child(
+        h_flex()
+          .gap(6)
+          .items_start()
+          // Chips may shrink and wrap their text here, so a long one never runs under the time and icons.
+          .child(div().flex_1().min_w(0).when(hasChips, (el) => el.child(chipRow(spec.chips.map((c) => c.min_w(0).flex_shrink(1))))))
+          .child(aside()),
+      )
+      .when(submitter, (el) => el.child(submitterLine(spec.submitter, t)));
+    return row
+      .gap(6)
+      .items_start()
+      .when(spec.index != null, (el) => el.child(indexCell()))
+      .child(prCell(spec.pr, t))
+      .child(body);
+  }
   const body = v_flex()
     .flex_1()
     .min_w(0)
     .gap(3)
     .child(div().whitespace_normal().child(spec.title))
-    .when(Boolean(spec.chips?.length), (el) => el.child(chipRow(spec.chips)))
-    .when(Boolean(spec.submitter), (el) => el.child(submitterLine(spec.submitter, t)));
-  return row
-    .gap(6)
-    .items_start()
-    .child(div().w(18).flex_none().text_right().text_size(12).text_color(t.dim).child(spec.index == null ? "" : String(spec.index)))
-    .child(prCell(spec.pr, t))
-    .child(body)
-    .child(
-      h_flex()
-        .flex_none()
-        .items_start()
-        .gap(2)
-        .child(spec.time ?? timeCell("", t))
-        .children(spec.icons ?? [iconSlot(), iconSlot()]),
-    );
+    .when(hasChips, (el) => el.child(chipRow(spec.chips)))
+    .when(submitter, (el) => el.child(submitterLine(spec.submitter, t)));
+  return row.gap(6).items_start().child(indexCell()).child(prCell(spec.pr, t)).child(body).child(aside());
 }
 
 // The worker of a bounced PR: a life dot, its name, and `exited` once it is gone.
@@ -1066,7 +1097,7 @@ function submitterLine(submitter, t) {
   return div().text_size(12).text_color(t.dim).whitespace_normal().child(submitter.text);
 }
 
-function batchView(repo, batch, t) {
+function batchView(repo, batch, t, narrow) {
   const step = batch.waitingMachine ? "Waiting for a slot" : batch.stepText ?? batch.phase ?? "Verifying";
   const facts = [batch.round, batch.reused].filter(Boolean);
   const fill = batch.waitingMachine ? t.muted : batch.longer ? t.ansi3 : t.working;
@@ -1097,6 +1128,7 @@ function batchView(repo, batch, t) {
     .children(
       batch.prs.map((entry, i) =>
         gridRow(hoverRow(h_flex().id(`batch-${repo.id}-${i}`).px(6).py(2), t), t, {
+          narrow,
           pr: entry.pr,
           title: entry.title,
           icons: rowIcons(`batch-${repo.id}-${i}`, entry, t),
@@ -1165,7 +1197,7 @@ function postVerifyView(post, t) {
     );
 }
 
-function waitingRow(repo, item, index, t) {
+function waitingRow(repo, item, index, t, narrow) {
   const id = `queued-${repo.id}-${index}`;
   const chips = [
     ...item.marks.map((mark) => chip(mark.text, toneColor(mark.tone, t), t)),
@@ -1173,6 +1205,7 @@ function waitingRow(repo, item, index, t) {
     ...(item.note ? [chip(item.note, t.dim, t)] : []),
   ];
   return gridRow(hoverRow(h_flex().id(id).px(6).py(2), t), t, {
+    narrow,
     index: item.position,
     pr: item.pr,
     title: item.title,
@@ -1183,8 +1216,9 @@ function waitingRow(repo, item, index, t) {
   });
 }
 
-function unknownRow(item, t) {
+function unknownRow(item, t, narrow) {
   return gridRow(h_flex().px(6).py(2), t, {
+    narrow,
     pr: item.pr,
     title: item.title,
     chips: [chip(item.reason ? `${item.state} · ${item.reason}` : item.state, t.ansi3, t)],

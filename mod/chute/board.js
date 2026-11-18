@@ -719,6 +719,11 @@ export function badgeText(board) {
 
 export const needsClock = (board) => board?.kind === "board" && board.repos.some((repo) => repo.active);
 
+// Panels narrower than this (logical px) draw PR rows with the time and icons under the title.
+export const NARROW_WIDTH = 340;
+
+export const isNarrow = (width) => Number.isFinite(width) && width < NARROW_WIDTH;
+
 export const RECENT_DEFAULT = 3;
 
 // The recent merges to draw: the first few, or all of them when `open`. `hidden` is how many `+ N more` stands for.
