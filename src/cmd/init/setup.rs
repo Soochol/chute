@@ -74,7 +74,7 @@ fn drive(
     out: &mut dyn Write,
     now: EpochMs,
 ) -> Result<ExitCode> {
-    let mut confirmed: Option<String> = None;
+    let mut confirmed: Option<(String, Vec<Sha>)> = None;
     for _ in 0..MAX_ATTEMPTS {
         let Some(ready) = prepare(args, ctx, out, now)? else {
             return Ok(ExitCode::SUCCESS);
@@ -88,25 +88,55 @@ fn drive(
             .into());
         }
         let open = merge::find_open_pr(ctx, &ready.info)?;
-        if !args.yes && confirmed.as_deref() != Some(diff.as_str()) {
-            let target = format!("{}/{}", ready.info.remote_name, ready.info.default_branch);
-            match &open {
-                Some(pr) => writeln!(out, "열린 PR {}을 이어 쓴다.", pr.number)?,
-                None => writeln!(out, "PR을 새로 만든다.")?,
+        let left_over = match &open {
+            Some(_) => None,
+            None => merge::remote_setup_tip(ctx, &ready.info)?,
+        };
+        let target = open.as_ref().map(|pr| &pr.head).or(left_over.as_ref());
+        let covered = |(agreed, heads): &(String, Vec<Sha>)| {
+            *agreed == diff && target.is_none_or(|head| heads.contains(head))
+        };
+        if !args.yes && !confirmed.as_ref().is_some_and(covered) {
+            let merge_into = format!("{}/{}", ready.info.remote_name, ready.info.default_branch);
+            match (&open, &left_over) {
+                (Some(pr), _) => writeln!(
+                    out,
+                    "열린 PR {}을 이어 쓴다(HEAD {}). 그 HEAD가 검증한 setup 커밋이 아니면 새 setup 커밋으로 덮어쓴다.",
+                    pr.number, pr.head
+                )?,
+                (None, Some(tip)) => writeln!(
+                    out,
+                    "원격에 {}이 이미 있고 열린 PR이 없다(HEAD {tip}). 그 HEAD가 검증한 setup 커밋이 아니면 새 setup 커밋으로 덮어쓴다.",
+                    merge::BRANCH
+                )?,
+                (None, None) => writeln!(out, "PR을 새로 만든다.")?,
             }
             writeln!(
                 out,
-                "setup 브랜치 {}를 push하고 PR을 만들어 {target}에 바로 머지한다. 큐를 거치지 않는다.",
+                "setup 브랜치 {}를 push하고 PR을 만들어 {merge_into}에 바로 머지한다. 큐를 거치지 않는다.",
                 merge::BRANCH
             )?;
             if !console.confirm(out)? {
                 return Err(Refusal("확인하지 않아 아무것도 바꾸지 않았다".into()).into());
             }
-            confirmed = Some(diff);
+            let mut heads: Vec<Sha> = target.cloned().into_iter().collect();
+            if let Some((_, earlier)) = confirmed.take() {
+                heads.extend(earlier);
+            }
+            confirmed = Some((diff.clone(), heads));
         }
-        match merge::land(ctx, &ready, open, out)? {
+        let overwrite = if args.yes {
+            merge::Overwrite::Refuse
+        } else {
+            merge::Overwrite::Confirmed
+        };
+        match merge::land(ctx, &ready, open, left_over, overwrite, out)? {
             Landed::Merged | Landed::AlreadyConfigured => return Ok(ExitCode::SUCCESS),
-            Landed::Moved => {}
+            Landed::Moved { head } => {
+                if let Some((_, heads)) = confirmed.as_mut() {
+                    heads.push(head);
+                }
+            }
         }
     }
     Err(Refusal("기본 브랜치가 계속 바뀐다. 잠시 뒤 다시 실행한다".into()).into())
@@ -455,12 +485,19 @@ mod tests {
         }
 
         fn go(&self, args: &Args, tty: Option<&str>, now: EpochMs) -> Ran {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
             let mut input = tty.unwrap_or("").as_bytes();
-            let mut console = Console {
-                tty: tty.is_some(),
-                input: &mut input,
-            };
+            self.go_reading(args, tty.is_some(), &mut input, now)
+        }
+
+        fn go_reading(
+            &self,
+            args: &Args,
+            tty: bool,
+            input: &mut dyn std::io::BufRead,
+            now: EpochMs,
+        ) -> Ran {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let mut console = Console { tty, input };
             let code = run_at(args, &self.ctx, &mut console, &mut out, &mut err, now).unwrap();
             let mut text = String::from_utf8(out).unwrap();
             text.push_str(&String::from_utf8(err).unwrap());
@@ -1240,6 +1277,21 @@ esac
     }
 
     #[test]
+    fn a_work_config_that_cannot_be_read_after_the_merge_is_kept_and_the_run_still_succeeds() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.gh_knob(
+            "on_view",
+            &format!("chmod 000 '{}'\n", w.work_config().display()),
+        );
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(ran.text.contains("머지했다"), "{}", ran.text);
+        assert!(ran.text.contains("달라 그대로 둔다"), "{}", ran.text);
+        assert!(w.work_config().exists());
+    }
+
+    #[test]
     fn a_rerun_with_an_open_pr_of_the_same_content_neither_creates_nor_pushes_again() {
         let w = World::new();
         let counted = w.counting("counted");
@@ -1340,21 +1392,335 @@ esac
         tip
     }
 
+    fn lease_in_git_log(w: &World, head: &str) -> bool {
+        std::fs::read_to_string(&w.git_log)
+            .unwrap()
+            .contains(&format!(
+                "--force-with-lease=refs/heads/chute/setup:{head} "
+            ))
+    }
+
+    fn conditions_of(w: &World, verify: &[&str], head: &str) -> anyhow::Error {
+        let ready = w.prepare(verify, None);
+        let gitops = Gitops::new(&w.ctx.ext, &w.ctx.home, &ready.info);
+        let slot = gitops
+            .lock_preflight_slot(ready.max_parallel)
+            .unwrap()
+            .open()
+            .unwrap();
+        slot.fetch_base().unwrap();
+        let head = Sha::try_from(head.to_owned()).unwrap();
+        slot.fetch_pr_head(PrNumber(1), &head).unwrap();
+        let err = merge::conditions(&w.ctx, &slot, &ready, PrNumber(1), &head).unwrap_err();
+        assert!(err.downcast_ref::<Refusal>().is_some(), "{err:#}");
+        err
+    }
+
     #[test]
-    fn a_pr_head_that_changes_files_besides_the_config_and_the_instructions_is_refused() {
+    fn a_pr_head_with_another_file_is_rebuilt_and_the_file_stays_out_of_main() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        let evil = push_on_top_of(&w, &setup, "evil.sh", "rm -rf /\n");
+
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+
+        assert!(lease_in_git_log(&w, &evil));
+        assert!(ran.text.contains(&evil), "{}", ran.text);
+        let merged = w.origin_main();
+        assert!(
+            !w.origin_git(&["ls-tree", "-r", "--name-only", &merged])
+                .contains("evil.sh")
+        );
+        assert_eq!(w.gh_called("pr create"), 1);
+    }
+
+    #[test]
+    fn the_conditions_refuse_a_head_that_changes_another_file() {
         let w = World::new();
         let counted = w.counting("counted");
         let setup = leave_an_open_pr(&w, &[&counted]);
         let main = w.origin_main();
+        let evil = push_on_top_of(&w, &setup, "evil.sh", "rm -rf /\n");
 
-        push_on_top_of(&w, &setup, "evil.sh", "rm -rf /\n");
+        let text = format!("{}", conditions_of(&w, &[&counted], &evil));
+        assert!(text.contains("evil.sh"), "{text}");
+        assert!(text.contains("밖의 파일"), "{text}");
+        assert_eq!(w.origin_main(), main);
+    }
+
+    fn push_head_with_an_extra_parent(w: &World, setup: &str) -> (String, String) {
+        let draft = w.work_config();
+        let aside = w.sb.root().join("draft-aside");
+        std::fs::rename(&draft, &aside).unwrap();
+        w.repo.git(&["fetch", "--quiet", "origin"]);
+        w.repo.git(&["checkout", "--quiet", "--orphan", "junk"]);
+        w.repo.git(&["rm", "-rfq", "."]);
+        let junk = w
+            .repo
+            .commit_file("secret.txt", "never shown in the diff\n", "junk");
+        w.repo.git(&["checkout", "--quiet", "-f", "main"]);
+        let tree = format!("{setup}^{{tree}}");
+        let smuggled = w
+            .repo
+            .git(&[
+                "commit-tree",
+                &tree,
+                "-p",
+                setup,
+                "-p",
+                &junk,
+                "-m",
+                COMMIT_MESSAGE,
+            ])
+            .trim()
+            .to_owned();
+        w.repo.git(&[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            &format!("{smuggled}:refs/heads/chute/setup"),
+        ]);
+        std::fs::rename(&aside, &draft).unwrap();
+        (smuggled, junk)
+    }
+
+    #[test]
+    fn a_reused_pr_head_with_an_extra_parent_is_rebuilt_and_its_history_stays_out_of_main() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        let before = w.origin_main();
+        let (smuggled, junk) = push_head_with_an_extra_parent(&w, &setup);
+
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+
+        assert!(lease_in_git_log(&w, &smuggled));
+        let merged = w.origin_main();
+        let parents = w.merge_parents(&merged);
+        assert_eq!(parents[0], before);
+        assert_eq!(w.merge_parents(&parents[1]), std::slice::from_ref(&before));
+        let hits = w.origin_git(&[
+            "log",
+            "--full-history",
+            "--format=%H",
+            &merged,
+            "--",
+            "secret.txt",
+        ]);
+        assert!(hits.trim().is_empty(), "{hits}");
+        assert!(
+            !w.origin_git(&["rev-list", &merged]).contains(&junk),
+            "the extra parent is in the history of main"
+        );
+    }
+
+    #[test]
+    fn the_conditions_refuse_a_head_with_the_verified_tree_but_another_parent() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        let main = w.origin_main();
+        let (smuggled, _) = push_head_with_an_extra_parent(&w, &setup);
+
+        let text = format!("{}", conditions_of(&w, &[&counted], &smuggled));
+        assert!(text.contains("부모"), "{text}");
+        assert_eq!(w.origin_main(), main);
+    }
+
+    #[test]
+    fn a_reused_pr_head_that_only_sets_the_exec_bit_is_rebuilt_and_merged() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        let draft = w.work_config();
+        let aside = w.sb.root().join("draft-aside");
+        std::fs::rename(&draft, &aside).unwrap();
+        w.repo.git(&["fetch", "--quiet", "origin"]);
+        w.repo.git(&["checkout", "--quiet", "-b", "other", &setup]);
+        w.repo.git(&["update-index", "--chmod=+x", "chute.toml"]);
+        w.repo.git(&["commit", "--quiet", "-m", "chmod"]);
+        let chmod = w.repo.head();
+        w.repo.git(&[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "other:refs/heads/chute/setup",
+        ]);
+        w.repo.git(&["checkout", "--quiet", "-f", "main"]);
+        std::fs::rename(&aside, &draft).unwrap();
+        let main = w.origin_main();
+
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+
+        assert!(lease_in_git_log(&w, &chmod));
+        let merged = w.origin_main();
+        assert_ne!(merged, main);
+        let mode = w.origin_git(&["ls-tree", &merged, "chute.toml"]);
+        assert!(mode.starts_with("100644 "), "{mode}");
+        let record: SetupRecord =
+            serde_json::from_slice(&std::fs::read(w.record_file()).unwrap()).unwrap();
+        assert_eq!(
+            w.origin_git(&["rev-parse", &format!("{merged}^{{tree}}")])
+                .trim(),
+            record.tree.as_str()
+        );
+    }
+
+    #[test]
+    fn a_crlf_draft_under_text_auto_merges_and_the_rerun_only_registers() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.push_main(".gitattributes", "* text=auto\n");
+        w.repo.write(
+            "chute.toml",
+            &step("counted", &counted).replace('\n', "\r\n"),
+        );
+        let main = w.origin_main();
+
+        let first = w.exec_yes(&[]);
+        assert_eq!(first.code, code(ExitCode::SUCCESS), "{}", first.text);
+        let merged = w.origin_main();
+        assert_ne!(merged, main);
+        let record: SetupRecord =
+            serde_json::from_slice(&std::fs::read(w.record_file()).unwrap()).unwrap();
+        assert_eq!(
+            w.origin_git(&["rev-parse", &format!("{merged}^{{tree}}")])
+                .trim(),
+            record.tree.as_str()
+        );
+        assert!(!w.work_config().exists());
+        assert!(first.text.contains("같아 지웠다"), "{}", first.text);
+        assert_eq!(w.setup_branch_pushes(), 1);
+
+        let second = w.exec_yes(&[]);
+        assert_eq!(second.code, code(ExitCode::SUCCESS), "{}", second.text);
+        assert!(second.text.contains("등록만 했다"), "{}", second.text);
+        assert_eq!(w.setup_branch_pushes(), 1);
+        assert_eq!(w.origin_main(), merged);
+    }
+
+    fn left_over_branch(w: &World) -> String {
+        w.repo
+            .pr_branch("chute/setup", "theirs.txt", "work in progress\n")
+    }
+
+    #[test]
+    fn a_left_over_setup_branch_is_named_with_its_head_before_the_terminal_question() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let theirs = left_over_branch(&w);
+        let main = w.origin_main();
+
+        let no = w.go(&World::args(&[&counted], None), Some("n\n"), NOW);
+        refused(&no);
+        let asked = no.text.split("[y/N]").next().unwrap();
+        assert!(asked.contains("chute/setup"), "{}", no.text);
+        assert!(asked.contains(&theirs), "{}", no.text);
+        assert!(asked.contains("새 setup 커밋으로 덮어쓴다"), "{}", no.text);
+        assert_eq!(w.origin_ref("refs/heads/chute/setup").unwrap(), theirs);
+        assert_eq!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr create"), 0);
+        assert_eq!(w.setup_branch_pushes(), 0);
+
+        let yes = w.go(&World::args(&[&counted], None), Some("y\n"), NOW);
+        assert_eq!(yes.code, code(ExitCode::SUCCESS), "{}", yes.text);
+        assert!(lease_in_git_log(&w, &theirs));
+        assert_ne!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr create"), 1);
+    }
+
+    #[test]
+    fn yes_does_not_overwrite_a_left_over_setup_branch() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let theirs = left_over_branch(&w);
+        let main = w.origin_main();
 
         let ran = w.exec_yes(&[&counted]);
         refused(&ran);
-        assert!(ran.text.contains("evil.sh"), "{}", ran.text);
-        assert!(ran.text.contains("밖의 파일"), "{}", ran.text);
+        assert!(ran.text.contains(&theirs), "{}", ran.text);
+        assert!(
+            ran.text.contains("git push origin --delete chute/setup"),
+            "{}",
+            ran.text
+        );
+        assert_eq!(w.origin_ref("refs/heads/chute/setup").unwrap(), theirs);
         assert_eq!(w.origin_main(), main);
-        assert_eq!(w.gh_called("pr merge"), 0);
+        assert_eq!(w.gh_called("pr create"), 0);
+        assert_eq!(w.setup_branch_pushes(), 0);
+    }
+
+    #[test]
+    fn a_left_over_setup_branch_that_is_the_verified_commit_gets_a_pr_without_a_push() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let setup = leave_an_open_pr(&w, &[&counted]);
+        std::fs::remove_file(w.gh_state.join("pr")).unwrap();
+        let (pushes, creates) = (w.setup_branch_pushes(), w.gh_called("pr create"));
+
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+
+        assert_eq!(w.setup_branch_pushes(), pushes);
+        assert_eq!(w.gh_called("pr create"), creates + 1);
+        let merged = w.origin_main();
+        assert_eq!(w.merge_parents(&merged)[1], setup);
+    }
+
+    struct BranchAppearsOnRead<'a> {
+        answer: &'a [u8],
+        hook: Option<Box<dyn FnOnce() + 'a>>,
+    }
+
+    impl std::io::Read for BranchAppearsOnRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.answer, buf)
+        }
+    }
+
+    impl std::io::BufRead for BranchAppearsOnRead<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if let Some(hook) = self.hook.take() {
+                hook();
+            }
+            Ok(self.answer)
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.answer = &self.answer[amount..];
+        }
+    }
+
+    #[test]
+    fn a_setup_branch_that_appears_after_the_confirmation_is_not_overwritten() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        let main = w.origin_main();
+        let theirs = std::cell::RefCell::new(String::new());
+        let mut input = BranchAppearsOnRead {
+            answer: b"y\n",
+            hook: Some(Box::new(|| {
+                *theirs.borrow_mut() = left_over_branch(&w);
+            })),
+        };
+
+        let ran = w.go_reading(&World::args(&[&counted], None), true, &mut input, NOW);
+
+        refused(&ran);
+        assert!(ran.text.contains("확인한 뒤 바뀌었다"), "{}", ran.text);
+        assert_eq!(
+            w.origin_ref("refs/heads/chute/setup").unwrap(),
+            *theirs.borrow()
+        );
+        assert_eq!(w.origin_main(), main);
+        assert_eq!(w.gh_called("pr create"), 0);
+        assert_eq!(w.setup_branch_pushes(), 0);
     }
 
     #[test]

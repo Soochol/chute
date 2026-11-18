@@ -867,6 +867,39 @@ impl Slot {
         Ok(Some(out.stdout))
     }
 
+    pub fn parents_of(&self, commit: &Sha) -> Result<Vec<Sha>> {
+        let out = self.run(&["rev-list", "--parents", "-n", "1", commit.as_str()])?;
+        out.split_whitespace()
+            .skip(1)
+            .map(|parent| Sha::try_from(parent.to_owned()).map_err(|e| anyhow!(e)))
+            .collect()
+    }
+
+    pub fn blob_id(&self, rev: &Sha, path: &str) -> Result<Option<Sha>> {
+        let out = self.git(&["rev-parse", "--verify", "--quiet", &format!("{rev}:{path}")])?;
+        if !out.success() {
+            return Ok(None);
+        }
+        Sha::try_from(out.stdout_text().trim().to_owned())
+            .map(Some)
+            .map_err(|e| anyhow!(e))
+    }
+
+    pub fn blob_id_as_added(&self, path: &str, file: &Path) -> Result<Sha> {
+        let file = file.to_string_lossy();
+        let out = self.run(&["hash-object", &format!("--path={path}"), "--", &file])?;
+        Sha::try_from(out.trim().to_owned()).map_err(|e| anyhow!(e))
+    }
+
+    pub fn fetch_remote_branch(&self, branch: &str) -> Result<Option<Sha>> {
+        if self.remote_branch_tip(branch)?.is_none() {
+            return Ok(None);
+        }
+        self.fetch(&format!("refs/heads/{branch}"))
+            .with_context(|| format!("{branch}를 가져오지 못했다"))
+            .map(Some)
+    }
+
     pub fn remote_branch_tip(&self, branch: &str) -> Result<Option<Sha>> {
         let git = &self.lock.git;
         let out = self.run(&[
@@ -1568,6 +1601,36 @@ mod tests {
             Some(b"a\n".to_vec())
         );
         assert_eq!(slot.read_file(&head, "missing.txt").unwrap(), None);
+    }
+
+    #[test]
+    fn parents_blobs_and_remote_branches_can_be_read_without_moving_a_ref() {
+        let w = World::new();
+        let head = w.open_pr(1, &[("a.txt", "a\n")]).head().clone();
+        let slot = w.slot(SlotName::Batch);
+        let main = slot.fetch_base().unwrap();
+        slot.fetch_pr_head(PrNumber(1), &head).unwrap();
+
+        assert_eq!(slot.parents_of(&head).unwrap(), [main]);
+        let blob = git(
+            &w.sb,
+            w.repo.origin(),
+            &["rev-parse", &format!("{head}:a.txt")],
+        );
+        assert_eq!(slot.blob_id(&head, "a.txt").unwrap(), Some(sha(&blob)));
+        assert_eq!(slot.blob_id(&head, "missing.txt").unwrap(), None);
+        let file = w.sb.root().join("a-copy.txt");
+        fs::write(&file, "a\n").unwrap();
+        assert_eq!(slot.blob_id_as_added("a.txt", &file).unwrap(), sha(&blob));
+
+        assert_eq!(slot.fetch_remote_branch("setup").unwrap(), None);
+        slot.push_branch(&head, "setup", None).unwrap();
+        let before = git(&w.sb, w.repo.path(), &["for-each-ref"]);
+        assert_eq!(
+            slot.fetch_remote_branch("setup").unwrap(),
+            Some(head.clone())
+        );
+        assert_eq!(git(&w.sb, w.repo.path(), &["for-each-ref"]), before);
     }
 
     #[test]

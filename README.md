@@ -106,7 +106,7 @@ chute init --setup --verify "pio run -e stm32_debug" --verify "python3 tests/tes
 | `--instructions <파일>` | 한 줄을 더할 지침 파일. 저장소 안의 상대 경로다. 없으면 기본 브랜치의 `AGENTS.md`, 없으면 `CLAUDE.md`, 둘 다 없으면 새 `AGENTS.md`다 |
 | `--yes` | 4단계의 확인을 묻지 않는다. 터미널이 아니면 필요하다. 터미널이 아니고 `--yes`도 없으면 diff를 출력하고 "`--yes`로 다시 실행한다"고 안내한 뒤 종료 코드 1로 멈춘다 |
 
-- 어느 단계에서 멈췄든 같은 명령을 다시 실행하면 이어 간다. 열린 `chute/setup` PR이 있고 내용이 같으면 PR을 새로 만들지 않고 브랜치도 다시 push하지 않는다. 초안을 고쳤으면 같은 PR에 새 커밋을 올린다.
+- 어느 단계에서 멈췄든 같은 명령을 다시 실행하면 이어 간다. 열린 `chute/setup` PR의 HEAD가 검증한 트리를 가졌고 부모가 기본 브랜치 끝 하나뿐이면 PR을 새로 만들지 않고 브랜치도 다시 push하지 않는다. 그렇지 않으면 같은 PR의 `chute/setup`을 새 setup 커밋으로 덮어쓰고 덮어쓴 HEAD SHA를 출력한다. 초안을 고쳤거나, 남이 커밋을 얹었거나, 부모나 파일 모드가 다른 경우다. 열린 PR 없이 원격에 `chute/setup`이 남아 있으면 그 끝이 검증한 커밋일 때만 그대로 PR을 만든다. 아니면 터미널에서는 그 HEAD SHA를 보이고 묻고, `--yes`는 덮어쓰지 않고 멈춘다.
 - 기본 브랜치에 `chute.toml`이 이미 있으면 `--setup`은 등록만 하고 "기본 브랜치에 chute.toml이 이미 있어 등록만 했다"고 알린다. 다른 PC는 이 명령이나 `chute init`으로 등록만 한다.
 - 머지한 뒤 작업 폴더의 `chute.toml`이 머지된 것과 같으면 지운다. `git pull`로 머지를 받는다. 다음은 `chute install`이고, 첫 `chute submit`이 데몬을 띄운다.
 - 옵션 없는 `chute init`은 그대로다. 초안을 쓰고 등록하고 지침 파일에 넣을 한 줄을 출력할 뿐 아무것도 올리지 않는다.

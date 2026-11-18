@@ -40,7 +40,13 @@ pub(super) struct OpenPr {
 pub(super) enum Landed {
     Merged,
     AlreadyConfigured,
-    Moved,
+    Moved { head: Sha },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Overwrite {
+    Refuse,
+    Confirmed,
 }
 
 #[derive(Deserialize)]
@@ -110,16 +116,35 @@ pub(super) fn find_open_pr(ctx: &Ctx, info: &RepoInfo) -> Result<Option<OpenPr>>
     }
 }
 
+pub(super) fn remote_setup_tip(ctx: &Ctx, info: &RepoInfo) -> Result<Option<Sha>> {
+    let out = ctx.ext.git(
+        &info.path,
+        [
+            "ls-remote",
+            "--heads",
+            &info.remote_name,
+            &format!("refs/heads/{BRANCH}"),
+        ],
+    )?;
+    let text = out.ok().context("원격의 chute/setup을 읽지 못했다")?;
+    text.split_whitespace()
+        .next()
+        .map(|tip| sha(tip.to_owned()))
+        .transpose()
+}
+
 pub(super) fn land(
     ctx: &Ctx,
     ready: &Ready,
     existing: Option<OpenPr>,
+    seen_tip: Option<Sha>,
+    overwrite: Overwrite,
     out: &mut dyn Write,
 ) -> Result<Landed> {
     let gitops = Gitops::new(&ctx.ext, &ctx.home, &ready.info);
     let slot = gitops.lock_preflight_slot(ready.max_parallel)?.open()?;
     slot.fetch_base()?;
-    let (commit, pr) = publish(ctx, &slot, ready, existing, out)?;
+    let (commit, pr) = publish(ctx, &slot, ready, existing, seen_tip, overwrite, out)?;
 
     let base = match conditions(ctx, &slot, ready, pr, &commit)? {
         Verdict::Go(base) => base,
@@ -133,7 +158,7 @@ pub(super) fn land(
         }
         Verdict::Moved => {
             writeln!(out, "검증한 뒤 기본 브랜치가 움직여 처음부터 다시 판정한다")?;
-            return Ok(Landed::Moved);
+            return Ok(Landed::Moved { head: commit });
         }
     };
 
@@ -169,7 +194,7 @@ pub(super) fn land(
     match slot.push(&merge_commit)? {
         PushOutcome::MainMoved => {
             writeln!(out, "검증한 뒤 기본 브랜치가 움직여 처음부터 다시 판정한다")?;
-            return Ok(Landed::Moved);
+            return Ok(Landed::Moved { head: commit });
         }
         PushOutcome::Pushed => {}
     }
@@ -184,22 +209,28 @@ pub(super) fn land(
 
 fn finish(slot: &Slot, ready: &Ready, merged: &Sha, out: &mut dyn Write) -> Result<()> {
     let work = ready.info.path.join(config::FILE_NAME);
-    let landed = slot.read_file(merged, config::FILE_NAME)?;
-    match (fs::read(&work), landed) {
-        (Ok(mine), Some(landed)) if mine == landed => {
+    if work.is_file() {
+        let same = match (
+            slot.blob_id(merged, config::FILE_NAME),
+            slot.blob_id_as_added(config::FILE_NAME, &work),
+        ) {
+            (Ok(landed), Ok(mine)) => landed.as_ref() == Some(&mine),
+            _ => false,
+        };
+        if same {
             fs::remove_file(&work).with_context(|| format!("지우지 못했다: {}", work.display()))?;
             writeln!(
                 out,
                 "작업 폴더의 chute.toml이 머지된 것과 같아 지웠다: {}",
                 work.display()
             )?;
+        } else {
+            writeln!(
+                out,
+                "작업 폴더의 chute.toml이 머지된 것과 달라 그대로 둔다: {}",
+                work.display()
+            )?;
         }
-        (Ok(_), _) => writeln!(
-            out,
-            "작업 폴더의 chute.toml이 머지된 것과 달라 그대로 둔다: {}",
-            work.display()
-        )?,
-        (Err(_), _) => {}
     }
     writeln!(out)?;
     writeln!(
@@ -214,6 +245,8 @@ fn publish(
     slot: &Slot,
     ready: &Ready,
     existing: Option<OpenPr>,
+    seen_tip: Option<Sha>,
+    overwrite: Overwrite,
     out: &mut dyn Write,
 ) -> Result<(Sha, PrNumber)> {
     let repo = &ready.info.path;
@@ -224,7 +257,7 @@ fn publish(
                 pr.number
             )));
         }
-        if has_setup_content(slot, ready, &pr.head)? {
+        if is_reusable(slot, ready, &pr.head)? {
             writeln!(out, "열린 PR {}의 내용이 같아 그대로 쓴다", pr.number)?;
             return Ok((pr.head, pr.number));
         }
@@ -232,14 +265,29 @@ fn publish(
         slot.push_branch(&commit, BRANCH, Some(&pr.head))?;
         writeln!(
             out,
-            "PR {}의 {BRANCH}를 새 setup 커밋으로 고쳤다",
-            pr.number
+            "PR {}의 {BRANCH}를 새 setup 커밋으로 고쳤다(덮어쓴 HEAD {})",
+            pr.number, pr.head
         )?;
         return Ok((commit, pr.number));
     }
-    let commit = build(slot, ready)?;
-    let tip = slot.remote_branch_tip(BRANCH)?;
-    slot.push_branch(&commit, BRANCH, tip.as_ref())?;
+    let commit = match slot.fetch_remote_branch(BRANCH)? {
+        None => {
+            let commit = build(slot, ready)?;
+            slot.push_branch(&commit, BRANCH, None)?;
+            commit
+        }
+        Some(tip) if is_reusable(slot, ready, &tip)? => tip,
+        Some(tip) => {
+            overwrite_left_over(ready, &tip, seen_tip.as_ref(), overwrite)?;
+            let commit = build(slot, ready)?;
+            slot.push_branch(&commit, BRANCH, Some(&tip))?;
+            writeln!(
+                out,
+                "열린 PR 없이 남은 {BRANCH}(HEAD {tip})를 새 setup 커밋으로 덮어썼다"
+            )?;
+            commit
+        }
+    };
     let steps = ready.steps.join(", ");
     let body = format!(
         "`chute init --setup`이 만들었다.\n\n검증한 단계: {steps}\n\n이 PR은 chute가 큐를 거치지 않고 기본 브랜치에 직접 머지한다."
@@ -273,6 +321,27 @@ fn publish(
     Ok((commit, pr.number))
 }
 
+fn overwrite_left_over(
+    ready: &Ready,
+    tip: &Sha,
+    seen_tip: Option<&Sha>,
+    overwrite: Overwrite,
+) -> Result<()> {
+    match overwrite {
+        Overwrite::Refuse => Err(refuse(format!(
+            "원격에 {BRANCH}가 이미 있고 열린 PR이 없다(HEAD {tip}). 덮어쓰지 않고 멈춘다. \
+             터미널에서 실행해 덮어쓸지 확인하거나, 필요 없는 브랜치면 \
+             `git push {} --delete {BRANCH}`로 지운 뒤 다시 실행한다",
+            ready.info.remote_name
+        ))),
+        Overwrite::Confirmed if seen_tip != Some(tip) => Err(refuse(format!(
+            "원격 {BRANCH}가 확인한 뒤 바뀌었다(확인 {}, 지금 {tip}). 덮어쓰지 않고 멈춘다. 다시 실행한다",
+            seen_tip.map_or_else(|| "브랜치 없음".to_owned(), ToString::to_string)
+        ))),
+        Overwrite::Confirmed => Ok(()),
+    }
+}
+
 fn build(slot: &Slot, ready: &Ready) -> Result<Sha> {
     let files: Vec<(&str, &[u8])> = ready
         .files
@@ -286,13 +355,9 @@ fn build(slot: &Slot, ready: &Ready) -> Result<Sha> {
     Ok(commit)
 }
 
-fn has_setup_content(slot: &Slot, ready: &Ready, head: &Sha) -> Result<bool> {
-    for (path, content) in &ready.files {
-        if slot.read_file(head, path)?.as_deref() != Some(content.as_slice()) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+fn is_reusable(slot: &Slot, ready: &Ready, commit: &Sha) -> Result<bool> {
+    Ok(slot.tree_of(commit)? == ready.tree
+        && slot.parents_of(commit)? == std::slice::from_ref(&ready.base))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -356,32 +421,34 @@ pub(super) fn conditions(
     }
     let changed = slot.changed_since_fork(&base, commit)?;
     let instructions = &ready.instructions;
-    let mut expected: Vec<(&str, &[u8])> = Vec::new();
-    for (path, content) in &ready.files {
-        expected.push((path.as_str(), content.as_slice()));
-    }
     for path in &changed {
-        if !expected.iter().any(|(file, _)| file == path) {
+        if !ready.files.iter().any(|(file, _)| file == path) {
             return Err(refuse(format!(
                 "PR {pr}가 {}과 지침 파일 밖의 파일 {path}도 바꾼다. 머지하지 않았다",
                 config::FILE_NAME
             )));
         }
     }
-    for (path, content) in expected {
+    for (path, _) in &ready.files {
         if !changed.iter().any(|changed| changed == path) {
             return Err(refuse(format!(
                 "PR {pr}가 {path}를 바꾸지 않는다. 머지하지 않았다"
             )));
         }
-        if slot.read_file(commit, path)?.as_deref() != Some(content) {
-            let what = if path == instructions.file {
+        if slot.read_file(commit, path)? != slot.read_file(&ready.tree, path)? {
+            let what = if *path == instructions.file {
                 "지침 파일의 변경이 chute 한 줄 추가가 아니다"
             } else {
                 "chute.toml이 검증한 초안과 다르다"
             };
             return Err(refuse(format!("PR {pr}의 {path}: {what}. 머지하지 않았다")));
         }
+    }
+    if !is_reusable(slot, ready, commit)? {
+        return Err(refuse(format!(
+            "PR {pr}의 HEAD {commit}가 검증한 setup 커밋이 아니다. 트리가 검증한 트리와 다르거나 부모가 기준 커밋 {} 하나가 아니다. 머지하지 않았다",
+            ready.base
+        )));
     }
     Ok(Verdict::Go(base))
 }
