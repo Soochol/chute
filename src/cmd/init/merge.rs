@@ -217,9 +217,15 @@ pub(super) fn land(
 fn finish(slot: &Slot, ready: &Ready, merged: &Sha, out: &mut dyn Write) -> Result<()> {
     let work = ready.info.path.join(config::FILE_NAME);
     if work.is_file() {
-        let landed = slot.blob_id(merged, config::FILE_NAME)?;
-        let mine = slot.blob_id_as_added(config::FILE_NAME, &work)?;
-        if landed.as_ref() == Some(&mine) {
+        // The merge is already pushed, so a file that cannot be compared is kept, not an error.
+        let same = match (
+            slot.blob_id(merged, config::FILE_NAME),
+            slot.blob_id_as_added(config::FILE_NAME, &work),
+        ) {
+            (Ok(landed), Ok(mine)) => landed.as_ref() == Some(&mine),
+            _ => false,
+        };
+        if same {
             fs::remove_file(&work).with_context(|| format!("지우지 못했다: {}", work.display()))?;
             writeln!(
                 out,

@@ -1279,6 +1279,21 @@ esac
     }
 
     #[test]
+    fn a_work_config_that_cannot_be_read_after_the_merge_is_kept_and_the_run_still_succeeds() {
+        let w = World::new();
+        let counted = w.counting("counted");
+        w.gh_knob(
+            "on_view",
+            &format!("chmod 000 '{}'\n", w.work_config().display()),
+        );
+        let ran = w.exec_yes(&[&counted]);
+        assert_eq!(ran.code, code(ExitCode::SUCCESS), "{}", ran.text);
+        assert!(ran.text.contains("머지했다"), "{}", ran.text);
+        assert!(ran.text.contains("달라 그대로 둔다"), "{}", ran.text);
+        assert!(w.work_config().exists());
+    }
+
+    #[test]
     fn a_rerun_with_an_open_pr_of_the_same_content_neither_creates_nor_pushes_again() {
         let w = World::new();
         let counted = w.counting("counted");
