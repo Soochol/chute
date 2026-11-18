@@ -293,5 +293,6 @@ chute 결과 halted slug=acme/widget at=1763270100456 base=9f8e7d6a5b4c step=tes
 - `chute up`, `chute down`: 사람이 데몬을 띄우고 멈춘다. 허브가 다른 PC여도 허브의 데몬에 닿는다.
 - `chute hub`, `chute hub set`, `chute hub take`: 사람이 허브를 보고 정하고 옮긴다.
 - `chute install`: 사람이 Codex 스킬 파일과 현황판을 설치한다.
+- `chute init --setup`: 사람이 새 저장소에 chute를 붙인다. `chute.toml` PR을 chute가 기본 브랜치에 바로 머지한다. 사용자가 명시적으로 시킬 때만 `--yes`와 함께 실행한다.
 
 `chute batches`, `chute init`, `chute daemon`도 사람이나 데몬의 일이다. 작업자가 쓸 명령은 `preflight`, `submit`, `giveup`, `status` 넷이다. 오케스트레이터 아래의 작업자는 `submit`도 쓰지 않는다. `submit`의 `--priority`, `--after`, `--repair`와 `chute events`, `chute flaky`, `chute gc`는 오케스트레이터가 쓴다(위 "오케스트레이터 아래에서 일할 때").
