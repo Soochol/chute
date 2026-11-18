@@ -199,6 +199,65 @@ fn a_second_step_failing_twice_fails_the_run_and_the_third_never_runs() {
 }
 
 #[test]
+fn a_step_that_fails_twice_keeps_the_tests_of_the_first_attempt() {
+    let rig = Rig::new();
+    let m = rig.marks_dir();
+    let cfg = config(
+        vec![with_failed(
+            step(
+                "t",
+                format!(
+                    "if [ ! -e '{m}/seen' ]; then touch '{m}/seen'; \
+                     echo 'test one ... FAILED'; echo 'test two ... FAILED'; exit 1; fi; \
+                     echo 'test three ... FAILED'; exit 1"
+                ),
+            ),
+            TEST_NAME,
+        )],
+        false,
+    );
+    let f = failed(rig.run(&cfg, &Options::default()));
+    assert_eq!(
+        f.first_attempt_tests,
+        Some(vec!["one".to_owned(), "two".to_owned()])
+    );
+    assert_eq!(f.tests(), ["three"]);
+    assert_eq!(f.log, log_path(&rig.logs(), "t", 2));
+
+    let silent = config(
+        vec![with_failed(
+            step(
+                "t",
+                format!(
+                    "[ -e '{m}/seen2' ] && {{ echo 'test four ... FAILED'; exit 1; }}; \
+                     touch '{m}/seen2'; echo boom; exit 1"
+                ),
+            ),
+            TEST_NAME,
+        )],
+        false,
+    );
+    let f = failed(rig.run(&silent, &Options::default()));
+    assert_eq!(f.first_attempt_tests, Some(Vec::new()));
+    assert_eq!(f.tests(), ["four"]);
+
+    let once = config(
+        vec![VerifyStep {
+            timeout: Duration::from_secs(2),
+            ..with_failed(
+                step("slow", "echo 'test five ... FAILED'; sleep 300"),
+                TEST_NAME,
+            )
+        }],
+        false,
+    );
+    let f = failed(rig.run(&once, &Options::default()));
+    assert_eq!(f.cause, Cause::TimedOut);
+    assert_eq!(f.first_attempt_tests, None);
+    assert_eq!(f.tests(), ["five"]);
+}
+
+#[test]
 fn a_step_that_passes_on_the_rerun_is_flaky_and_the_run_goes_on() {
     let rig = Rig::new();
     let m = rig.marks_dir();

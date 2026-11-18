@@ -7,7 +7,9 @@ use serde::Serialize;
 
 use crate::config::{Config, FlakyPolicy, PROBE_PLACEHOLDER};
 use crate::gitops::Slot;
-use crate::model::{BatchId, EpochMs, Event, EventKind, ProbeEvidence, Sha, Warning, WarningKind};
+use crate::model::{
+    BatchId, EpochMs, Event, EventKind, ProbeEvidence, RerunSignal, Sha, Warning, WarningKind,
+};
 use crate::store::RepoStore;
 use crate::verify::{self, Cancel, CommandEnd, Options};
 
@@ -145,6 +147,66 @@ pub fn ledger(events: &[Event], now: EpochMs, policy: &FlakyPolicy, days: u32) -
             .then(a.key.cmp(&b.key))
     });
     entries
+}
+
+/// Whether each of `tests` was recorded as flaky in `step` within the last `days` days by a batch
+/// other than `except`. An empty `tests` is never known, and neither is a step-level record that
+/// names no test.
+pub fn known_flaky(
+    events: &[Event],
+    now: EpochMs,
+    days: u32,
+    step: &str,
+    tests: &[String],
+    except: &BatchId,
+) -> bool {
+    let since = window_start(now, days);
+    let recorded: Vec<&[String]> = events
+        .iter()
+        .filter(|e| e.at_ms.0 >= since)
+        .filter_map(|e| match &e.kind {
+            EventKind::Flaky {
+                batch,
+                step: recorded,
+                tests,
+                ..
+            } if batch != except && recorded == step => Some(tests.as_slice()),
+            _ => None,
+        })
+        .collect();
+    !tests.is_empty()
+        && tests
+            .iter()
+            .all(|test| recorded.iter().any(|named| named.contains(test)))
+}
+
+/// The sign of flakiness in a solo failure, with the tests to record if the verification run
+/// again passes: the tests of both attempts. `None` when the failure shows none.
+///
+/// Different tests: both attempts of the step named tests and no test is in both. Known flaky:
+/// every test that failed twice, or the last attempt's tests when the first attempt named none or
+/// the step ran once, is in the ledger of the last `days` days from another batch than `batch`.
+pub fn rerun_signal(
+    failed: &verify::Failed,
+    events: &[Event],
+    now: EpochMs,
+    days: u32,
+    batch: &BatchId,
+) -> Option<(RerunSignal, Vec<String>)> {
+    let last = failed.tests();
+    let first = failed.first_attempt_tests.as_deref().unwrap_or_default();
+    let mut named = first.to_vec();
+    named.extend(last.iter().filter(|t| !first.contains(t)).cloned());
+    if !first.is_empty() && !last.is_empty() && !last.iter().any(|t| first.contains(t)) {
+        return Some((RerunSignal::DifferentTests, named));
+    }
+    let twice: Vec<String> = if first.is_empty() {
+        last
+    } else {
+        last.into_iter().filter(|t| first.contains(t)).collect()
+    };
+    known_flaky(events, now, days, &failed.step, &twice, batch)
+        .then_some((RerunSignal::KnownFlaky, named))
 }
 
 fn chronic_keys(events: &[Event], now: EpochMs, policy: &FlakyPolicy) -> BTreeMap<Key, u32> {
@@ -405,6 +467,78 @@ mod tests {
             step: step.into(),
             test: test.map(str::to_owned),
         }
+    }
+
+    fn failed(first: Option<&[&str]>, last: &[&str]) -> verify::Failed {
+        let strings = |tests: &[&str]| tests.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        verify::Failed {
+            step: "test".into(),
+            cause: verify::Cause::Exited(1),
+            detail: match crate::model::NonEmpty::new(strings(last)) {
+                Some(tests) => verify::Detail::Tests(tests),
+                None => verify::Detail::Tail("끝".into()),
+            },
+            log: "/logs/test.2.log".into(),
+            confirmed: None,
+            first_attempt_tests: first.map(strings),
+            named_by: None,
+        }
+    }
+
+    fn signal(failed: &verify::Failed, events: &[Event]) -> Option<(RerunSignal, Vec<String>)> {
+        rerun_signal(failed, events, NOW, 30, &BatchId("now".into()))
+    }
+
+    #[test]
+    fn attempts_that_name_tests_sharing_none_are_a_sign_with_both_names() {
+        let (kind, tests) = signal(&failed(Some(&["a", "b"]), &["c"]), &[]).unwrap();
+
+        assert_eq!(kind, RerunSignal::DifferentTests);
+        assert_eq!(tests, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_shared_test_or_a_missing_name_or_one_run_is_no_sign_without_the_ledger() {
+        assert_eq!(signal(&failed(Some(&["a", "b"]), &["b", "c"]), &[]), None);
+        assert_eq!(signal(&failed(Some(&[]), &["c"]), &[]), None);
+        assert_eq!(signal(&failed(Some(&["a"]), &[]), &[]), None);
+        assert_eq!(signal(&failed(None, &["c"]), &[]), None);
+    }
+
+    #[test]
+    fn tests_all_in_the_ledger_from_another_batch_are_a_sign() {
+        let events = [flaky(3, "b1", "test", &["a", "b"])];
+
+        let (kind, tests) = signal(&failed(Some(&["a", "b"]), &["a"]), &events).unwrap();
+        assert_eq!(kind, RerunSignal::KnownFlaky);
+        assert_eq!(tests, ["a", "b"]);
+        assert!(signal(&failed(Some(&[]), &["a", "b"]), &events).is_some());
+        assert!(signal(&failed(None, &["a"]), &events).is_some());
+        assert_eq!(
+            signal(&failed(Some(&["a", "x"]), &["a", "x"]), &events),
+            None
+        );
+    }
+
+    #[test]
+    fn the_ledger_ignores_this_batch_other_steps_old_records_and_records_naming_no_test() {
+        let failure = failed(Some(&["a"]), &["a"]);
+
+        assert_eq!(signal(&failure, &[flaky(3, "now", "test", &["a"])]), None);
+        assert_eq!(signal(&failure, &[flaky(3, "b1", "lint", &["a"])]), None);
+        assert_eq!(signal(&failure, &[flaky(31, "b1", "test", &["a"])]), None);
+        assert_eq!(signal(&failure, &[flaky(3, "b1", "test", &[])]), None);
+        assert!(signal(&failure, &[flaky(29, "b1", "test", &["a"])]).is_some());
+    }
+
+    #[test]
+    fn a_batch_other_than_this_one_counts_even_when_this_batch_flaked_the_test_too() {
+        let events = [
+            flaky(3, "b1", "test", &["a"]),
+            flaky(0, "now", "test", &["a"]),
+        ];
+
+        assert!(signal(&failed(None, &["a"]), &events).is_some());
     }
 
     #[test]

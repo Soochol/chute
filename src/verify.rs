@@ -123,6 +123,9 @@ pub struct Failed {
     /// With `rerun_with_probe`, when the step failed twice: the tests that both attempts named.
     /// Empty when an attempt named none. `None` when the step was not run twice.
     pub confirmed: Option<Vec<String>>,
+    /// When the step ran twice and failed twice: the tests the first attempt named, empty when it
+    /// named none. `None` when the step ran once. `detail` stays the last attempt's.
+    pub first_attempt_tests: Option<Vec<String>>,
     /// The `failed` pattern of the step, which named the tests.
     pub named_by: Option<String>,
 }
@@ -340,6 +343,7 @@ impl Ctx<'_> {
             End::Cancelled => Ok(StepEnd::Cancelled),
             End::Failed(cause) => {
                 let mut failed = failure(step, cause, second_log)?;
+                failed.first_attempt_tests = Some(first_tests.clone());
                 if self.opts.rerun_with_probe {
                     let second = failed.tests();
                     let both: Vec<String> = second
@@ -533,6 +537,7 @@ fn failure(step: &VerifyStep, cause: Cause, log: PathBuf) -> Result<Failed> {
         detail,
         log,
         confirmed: None,
+        first_attempt_tests: None,
         named_by: step.failed.as_ref().map(|re| re.as_str().to_owned()),
     })
 }
