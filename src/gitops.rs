@@ -833,6 +833,28 @@ impl Slot {
         }
     }
 
+    /// The slot ends at the new commit. A path that the repository ignores is still added.
+    pub fn commit_files(
+        &self,
+        parent: &Sha,
+        files: &[(&str, &[u8])],
+        message: &str,
+    ) -> Result<Sha> {
+        self.checkout(parent)?;
+        for (path, content) in files {
+            let target = self.path.join(path);
+            if let Some(dir) = target.parent() {
+                fs::create_dir_all(dir)
+                    .with_context(|| format!("만들지 못했다: {}", dir.display()))?;
+            }
+            fs::write(&target, content)
+                .with_context(|| format!("쓰지 못했다: {}", target.display()))?;
+            self.run(&["add", "--force", "--", path])?;
+        }
+        self.run(&["commit", "--quiet", "-m", message])?;
+        self.head()
+    }
+
     pub fn is_ancestor(&self, commit: &Sha, of: &Sha) -> Result<bool> {
         let out = self.git(&["merge-base", "--is-ancestor", commit.as_str(), of.as_str()])?;
         match out.code {

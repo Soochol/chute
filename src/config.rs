@@ -559,9 +559,41 @@ pub fn remote_key(text: &str) -> Option<String> {
 }
 
 pub fn draft(verify_run: &str) -> String {
-    let run = toml::Value::String(verify_run.to_owned());
-    format!(
-        r#"# chute 설정. 기본 브랜치에 올라간 이 파일을 읽는다.
+    draft_steps(&[verify_run])
+}
+
+/// One command keeps the step name `test`; several are `test-1`, `test-2`, and so on.
+pub fn draft_steps<S: AsRef<str>>(runs: &[S]) -> String {
+    let mut text = String::from(DRAFT_HEAD);
+    for (i, run) in runs.iter().enumerate() {
+        let name = match runs.len() {
+            1 => "test".to_owned(),
+            _ => format!("test-{}", i + 1),
+        };
+        let run = toml::Value::String(run.as_ref().to_owned());
+        if i == 0 {
+            text.push_str(&format!(
+                r#"[[verify]]
+name = "{name}"
+# 검증 worktree에서 sh -c로 실행한다
+run = {run}
+timeout = 3600          # 초
+# failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
+# probe = "cargo test {{tests}} -- --exact"   # 흔들린 시험만 되풀이하는 명령. {{tests}} 자리가 필요하다
+# paths = ["src/", "Cargo.toml"]   # 바뀐 파일이 이 접두어로 시작할 때만 이 단계를 돈다. 비우면 안 된다
+"#
+            ));
+        } else {
+            text.push_str(&format!(
+                "\n[[verify]]\nname = \"{name}\"\nrun = {run}\ntimeout = 3600          # 초\n"
+            ));
+        }
+    }
+    text.push_str(DRAFT_TAIL);
+    text
+}
+
+const DRAFT_HEAD: &str = r#"# chute 설정. 기본 브랜치에 올라간 이 파일을 읽는다.
 approval = "agent"      # "agent"면 자동 머지, "human"이면 승인 버튼을 기다린다
 budget = 3              # 연속 반송 한도. 넘으면 큐에서 빼고 submit한 터미널에 알린다
 max_batch = 8           # 한 batch의 PR 수 상한
@@ -596,24 +628,16 @@ probe_seconds = 180     # 되풀이하는 시간 상한(초)
 chronic = 3             # 이만큼 흔들리면 만성으로 본다
 chronic_days = 30       # 만성을 세는 기간(일)
 
-[[verify]]
-name = "test"
-# 검증 worktree에서 sh -c로 실행한다
-run = {run}
-timeout = 3600          # 초
-# failed = 'test (\S+) \.\.\. FAILED'   # 실패한 시험 이름을 뽑는 정규식
-# probe = "cargo test {{tests}} -- --exact"   # 흔들린 시험만 되풀이하는 명령. {{tests}} 자리가 필요하다
-# paths = ["src/", "Cargo.toml"]   # 바뀐 파일이 이 접두어로 시작할 때만 이 단계를 돈다. 비우면 안 된다
+"#;
 
+const DRAFT_TAIL: &str = r#"
 # 머지 뒤에 기본 브랜치에서 돌릴 단계. [[verify]]보다 느려 batch가 기다리기 싫은 단계를 둔다.
 # 모양은 [[verify]]와 같고, 단계 이름은 [[verify]]와 겹치면 안 된다. probe가 있으면 한 번 실패한 단계는 실패한 시험만 probe로 다시 돈다.
 # [[post_verify]]
 # name = "e2e"
 # run = "npm run e2e"
 # timeout = 1800
-"#
-    )
-}
+"#;
 
 pub const MAX_DELTAS: usize = 20;
 const MAX_VALUE_CHARS: usize = 500;
@@ -1235,6 +1259,29 @@ probe = "cargo test {tests} -- --exact"
             Some("team/up")
         );
         assert_eq!(remote_key("not toml ["), None);
+    }
+
+    #[test]
+    fn draft_steps_name_one_step_test_and_several_test_n_and_keep_every_other_key() {
+        assert_eq!(draft_steps(&["cargo test"]), draft("cargo test"));
+        let several = draft_steps(&["a b", "c"]);
+        let config = Config::parse(&several).unwrap();
+        let steps: Vec<_> = config
+            .verify
+            .iter()
+            .map(|s| (s.name.as_str(), s.run.as_str(), s.timeout.as_secs()))
+            .collect();
+        assert_eq!(steps, [("test-1", "a b", 3600), ("test-2", "c", 3600)]);
+
+        let single = draft("a b");
+        let before = |text: &str| text[..text.find("[[verify]]").unwrap()].to_owned();
+        let after = |text: &str| text[text.find("\n# 머지 뒤").unwrap()..].to_owned();
+        assert_eq!(before(&several), before(&single));
+        assert_eq!(after(&several), after(&single));
+        let reread = Config::parse(&single).unwrap();
+        assert_eq!(config.budget, reread.budget);
+        assert_eq!(config.max_parallel, reread.max_parallel);
+        assert_eq!(config.reuse, reread.reuse);
     }
 
     #[test]

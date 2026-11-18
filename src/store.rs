@@ -6,12 +6,12 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{
     BatchId, BatchRecord, DaemonInfo, EpochMs, Event, EventKind, HubConfig, MachineId, PrNumber,
-    RemovedReason, RepoInfo, RevertRecord, Slug, State,
+    RemovedReason, RepoInfo, RevertRecord, Sha, Slug, State,
 };
 
 #[derive(Clone, Debug)]
@@ -92,11 +92,20 @@ const BATCH_FILE: &str = "batch.json";
 const REVERT_FILE: &str = "revert.json";
 const HUB_FILE: &str = "hub.json";
 const TAKEN_FILE: &str = "taken.json";
+const SETUP_FILE: &str = "setup.json";
 
 #[derive(Clone, Debug)]
 pub struct RepoStore {
     home: PathBuf,
     dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupRecord {
+    pub base: Sha,
+    pub tree: Sha,
+    pub config: String,
+    pub at_ms: EpochMs,
 }
 
 #[derive(Debug)]
@@ -144,6 +153,16 @@ impl RepoStore {
 
     pub fn info(&self) -> Result<Option<RepoInfo>> {
         read_json(&self.dir.join(REPO_FILE))
+    }
+
+    pub fn setup_record(&self) -> Result<Option<SetupRecord>> {
+        read_json(&self.dir.join(SETUP_FILE))
+    }
+
+    pub fn write_setup_record(&self, record: &SetupRecord) -> Result<()> {
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("만들지 못했다: {}", self.dir.display()))?;
+        write_json_atomic(&self.dir.join(SETUP_FILE), record)
     }
 
     /// A snapshot of `state.json` without the lock. Writers rename into place, so a reader

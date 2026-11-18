@@ -88,7 +88,7 @@ fn check(file: PathBuf) -> Checked {
     }
 }
 
-fn read(file: &std::path::Path) -> Result<Config> {
+pub(crate) fn read(file: &std::path::Path) -> Result<Config> {
     let text = fs::read_to_string(file)
         .with_context(|| format!("설정 파일을 읽지 못했다: {}", file.display()))?;
     Config::parse(&text)
