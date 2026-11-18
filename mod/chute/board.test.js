@@ -14,7 +14,6 @@ import {
   formatDuration,
   interpret,
   RECENT_DEFAULT,
-  STAGE_NAMES,
   clockExact,
   clockText,
   gradeOf,
@@ -29,6 +28,7 @@ import {
   tint,
   toneToken,
   usualSeconds,
+  MIN_USUAL_SECONDS,
 } from "./board.js";
 
 import { NARROW_WIDTH, isNarrow } from "./board.js";
@@ -1455,11 +1455,19 @@ test("a batch without a step list shows the step name only, and one without a st
 });
 
 test("the usual time is the median of recent seconds, and absent below three samples", () => {
-  assert.equal(usualSeconds([{ seconds: 10 }, { seconds: 30 }, { seconds: 20 }]), 20);
-  assert.equal(usualSeconds([{ seconds: 10 }, { seconds: 30 }, { seconds: 20 }, { seconds: 40 }]), 25);
-  assert.equal(usualSeconds([{ seconds: 10 }, { seconds: 30 }]), null);
-  assert.equal(usualSeconds([{ seconds: 10 }, { seconds: null }, { seconds: "x" }, { seconds: 30 }]), null);
+  assert.equal(usualSeconds([{ seconds: 100 }, { seconds: 300 }, { seconds: 200 }]), 200);
+  assert.equal(usualSeconds([{ seconds: 100 }, { seconds: 300 }, { seconds: 200 }, { seconds: 400 }]), 250);
+  assert.equal(usualSeconds([{ seconds: 100 }, { seconds: 300 }]), null);
+  assert.equal(usualSeconds([{ seconds: 100 }, { seconds: null }, { seconds: "x" }, { seconds: 300 }]), null);
   assert.equal(usualSeconds(undefined), null);
+});
+
+test("the usual time leaves out batches under a minute", () => {
+  const of = (...seconds) => usualSeconds(seconds.map((value) => ({ seconds: value })));
+  assert.equal(of(20, 22, 25, 250, 283, 300), 283);
+  assert.equal(of(20, 30, 250, 300), null);
+  assert.equal(of(59, 60, 61, 62), 61);
+  assert.equal(MIN_USUAL_SECONDS, 60);
 });
 
 test("the running batch shows its step n/m, elapsed time, and a progress bar only when the usual time is known", () => {
@@ -1479,6 +1487,60 @@ test("the running batch shows its step n/m, elapsed time, and a progress bar onl
   assert.equal(late.longer, true);
   delete data.batch.steps;
   assert.equal(batch(NOW).stepText, "test");
+});
+
+const stepBarOf = (batch) => {
+  const data = quiet();
+  data.batch = { prs: [12], started_ms: NOW - 1000, ...batch };
+  return interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0];
+};
+const states = (batch) => stepBarOf(batch).stepBar.map((s) => s.state);
+
+test("the step bar marks done, current and later steps from the step list", () => {
+  const steps = ["fmt", "clippy", "test"];
+  for (const phase of ["verifying", "bisecting"]) {
+    const bar = stepBarOf({ phase, steps, step: "clippy" }).stepBar;
+    assert.deepEqual(bar, [
+      { name: "fmt", state: "done" },
+      { name: "clippy", state: "current" },
+      { name: "test", state: "todo" },
+    ]);
+  }
+  assert.deepEqual(states({ phase: "verifying", steps, step: "other" }), ["todo", "todo", "todo"]);
+  assert.deepEqual(states({ phase: "verifying", steps }), ["todo", "todo", "todo"]);
+  assert.deepEqual(states({ steps, step: "test" }), ["done", "done", "current"]);
+  assert.deepEqual(states({ phase: "nonsense", steps, step: "fmt" }), ["current", "todo", "todo"]);
+  const odd = stepBarOf({ phase: "verifying", steps: ["fmt", 1, null, "", "test"], step: "test" }).stepBar;
+  assert.deepEqual(odd.map((s) => s.name), ["fmt", "test"]);
+  assert.deepEqual(odd.map((s) => s.state), ["done", "current"]);
+});
+
+test("the step bar is all done while pushing and all later while building", () => {
+  const steps = ["fmt", "clippy", "test"];
+  assert.deepEqual(states({ phase: "pushing", steps, step: "clippy" }), ["done", "done", "done"]);
+  assert.deepEqual(states({ phase: "building", steps, step: "clippy" }), ["todo", "todo", "todo"]);
+});
+
+test("a batch without a step list has no step bar", () => {
+  assert.deepEqual(stepBarOf({ phase: "verifying", step: "test" }).stepBar, []);
+  assert.deepEqual(stepBarOf({ phase: "verifying", steps: [], step: "test" }).stepBar, []);
+  assert.equal(stepBarOf({ phase: "verifying", step: "test" }).stepText, "test");
+  assert.equal(stepBarOf({ phase: "verifying", steps: [], step: "test" }).stepText, "test");
+  assert.equal(stepBarOf({ phase: "verifying" }).stepText, null);
+});
+
+test("the phase line joins the phase, the round and the reused pass", () => {
+  const data = quiet();
+  data.batch = clone(fixture.batch);
+  const line = () => interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0].phaseLine;
+  assert.equal(line(), "Verifying · Round 1 · Reused preflight pass");
+  delete data.batch.phase;
+  assert.equal(line(), "Verifying · Round 1 · Reused preflight pass");
+  delete data.batch.round;
+  delete data.batch.reused;
+  assert.equal(line(), "Verifying");
+  data.batch.phase = "pushing";
+  assert.equal(line(), "Pushing");
 });
 
 test("a batch without started_ms shows no usual time, elapsed time or progress even when the usual time is known", () => {
@@ -2142,20 +2204,6 @@ test("the daemon is running, idle with an empty queue, off only with a queue, an
 test("a repo whose hub is unreachable has an unknown daemon", () => {
   const repo = only(unreachable);
   assert.equal(repo.daemon.state, "unknown");
-});
-
-test("the batch stage is the index of the phase, and null for a missing or unknown phase", () => {
-  const stageOf = (phase) => {
-    const data = clone(fixture);
-    if (phase === undefined) delete data.batch.phase;
-    else data.batch.phase = phase;
-    return section(only(data), "batch").items[0].stage;
-  };
-  assert.deepEqual(["building", "verifying", "bisecting", "pushing"].map(stageOf), [0, 1, 2, 3]);
-  assert.deepEqual(STAGE_NAMES, ["Building", "Verifying", "Bisecting", "Pushing"]);
-  for (const odd of [undefined, null, "waiting", "", "Verifying", "toString", "constructor", 1, ["building"]]) {
-    assert.equal(stageOf(odd), null, JSON.stringify(odd));
-  }
 });
 
 test("tint gives #rrggbbaa for #rgb, #rrggbb and #rrggbbaa, and null for anything else", () => {
