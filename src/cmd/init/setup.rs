@@ -74,8 +74,6 @@ fn drive(
     out: &mut dyn Write,
     now: EpochMs,
 ) -> Result<ExitCode> {
-    // The diff the user agreed to, and the setup branch heads (theirs or ones this run pushed)
-    // that the agreement covers.
     let mut confirmed: Option<(String, Vec<Sha>)> = None;
     for _ in 0..MAX_ATTEMPTS {
         let Some(ready) = prepare(args, ctx, out, now)? else {
@@ -1452,8 +1450,6 @@ esac
         assert_eq!(w.origin_main(), main);
     }
 
-    /// A commit with the setup tree whose parents are `setup` and an unrelated root commit that
-    /// holds `secret.txt`, pushed over `chute/setup`. Returns it and the root commit.
     fn push_head_with_an_extra_parent(w: &World, setup: &str) -> (String, String) {
         let draft = w.work_config();
         let aside = w.sb.root().join("draft-aside");

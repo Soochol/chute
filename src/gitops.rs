@@ -867,7 +867,6 @@ impl Slot {
         Ok(Some(out.stdout))
     }
 
-    /// The parents of `commit`, in order.
     pub fn parents_of(&self, commit: &Sha) -> Result<Vec<Sha>> {
         let out = self.run(&["rev-list", "--parents", "-n", "1", commit.as_str()])?;
         out.split_whitespace()
@@ -876,7 +875,6 @@ impl Slot {
             .collect()
     }
 
-    /// The blob id of `path` in `rev`, or `None` when the path is not there.
     pub fn blob_id(&self, rev: &Sha, path: &str) -> Result<Option<Sha>> {
         let out = self.git(&["rev-parse", "--verify", "--quiet", &format!("{rev}:{path}")])?;
         if !out.success() {
@@ -887,16 +885,12 @@ impl Slot {
             .map_err(|e| anyhow!(e))
     }
 
-    /// The blob id that `git add` would store for `file` at `path`: line endings and the other
-    /// filters follow the attributes of what the slot has checked out.
     pub fn blob_id_as_added(&self, path: &str, file: &Path) -> Result<Sha> {
         let file = file.to_string_lossy();
         let out = self.run(&["hash-object", &format!("--path={path}"), "--", &file])?;
         Sha::try_from(out.trim().to_owned()).map_err(|e| anyhow!(e))
     }
 
-    /// Fetches the objects of the remote branch and returns its tip, or `None` when the branch
-    /// does not exist. No ref in the repository moves.
     pub fn fetch_remote_branch(&self, branch: &str) -> Result<Option<Sha>> {
         if self.remote_branch_tip(branch)?.is_none() {
             return Ok(None);

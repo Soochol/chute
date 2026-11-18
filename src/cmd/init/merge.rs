@@ -40,18 +40,12 @@ pub(super) struct OpenPr {
 pub(super) enum Landed {
     Merged,
     AlreadyConfigured,
-    /// The default branch moved. `head` is the setup branch head this run left behind.
-    Moved {
-        head: Sha,
-    },
+    Moved { head: Sha },
 }
 
-/// What `land` may do with a `chute/setup` that is on the remote while no PR is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Overwrite {
-    /// Stop: nobody confirmed overwriting it.
     Refuse,
-    /// The terminal user saw its head and answered yes.
     Confirmed,
 }
 
@@ -122,7 +116,6 @@ pub(super) fn find_open_pr(ctx: &Ctx, info: &RepoInfo) -> Result<Option<OpenPr>>
     }
 }
 
-/// The head of `chute/setup` on the remote, read without fetching. `None` when there is none.
 pub(super) fn remote_setup_tip(ctx: &Ctx, info: &RepoInfo) -> Result<Option<Sha>> {
     let out = ctx.ext.git(
         &info.path,
@@ -217,7 +210,6 @@ pub(super) fn land(
 fn finish(slot: &Slot, ready: &Ready, merged: &Sha, out: &mut dyn Write) -> Result<()> {
     let work = ready.info.path.join(config::FILE_NAME);
     if work.is_file() {
-        // The merge is already pushed, so a file that cannot be compared is kept, not an error.
         let same = match (
             slot.blob_id(merged, config::FILE_NAME),
             slot.blob_id_as_added(config::FILE_NAME, &work),
@@ -329,8 +321,6 @@ fn publish(
     Ok((commit, pr.number))
 }
 
-/// Lets `publish` overwrite the remote `chute/setup` at `tip` only when the terminal user saw
-/// exactly that head.
 fn overwrite_left_over(
     ready: &Ready,
     tip: &Sha,
@@ -365,8 +355,6 @@ fn build(slot: &Slot, ready: &Ready) -> Result<Sha> {
     Ok(commit)
 }
 
-/// A commit the setup can use as it is: the verified tree on top of the verified base alone.
-/// Merging it brings in nothing that the verification did not see.
 fn is_reusable(slot: &Slot, ready: &Ready, commit: &Sha) -> Result<bool> {
     Ok(slot.tree_of(commit)? == ready.tree
         && slot.parents_of(commit)? == std::slice::from_ref(&ready.base))
