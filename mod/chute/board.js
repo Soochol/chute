@@ -501,11 +501,12 @@ export function pullUrl(slug, pr) {
 }
 
 export const MIN_USUAL_SAMPLES = 3;
+export const MIN_USUAL_SECONDS = 60;
 
 export function usualSeconds(recent) {
   const samples = list(recent)
     .map((r) => (isObject(r) ? r.seconds : null))
-    .filter((v) => Number.isFinite(v) && v >= 0)
+    .filter((v) => Number.isFinite(v) && v >= MIN_USUAL_SECONDS)
     .sort((a, b) => a - b);
   if (samples.length < MIN_USUAL_SAMPLES) return null;
   const mid = Math.floor(samples.length / 2);
@@ -593,12 +594,14 @@ function postVerifyOf(post, now) {
   };
 }
 
-const STAGES = Object.keys(PHASE);
-export const STAGE_NAMES = Object.values(PHASE);
-const stageOf = (phase) => {
-  const at = typeof phase === "string" ? STAGES.indexOf(phase) : -1;
-  return at >= 0 ? at : null;
-};
+function stepBarOf(phase, steps, at) {
+  return steps.map((name, i) => {
+    let state = "todo";
+    if (phase === "pushing") state = "done";
+    else if (phase !== "building" && at >= 0) state = i < at ? "done" : i === at ? "current" : "todo";
+    return { name, state };
+  });
+}
 
 function batchOf(batch, members, now, usualS, slug) {
   if (!isObject(batch) && members.length === 0) return [];
@@ -620,18 +623,22 @@ function batchOf(batch, members, now, usualS, slug) {
   const steps = list(b.steps).filter((name) => typeof name === "string" && name);
   const at = step ? steps.indexOf(step) : -1;
   const stepText = step && at >= 0 ? `${step} ${at + 1}/${steps.length}` : step;
+  const phaseName = b.phase == null ? null : named(PHASE, b.phase);
   const elapsedS = Number.isFinite(b.started_ms) ? Math.max(0, (now - b.started_ms) / 1000) : null;
+  const round = Number.isFinite(b.round) && b.round > 0 ? `Round ${b.round}` : null;
+  const reused = b.reused === "preflight" || b.reused === "batch" ? `Reused ${b.reused} pass` : null;
   const timed = usualS != null && usualS > 0 && elapsedS != null;
   return [
     {
       prs,
-      phase: b.phase == null ? null : named(PHASE, b.phase),
-      stage: stageOf(b.phase),
+      phase: phaseName,
       step,
       stepText,
+      stepBar: stepBarOf(b.phase, steps, at),
+      phaseLine: [phaseName ?? "Verifying", round, reused].filter(Boolean).join(" · "),
       waitingMachine: b.waiting_machine === true,
-      reused: b.reused === "preflight" || b.reused === "batch" ? `Reused ${b.reused} pass` : null,
-      round: Number.isFinite(b.round) && b.round > 0 ? `Round ${b.round}` : null,
+      reused,
+      round,
       elapsed: elapsedS != null ? formatDuration(elapsedS) : null,
       usual: usualS != null && elapsedS != null ? `usually ${formatDuration(usualS)}` : null,
       progress: timed ? Math.min(1, elapsedS / usualS) : null,

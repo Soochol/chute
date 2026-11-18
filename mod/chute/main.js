@@ -35,7 +35,6 @@ import {
   overviewText,
   pollInterval,
   recentWindow,
-  STAGE_NAMES,
   tint,
   toggleFold,
   toneToken,
@@ -589,8 +588,10 @@ export default class Chute extends View {
     const approval = repo.approval ? ` · ${repo.approval}` : "";
     const color = toneColor(repo.status.tone, t);
     const status = folded || repo.quiet ? repo.summary : repo.status.text;
-    return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx))
+    const statusColor = repo.status.tone === "waiting" ? t.muted : repo.status.tone === "ok" ? t.foreground : color;
+    const first = h_flex()
       .items_center()
+      .gap(8)
       .child(chevron(t, folded ? "▸" : "▾"))
       .child(
         div()
@@ -606,7 +607,28 @@ export default class Chute extends View {
       )
       .child(div().id(`name-${repo.id}`).flex_shrink(0).max_w(140).truncate().font_semibold().tooltip(`${repo.slug}${approval}`).child(repo.name))
       .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1, t)))
-      .child(div().flex_1())
+      .child(div().flex_1());
+    if (this.narrow) {
+      return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx)).child(
+        v_flex()
+          .flex_1()
+          .min_w(0)
+          .child(first)
+          .child(
+            div()
+              .id(`status-${repo.id}`)
+              .pl(HEAD_INDENT)
+              .text_size(12)
+              .text_color(statusColor)
+              .whitespace_normal()
+              .tooltip(status)
+              .child(status),
+          ),
+      );
+    }
+    return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx))
+      .items_center()
+      .child(first.flex_1().min_w(0))
       .child(
         h_flex()
           .id(`status-${repo.id}`)
@@ -614,14 +636,7 @@ export default class Chute extends View {
           .gap(6)
           .items_center()
           .tooltip(status)
-          .child(
-            div()
-              .min_w(0)
-              .truncate()
-              .text_size(12)
-              .text_color(repo.status.tone === "waiting" ? t.muted : repo.status.tone === "ok" ? t.foreground : color)
-              .child(status),
-          ),
+          .child(div().min_w(0).truncate().text_size(12).text_color(statusColor).child(status)),
       );
   }
 
@@ -951,6 +966,8 @@ const dot = (color, active = false) =>
     .bg(color)
     .when(active, (el) => el.loop("opacity", { from: 1, to: 0.35, period: 1600 }));
 
+// chevron (10) + gap (8) + daemon dot (10) + gap (8)
+const HEAD_INDENT = 36;
 const chevron = (t, mark = "›") => div().flex_none().w(10).text_color(t.dim).text_right().child(mark);
 
 function iconButton(id, label, t, onClick, tip) {
@@ -1209,7 +1226,11 @@ function submitterLine(submitter, t) {
 
 function batchView(repo, batch, t, narrow) {
   const step = batch.waitingMachine ? "Waiting for a slot" : batch.stepText ?? batch.phase ?? "Verifying";
-  const facts = [batch.round, batch.reused].filter(Boolean);
+  const bar = batch.stepBar;
+  const at = bar.findIndex((s) => s.state === "current");
+  const names = (state) => bar.filter((s) => s.state === state).map((s) => s.name);
+  const done = names("done");
+  const todo = names("todo");
   const fill = batch.waitingMachine ? t.muted : batch.longer ? t.ansi3 : t.working;
   return v_flex()
     .gap(6)
@@ -1247,34 +1268,54 @@ function batchView(repo, batch, t, narrow) {
         }),
       ),
     )
-    .child(
-      h_flex()
-        .gap(4)
-        .px(6)
-        .children(
-          STAGE_NAMES.map((name, i) => {
-            const current = i === batch.stage;
-            return v_flex()
-              .id(`stage-${repo.id}-${name}`)
-              .flex_1()
-              .min_w(0)
-              .gap(3)
-              .child(div().h(4).rounded(2).bg(current ? fill : t.border))
-              .child(div().truncate().text_size(11).text_color(current ? t.foreground : t.dim).child(name));
-          }),
-        ),
+    .when(bar.length > 0, (el) =>
+      el.child(
+        h_flex()
+          .gap(3)
+          .px(6)
+          .children(
+            bar.map((s, i) =>
+              div()
+                .id(`step-${repo.id}-${i}`)
+                .flex_1()
+                .min_w(0)
+                .h(4)
+                .rounded(2)
+                .bg(s.state === "done" ? t.ansi2 : s.state === "current" ? fill : t.border)
+                .tooltip(s.name),
+            ),
+          ),
+      ),
+    )
+    .when(done.length > 0, (el) =>
+      el.child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(`✓ ${done.join(" · ")}`)),
     )
     .child(
       h_flex()
         .gap(8)
         .px(6)
         .items_baseline()
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.working).child(step))
+        .child(
+          div()
+            .flex_1()
+            .min_w(0)
+            .when(bar.length === 0, (d) => d.truncate())
+            .text_size(12)
+            .text_color(batch.waitingMachine ? t.muted : t.working)
+            .child(
+              bar.length === 0 || batch.waitingMachine
+                ? step
+                : at >= 0
+                  ? `▸ ${bar[at].name}  ${at + 1} of ${bar.length}`
+                  : step,
+            ),
+        )
         .when(batch.longer, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi3).child("Slower than usual"))),
     )
-    .when(facts.length > 0, (el) =>
-      el.child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(facts.join(" · "))),
-    );
+    .when(todo.length > 0 && bar.length > 0, (el) =>
+      el.child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(`○ ${todo.join(" · ")}`)),
+    )
+    .child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(batch.phaseLine));
 }
 
 function postVerifyView(post, t) {
