@@ -160,6 +160,20 @@ pub fn known_flaky(
     tests: &[String],
     except: &BatchId,
 ) -> bool {
+    !tests.is_empty()
+        && ledger_tests(events, now, days, step, tests, Some(except)).len() == tests.len()
+}
+
+/// The tests among `tests` that a flaky record of `step` within the last `days` days names. A
+/// record of `except` does not count when it is given.
+pub fn ledger_tests(
+    events: &[Event],
+    now: EpochMs,
+    days: u32,
+    step: &str,
+    tests: &[String],
+    except: Option<&BatchId>,
+) -> Vec<String> {
     let since = window_start(now, days);
     let recorded: Vec<&[String]> = events
         .iter()
@@ -170,14 +184,15 @@ pub fn known_flaky(
                 step: recorded,
                 tests,
                 ..
-            } if batch != except && recorded == step => Some(tests.as_slice()),
+            } if Some(batch) != except && recorded == step => Some(tests.as_slice()),
             _ => None,
         })
         .collect();
-    !tests.is_empty()
-        && tests
-            .iter()
-            .all(|test| recorded.iter().any(|named| named.contains(test)))
+    tests
+        .iter()
+        .filter(|test| recorded.iter().any(|named| named.contains(test)))
+        .cloned()
+        .collect()
 }
 
 /// The sign of flakiness in a solo failure, with the tests to record if the verification run

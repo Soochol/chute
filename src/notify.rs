@@ -1147,6 +1147,7 @@ mod tests {
             failed_tests: Vec::new(),
             log: "/l".into(),
             tree: sha("abcdef1234567"),
+            evidence: None,
         };
         assert_eq!(
             mode_of(&Failure::Verify(step(VerifyMode::Solo))),

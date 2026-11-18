@@ -555,6 +555,39 @@ pub struct StepFailure {
     pub failed_tests: Vec<String>,
     pub log: PathBuf,
     pub tree: Sha,
+    /// What chute observed while judging a solo failure. Absent for older records and for
+    /// failures judged without it (preflight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Box<SoloEvidence>>,
+}
+
+/// The facts behind a solo failure, as far as chute checked them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoloEvidence {
+    /// How the base branch was checked, `None` when the failure was reported without checking it.
+    #[serde(default)]
+    pub base: Option<BaseCheck>,
+    /// How many times this batch verified the PR's tree. Every verification failed.
+    pub runs: u32,
+    /// The tests each attempt of the failed step on the PR's tree named, oldest first. A
+    /// verification runs a failed step a second time, so there can be more attempts than runs. An
+    /// attempt that named no test is an empty list.
+    pub attempts: Vec<Vec<String>>,
+    /// The days the ledger was read over (`flaky.chronic_days`).
+    #[serde(default)]
+    pub ledger_days: u32,
+    /// Failed tests that the flaky ledger holds for this step within `ledger_days`.
+    #[serde(default)]
+    pub ledger_tests: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseCheck {
+    /// This batch ran the base branch and it passed.
+    RanInThisBatch,
+    /// The base branch is one chute verified earlier, so this batch did not run it.
+    VerifiedEarlier,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1835,6 +1868,7 @@ mod tests {
             failed_tests: vec!["a::b".into()],
             log: "/s/log".into(),
             tree: sha("abc1234"),
+            evidence: None,
         };
         let failures = [
             Failure::Conflict {

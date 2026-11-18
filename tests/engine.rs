@@ -3243,6 +3243,71 @@ fn a_solo_failure_whose_attempts_name_different_tests_again_is_bounced_after_one
     assert_eq!(step.failed_tests, ["test_d"]);
 }
 
+fn bounce_report(lab: &Lab, pr: u64) -> (String, serde_json::Value) {
+    let report = lab.item(pr).unwrap().last_failure.unwrap().report;
+    let md = fs::read_to_string(&report).unwrap();
+    let json = fs::read_to_string(report.with_extension("json")).unwrap();
+    (md, serde_json::from_str(&json).unwrap())
+}
+
+#[test]
+fn a_solo_bounce_report_says_the_base_was_verified_earlier_and_not_run_again() {
+    let lab = lab_on_a_pushed_base();
+    queue_by_orchestrator(&lab, 2, &[("BAD", "")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[2]));
+    let (md, json) = bounce_report(&lab, 2);
+    assert!(!md.contains("원인이다"), "{md}");
+    assert!(
+        md.contains("- 기준 브랜치: chute가 앞서 검증한 커밋이라 이 batch에서는 돌리지 않았다"),
+        "{md}"
+    );
+    assert!(md.contains("(1번 돌려 1번 실패)"), "{md}");
+    let evidence = &json["failure"]["evidence"];
+    assert_eq!(evidence["base"], "verified_earlier", "{json}");
+    assert_eq!(evidence["runs"], 1, "{json}");
+    assert_eq!(
+        evidence["attempts"],
+        serde_json::json!([["bad_test"], ["bad_test"]]),
+        "검증은 실패한 단계를 한 번 더 돌린다"
+    );
+}
+
+#[test]
+fn a_solo_bounce_after_one_more_verification_reports_two_failed_runs() {
+    let lab = Lab::new(&scripted_failures(&[
+        &["test_a"],
+        &["test_b"],
+        &["test_c"],
+        &["test_d"],
+    ]));
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let (md, json) = bounce_report(&lab, 1);
+    assert!(!md.contains("원인이다"), "{md}");
+    assert!(md.contains("(2번 돌려 2번 실패)"), "{md}");
+    assert!(
+        md.contains("- 기준 브랜치: 이 batch에서 돌려 통과했다"),
+        "{md}"
+    );
+    assert!(md.contains("서로 달랐다"), "{md}");
+    for test in ["test_a", "test_b", "test_c", "test_d"] {
+        assert!(md.contains(test), "{test}: {md}");
+    }
+    let evidence = &json["failure"]["evidence"];
+    assert_eq!(evidence["base"], "ran_in_this_batch", "{json}");
+    assert_eq!(evidence["runs"], 2, "{json}");
+    assert_eq!(
+        evidence["attempts"],
+        serde_json::json!([["test_a"], ["test_b"], ["test_c"], ["test_d"]])
+    );
+}
+
 #[test]
 fn a_solo_failure_of_a_test_another_batch_recorded_as_flaky_is_verified_again() {
     let lab = Lab::build(

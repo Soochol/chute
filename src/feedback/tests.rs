@@ -152,6 +152,7 @@ impl Lab {
             failed_tests: tests.iter().map(|t| (*t).to_owned()).collect(),
             log,
             tree: sha(&self.repo.head()),
+            evidence: None,
         }
     }
 
@@ -2405,7 +2406,8 @@ fn a_preflight_report_talks_about_a_commit_not_a_pr_and_names_the_folder_once() 
         .unwrap();
 
     let md = read(&solo.md);
-    assert!(md.contains("기준 브랜치에 이 커밋만 얹어도"), "{md}");
+    assert!(md.contains("기준 브랜치에 이 커밋만 얹은 트리에서"), "{md}");
+    assert!(!md.contains("원인이다"), "{md}");
     assert!(!md.contains("이 PR"), "{md}");
     let repro = solo.doc.step.unwrap().repro.join("\n");
     let twice = format!("{0}-{0}", short(&commit));
@@ -4333,4 +4335,182 @@ fn a_parcel_without_env_from_an_older_hub_still_decodes() {
         panic!("반송 묶음이어야 한다");
     };
     assert_eq!(env, &None);
+}
+
+fn evidence(base: Option<BaseCheck>, attempts: &[&[&str]], ledger: &[&str]) -> SoloEvidence {
+    let names = |list: &[&str]| list.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+    SoloEvidence {
+        base,
+        runs: 1,
+        attempts: attempts.iter().map(|a| names(a)).collect(),
+        ledger_days: 30,
+        ledger_tests: names(ledger),
+    }
+}
+
+fn solo_report_md(lab: &Lab, tests: &[&str], evidence: Option<SoloEvidence>) -> String {
+    let item = lab.item(12, "feat/b");
+    let failure = Failure::Verify(StepFailure {
+        evidence: evidence.map(Box::new),
+        ..lab.step(VerifyMode::Solo, tests, lab.log("x\n"))
+    });
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &failure, None)
+        .unwrap();
+    let md = read(&written.md);
+    assert!(!md.contains("원인이다"), "{md}");
+    md
+}
+
+#[test]
+fn a_solo_report_says_the_base_passed_in_this_batch() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let mut found = evidence(
+        Some(BaseCheck::RanInThisBatch),
+        &[&["a::b"], &["a::b"]],
+        &[],
+    );
+    found.runs = 2;
+
+    let md = solo_report_md(&lab, &["a::b"], Some(found));
+
+    assert!(md.contains("(2번 돌려 2번 실패)"), "{md}");
+    assert!(
+        md.contains("- 기준 브랜치: 이 batch에서 돌려 통과했다"),
+        "{md}"
+    );
+    assert!(
+        md.contains("최근 30일 장부에 이 단계의 흔들림 기록이 있는 실패 시험은 없다"),
+        "{md}"
+    );
+}
+
+#[test]
+fn a_solo_report_says_the_base_was_taken_from_an_earlier_verification() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+
+    let earlier = solo_report_md(
+        &lab,
+        &["a::b"],
+        Some(evidence(
+            Some(BaseCheck::VerifiedEarlier),
+            &[&["a::b"]],
+            &[],
+        )),
+    );
+    let unchecked = solo_report_md(&lab, &["a::b"], Some(evidence(None, &[&["a::b"]], &[])));
+
+    assert!(
+        earlier
+            .contains("- 기준 브랜치: chute가 앞서 검증한 커밋이라 이 batch에서는 돌리지 않았다"),
+        "{earlier}"
+    );
+    assert!(
+        unchecked.contains("- 기준 브랜치: 확인하지 않았다"),
+        "{unchecked}"
+    );
+}
+
+#[test]
+fn a_solo_report_names_the_failed_tests_the_flaky_ledger_has() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+
+    let md = solo_report_md(
+        &lab,
+        &["a::known", "a::new"],
+        Some(evidence(
+            Some(BaseCheck::RanInThisBatch),
+            &[&["a::known", "a::new"]],
+            &["a::known"],
+        )),
+    );
+
+    assert!(
+        md.contains("최근 30일 장부에 이 단계의 흔들림 기록이 있는 실패 시험: `a::known`"),
+        "{md}"
+    );
+}
+
+#[test]
+fn a_solo_report_shows_the_tests_of_both_attempts_when_they_differ() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+
+    let different = solo_report_md(
+        &lab,
+        &["a::second"],
+        Some(evidence(
+            Some(BaseCheck::RanInThisBatch),
+            &[&["a::first"], &["a::second"]],
+            &[],
+        )),
+    );
+    let same = solo_report_md(
+        &lab,
+        &["a::first"],
+        Some(evidence(
+            Some(BaseCheck::RanInThisBatch),
+            &[&["a::first"], &["a::first"]],
+            &[],
+        )),
+    );
+
+    assert!(different.contains("서로 달랐다"), "{different}");
+    assert!(different.contains("1번째 시도: `a::first`"), "{different}");
+    assert!(different.contains("2번째 시도: `a::second`"), "{different}");
+    assert!(same.contains("모든 시도에서 같았다"), "{same}");
+    assert!(!same.contains("번째 시도"), "{same}");
+}
+
+#[test]
+fn a_solo_report_without_evidence_states_only_what_happened() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+
+    let md = solo_report_md(&lab, &["a::b"], None);
+
+    assert!(
+        md.contains("- 범위: 단독. 기준 브랜치에 이 PR만 얹은 트리에서 같은 단계가 실패했다"),
+        "{md}"
+    );
+    assert!(
+        !md.contains("- 기준 브랜치:") && !md.contains("- 장부:"),
+        "{md}"
+    );
+}
+
+#[test]
+fn a_report_json_and_a_state_without_the_evidence_field_still_load() {
+    let lab = Lab::new();
+    let failure = Failure::Verify(lab.step(VerifyMode::Solo, &["a::b"], lab.log("x\n")));
+    let mut json = serde_json::to_value(&failure).unwrap();
+    assert!(json.get("evidence").is_none(), "{json}");
+    json.as_object_mut().unwrap().remove("evidence");
+    assert_eq!(serde_json::from_value::<Failure>(json).unwrap(), failure);
+
+    let record = serde_json::json!({
+        "kind": "verify", "mode": "solo", "step": "test", "failed_tests": ["a::b"],
+        "log": "/s/log", "tree": "abc1234",
+        "summary": "s", "report": "/s/r.md", "at_ms": 1
+    });
+    let old: FailureRecord = serde_json::from_value(record).unwrap();
+    let Failure::Verify(step) = old.failure else {
+        panic!("검증 실패여야 한다");
+    };
+    assert_eq!(step.evidence, None);
+
+    let with = Failure::Verify(StepFailure {
+        evidence: Some(Box::new(evidence(
+            Some(BaseCheck::VerifiedEarlier),
+            &[&["a::b"]],
+            &["a::b"],
+        ))),
+        ..lab.step(VerifyMode::Solo, &["a::b"], lab.log("x\n"))
+    });
+    let text = serde_json::to_string(&with).unwrap();
+    assert_eq!(serde_json::from_str::<Failure>(&text).unwrap(), with);
 }

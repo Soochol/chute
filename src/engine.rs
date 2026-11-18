@@ -23,11 +23,11 @@ use crate::gitops::{
     FAILED_REF_PREFIX, Gitops, ItemResult, MergeItem, PrHead, PushOutcome, Slot, SlotLock, SlotName,
 };
 use crate::model::{
-    Agent, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason, EpochMs,
-    Event, EventKind, Failure, Flaky, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
+    Agent, BaseCheck, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason,
+    EpochMs, Event, EventKind, Failure, Flaky, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
     ProbeEvidence, QueueItem, QueuedReason, RemovedReason, RepoInfo, Rerun, RerunSignal, ResumedBy,
-    Reused, Sha, SkippedStep, State, StepFailure, TreeKey, VerifiedBy, VerifiedTree, VerifyMode,
-    Warning, WarningKind,
+    Reused, Sha, SkippedStep, SoloEvidence, State, StepFailure, TreeKey, VerifiedBy, VerifiedTree,
+    VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, Removal, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
@@ -701,6 +701,8 @@ impl Engine {
             repairing,
             reran: BTreeSet::new(),
             rerunning: None,
+            earlier_attempts: BTreeMap::new(),
+            bases_ran: BTreeSet::new(),
         };
         let result = run.execute(&taken);
         let only_deferred = run.only_deferred();
@@ -930,6 +932,16 @@ struct Run<'e> {
     repairing: bool,
     reran: BTreeSet<PrNumber>,
     rerunning: Option<Rerunning>,
+    /// The tests each earlier run of a rerun PR's failed step named.
+    earlier_attempts: BTreeMap<PrNumber, Vec<Vec<String>>>,
+    /// Bases this batch ran and found sound.
+    bases_ran: BTreeSet<Sha>,
+}
+
+/// The result of checking a base: how it was found sound, or why it is broken.
+enum BaseVerdict {
+    Sound(BaseCheck),
+    Broken(Failed),
 }
 
 struct Rerunning {
@@ -1772,12 +1784,19 @@ impl Run<'_> {
         {
             return self.rerun(pr, &failed, signal, tests, &tip);
         }
+        let mut base_check = None;
         if !self.repairing {
             match &blame {
-                Blame::Solo { base } => self.confirm_solo_base(pr, base)?,
-                Blame::Combo(_) => self.require_sound_base(&b.base)?,
+                Blame::Solo { base } => base_check = Some(self.confirm_solo_base(pr, base)?),
+                Blame::Combo(_) => {
+                    self.require_sound_base(&b.base)?;
+                }
             }
         }
+        let evidence = match &blame {
+            Blame::Solo { .. } => Some(self.solo_evidence(pr, &failed, base_check)?),
+            Blame::Combo(_) => None,
+        };
         let item = self.items[&pr].clone();
         let mode = match blame {
             Blame::Solo { .. } => VerifyMode::Solo,
@@ -1796,10 +1815,40 @@ impl Run<'_> {
                 }
             }
         };
-        let failure = step_failure(&failed, mode, &tip);
+        let failure = step_failure(&failed, mode, &tip, evidence);
         let name = format!("pr{}-{}", pr.0, self.id().0);
         self.engine.gitops.set_failed_ref(&name, &tip)?;
         self.bounce(pr, failure, Some(&name))
+    }
+
+    fn solo_evidence(
+        &self,
+        pr: PrNumber,
+        failed: &Failed,
+        base: Option<BaseCheck>,
+    ) -> Result<SoloEvidence> {
+        let mut attempts = self.earlier_attempts.get(&pr).cloned().unwrap_or_default();
+        attempts.extend(attempts_of(failed));
+        let ledger_days = self.config.flaky.chronic_days;
+        let ledger_tests = flaky::ledger_tests(
+            &self.engine.store.history()?.events,
+            EpochMs::now(),
+            ledger_days,
+            &failed.step,
+            &failed.tests(),
+            None,
+        );
+        Ok(SoloEvidence {
+            base,
+            runs: if self.earlier_attempts.contains_key(&pr) {
+                2
+            } else {
+                1
+            },
+            attempts,
+            ledger_days,
+            ledger_tests,
+        })
     }
 
     fn rerun_signal(
@@ -1828,6 +1877,7 @@ impl Run<'_> {
         failed_tree: &Sha,
     ) -> Result<()> {
         self.reran.insert(pr);
+        self.earlier_attempts.insert(pr, attempts_of(failed));
         self.record.reruns.push(Rerun {
             pr,
             step: failed.step.clone(),
@@ -1867,10 +1917,14 @@ impl Run<'_> {
         }
     }
 
-    fn check_base(&mut self, base: &Sha, again: bool) -> Result<Option<Failed>> {
+    fn check_base(&mut self, base: &Sha, again: bool) -> Result<BaseVerdict> {
         let engine = self.engine;
         if !again && engine.store.load()?.verified_bases.contains(base) {
-            return Ok(None);
+            return Ok(BaseVerdict::Sound(if self.bases_ran.contains(base) {
+                BaseCheck::RanInThisBatch
+            } else {
+                BaseCheck::VerifiedEarlier
+            }));
         }
         self.slot.checkout(base)?;
         match self.verify(base, Scope::Whole, false)? {
@@ -1881,24 +1935,28 @@ impl Run<'_> {
                     }
                     Ok(())
                 })?;
-                Ok(None)
+                self.bases_ran.insert(base.clone());
+                Ok(BaseVerdict::Sound(BaseCheck::RanInThisBatch))
             }
-            Verdict::Fail(failed) => Ok(Some(failed)),
+            Verdict::Fail(failed) => Ok(BaseVerdict::Broken(failed)),
         }
     }
 
     fn base_sound(&mut self, base: &Sha) -> Result<bool> {
-        Ok(self.check_base(base, false)?.is_none())
+        Ok(matches!(
+            self.check_base(base, false)?,
+            BaseVerdict::Sound(_)
+        ))
     }
 
-    fn require_sound_base(&mut self, base: &Sha) -> Result<()> {
+    fn require_sound_base(&mut self, base: &Sha) -> Result<BaseCheck> {
         match self.check_base(base, false)? {
-            None => Ok(()),
-            Some(failed) => self.halt(base, &failed, false),
+            BaseVerdict::Sound(check) => Ok(check),
+            BaseVerdict::Broken(failed) => self.halt(base, &failed, false),
         }
     }
 
-    fn confirm_solo_base(&mut self, pr: PrNumber, base: &Sha) -> Result<()> {
+    fn confirm_solo_base(&mut self, pr: PrNumber, base: &Sha) -> Result<BaseCheck> {
         let engine = self.engine;
         let doubted = engine
             .store
@@ -1907,11 +1965,11 @@ impl Run<'_> {
             .is_some_and(|d| d.base == *base && d.prs.iter().any(|p| *p != pr));
         if doubted {
             return match self.check_base(base, true)? {
-                None => Ok(()),
-                Some(failed) => self.halt(base, &failed, true),
+                BaseVerdict::Sound(check) => Ok(check),
+                BaseVerdict::Broken(failed) => self.halt(base, &failed, true),
             };
         }
-        self.require_sound_base(base)?;
+        let check = self.require_sound_base(base)?;
         engine.store.update(|s| {
             let mut doubt = match s.base_doubt.take() {
                 Some(d) if d.base == *base => d,
@@ -1925,7 +1983,8 @@ impl Run<'_> {
             }
             s.base_doubt = Some(doubt);
             Ok(())
-        })
+        })?;
+        Ok(check)
     }
 
     fn clear_base_doubt(&self) -> Result<()> {
@@ -1939,7 +1998,7 @@ impl Run<'_> {
         })
     }
 
-    fn halt(&mut self, base: &Sha, failed: &Failed, rechecked: bool) -> Result<()> {
+    fn halt<T>(&mut self, base: &Sha, failed: &Failed, rechecked: bool) -> Result<T> {
         let engine = self.engine;
         let pushed_by_chute = self.pushed_by_chute(base);
         engine.store.update(|s| {
@@ -2200,7 +2259,19 @@ fn unreachable_of(delivery: &Delivery) -> Option<String> {
     }
 }
 
-fn step_failure(failed: &Failed, mode: VerifyMode, tree: &Sha) -> Failure {
+/// The tests each attempt of the failed step named, oldest first.
+fn attempts_of(failed: &Failed) -> Vec<Vec<String>> {
+    let mut attempts: Vec<Vec<String>> = failed.first_attempt_tests.iter().cloned().collect();
+    attempts.push(failed.tests());
+    attempts
+}
+
+fn step_failure(
+    failed: &Failed,
+    mode: VerifyMode,
+    tree: &Sha,
+    evidence: Option<SoloEvidence>,
+) -> Failure {
     let failed_tests = match &failed.detail {
         Detail::Tests(tests) => tests.to_vec(),
         Detail::Tail(_) => Vec::new(),
@@ -2211,6 +2282,7 @@ fn step_failure(failed: &Failed, mode: VerifyMode, tree: &Sha) -> Failure {
         failed_tests,
         log: failed.log.clone(),
         tree: tree.clone(),
+        evidence: evidence.map(Box::new),
     };
     match failed.cause {
         Cause::TimedOut => Failure::Timeout(step),
@@ -2275,12 +2347,12 @@ mod tests {
         let tests = NonEmpty::new(vec!["a::b".to_owned()]).unwrap();
         let timed_out = failed(Cause::TimedOut, Detail::Tail("...".into()));
         assert!(matches!(
-            step_failure(&timed_out, VerifyMode::Solo, &tree()),
+            step_failure(&timed_out, VerifyMode::Solo, &tree(), None),
             Failure::Timeout(_)
         ));
         for cause in [Cause::Exited(1), Cause::Signaled(9)] {
             let one = failed(cause, Detail::Tests(tests.clone()));
-            let Failure::Verify(step) = step_failure(&one, VerifyMode::Solo, &tree()) else {
+            let Failure::Verify(step) = step_failure(&one, VerifyMode::Solo, &tree(), None) else {
                 panic!("검증 실패여야 한다");
             };
             assert_eq!(step.failed_tests, ["a::b"]);
@@ -2292,7 +2364,7 @@ mod tests {
     #[test]
     fn a_failure_without_test_names_carries_none() {
         let one = failed(Cause::Exited(2), Detail::Tail("끝부분".into()));
-        let Failure::Verify(step) = step_failure(&one, VerifyMode::Solo, &tree()) else {
+        let Failure::Verify(step) = step_failure(&one, VerifyMode::Solo, &tree(), None) else {
             panic!("검증 실패여야 한다");
         };
         assert!(step.failed_tests.is_empty());
