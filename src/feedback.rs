@@ -895,7 +895,6 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
     out.push(String::new());
 }
 
-/// States what chute observed about a solo failure. It does not say who caused it.
 fn render_solo_scope(
     out: &mut Vec<String>,
     this: &str,

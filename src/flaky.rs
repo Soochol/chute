@@ -164,8 +164,6 @@ pub fn known_flaky(
         && ledger_tests(events, now, days, step, tests, Some(except)).len() == tests.len()
 }
 
-/// The tests among `tests` that a flaky record of `step` within the last `days` days names. A
-/// record of `except` does not count when it is given.
 pub fn ledger_tests(
     events: &[Event],
     now: EpochMs,

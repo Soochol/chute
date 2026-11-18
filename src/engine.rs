@@ -932,21 +932,16 @@ struct Run<'e> {
     repairing: bool,
     reran: BTreeSet<PrNumber>,
     rerunning: Option<Rerunning>,
-    /// The tests each earlier run of a rerun PR's failed step named.
     earlier_attempts: BTreeMap<PrNumber, EarlierRun>,
-    /// Bases this batch ran and found sound.
     bases_ran: BTreeSet<Sha>,
 }
 
-/// The failed verification that made chute run a PR again, as far as a report may count it: only
-/// a later failure of the same step on the same base continues it.
 struct EarlierRun {
     step: String,
     base: Sha,
     attempts: Vec<Vec<String>>,
 }
 
-/// The result of checking a base: how it was found sound, or why it is broken.
 enum BaseVerdict {
     Sound(BaseCheck),
     Broken(Failed),
@@ -2284,7 +2279,6 @@ fn unreachable_of(delivery: &Delivery) -> Option<String> {
     }
 }
 
-/// The tests each attempt of the failed step named, oldest first.
 fn attempts_of(failed: &Failed) -> Vec<Vec<String>> {
     let mut attempts: Vec<Vec<String>> = failed.first_attempt_tests.iter().cloned().collect();
     attempts.push(failed.tests());
