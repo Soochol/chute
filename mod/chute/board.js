@@ -430,7 +430,10 @@ const DAEMON_UNKNOWN = { state: "unknown", tone: "idle", text: "Daemon state unk
 
 function daemonOf(view, queue) {
   if (!isObject(view.daemon)) return DAEMON_UNKNOWN;
-  if (view.daemon.running === true) return { state: "running", tone: "ok", text: "Daemon running" };
+  if (view.daemon.running === true) {
+    const doing = typeof view.daemon.doing === "string" ? view.daemon.doing.trim() : "";
+    return { state: "running", tone: "ok", text: doing ? `Daemon running\n${doing}` : "Daemon running" };
+  }
   if (view.daemon.running !== false) return DAEMON_UNKNOWN;
   if (queue.length === 0) return { state: "idle", tone: "idle", text: "Daemon idle · queue empty" };
   return { state: "off", tone: "error", text: `Daemon off · ${queue.length} ${queue.length === 1 ? "PR" : "PRs"} in queue` };
@@ -638,17 +641,22 @@ function postVerifyAlerts(post, now, merged) {
   ];
 }
 
-function postVerifyOf(post, now) {
+function postVerifyOf(post, now, usualS) {
   if (!isObject(post)) return null;
   const green = isObject(post.last_green) ? post.last_green : null;
   const run = isObject(post.run) ? post.run : null;
   if (!green && !run) return null;
+  const runS = run && Number.isFinite(run.started_ms) ? Math.max(0, (now - run.started_ms) / 1000) : null;
+  const timed = usualS != null && runS != null;
   return {
     green: green
       ? { commit: shortSha(green.commit), ago: Number.isFinite(green.at_ms) ? formatAgo(now - green.at_ms) : "" }
       : null,
     run: run
       ? {
+          usual: timed ? formatDuration(usualS) : null,
+          progress: timed && run.waiting_machine !== true ? Math.min(1, runS / usualS) : null,
+          longer: timed && runS > usualS,
           commit: shortSha(run.commit),
           label: run.phase === "searching" ? "Finding culprit" : "Checking",
           step: str(run.step) || null,
@@ -659,16 +667,43 @@ function postVerifyOf(post, now) {
   };
 }
 
-function stepBarOf(phase, steps, at) {
-  return steps.map((name, i) => {
+const positive = (v) => (Number.isFinite(v) && v > 0 ? v : null);
+
+function stepBarOf(phase, steps, at, batch, now) {
+  const secondsOf = new Map();
+  for (const d of list(batch.done)) {
+    if (isObject(d) && typeof d.step === "string" && Number.isFinite(d.seconds)) secondsOf.set(d.step, d.seconds);
+  }
+  const usualSteps = isObject(batch.usual) ? batch.usual : {};
+  const bar = steps.map((name, i) => {
     let state = "todo";
     if (phase === "pushing") state = "done";
     else if (phase !== "building" && at >= 0) state = i < at ? "done" : i === at ? "current" : "todo";
-    return { name, state };
+    const item = { name, state };
+    if (state === "done") item.seconds = secondsOf.get(name) ?? null;
+    if (state === "current") {
+      item.elapsed = Number.isFinite(batch.step_started_ms) ? Math.max(0, (now - batch.step_started_ms) / 1000) : null;
+      item.usual = positive(usualSteps[name]);
+    }
+    return item;
   });
+  for (const name of list(batch.skipped)) {
+    if (typeof name === "string" && name && !steps.includes(name) && !bar.some((s) => s.name === name)) {
+      bar.push({ name, state: "skipped" });
+    }
+  }
+  return bar;
 }
 
-function batchOf(batch, members, now, usualS, slug) {
+const RERUN_TEXT = { known_flaky: "rerun: known flaky", different_tests: "rerun: different tests" };
+
+function rerunTextOf(reruns) {
+  const last = list(reruns).at(-1);
+  if (!isObject(last)) return null;
+  return Object.hasOwn(RERUN_TEXT, last.signal) ? RERUN_TEXT[last.signal] : "rerun";
+}
+
+function batchOf(batch, members, now, usualS, slug, usualSteps) {
   if (!isObject(batch) && members.length === 0) return [];
   const b = isObject(batch) ? batch : {};
   const unlisted = new Map();
@@ -693,16 +728,18 @@ function batchOf(batch, members, now, usualS, slug) {
   const round = Number.isFinite(b.round) && b.round > 0 ? `Round ${b.round}` : null;
   const reused = b.reused === "preflight" || b.reused === "batch" ? `Reused ${b.reused} pass` : null;
   const timed = usualS != null && usualS > 0 && elapsedS != null;
+  const rerunText = rerunTextOf(b.reruns);
   return [
     {
       prs,
       phase: phaseName,
       step,
       stepText,
-      stepBar: stepBarOf(b.phase, steps, at),
-      phaseLine: [phaseName ?? "Verifying", round, reused].filter(Boolean).join(" · "),
+      stepBar: stepBarOf(b.phase, steps, at, { ...b, usual: usualSteps }, now),
+      phaseLine: [phaseName ?? "Verifying", round, rerunText, reused].filter(Boolean).join(" · "),
       waitingMachine: b.waiting_machine === true,
       reused,
+      rerunText,
       round,
       elapsed: elapsedS != null ? formatDuration(elapsedS) : null,
       usual: usualS != null && elapsedS != null ? `usually ${formatDuration(usualS)}` : null,
@@ -961,10 +998,12 @@ function repoBoard(view, now) {
   const recent = recentMergedOf(view, slug, now);
   const recentBatches = recentBatchesOf(view.recent);
   placed.alerts = alertsOf(view, queue, now, recent);
-  placed.batch = batchOf(view.batch, inBatch, now, usualSeconds(view.recent), slug);
+  const usual = isObject(view.usual) ? view.usual : null;
+  const batchUsual = usual ? positive(usual.batch_s) : usualSeconds(view.recent);
+  placed.batch = batchOf(view.batch, inBatch, now, batchUsual, slug, usual && isObject(usual.steps) ? usual.steps : null);
 
   const notices = noticesOf(view, queue, placed.alerts);
-  const postVerify = postVerifyOf(view.post_verify, now);
+  const postVerify = postVerifyOf(view.post_verify, now, usual ? positive(usual.post_verify_s) : null);
   const status = statusLineOf(view, queue, placed.batch[0] ?? null, placed.bounced.filter((card) => card.needs.length > 0).length);
   const quiet = SECTION_ORDER.every((id) => placed[id].length === 0) && postVerify?.run == null;
   return {

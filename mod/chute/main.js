@@ -27,6 +27,7 @@ import {
   clockText,
   diffNotices,
   failureText,
+  formatDuration,
   interpret,
   isNarrow,
   isWide,
@@ -51,6 +52,7 @@ const SHARED_KEY = "chute.status";
 const SURFACE_ALPHA = 0.06;
 const CARD_ALPHA = 0.12;
 const CHIP_ALPHA = 0.14;
+const SKIPPED_ALPHA = 0.03;
 const ICON_SIZE = 20;
 const CARD_SYMBOL = { error: "✕", warn: "△" };
 const NEED_TONE = { worker_gone: "error", last_retry: "warn" };
@@ -1291,8 +1293,16 @@ function batchView(repo, batch, t, narrow) {
   const bar = batch.stepBar;
   const at = bar.findIndex((s) => s.state === "current");
   const names = (state) => bar.filter((s) => s.state === state).map((s) => s.name);
-  const done = names("done");
+  const done = bar
+    .filter((s) => s.state === "done")
+    .map((s) => (s.seconds != null ? `${s.name} ${formatDuration(s.seconds)}` : s.name));
   const todo = names("todo");
+  const skipped = names("skipped");
+  const runCount = bar.length - skipped.length;
+  const current = at >= 0 ? bar[at] : null;
+  const currentTimes = current && current.elapsed != null
+    ? ` · ${formatDuration(current.elapsed)}${current.usual != null ? ` / ${formatDuration(current.usual)}` : ""}`
+    : "";
   const fill = batch.waitingMachine ? t.muted : batch.longer ? t.ansi3 : t.working;
   return v_flex()
     .gap(6)
@@ -1343,8 +1353,16 @@ function batchView(repo, batch, t, narrow) {
                 .min_w(0)
                 .h(4)
                 .rounded(2)
-                .bg(s.state === "done" ? t.ansi2 : s.state === "current" ? fill : t.border)
-                .tooltip(s.name),
+                .bg(
+                  s.state === "done"
+                    ? t.ansi2
+                    : s.state === "current"
+                      ? fill
+                      : s.state === "skipped"
+                        ? faded(t, t.foreground, SKIPPED_ALPHA)
+                        : t.border,
+                )
+                .tooltip(s.state === "skipped" ? `${s.name} · skipped (paths)` : s.name),
             ),
           ),
       ),
@@ -1368,7 +1386,7 @@ function batchView(repo, batch, t, narrow) {
               bar.length === 0 || batch.waitingMachine
                 ? step
                 : at >= 0
-                  ? `▸ ${bar[at].name}  ${at + 1} of ${bar.length}`
+                  ? `▸ ${bar[at].name}  ${at + 1} of ${runCount}${currentTimes}`
                   : step,
             ),
         )
@@ -1376,6 +1394,9 @@ function batchView(repo, batch, t, narrow) {
     )
     .when(todo.length > 0 && bar.length > 0, (el) =>
       el.child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(`○ ${todo.join(" · ")}`)),
+    )
+    .when(skipped.length > 0, (el) =>
+      el.child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(`– ${skipped.join(" · ")} · skipped (paths)`)),
     )
     .child(div().px(6).text_size(11).text_color(t.dim).whitespace_normal().child(batch.phaseLine));
 }
@@ -1405,17 +1426,26 @@ function postVerifyView(post, t) {
               ? `${run.commit} waiting for a slot`
 
               : `${run.commit} ${run.label}${run.step ? ` · ${run.step}` : ""}`,
-            run.elapsed,
+            run.elapsed && run.usual ? `${run.elapsed} / usually ${run.usual}` : run.elapsed,
           ),
         )
         .child(
-          div()
-            .ml(24)
-            .mr(6)
-            .h(4)
-            .rounded(2)
-            .bg(run.waitingMachine ? t.muted : t.working)
-            .when(!run.waitingMachine, (bar) => bar.loop("opacity", { from: 1, to: 0.35, period: 1600 })),
+          run.progress != null
+            ? h_flex()
+                .ml(24)
+                .mr(6)
+                .h(4)
+                .rounded(2)
+                .bg(t.border)
+                .child(div().h(4).rounded(2).flex_grow(run.progress).flex_basis(0).bg(run.longer ? t.ansi3 : t.working))
+                .child(div().h(4).flex_grow(1 - run.progress).flex_basis(0))
+            : div()
+                .ml(24)
+                .mr(6)
+                .h(4)
+                .rounded(2)
+                .bg(run.waitingMachine ? t.muted : t.working)
+                .when(!run.waitingMachine, (bar) => bar.loop("opacity", { from: 1, to: 0.35, period: 1600 })),
         ),
     );
 }

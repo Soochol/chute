@@ -1506,9 +1506,25 @@ test("the usual time leaves out batches under a minute", () => {
   assert.equal(MIN_USUAL_SECONDS, 60);
 });
 
+test("the usual batch time comes from chute when it gives one", () => {
+  const data = quiet();
+  data.batch = clone(fixture.batch);
+  data.recent = [{ seconds: 200 }, { seconds: 600 }, { seconds: 400 }];
+  const batch = () => interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0];
+  assert.equal(batch().usual, "usually 6m 40s");
+  data.usual = { ...fixture.usual, batch_s: null };
+  const none = batch();
+  assert.deepEqual([none.usual, none.progress, none.longer], [null, null, false]);
+  data.usual = "x";
+  assert.equal(batch().usual, "usually 6m 40s");
+  delete data.usual;
+  assert.equal(batch().usual, `usually ${formatDuration(usualSeconds(data.recent))}`);
+});
+
 test("the running batch shows its step n/m, elapsed time, and a progress bar only when the usual time is known", () => {
   const data = quiet();
   data.batch = clone(fixture.batch);
+  delete data.usual;
   const batch = (now) => interpret(ok(data), now).repos[0].sections.find((s) => s.id === "batch").items[0];
   assert.equal(batch(NOW).stepText, "test 3/3");
   assert.equal(batch(NOW).elapsed, "5m 12s");
@@ -1537,8 +1553,8 @@ test("the step bar marks done, current and later steps from the step list", () =
   for (const phase of ["verifying", "bisecting"]) {
     const bar = stepBarOf({ phase, steps, step: "clippy" }).stepBar;
     assert.deepEqual(bar, [
-      { name: "fmt", state: "done" },
-      { name: "clippy", state: "current" },
+      { name: "fmt", state: "done", seconds: null },
+      { name: "clippy", state: "current", elapsed: null, usual: 30 },
       { name: "test", state: "todo" },
     ]);
   }
@@ -1577,6 +1593,69 @@ test("the phase line joins the phase, the round and the reused pass", () => {
   assert.equal(line(), "Verifying");
   data.batch.phase = "pushing";
   assert.equal(line(), "Pushing");
+});
+
+test("done steps carry their time and the current step its elapsed and usual time", () => {
+  const data = quiet();
+  data.batch = clone(fixture.batch);
+  const bar = () => interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0].stepBar;
+  const full = bar();
+  assert.deepEqual(full.map((s) => [s.name, s.state, s.seconds]), [["fmt", "done", 4], ["clippy", "done", 31], ["test", "current", undefined], ["e2e", "skipped", undefined]]);
+  assert.equal(full[2].elapsed, (NOW - fixture.batch.step_started_ms) / 1000);
+  assert.equal(full[2].usual, fixture.usual.steps.test);
+  delete data.batch.done;
+  delete data.batch.step_started_ms;
+  delete data.usual;
+  const bare = bar();
+  assert.deepEqual([bare[0].seconds, bare[1].seconds, bare[2].elapsed, bare[2].usual], [null, null, null, null]);
+});
+
+test("a batch with no current step draws no elapsed time even when step_started_ms is left over", () => {
+  const data = quiet();
+  data.batch = { ...clone(fixture.batch), step: null };
+  const bar = interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0].stepBar;
+  assert.ok(bar.every((s) => s.state !== "current" && !("elapsed" in s)));
+});
+
+test("skipped steps follow the run steps in the step bar", () => {
+  const bar = (skipped) => stepBarOf({ phase: "verifying", steps: ["fmt", "test"], step: "test", skipped }).stepBar;
+  assert.deepEqual(bar(["e2e"]).at(-1), { name: "e2e", state: "skipped" });
+  assert.equal(bar(["e2e"]).length, 3);
+  assert.deepEqual(bar(["fmt", 1, null, "e2e"]).map((s) => s.name), ["fmt", "test", "e2e"]);
+  assert.equal(bar(undefined).length, 2);
+});
+
+test("the phase line names the last rerun", () => {
+  const data = quiet();
+  data.batch = clone(fixture.batch);
+  const line = () => interpret(ok(data), NOW).repos[0].sections.find((s) => s.id === "batch").items[0].phaseLine;
+  data.batch.reruns = [{ pr: 1, step: "test", failed_round: 1, signal: "different_tests", tests: [] }, { pr: 1, step: "test", failed_round: 2, signal: "known_flaky", tests: [] }];
+  assert.equal(line(), "Verifying · Round 1 · rerun: known flaky · Reused preflight pass");
+  data.batch.reruns = [{ signal: "different_tests" }];
+  assert.match(line(), /rerun: different tests/);
+  data.batch.reruns = [{ signal: "other" }];
+  assert.match(line(), /Round 1 · rerun · Reused/);
+  data.batch.reruns = [];
+  assert.equal(line(), "Verifying · Round 1 · Reused preflight pass");
+});
+
+test("the running post-merge check has a usual time and progress when chute gives one", () => {
+  const data = quiet();
+  const start = NOW - 300_000;
+  data.post_verify = { run: { commit: "abcdef1234", started_ms: start, phase: "checking" } };
+  data.usual = { post_verify_s: 400 };
+  const run = (now = NOW) => interpret(ok(data), now).repos[0].postVerify.run;
+  assert.equal(run().usual, "6m 40s");
+  assert.equal(Math.round(run().progress * 100), 75);
+  assert.equal(run().longer, false);
+  const late = run(start + 500_000);
+  assert.deepEqual([late.progress, late.longer], [1, true]);
+  data.post_verify.run.waiting_machine = true;
+  assert.equal(run().progress, null);
+  delete data.post_verify.run.waiting_machine;
+  delete data.usual;
+  const none = run();
+  assert.deepEqual([none.usual, none.progress, none.longer], [null, null, false]);
 });
 
 test("a batch without started_ms shows no usual time, elapsed time or progress even when the usual time is known", () => {
@@ -2235,6 +2314,13 @@ test("the daemon is running, idle with an empty queue, off only with a queue, an
       assert.equal(toneToken(unknown.tone), "dim");
     }
   }
+});
+
+test("the daemon tooltip adds what the running daemon is doing", () => {
+  const daemonOf = (daemon) => only(tonedRepo("o/d", (d) => { d.daemon = daemon; d.queue = []; })).daemon;
+  assert.equal(daemonOf({ running: true, doing: "큐를 보는 중" }).text, "Daemon running\n큐를 보는 중");
+  for (const doing of [undefined, null, "", "  ", 3]) assert.equal(daemonOf({ running: true, doing }).text, "Daemon running");
+  assert.equal(daemonOf({ running: false, doing: "x" }).text, "Daemon idle · queue empty");
 });
 
 test("a repo whose hub is unreachable has an unknown daemon", () => {
