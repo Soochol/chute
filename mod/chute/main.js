@@ -1755,9 +1755,9 @@ function postVerifyView(post, t) {
       .gap(8)
       .px(6)
       .py(2)
-      .items_baseline()
+      .items_start()
       .child(div().w(10).flex_none().text_color(color).child(mark))
-      .child(div().flex_1().min_w(0).truncate().text_size(12).child(text))
+      .child(div().flex_1().min_w(0).whitespace_normal().text_size(12).child(text))
       .when(Boolean(right), (el) => el.child(div().flex_none().min_w(44).text_right().text_size(11).text_color(t.dim).child(right)));
   const run = post.run;
   return v_flex()
