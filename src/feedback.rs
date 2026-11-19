@@ -898,7 +898,8 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
 }
 
 /// `{result}({N}번 돌려 {breakdown})`. A report without per-run outcomes says every run ended
-/// the way the last one did.
+/// the way the last one did. Old evidence with no runs at all has nothing to break down, so it
+/// says only how the step ended, with no parenthesis.
 fn solo_runs(evidence: &SoloEvidence, timed_out: bool) -> String {
     let legacy;
     let outcomes: &[RunOutcome] = if evidence.run_outcomes.is_empty() {
@@ -915,6 +916,7 @@ fn solo_runs(evidence: &SoloEvidence, timed_out: bool) -> String {
     let count = |kind: RunOutcome| outcomes.iter().filter(|o| **o == kind).count();
     let (failed, timeouts) = (count(RunOutcome::Failed), count(RunOutcome::TimedOut));
     let result = match (failed, timeouts) {
+        (0, 0) if outcomes.is_empty() && timed_out => "시간 초과로 끝났다",
         (_, 0) => "실패했다",
         (0, _) => "시간 초과로 끝났다",
         _ => "통과하지 못했다",
@@ -932,6 +934,9 @@ fn solo_runs(evidence: &SoloEvidence, timed_out: bool) -> String {
     .filter(|(n, _)| *n > 0)
     .map(|(n, what)| format!("{n}{what}"))
     .collect();
+    if outcomes.is_empty() {
+        return result.to_owned();
+    }
     format!("{result}({}번 돌려 {})", outcomes.len(), parts.join(", "))
 }
 

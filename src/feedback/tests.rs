@@ -4646,6 +4646,39 @@ fn an_old_solo_evidence_without_runs_by_kind_still_renders_as_before() {
 }
 
 #[test]
+fn an_old_solo_evidence_with_zero_runs_says_only_how_it_ended() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let zero = || -> SoloEvidence {
+        serde_json::from_value(serde_json::json!({
+            "base": "ran_in_this_batch", "runs": 0, "attempts": [],
+            "ledger_days": 30, "ledger_tests": []
+        }))
+        .unwrap()
+    };
+
+    let failed = solo_report_md(&lab, &[], Some(zero()));
+    let item = lab.item(12, "feat/b");
+    let timeout = Failure::Timeout(StepFailure {
+        evidence: Some(Box::new(zero())),
+        ..lab.step(VerifyMode::Solo, &[], lab.log("hang\n"))
+    });
+    let written = lab
+        .fb()
+        .write_report(&Subject::from(&item), &timeout, None)
+        .unwrap();
+    let timed_out = read(&written.md);
+
+    assert!(failed.contains("트리에서 실패했다\n"), "{failed}");
+    assert!(!failed.contains("번 돌려"), "{failed}");
+    assert!(
+        timed_out.contains("트리에서 시간 초과로 끝났다\n"),
+        "{timed_out}"
+    );
+    assert!(!timed_out.contains("번 돌려"), "{timed_out}");
+}
+
+#[test]
 fn a_solo_scope_compares_attempts_of_a_hundred_thousand_names() {
     let lab = Lab::new();
     lab.repo.pr_branch("feat/b", "b.txt", "b\n");
