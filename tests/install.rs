@@ -67,7 +67,7 @@ fn installs_the_codex_skill_and_the_mod_with_repository_content() {
     assert_eq!(fs::read_to_string(path).unwrap(), skill);
     assert!(!sb.home().join(".claude/skills").exists());
     let mod_dir = herdr_home(&sb).join("mods/chute");
-    for name in ["main.js", "board.js", "mod.json"] {
+    for name in ["main.js", "board.js", "detail.js", "mod.json"] {
         let got = fs::read_to_string(mod_dir.join(name)).unwrap();
         assert_eq!(got, repo_file(&format!("mod/chute/{name}")), "{name}");
     }
@@ -150,6 +150,7 @@ fn leaves_templates_and_agents_md_alone() {
         ".config/herdr-app/mods",
         ".config/herdr-app/mods/chute",
         ".config/herdr-app/mods/chute/board.js",
+        ".config/herdr-app/mods/chute/detail.js",
         ".config/herdr-app/mods/chute/main.js",
         ".config/herdr-app/mods/chute/mod.json",
     ]
