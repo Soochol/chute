@@ -1393,6 +1393,7 @@ impl Run<'_> {
         self.update_batch(|b| {
             b.phase = phase;
             b.step = None;
+            b.step_started_ms = None;
         })
     }
 

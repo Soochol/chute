@@ -411,7 +411,10 @@ fn median(mut values: Vec<u64>) -> Option<u64> {
     match values.len() {
         0 => None,
         n if n % 2 == 1 => Some(values[n / 2]),
-        n => Some((values[n / 2 - 1] + values[n / 2]) / 2),
+        n => {
+            let (a, b) = (values[n / 2 - 1], values[n / 2]);
+            Some(a / 2 + b / 2 + (a % 2 + b % 2) / 2)
+        }
     }
 }
 
@@ -424,6 +427,14 @@ fn usual_median(recent_first: impl Iterator<Item = u64>) -> Option<u64> {
 }
 
 pub fn usual(events: &[Event], batch: Option<&Batch>) -> Usual {
+    struct Finished<'a> {
+        seconds: u64,
+        ran: &'a [String],
+        verifications: u32,
+        step_times: &'a [crate::model::StepTime],
+        merged_any: bool,
+        bounced_any: bool,
+    }
     let finished = || {
         events.iter().rev().filter_map(|e| match &e.kind {
             EventKind::BatchFinished {
@@ -431,14 +442,23 @@ pub fn usual(events: &[Event], batch: Option<&Batch>) -> Usual {
                 ran,
                 verifications,
                 step_times,
+                merged,
+                bounced,
                 ..
-            } => Some((*seconds, ran, *verifications, step_times)),
+            } => Some(Finished {
+                seconds: *seconds,
+                ran,
+                verifications: *verifications,
+                step_times,
+                merged_any: !merged.is_empty(),
+                bounced_any: !bounced.is_empty(),
+            }),
             _ => None,
         })
     };
     let mut by_step: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-    for (_, _, _, times) in finished() {
-        for time in times.iter().rev() {
+    for run in finished() {
+        for time in run.step_times.iter().rev() {
             let runs = by_step.entry(time.step.as_str()).or_default();
             if runs.len() < USUAL_RUNS {
                 runs.push(time.seconds);
@@ -452,8 +472,13 @@ pub fn usual(events: &[Event], batch: Option<&Batch>) -> Usual {
     let batch_s = batch.filter(|b| !b.steps.is_empty()).and_then(|b| {
         usual_median(
             finished()
-                .filter(|(_, ran, verifications, _)| *verifications == 1 && **ran == b.steps)
-                .map(|(seconds, ..)| seconds),
+                .filter(|run| {
+                    run.verifications == 1
+                        && !run.bounced_any
+                        && run.merged_any
+                        && run.ran == b.steps
+                })
+                .map(|run| run.seconds),
         )
     });
     let post_verify_s = usual_median(events.iter().rev().filter_map(|e| match &e.kind {
@@ -571,12 +596,7 @@ pub fn summarize<Tz: TimeZone>(
             | EventKind::PostFixed { .. } => {}
         }
     }
-    leads.sort_unstable();
-    today.median_lead_s = match leads.len() {
-        0 => None,
-        n if n % 2 == 1 => Some(leads[n / 2]),
-        n => Some((leads[n / 2 - 1] + leads[n / 2]) / 2),
-    };
+    today.median_lead_s = median(leads);
     recent.reverse();
     recent.truncate(RECENT_BATCHES);
     recent_merged.reverse();
@@ -907,6 +927,44 @@ mod tests {
     }
 
     #[test]
+    fn a_bounced_batch_is_not_a_sample_of_the_usual_batch_time() {
+        let now = running_batch(&["fmt", "test"]);
+        let merged = |seconds| finished_with(seconds, &["fmt", "test"], 1, &[]);
+        let outcome = |seconds, merged: &[u64], bounced: &[u64]| {
+            let mut event = finished_with(seconds, &["fmt", "test"], 1, &[]);
+            if let EventKind::BatchFinished {
+                merged: m,
+                bounced: b,
+                ..
+            } = &mut event.kind
+            {
+                *m = merged.iter().copied().map(PrNumber).collect();
+                *b = bounced.iter().copied().map(PrNumber).collect();
+            }
+            event
+        };
+
+        let three_merged = vec![
+            merged(100),
+            outcome(900, &[], &[2]),
+            merged(300),
+            outcome(900, &[1], &[2]),
+            outcome(900, &[], &[]),
+            merged(200),
+        ];
+        assert_eq!(usual(&three_merged, Some(&now)).batch_s, Some(200));
+
+        let mostly_bounced = vec![
+            merged(100),
+            outcome(900, &[], &[1]),
+            outcome(900, &[], &[1, 2]),
+            merged(300),
+            outcome(900, &[], &[3]),
+        ];
+        assert_eq!(usual(&mostly_bounced, Some(&now)).batch_s, None);
+    }
+
+    #[test]
     fn the_usual_post_merge_time_is_the_median_of_recent_green_runs() {
         let green = |seconds| Event {
             at_ms: EpochMs(1),
@@ -1173,6 +1231,27 @@ mod tests {
         let (today, _, _) = summarize(&events, &now);
         assert_eq!(today.median_lead_s, Some(250));
         assert_eq!(today.flaky, 1);
+    }
+
+    #[test]
+    fn the_usual_median_of_huge_values_does_not_overflow() {
+        let green = |seconds| Event {
+            at_ms: EpochMs(1),
+            kind: EventKind::PostGreen {
+                commit: Sha::try_from("abc1234".to_owned()).unwrap(),
+                previous: None,
+                seconds,
+            },
+        };
+        let events: Vec<Event> = [u64::MAX, u64::MAX, 1, 2].map(green).into();
+
+        assert_eq!(usual(&events, None).post_verify_s, Some(1 << 63));
+    }
+
+    #[test]
+    fn the_median_of_two_huge_values_is_their_floored_mean() {
+        assert_eq!(median(vec![u64::MAX, u64::MAX - 2]), Some(u64::MAX - 1));
+        assert_eq!(median(vec![1, 2]), Some(1));
     }
 
     #[test]
