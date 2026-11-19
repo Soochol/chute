@@ -480,6 +480,10 @@ printf '{{"state":"%s","headRefOid":"%s","mergeCommit":null,"isDraft":%s,"baseRe
                     started_ms: EpochMs::now(),
                     waiting_machine: false,
                     reused: None,
+                    step_started_ms: None,
+                    done: Vec::new(),
+                    skipped: Vec::new(),
+                    reruns: Vec::new(),
                 });
                 Ok(())
             })

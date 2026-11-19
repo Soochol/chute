@@ -19,7 +19,8 @@
   "daemon": {
     "running": false,
     "terminal": null,
-    "pid": null
+    "pid": null,
+    "doing": null
   },
   "blocked": null,
   "batch": null,
@@ -47,5 +48,10 @@
     "run": null,
     "red": null,
     "last_started_ms": null
+  },
+  "usual": {
+    "batch_s": null,
+    "steps": {},
+    "post_verify_s": null
   }
 }

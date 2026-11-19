@@ -26,15 +26,15 @@ use crate::model::{
     Agent, BaseCheck, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason,
     EpochMs, Event, EventKind, Failure, Flaky, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
     ProbeEvidence, QueueItem, QueuedReason, RemovedReason, RepoInfo, Rerun, RerunSignal, ResumedBy,
-    Reused, RunOutcome, Sha, SkippedStep, SoloEvidence, State, StepFailure, TreeKey, VerifiedBy,
-    VerifiedTree, VerifyMode, Warning, WarningKind,
+    Reused, RunOutcome, Sha, SkippedStep, SoloEvidence, State, StepFailure, StepResult, StepRun,
+    StepTime, TreeKey, VerifiedBy, VerifiedTree, VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, Removal, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
 use crate::queue::{self, Recorded};
 use crate::reuse;
 use crate::store::{Home, RepoStore};
-use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome};
+use crate::verify::{self, Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome, StepEnded};
 
 const PUSH_ROUNDS: u32 = 3;
 const SLOT_LOCK_TRIES: u32 = 40;
@@ -451,6 +451,9 @@ impl Engine {
                         bounced: bounced_prs,
                         seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
                         verify_s: record.verify_s,
+                        ran: record.ran(),
+                        verifications: record.verifications,
+                        step_times: record.passed_times(),
                     })?;
                 }
                 record.finished_ms = Some(now);
@@ -641,6 +644,10 @@ impl Engine {
                     started_ms: EpochMs::now(),
                     waiting_machine: false,
                     reused: None,
+                    step_started_ms: None,
+                    done: Vec::new(),
+                    skipped: Vec::new(),
+                    reruns: Vec::new(),
                 });
             }
             let items = prs
@@ -683,6 +690,7 @@ impl Engine {
                 skipped: Vec::new(),
                 reused: Vec::new(),
                 reruns: Vec::new(),
+                step_times: Vec::new(),
             },
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
@@ -1545,10 +1553,14 @@ impl Run<'_> {
         self.record.verifications += 1;
         let round = self.record.verifications;
         let steps = self.config.steps_for(changed.as_deref());
+        let left_out = self.config.skipped_steps(changed.as_deref());
         self.update_batch(|b| {
             b.round = round;
             b.step = None;
+            b.step_started_ms = None;
             b.steps = steps.clone();
+            b.done = Vec::new();
+            b.skipped = left_out.clone();
             b.reused = None;
             b.phase = if b.phase == Phase::Building {
                 Phase::Verifying
@@ -1561,9 +1573,31 @@ impl Run<'_> {
             let _ = engine.store.update(|s| {
                 if let Some(batch) = &mut s.batch {
                     batch.step = Some(name.to_owned());
+                    batch.step_started_ms = Some(EpochMs::now());
                 }
                 Ok(())
             });
+        };
+        let ended = RefCell::new(Vec::new());
+        let on_step_end = |end: &StepEnded| {
+            let seconds = end.duration.as_secs();
+            ended.borrow_mut().push(StepRun {
+                round,
+                step: end.step.clone(),
+                seconds,
+                result: end.result,
+            });
+            if end.result == StepResult::Passed {
+                let _ = engine.store.update(|s| {
+                    if let Some(batch) = &mut s.batch {
+                        batch.done.push(StepTime {
+                            step: end.step.clone(),
+                            seconds,
+                        });
+                    }
+                    Ok(())
+                });
+            }
         };
         let on_machine_wait = |wait: Wait| {
             let _ = engine.store.update(|s| {
@@ -1592,10 +1626,13 @@ impl Run<'_> {
                 on_machine_wait: Some(&on_machine_wait),
                 changed: changed.as_deref(),
                 on_skip: Some(&on_skip),
+                on_step_end: Some(&on_step_end),
+                clock: engine.timing.clock.clone(),
                 ..Options::default()
             },
         )?;
         self.verify_time += started.elapsed();
+        self.record.step_times.extend(ended.into_inner());
         self.record.skipped.extend(
             skipped
                 .into_inner()
@@ -2001,6 +2038,8 @@ impl Run<'_> {
             signal,
             tests: tests.clone(),
         });
+        let reruns = self.record.reruns.clone();
+        self.update_batch(|b| b.reruns = reruns)?;
         self.save_record()?;
         self.rerunning = Some(Rerunning {
             step: FlakyStep {
@@ -2327,6 +2366,9 @@ impl Run<'_> {
                 bounced: self.bounced.clone(),
                 seconds: now.0.saturating_sub(self.record.started_ms.0) / 1000,
                 verify_s: self.record.verify_s,
+                ran: self.record.ran(),
+                verifications: self.record.verifications,
+                step_times: self.record.passed_times(),
             })?;
         }
         engine.store.update(|s| {

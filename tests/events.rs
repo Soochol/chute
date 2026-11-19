@@ -21,6 +21,9 @@ fn finished(at: u64, merged: &[u64]) -> Event {
             bounced: vec![],
             seconds: 1,
             verify_s: 1,
+            ran: vec![],
+            verifications: 0,
+            step_times: vec![],
         },
     }
 }

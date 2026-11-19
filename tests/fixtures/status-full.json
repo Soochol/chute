@@ -19,7 +19,8 @@
   "daemon": {
     "running": true,
     "terminal": "desk/t1zz",
-    "pid": 4242
+    "pid": 4242,
+    "doing": "큐를 보는 중"
   },
   "blocked": {
     "reason": "base_broken",
@@ -47,7 +48,14 @@
     "round": 1,
     "started_ms": 1794724200000,
     "waiting_machine": false,
-    "reused": "preflight"
+    "reused": "preflight",
+    "step_started_ms": 1794724240000,
+    "done": [
+      { "step": "fmt", "seconds": 4 },
+      { "step": "clippy", "seconds": 31 }
+    ],
+    "skipped": ["e2e"],
+    "reruns": []
   },
   "queue": [
     {
@@ -699,5 +707,10 @@
       "holding": false
     },
     "last_started_ms": 1794723600000
+  },
+  "usual": {
+    "batch_s": 400,
+    "steps": { "fmt": 4, "clippy": 30, "test": 360 },
+    "post_verify_s": 427
   }
 }

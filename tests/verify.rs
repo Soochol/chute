@@ -6,14 +6,17 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Barrier, mpsc};
+use std::sync::{Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chute::clock::Clock;
 use chute::config::{Config, VerifyStep};
-use chute::model::{NonEmpty, Slug};
+use chute::model::{NonEmpty, Slug, StepResult};
 use chute::store::{Home, RepoStore};
-use chute::verify::{Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome, log_path, run};
+use chute::verify::{
+    Cancel, Cause, Detail, Failed, FlakyStep, Options, Outcome, StepEnded, log_path, run,
+};
 use support::Sandbox;
 
 struct Rig {
@@ -1698,4 +1701,135 @@ fn without_a_list_of_changed_files_every_step_runs() {
 
     assert!(skipped.borrow().is_empty());
     assert!(rig.mark("web").exists());
+}
+
+type Ended = Vec<(String, StepResult, Duration)>;
+
+fn record_into(ended: &Mutex<Ended>) -> impl Fn(&StepEnded) + '_ {
+    move |end| {
+        ended
+            .lock()
+            .unwrap()
+            .push((end.step.clone(), end.result, end.duration));
+    }
+}
+
+#[test]
+fn the_step_end_callback_reports_each_step_with_its_result_and_the_time_on_the_clock() {
+    let rig = Rig::new();
+    let m = rig.marks_dir();
+    let cfg = config(
+        vec![
+            step(
+                "first",
+                format!("touch '{m}/started'; until [ -e '{m}/release' ]; do sleep 0.05; done"),
+            ),
+            step("second", "true"),
+        ],
+        false,
+    );
+    let clock = Clock::frozen();
+    let ended = Mutex::new(Ended::new());
+
+    let outcome = thread::scope(|s| {
+        let run = s.spawn(|| {
+            let on_end = record_into(&ended);
+            let opts = Options {
+                on_step_end: Some(&on_end),
+                clock: clock.clone(),
+                ..Options::default()
+            };
+            rig.run(&cfg, &opts)
+        });
+        wait_for(&rig.mark("started"));
+        clock.advance(Duration::from_secs(90));
+        fs::write(rig.mark("release"), "").unwrap();
+        run.join().unwrap()
+    });
+
+    passed(outcome);
+    assert_eq!(
+        *ended.lock().unwrap(),
+        [
+            (
+                "first".to_owned(),
+                StepResult::Passed,
+                Duration::from_secs(90)
+            ),
+            ("second".to_owned(), StepResult::Passed, Duration::ZERO),
+        ]
+    );
+}
+
+#[test]
+fn the_step_end_callback_reports_a_failed_step_once_with_the_time_of_both_attempts() {
+    let rig = Rig::new();
+    let m = rig.marks_dir();
+    let two_attempts = format!(
+        "if [ -e '{m}/a1' ]; then touch '{m}/a2'; until [ -e '{m}/rel2' ]; do sleep 0.05; done; \
+         else touch '{m}/a1'; until [ -e '{m}/rel1' ]; do sleep 0.05; done; fi; exit 1"
+    );
+    let cfg = config(
+        vec![
+            with_paths(step("docs", "true"), &["docs/"]),
+            step("flop", two_attempts),
+        ],
+        false,
+    );
+    let changed = vec!["src/main.rs".to_owned()];
+    let clock = Clock::frozen();
+    let ended = Mutex::new(Ended::new());
+
+    let outcome = thread::scope(|s| {
+        let run = s.spawn(|| {
+            let on_end = record_into(&ended);
+            let opts = Options {
+                changed: Some(&changed),
+                on_step_end: Some(&on_end),
+                clock: clock.clone(),
+                ..Options::default()
+            };
+            rig.run(&cfg, &opts)
+        });
+        wait_for(&rig.mark("a1"));
+        clock.advance(Duration::from_secs(30));
+        fs::write(rig.mark("rel1"), "").unwrap();
+        wait_for(&rig.mark("a2"));
+        clock.advance(Duration::from_secs(60));
+        fs::write(rig.mark("rel2"), "").unwrap();
+        run.join().unwrap()
+    });
+
+    assert_eq!(failed(outcome).step, "flop");
+    assert_eq!(
+        *ended.lock().unwrap(),
+        [(
+            "flop".to_owned(),
+            StepResult::Failed,
+            Duration::from_secs(90)
+        )]
+    );
+
+    let slow = config(
+        vec![VerifyStep {
+            timeout: Duration::from_secs(1),
+            ..step("slow", "sleep 300")
+        }],
+        false,
+    );
+    let timed = Mutex::new(Ended::new());
+    let on_end = record_into(&timed);
+    let opts = Options {
+        on_step_end: Some(&on_end),
+        clock: Clock::frozen(),
+        ..Options::default()
+    };
+
+    let f = failed(rig.run(&slow, &opts));
+
+    assert_eq!(f.cause, Cause::TimedOut);
+    assert_eq!(
+        *timed.lock().unwrap(),
+        [("slow".to_owned(), StepResult::TimedOut, Duration::ZERO)]
+    );
 }

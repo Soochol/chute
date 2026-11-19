@@ -658,6 +658,37 @@ pub struct Batch {
     pub waiting_machine: bool,
     #[serde(default)]
     pub reused: Option<VerifiedBy>,
+    /// When the step in `step` started. Cleared when a round starts.
+    #[serde(default)]
+    pub step_started_ms: Option<EpochMs>,
+    #[serde(default)]
+    pub done: Vec<StepTime>,
+    #[serde(default)]
+    pub skipped: Vec<String>,
+    #[serde(default)]
+    pub reruns: Vec<Rerun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepTime {
+    pub step: String,
+    pub seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepResult {
+    Passed,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRun {
+    pub round: u32,
+    pub step: String,
+    pub seconds: u64,
+    pub result: StepResult,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,6 +969,29 @@ pub struct BatchRecord {
     pub reused: Vec<Reused>,
     #[serde(default)]
     pub reruns: Vec<Rerun>,
+    #[serde(default)]
+    pub step_times: Vec<StepRun>,
+}
+
+impl BatchRecord {
+    pub fn ran(&self) -> Vec<String> {
+        self.step_times
+            .iter()
+            .filter(|run| run.round == 1)
+            .map(|run| run.step.clone())
+            .collect()
+    }
+
+    pub fn passed_times(&self) -> Vec<StepTime> {
+        self.step_times
+            .iter()
+            .filter(|run| run.result == StepResult::Passed)
+            .map(|run| StepTime {
+                step: run.step.clone(),
+                seconds: run.seconds,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -993,6 +1047,12 @@ pub enum EventKind {
         bounced: Vec<PrNumber>,
         seconds: u64,
         verify_s: u64,
+        #[serde(default)]
+        ran: Vec<String>,
+        #[serde(default)]
+        verifications: u32,
+        #[serde(default)]
+        step_times: Vec<StepTime>,
     },
     Reverted {
         batch: BatchId,
@@ -1162,6 +1222,19 @@ pub struct StatusView {
     /// Absent from the output of a chute older than the check after the merge.
     #[serde(default)]
     pub post_verify: PostState,
+    #[serde(default)]
+    pub usual: Usual,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usual {
+    /// Single round batches that ran the steps of the current batch.
+    #[serde(default)]
+    pub batch_s: Option<u64>,
+    #[serde(default)]
+    pub steps: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub post_verify_s: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1188,6 +1261,8 @@ pub struct DaemonView {
     pub running: bool,
     pub terminal: Option<TerminalId>,
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub doing: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1355,6 +1430,42 @@ mod tests {
         assert!(batch.steps.is_empty());
         let view: StatusView = serde_json::from_value(old).unwrap();
         assert!(view.batch.unwrap().steps.is_empty());
+    }
+
+    #[test]
+    fn state_batch_records_and_history_written_before_step_times_still_load() {
+        let mut old: Value = serde_json::from_str(FIXTURE).unwrap();
+        old.as_object_mut().unwrap().remove("usual");
+        old["daemon"].as_object_mut().unwrap().remove("doing");
+        for field in ["step_started_ms", "done", "skipped", "reruns"] {
+            old["batch"].as_object_mut().unwrap().remove(field);
+        }
+        let batch: Batch = serde_json::from_value(old["batch"].clone()).unwrap();
+        assert_eq!(batch.step_started_ms, None);
+        assert!(batch.done.is_empty() && batch.skipped.is_empty() && batch.reruns.is_empty());
+        let view: StatusView = serde_json::from_value(old).unwrap();
+        assert_eq!(view.usual, Usual::default());
+        assert_eq!(view.daemon.doing, None);
+        assert_eq!(view.batch, Some(batch));
+
+        let record = r#"{"id":"b1","base":"abc1234","prs":[1],"started_ms":1,"finished_ms":2,"merges":[],"bounced":[],"flaky":[],"verify_s":3}"#;
+        let record: BatchRecord = serde_json::from_str(record).unwrap();
+        assert!(record.step_times.is_empty());
+        assert!(record.ran().is_empty() && record.passed_times().is_empty());
+
+        let line = r#"{"at_ms":5,"event":"batch_finished","batch":"b1","merged":[1],"bounced":[],"seconds":9,"verify_s":4}"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        let EventKind::BatchFinished {
+            ran,
+            verifications,
+            step_times,
+            ..
+        } = event.kind
+        else {
+            panic!("batch_finished여야 한다");
+        };
+        assert!(ran.is_empty() && step_times.is_empty());
+        assert_eq!(verifications, 0);
     }
 
     #[test]

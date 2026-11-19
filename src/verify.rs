@@ -18,7 +18,7 @@ use nix::unistd::Pid;
 use crate::clock::Clock;
 use crate::config::{Config, PROBE_PLACEHOLDER, VerifyStep};
 use crate::flaky;
-use crate::model::{EpochMs, NonEmpty};
+use crate::model::{EpochMs, NonEmpty, StepResult};
 use crate::pc_limit::{self, Wait};
 use crate::store::RepoStore;
 
@@ -70,6 +70,20 @@ pub struct Options<'a> {
     /// Called with the step's name for each step left out because of `paths`.
     pub on_skip: Option<&'a dyn Fn(&str)>,
     pub wanted: Option<Wanted<'a>>,
+    /// Called once when a step ends by passing, failing or timing out. Not called for a step
+    /// that was cancelled or left out by `paths`.
+    pub on_step_end: Option<&'a dyn Fn(&StepEnded)>,
+    /// Measures the duration in `StepEnded`. A step's own time limit is always judged on the
+    /// system clock.
+    pub clock: Clock,
+}
+
+/// A step that ended, with the time from its first attempt's start to its last attempt's end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepEnded {
+    pub step: String,
+    pub result: StepResult,
+    pub duration: Duration,
 }
 
 /// The failure a culprit search looks for: one step, and the tests that failed twice at the tip.
@@ -95,6 +109,8 @@ impl Default for Options<'_> {
             changed: None,
             on_skip: None,
             wanted: None,
+            on_step_end: None,
+            clock: Clock::System,
         }
     }
 }
@@ -209,7 +225,24 @@ pub fn run(
         if let Some(on_step) = opts.on_step {
             on_step(&step.name);
         }
-        match ctx.step(step)? {
+        let started = opts.clock.now();
+        let end = ctx.step(step)?;
+        let result = match &end {
+            StepEnd::Passed { .. } => Some(StepResult::Passed),
+            StepEnd::Failed(failed) if failed.cause == Cause::TimedOut => {
+                Some(StepResult::TimedOut)
+            }
+            StepEnd::Failed(_) => Some(StepResult::Failed),
+            StepEnd::Cancelled => None,
+        };
+        if let (Some(on_step_end), Some(result)) = (opts.on_step_end, result) {
+            on_step_end(&StepEnded {
+                step: step.name.clone(),
+                result,
+                duration: opts.clock.now().saturating_duration_since(started),
+            });
+        }
+        match end {
             StepEnd::Passed { flaky: None } => {}
             StepEnd::Passed { flaky: Some(step) } => flaky.push(step),
             StepEnd::Failed(failed) => return Ok(Outcome::Failed(failed)),

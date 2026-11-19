@@ -708,6 +708,10 @@ mod tests {
                     started_ms: EpochMs(1),
                     waiting_machine: false,
                     reused: None,
+                    step_started_ms: None,
+                    done: Vec::new(),
+                    skipped: Vec::new(),
+                    reruns: Vec::new(),
                 });
                 s.blocked = Some(Blocked {
                     reason: BlockReason::BaseBroken,
