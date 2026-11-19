@@ -217,18 +217,20 @@ test("the flaky ledger lists chronic tests first, then by count and last time", 
 });
 
 test("batch rows show step times only when chute records them", () => {
+  const run = (round, step, seconds, result = "passed") => ({ round, step, seconds, result });
   const batches = batchesOf([
     entry("b20261119-120000", 0, 475, { merged: [616, 617], bounced: [5] }),
     entry("b20261119-110000-2", -4000, 100, {
-      step_times: [
-        { step: "check", seconds: 48 },
-        { step: "clippy", seconds: 71 },
+      step_times: [run(1, "check", 50), run(1, "clippy", 71), run(2, "check", 48), run(2, "e2e", 200, "timed_out")],
+      skipped: [
+        { round: 1, step: "e2e" },
+        { round: 2, step: "e2e" },
+        { round: 2, step: "docs" },
       ],
-      skipped: [{ round: 1, step: "e2e" }, { round: 2, step: "e2e" }],
       reruns: [{ pr: 3 }],
       reverted: true,
     }),
-    entry("b20261119-100000", -9000, 60, { step_times: { check: 48, clippy: 71 } }),
+    entry("b20261119-100000", -9000, 60, { step_times: [run(1, "check", 48), run(1, "clippy", 71)] }),
     { id: "odd", started_ms: T0 - 20_000_000, finished_ms: null, merged: [], bounced: [], reverted: false },
   ]);
   const rows = batchRows(batches);
@@ -241,11 +243,11 @@ test("batch rows show step times only when chute records them", () => {
   assert.equal(rows[0].merged, "#616 #617");
   assert.equal(rows[0].bounced, "#5");
   assert.equal(rows[0].started, clockText(T0));
-  assert.equal(rows[1].steps, "check 48s · clippy 1m 11s · 2 skipped · 1 rerun");
+  assert.equal(rows[1].steps, "check 48s · clippy 1m 11s · e2e 3m 20s timed out · 2 skipped · 1 rerun");
   assert.equal(rows[1].reverted, true);
   assert.equal(rows[2].steps, "check 48s · clippy 1m 11s");
   assert.equal(rows[3].took, "—");
   assert.equal(rows[3].merged, "");
-  assert.equal(parseBatches(ok(JSON.stringify([entry("x", 0, 1, { step_times: "bad", skipped: "bad" })]))).kind, "ok");
-  assert.equal(batchRows(batchesOf([entry("x", 0, 1, { step_times: "bad", skipped: "bad" })]))[0].steps, null);
+  const odd = batchesOf([entry("x", 0, 1, { step_times: "bad", skipped: "bad", reruns: 7 })]);
+  assert.equal(batchRows(odd)[0].steps, null);
 });

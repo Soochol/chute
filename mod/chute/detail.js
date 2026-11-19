@@ -42,23 +42,23 @@ function json(result, what) {
   }
 }
 
-const countOf = (v) => (Array.isArray(v) ? v.length : Number.isSafeInteger(v) && v > 0 ? v : 0);
+const FAILED_RESULT = { failed: "failed", timed_out: "timed out" };
 
-function secondsOf(entry) {
-  if (!isObject(entry)) return null;
-  const s = entry.seconds ?? entry.secs ?? entry.s;
-  return Number.isFinite(s) && s >= 0 ? s : null;
-}
-
+// `step_times` holds one run per step per verification round. Each step shows its latest run.
 function stepTimesOf(value) {
-  const pairs = Array.isArray(value)
-    ? value.map((e) => (Array.isArray(e) ? [e[0], e[1]] : [e?.step ?? e?.name, secondsOf(e)]))
-    : isObject(value)
-      ? Object.entries(value)
-      : [];
-  const times = pairs.filter(([name, s]) => typeof name === "string" && name !== "" && Number.isFinite(s) && s >= 0);
-  return times.length > 0 ? times.map(([name, s]) => `${name} ${formatDuration(s)}`).join(" · ") : "";
+  const latest = new Map();
+  for (const run of list(value)) {
+    if (!isObject(run) || typeof run.step !== "string" || run.step === "" || !Number.isFinite(run.seconds) || run.seconds < 0) continue;
+    const round = Number.isFinite(run.round) ? run.round : 0;
+    const seen = latest.get(run.step);
+    if (!seen || round >= seen.round) latest.set(run.step, { round, seconds: run.seconds, result: run.result });
+  }
+  return [...latest]
+    .map(([step, run]) => [step, formatDuration(run.seconds), FAILED_RESULT[run.result]].filter(Boolean).join(" "))
+    .join(" · ");
 }
+
+const skippedStepsOf = (value) => new Set(list(value).filter((s) => isObject(s) && typeof s.step === "string").map((s) => s.step)).size;
 
 function batchOf(entry) {
   if (!isObject(entry) || typeof entry.id !== "string" || entry.id === "") return null;
@@ -73,8 +73,8 @@ function batchOf(entry) {
     bounced: prs(entry.bounced),
     reverted: entry.reverted === true,
     stepTimes: stepTimesOf(entry.step_times),
-    skipped: countOf(entry.skipped),
-    reruns: countOf(entry.reruns),
+    skipped: skippedStepsOf(entry.skipped),
+    reruns: list(entry.reruns).length,
   };
 }
 
