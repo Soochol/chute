@@ -29,11 +29,13 @@ import {
   failureText,
   interpret,
   isNarrow,
+  isWide,
   needsClock,
   nextFold,
   overview,
   overviewText,
   pollInterval,
+  recentGroups,
   recentWindow,
   tint,
   toggleFold,
@@ -114,6 +116,7 @@ export default class Chute extends View {
     this.file = typeof given.file === "string" && given.file ? given : null;
     this.overlay = typeof given.overlay === "string" ? given.overlay : null;
     this.narrow = false;
+    this.wide = false;
     if (this.file) {
       this.loadFile(cx);
       return;
@@ -412,8 +415,10 @@ export default class Chute extends View {
       .text_size(13)
       .on_size_change((size, cx) => {
         const narrow = isNarrow(size.width);
-        if (narrow === this.narrow) return;
+        const wide = isWide(size.width);
+        if (narrow === this.narrow && wide === this.wide) return;
         this.narrow = narrow;
+        this.wide = wide;
         cx.notify();
       });
     if (this.file) return this.fileView(frame, t);
@@ -562,23 +567,36 @@ export default class Chute extends View {
           : section.items.length > 0;
     const filled = repo.sections.filter(drawn);
     const empty = repo.sections.filter((section) => section.id !== "human" && section.items.length === 0);
-    return v_flex()
-      .gap(12)
-      .child(
-        view.when(!repo.hub.reachable, (el) =>
-          el.child(
-            v_flex()
-              .gap(2)
-              .pl(24)
-              .child(div().text_size(12).text_color(t.dim).child(`Retrying every ${REMOTE_POLL_MS / 1000}s`)),
-          ),
-        ),
-      )
-      .children(filled.map((section) => this.sectionView(repo, section, t, lifted)))
-      .when(Boolean(repo.postVerify), (el) => el.child(postVerifyView(repo.postVerify, t)))
-      .when(repo.recent.length > 0, (el) => el.child(this.recentView(repo, t)))
-      .when(Boolean(repo.today), (el) => el.child(this.todayView(repo, t)))
-      .when(empty.length > 0 && !repo.quiet, (el) => el.child(emptyLine(empty, t)));
+    const retry = view.when(!repo.hub.reachable, (el) =>
+      el.child(
+        v_flex()
+          .gap(2)
+          .pl(24)
+          .child(div().text_size(12).text_color(t.dim).child(`Retrying every ${REMOTE_POLL_MS / 1000}s`)),
+      ),
+    );
+    const live = filled.map((section) => this.sectionView(repo, section, t, lifted));
+    const emptyRow = empty.length > 0 && !repo.quiet ? [emptyLine(empty, t)] : [];
+    const past = [
+      ...(repo.postVerify ? [postVerifyView(repo.postVerify, t)] : []),
+      ...(repo.strip ? [this.stripView(repo, t)] : []),
+      ...(repo.today ? [this.todayView(repo, t)] : []),
+      ...(repo.recent.length > 0 ? [this.recentView(repo, t)] : []),
+    ];
+    if (this.wide) {
+      const left = [...live, ...emptyRow];
+      const column = (items) => v_flex().min_w(0).gap(12).children(items);
+      const columns =
+        left.length > 0 && past.length > 0
+          ? h_flex()
+              .items_start()
+              .gap(18)
+              .child(column(left).flex_grow(1.25).flex_basis(0))
+              .child(column(past).flex_grow(1).flex_basis(0))
+          : column([...left, ...past]);
+      return v_flex().gap(12).child(retry).child(columns);
+    }
+    return v_flex().gap(12).child(retry).children([...live, ...past, ...emptyRow]);
   }
 
   repoHead(repo, folded, t) {
@@ -852,25 +870,72 @@ export default class Chute extends View {
     });
   }
 
+  stripView(repo, t) {
+    const strip = repo.strip;
+    return v_flex()
+      .gap(4)
+      .child(sectionTitle("Last batches", strip.bars.length, t))
+      .child(
+        h_flex()
+          .h(28)
+          .px(6)
+          .gap(3)
+          .items_end()
+          .children(
+            strip.bars.map((bar, i) =>
+              div()
+                .id(`bar-${repo.id}-${i}`)
+                .flex_1()
+                .min_w(0)
+                .max_w(30)
+                .h(4 + 24 * bar.height)
+                .rounded(2)
+                .bg(bar.tone === "bounced" ? t.ansi1 : t.ansi2)
+                .tooltip(bar.tip),
+            ),
+          ),
+      )
+      .child(
+        h_flex()
+          .px(6)
+          .text_size(11)
+          .text_color(t.dim)
+          .child(div().flex_1().child(strip.from))
+          .child(div().flex_none().child(strip.to)),
+      );
+  }
+
   recentView(repo, t) {
     const open = this.moreOpen.has(repo.id);
     const { rows, hidden, more } = recentWindow(repo.recent, open);
+    const groups = recentGroups(rows, repo.recentBatches);
+    let at = 0;
     return v_flex()
       .gap(4)
       .child(sectionTitle("Recent", null, t))
       .children(
-        rows.map((m, i) => {
-          const id = `merged-${repo.id}-${i}`;
-          const row = m.url ? linkRow(id, t, (cx) => cx.open_url(m.url)) : hoverRow(h_flex().id(id).px(6).py(4), t);
-          return gridRow(row, t, {
-            narrow: this.narrow,
-            pr: m.pr,
-            title: m.title,
-            time: timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
-            icons: rowIcons(id, m, t),
-            chips: m.bounces > 0 ? [chip(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`, t.dim, t)] : [],
-          });
-        }),
+        groups.map((group) =>
+          v_flex()
+            .gap(2)
+            .when(group.head != null, (el) =>
+              el.child(div().px(6).min_w(0).truncate().text_size(11).text_color(t.dim).child(group.head)),
+            )
+            .children(
+              group.rows.map((m) => {
+                const i = at++;
+                const id = `merged-${repo.id}-${i}`;
+                const row = m.url ? linkRow(id, t, (cx) => cx.open_url(m.url)) : hoverRow(h_flex().id(id).px(6).py(4), t);
+                return gridRow(row, t, {
+                  narrow: this.narrow || this.wide,
+                  pr: m.pr,
+                  title: m.title,
+                  time: timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
+                  icons: rowIcons(id, m, t),
+                  chips: m.bounces > 0 ? [chip(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`, t.dim, t)] : [],
+                });
+              }),
+            ),
+        ),
       )
       .when(hidden > 0, (el) =>
         el.child(

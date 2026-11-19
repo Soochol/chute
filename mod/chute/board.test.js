@@ -31,7 +31,7 @@ import {
   MIN_USUAL_SECONDS,
 } from "./board.js";
 
-import { NARROW_WIDTH, isNarrow } from "./board.js";
+import { NARROW_WIDTH, WIDE_WIDTH, isNarrow, isWide, recentGroups } from "./board.js";
 
 const fixture = JSON.parse(readFileSync(new URL("../../tests/fixtures/status-full.json", import.meta.url), "utf8"));
 const NOW = fixture.batch.started_ms + 312_000;
@@ -1025,7 +1025,7 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary", "todo", "item", "needs", "flaky", "messages", "stepBar", "retryDots"]);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary", "todo", "item", "needs", "flaky", "messages", "stepBar", "retryDots", "strip", "bars", "recentBatches", "merged", "bounced"]);
     CONTAINERS.add("daemon");
     const leaves = [];
     const walk = (value, path, key) => {
@@ -1597,7 +1597,7 @@ test("recent merges: five from recent_merged, with titles, bounce counts and a G
   data.recent_merged = Array.from({ length: 7 }, (_, i) => ({ pr: 20 - i, title: `제목 ${i}`, batch: "b", merged_ms: NOW - 60_000 * (i + 1), bounces: i === 1 ? 2 : 0 }));
   const recent = only(data).recent;
   assert.equal(recent.length, 5);
-  assert.deepEqual({ ...recent[1], tip: undefined }, { pr: 19, title: "제목 1", bounces: 2, ago: "2m ago", took: "", tip: undefined, url: "https://github.com/Soochol/chute/pull/19" });
+  assert.deepEqual({ ...recent[1], tip: undefined }, { pr: 19, title: "제목 1", bounces: 2, ago: "2m ago", took: "", tip: undefined, url: "https://github.com/Soochol/chute/pull/19", batch: "b", at: NOW - 120_000 });
   assert.deepEqual(only([fixture]).recent.map((m) => [m.pr, m.title, m.bounces]), [
     [8, "feat: 큐 상태 전이 추가", 1],
     [7, "fix: 잠금 해제 순서를 고친다", 0],
@@ -2267,4 +2267,62 @@ test("isNarrow is true only for a finite width below NARROW_WIDTH", () => {
   assert.equal(isNarrow(NARROW_WIDTH), false);
   assert.equal(isNarrow(360), false);
   for (const odd of [null, undefined, NaN, Infinity]) assert.equal(isNarrow(odd), false, String(odd));
+});
+
+test("the batch strip draws recent batches oldest first, red when a PR bounced", () => {
+  const strip = only([fixture]).strip;
+  assert.deepEqual(strip.bars.map((b) => [b.key, b.tone]), [["b20261115-143000", "merged"], ["b20261115-150000", "bounced"]]);
+  const [first, second] = strip.bars;
+  for (const part of ["merged #7 #8", "bounced #11", "6m 28s"]) assert.ok(second.tip.includes(part), second.tip);
+  assert.ok(first.tip.includes("merged #5 #6") && !first.tip.includes("bounced"), first.tip);
+  assert.equal(strip.from, clockText(fixture.recent[1].finished_ms));
+  assert.equal(strip.to, clockText(fixture.recent[0].finished_ms));
+});
+
+test("the batch strip uses a log scale with a floor and skips broken entries", () => {
+  const entry = (seconds, i) => ({ batch: `b${i}`, merged: [i + 1], bounced: [], seconds, finished_ms: 1_000_000 * (i + 1) });
+  const data = clone(fixture);
+  data.recent = [1000, 100, 10].map(entry);
+  const { bars } = only(data).strip;
+  assert.equal(bars.length, 3);
+  assert.equal(bars[2].height, 1);
+  assert.ok(bars[0].height < bars[1].height && bars[1].height < bars[2].height);
+  assert.ok(bars.every((b) => b.height >= 0.15));
+  data.recent = [entry(10, 0), { ...entry(20, 1), seconds: "20" }, { ...entry(20, 2), finished_ms: null }, { batch: "x", merged: [1] }, null, 7, [], entry(0, 3)];
+  assert.equal(only(data).strip.bars.length, 2);
+  assert.ok(only(data).strip.bars.every((b) => Number.isFinite(b.height) && b.height >= 0.15));
+  data.recent = [null, { seconds: 1 }];
+  assert.equal(only(data).strip, null);
+  delete data.recent;
+  assert.equal(only(data).strip, null);
+});
+
+test("recent merges are grouped by batch with a head from the recent batch", () => {
+  const repo = only([fixture]);
+  const groups = recentGroups(repo.recent, repo.recentBatches);
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups[0].rows.map((m) => m.pr), [8, 7]);
+  assert.ok(groups[0].head.includes("batch of 2") && groups[0].head.includes("6m 28s"), groups[0].head);
+  assert.ok(groups[0].head.startsWith(clockText(fixture.recent[0].finished_ms)), groups[0].head);
+  assert.deepEqual(groups[1].rows.map((m) => m.pr), [6]);
+  assert.ok(groups[1].head.includes("batch of 2"), groups[1].head);
+});
+
+test("a recent group without its batch in recent uses the first merge time and the row count", () => {
+  const row = (pr, batch, at) => ({ pr, batch, at });
+  const two = recentGroups([row(3, "x", NOW), row(2, "x", NOW - 60_000)], []);
+  assert.equal(two.length, 1);
+  assert.equal(two[0].head, `${clockText(NOW)} · batch of 2`);
+  const one = recentGroups([row(3, "x", NOW)], []);
+  assert.equal(one[0].head, clockText(NOW));
+  const mixed = recentGroups([row(3, null, NOW), row(2, null, NOW), row(1, "y", null)], undefined);
+  assert.deepEqual(mixed.map((g) => [g.rows.length, g.head]), [[1, null], [1, null], [1, null]]);
+});
+
+test("the panel is wide from 520 logical pixels", () => {
+  assert.equal(WIDE_WIDTH, 520);
+  assert.equal(isWide(519), false);
+  assert.equal(isWide(520), true);
+  assert.equal(isWide(NaN), false);
+  assert.equal(isWide(undefined), false);
 });
