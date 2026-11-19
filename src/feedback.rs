@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -18,7 +19,8 @@ use crate::hub::{ForwardErrorKind, exec_on_input};
 use crate::machine::{self, Machine};
 use crate::model::{
     Agent, BaseCheck, ConflictFile, EpochMs, FailedCheck, Failure, FailureRecord, Partner,
-    PrNumber, QueueItem, RepoInfo, Sha, Slug, SoloEvidence, StepFailure, TerminalId, VerifyMode,
+    PrNumber, QueueItem, RepoInfo, RunOutcome, Sha, Slug, SoloEvidence, StepFailure, TerminalId,
+    VerifyMode,
 };
 use crate::repo;
 use crate::store::RepoStore;
@@ -895,6 +897,44 @@ fn render_conflict(out: &mut Vec<String>, files: &[ConflictFile]) {
     out.push(String::new());
 }
 
+/// `{result}({N}번 돌려 {breakdown})`. A report without per-run outcomes says every run ended
+/// the way the last one did.
+fn solo_runs(evidence: &SoloEvidence, timed_out: bool) -> String {
+    let legacy;
+    let outcomes: &[RunOutcome] = if evidence.run_outcomes.is_empty() {
+        let last = if timed_out {
+            RunOutcome::TimedOut
+        } else {
+            RunOutcome::Failed
+        };
+        legacy = vec![last; evidence.runs as usize];
+        &legacy
+    } else {
+        &evidence.run_outcomes
+    };
+    let count = |kind: RunOutcome| outcomes.iter().filter(|o| **o == kind).count();
+    let (failed, timeouts) = (count(RunOutcome::Failed), count(RunOutcome::TimedOut));
+    let result = match (failed, timeouts) {
+        (_, 0) => "실패했다",
+        (0, _) => "시간 초과로 끝났다",
+        _ => "통과하지 못했다",
+    };
+    let parts: Vec<String> = [
+        (failed, "번 실패"),
+        (timeouts, "번 시간 초과"),
+        (count(RunOutcome::Passed), "번 통과"),
+        (
+            count(RunOutcome::NotRun),
+            "번은 앞 단계가 실패해 이 단계를 돌리지 않았다",
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n}{what}"))
+    .collect();
+    format!("{result}({}번 돌려 {})", outcomes.len(), parts.join(", "))
+}
+
 fn render_solo_scope(
     out: &mut Vec<String>,
     this: &str,
@@ -907,20 +947,17 @@ fn render_solo_scope(
         ));
         return;
     };
-    let runs = evidence.runs;
-    let (result, count) = if timed_out {
-        ("시간 초과로 끝났다", "시간 초과")
-    } else {
-        ("실패했다", "실패")
-    };
     out.push(format!(
-        "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 {result}({runs}번 돌려 {runs}번 {count})"
+        "- 범위: 단독. 기준 브랜치에 {this}만 얹은 트리에서 {}",
+        solo_runs(evidence, timed_out)
     ));
     out.push(match evidence.base {
         Some(BaseCheck::RanInThisBatch) => "- 기준 브랜치: 이 batch에서 돌려 통과했다".to_owned(),
         Some(BaseCheck::VerifiedEarlier) => {
             "- 기준 브랜치: chute가 앞서 검증한 커밋이라 이 batch에서는 돌리지 않았다".to_owned()
         }
+        Some(BaseCheck::PushedSkippedByPaths) => "- 기준 브랜치: 이 batch가 push한 커밋이다. 그 검증은 변경 범위(`paths`)에 들지 않아 이 단계를 건너뛰었다".to_owned(),
+        Some(BaseCheck::PushedReused) => "- 기준 브랜치: 이 batch가 push한 커밋이다. 같은 트리를 앞서 검증한 기록이 있어 이 batch에서는 돌리지 않았다".to_owned(),
         None => "- 기준 브랜치: 확인하지 않았다".to_owned(),
     });
     if evidence.attempts.iter().all(Vec::is_empty) {
@@ -948,10 +985,10 @@ fn render_solo_scope(
         ));
         return;
     }
-    let same = evidence
-        .attempts
-        .windows(2)
-        .all(|pair| pair[0].len() == pair[1].len() && pair[0].iter().all(|t| pair[1].contains(t)));
+    let same = evidence.attempts.windows(2).all(|pair| {
+        let later: HashSet<&String> = pair[1].iter().collect();
+        pair[0].len() == pair[1].len() && pair[0].iter().all(|t| later.contains(t))
+    });
     if same {
         out.push(format!(
             "- 시도별 실패 시험({}번 시도): 모든 시도에서 같았다",

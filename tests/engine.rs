@@ -3452,10 +3452,171 @@ fn a_solo_report_counts_only_the_attempts_of_the_step_that_failed() {
     let (md, json) = bounce_report(&lab, 1);
     assert_eq!(json["failure"]["step"], "lint");
     assert!(!md.contains("test_a") && !md.contains("test_b"), "{md}");
-    assert!(md.contains("(1번 돌려 1번 실패)"), "{md}");
+    assert!(
+        md.contains("(2번 돌려 1번 실패, 1번은 앞 단계가 실패해 이 단계를 돌리지 않았다)"),
+        "{md}"
+    );
     assert_eq!(
         json["failure"]["evidence"]["attempts"],
         serde_json::json!([["lint_x"], ["lint_x"]])
+    );
+}
+
+fn scope_line(md: &str) -> &str {
+    md.lines().find(|l| l.starts_with("- 범위:")).unwrap()
+}
+
+const SLOW_STEP_SECONDS: u64 = 5;
+
+#[test]
+fn a_solo_report_counts_a_failure_and_a_timeout_of_two_runs() {
+    let script = "c='@ROOT@/runs'; n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\n\
+case $n in\n\
+1) fail 'FAILED test_a';;\n\
+2) fail 'FAILED test_b';;\n\
+3) echo 'FAILED test_c'; sleep 600;;\n\
+esac";
+    let lab = Lab::build(script, "", SLOW_STEP_SECONDS);
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let (md, json) = bounce_report(&lab, 1);
+    assert_eq!(
+        scope_line(&md),
+        "- 범위: 단독. 기준 브랜치에 이 PR만 얹은 트리에서 통과하지 못했다(2번 돌려 1번 실패, 1번 시간 초과)",
+        "{md}"
+    );
+    assert!(
+        md.contains("- 기준 브랜치: 이 batch에서 돌려 통과했다"),
+        "{md}"
+    );
+    let evidence = &json["failure"]["evidence"];
+    assert_eq!(evidence["runs"], 2, "{json}");
+    assert_eq!(
+        evidence["run_outcomes"],
+        serde_json::json!(["failed", "timed_out"]),
+        "{json}"
+    );
+}
+
+#[test]
+fn a_solo_report_counts_a_timeout_and_a_failure_of_two_runs() {
+    let script = "c='@ROOT@/runs'; n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\n\
+case $n in\n\
+1) echo 'FAILED test_k'; sleep 600;;\n\
+2) fail 'FAILED test_k';;\n\
+3) fail 'FAILED test_k';;\n\
+esac";
+    let lab = Lab::build(script, "", SLOW_STEP_SECONDS);
+    recorded_as_flaky_by_another_batch(&lab, 3, "test_k");
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let (md, json) = bounce_report(&lab, 1);
+    assert_eq!(
+        scope_line(&md),
+        "- 범위: 단독. 기준 브랜치에 이 PR만 얹은 트리에서 통과하지 못했다(2번 돌려 1번 실패, 1번 시간 초과)",
+        "{md}"
+    );
+    let evidence = &json["failure"]["evidence"];
+    assert_eq!(evidence["runs"], 2, "{json}");
+    assert_eq!(
+        evidence["run_outcomes"],
+        serde_json::json!(["timed_out", "failed"]),
+        "{json}"
+    );
+}
+
+#[test]
+fn a_solo_report_counts_the_run_where_the_failed_step_passed() {
+    let lint = "\n[[verify]]\nname = \"lint\"\nrun = \"sh @ROOT@/lint.sh\"\ntimeout = 60\nfailed = 'FAILED (\\S+)'\n";
+    let lab = Lab::build_with_step(
+        &scripted_outcomes(&[None, Some(&["check_x"]), Some(&["check_x"])]),
+        "",
+        60,
+        lint,
+    );
+    fs::write(
+        lab.sb.root().join("lint.sh"),
+        "c='@ROOT@/lint-runs'; n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\n\
+[ $n -eq 1 ] && { echo 'FAILED lint_a'; exit 1; }\n\
+[ $n -eq 2 ] && { echo 'FAILED lint_b'; exit 1; }\n\
+exit 0\n"
+            .replace("@ROOT@", &lab.sb.root().display().to_string()),
+    )
+    .unwrap();
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.bounced, prs(&[1]));
+    let (md, json) = bounce_report(&lab, 1);
+    assert_eq!(json["failure"]["step"], "check");
+    assert_eq!(
+        scope_line(&md),
+        "- 범위: 단독. 기준 브랜치에 이 PR만 얹은 트리에서 실패했다(2번 돌려 1번 실패, 1번 통과)",
+        "{md}"
+    );
+    let evidence = &json["failure"]["evidence"];
+    assert_eq!(evidence["runs"], 2, "{json}");
+    assert_eq!(
+        evidence["run_outcomes"],
+        serde_json::json!(["passed", "failed"]),
+        "{json}"
+    );
+    assert_eq!(
+        evidence["attempts"],
+        serde_json::json!([["check_x"], ["check_x"]])
+    );
+}
+
+#[test]
+fn a_solo_report_says_the_pushed_base_skipped_the_step_by_paths() {
+    let lab = Lab::build_with_step(BAD, "", 60, WEB_ONLY);
+    lab.main_commit(&[("x", "0\n")], "feat: x0");
+    lab.repo
+        .git(&["checkout", "--quiet", "-B", "pr-2", "origin/main"]);
+    lab.repo.write("x", "3\n");
+    lab.repo.write("BAD", "");
+    lab.repo.write("web/w.js", "w\n");
+    lab.repo.git(&["add", "x", "BAD", "web/w.js"]);
+    lab.repo.git(&["commit", "--quiet", "-m", "feat: change 2"]);
+    let head2 = lab.repo.head();
+    lab.repo.git(&[
+        "push",
+        "--quiet",
+        "--force",
+        "origin",
+        &format!("{head2}:refs/heads/pr-2"),
+        &format!("{head2}:refs/pull/2/head"),
+    ]);
+    lab.repo.git(&["checkout", "--quiet", "main"]);
+    lab.gh_says_head(2, &head2);
+    lab.main_commit(&[("x", "1\n")], "feat: x1");
+    lab.open_pr(1, &[("x", "0\n")]);
+    lab.queue_pr(
+        2,
+        &engine_kit::sha(&head2),
+        Some(lab.agent()),
+        Approval::Agent,
+    );
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(summary.bounced, prs(&[2]));
+    let (md, json) = bounce_report(&lab, 2);
+    assert!(
+        md.contains("- 기준 브랜치: 이 batch가 push한 커밋이다. 그 검증은 변경 범위(`paths`)에 들지 않아 이 단계를 건너뛰었다\n"),
+        "{md}"
+    );
+    assert_eq!(
+        json["failure"]["evidence"]["base"], "pushed_skipped_by_paths",
+        "{json}"
     );
 }
 

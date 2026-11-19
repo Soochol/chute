@@ -4345,6 +4345,7 @@ fn evidence(base: Option<BaseCheck>, attempts: &[&[&str]], ledger: &[&str]) -> S
         attempts: attempts.iter().map(|a| names(a)).collect(),
         ledger_days: 30,
         ledger_tests: names(ledger),
+        run_outcomes: Vec::new(),
     }
 }
 
@@ -4557,4 +4558,106 @@ fn a_timed_out_solo_report_says_timeout_not_failure_in_the_scope_line() {
         md.contains("트리에서 시간 초과로 끝났다(1번 돌려 1번 시간 초과)"),
         "{md}"
     );
+}
+
+fn with_outcomes(outcomes: &[RunOutcome]) -> SoloEvidence {
+    let mut found = evidence(Some(BaseCheck::RanInThisBatch), &[&["a::b"]], &[]);
+    found.runs = outcomes.len() as u32;
+    found.run_outcomes = outcomes.to_vec();
+    found
+}
+
+fn scope_line(md: &str) -> &str {
+    md.lines().find(|l| l.starts_with("- 범위:")).unwrap()
+}
+
+#[test]
+fn a_solo_scope_line_lists_each_kind_of_run_in_order() {
+    use RunOutcome::*;
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let head = "- 범위: 단독. 기준 브랜치에 이 PR만 얹은 트리에서 ";
+    let cases: [(&[RunOutcome], &str); 6] = [
+        (
+            &[Failed, TimedOut],
+            "통과하지 못했다(2번 돌려 1번 실패, 1번 시간 초과)",
+        ),
+        (
+            &[TimedOut, Failed],
+            "통과하지 못했다(2번 돌려 1번 실패, 1번 시간 초과)",
+        ),
+        (&[Passed, Failed], "실패했다(2번 돌려 1번 실패, 1번 통과)"),
+        (
+            &[NotRun, Failed],
+            "실패했다(2번 돌려 1번 실패, 1번은 앞 단계가 실패해 이 단계를 돌리지 않았다)",
+        ),
+        (&[Failed], "실패했다(1번 돌려 1번 실패)"),
+        (&[Failed, Failed], "실패했다(2번 돌려 2번 실패)"),
+    ];
+    for (outcomes, tail) in cases {
+        let md = solo_report_md(&lab, &["a::b"], Some(with_outcomes(outcomes)));
+        assert_eq!(scope_line(&md), format!("{head}{tail}"), "{md}");
+    }
+    let timeouts = with_outcomes(&[TimedOut, TimedOut]);
+    let md = solo_report_md(&lab, &["a::b"], Some(timeouts));
+    assert_eq!(
+        scope_line(&md),
+        format!("{head}시간 초과로 끝났다(2번 돌려 2번 시간 초과)"),
+        "{md}"
+    );
+}
+
+#[test]
+fn a_solo_report_says_a_pushed_base_was_reused_and_not_run() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let mut reused = with_outcomes(&[RunOutcome::Failed]);
+    reused.base = Some(BaseCheck::PushedReused);
+    let mut skipped = with_outcomes(&[RunOutcome::Failed]);
+    skipped.base = Some(BaseCheck::PushedSkippedByPaths);
+
+    let reused = solo_report_md(&lab, &["a::b"], Some(reused));
+    let skipped = solo_report_md(&lab, &["a::b"], Some(skipped));
+
+    assert!(
+        reused.contains("- 기준 브랜치: 이 batch가 push한 커밋이다. 같은 트리를 앞서 검증한 기록이 있어 이 batch에서는 돌리지 않았다\n"),
+        "{reused}"
+    );
+    assert!(
+        skipped.contains("- 기준 브랜치: 이 batch가 push한 커밋이다. 그 검증은 변경 범위(`paths`)에 들지 않아 이 단계를 건너뛰었다\n"),
+        "{skipped}"
+    );
+}
+
+#[test]
+fn an_old_solo_evidence_without_runs_by_kind_still_renders_as_before() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let old: SoloEvidence = serde_json::from_value(serde_json::json!({
+        "base": "ran_in_this_batch", "runs": 2, "attempts": [["a::b"], ["a::b"]],
+        "ledger_days": 30, "ledger_tests": []
+    }))
+    .unwrap();
+    assert!(old.run_outcomes.is_empty());
+
+    let md = solo_report_md(&lab, &["a::b"], Some(old));
+
+    assert!(md.contains("트리에서 실패했다(2번 돌려 2번 실패)"), "{md}");
+}
+
+#[test]
+fn a_solo_scope_compares_attempts_of_a_hundred_thousand_names() {
+    let lab = Lab::new();
+    lab.repo.pr_branch("feat/b", "b.txt", "b\n");
+    let names: Vec<String> = (0..100_000).map(|i| format!("t{i}")).collect();
+    let mut other = names.clone();
+    *other.last_mut().unwrap() = "different".to_owned();
+    let mut found = with_outcomes(&[RunOutcome::Failed, RunOutcome::Failed]);
+    found.attempts = vec![names.clone(), names.clone()];
+    let same = solo_report_md(&lab, &[], Some(found.clone()));
+    found.attempts = vec![names, other];
+    let differs = solo_report_md(&lab, &[], Some(found));
+
+    assert!(same.contains("모든 시도에서 같았다"), "{same}");
+    assert!(differs.contains("서로 달랐다"), "{differs}");
 }
