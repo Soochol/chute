@@ -438,7 +438,6 @@ export default class Chute extends View {
     this.loadDetail(cx);
   }
 
-  // Each command fills its own tab, so a slow hub delays only that tab. A newer read drops the answers of an older one.
   loadDetail(cx) {
     const generation = ++this.generation;
     const args = detailArgs(this.detail.repo);

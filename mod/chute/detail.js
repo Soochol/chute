@@ -24,7 +24,6 @@ const spaced = (v) => str(v).replaceAll("_", " ");
 const shortSha = (v) => str(v).slice(0, 7);
 const failed = (detail) => ({ kind: "failed", detail });
 
-// The command result as the caller got it: `{ code, stdout, stderr }`, or `{ spawnError }` when it could not start.
 function output(result, what) {
   if (!isObject(result)) return failed("Couldn't run the command");
   if (result.spawnError !== undefined) return failed(causeText(result.spawnError) || "Couldn't run the command");
@@ -51,7 +50,6 @@ function secondsOf(entry) {
   return Number.isFinite(s) && s >= 0 ? s : null;
 }
 
-// `step_times` is not recorded by every chute version; read the list and the name-to-seconds forms.
 function stepTimesOf(value) {
   const pairs = Array.isArray(value)
     ? value.map((e) => (Array.isArray(e) ? [e[0], e[1]] : [e?.step ?? e?.name, secondsOf(e)]))
@@ -163,7 +161,6 @@ export function bounceReasons(events) {
     .join(", ");
 }
 
-// `events` is the parsed event result, or null when it failed or is still being read.
 export function overviewOf(batches, events = null) {
   const longOnes = batches.filter((b) => b.seconds !== null && b.seconds >= LONG_BATCH_SECONDS).map((b) => b.seconds);
   const drawn = batches.filter((b) => b.finished !== null && b.seconds !== null).reverse();
@@ -201,26 +198,27 @@ export function flakyRows(entries, now = Date.now()) {
 
 const withPr = (name) => (e) => `${name}${Number.isSafeInteger(e.pr) && e.pr > 0 ? ` #${e.pr}` : ""}`;
 
-// kind -> [glyph, tone, text]. The tone names are the ones `toneToken` knows.
+const kind = (glyph, tone, text) => ({ glyph, tone, text });
+
 const EVENT = {
-  merged: ["✓", "ok", (e) => `merged #${e.pr}`],
-  bounced: [
+  merged: kind("✓", "ok", (e) => `merged #${e.pr}`),
+  bounced: kind(
     "✕",
     "error",
     (e) =>
       [`bounced #${e.pr}`, spaced(e.reason), Number.isSafeInteger(e.attempts) ? `attempt ${e.attempts}` : ""]
         .filter(Boolean)
         .join(" · "),
-  ],
-  flaky: [
+  ),
+  flaky: kind(
     "△",
     "warn",
     (e) => {
       const tests = list(e.tests).filter((t) => typeof t === "string");
       return tests.length > 0 ? `flaky ${tests.join(", ")} · ${str(e.step)}` : `flaky ${str(e.step)}`;
     },
-  ],
-  batch_finished: [
+  ),
+  batch_finished: kind(
     "▪",
     "waiting",
     (e) =>
@@ -232,26 +230,26 @@ const EVENT = {
       ]
         .filter(Boolean)
         .join(" · "),
-  ],
-  post_green: ["✓", "ok", (e) => `post-merge green ${shortSha(e.commit)}`],
-  post_failed: [
+  ),
+  post_green: kind("✓", "ok", (e) => `post-merge green ${shortSha(e.commit)}`),
+  post_failed: kind(
     "✕",
     "error",
     (e) => `post-merge failed ${str(e.step)} · culprit ${Number.isSafeInteger(e.culprit?.pr) && e.culprit.pr > 0 ? `#${e.culprit.pr}` : "unknown"}`,
-  ],
-  post_fixed: ["✓", "ok", (e) => `post-merge fixed ${shortSha(e.commit)}`],
-  blocked: ["✕", "error", (e) => `queue stopped · ${spaced(e.reason)} ${shortSha(e.base)}`],
-  resumed: ["▸", "working", (e) => `resumed by ${spaced(e.by)}${Number.isSafeInteger(e.pr) && e.pr > 0 ? ` #${e.pr}` : ""}`],
-  reverted: ["↺", "warn", (e) => `reverted ${prText(e.prs)}`],
-  submitted: ["+", "waiting", (e) => `submitted #${e.pr}`],
-  needs_human: ["?", "human", withPr("needs human")],
-  removed: ["–", "waiting", withPr("removed")],
-  dropped: ["–", "waiting", withPr("dropped")],
-  gave_up: ["–", "waiting", withPr("gave up")],
-  closed: ["–", "waiting", withPr("closed")],
-  reused: ["·", "dim", withPr("reused")],
-  flaky_probe: ["·", "dim", withPr("flaky probe")],
-  notified: ["·", "dim", withPr("notified")],
+  ),
+  post_fixed: kind("✓", "ok", (e) => `post-merge fixed ${shortSha(e.commit)}`),
+  blocked: kind("✕", "error", (e) => `queue stopped · ${spaced(e.reason)} ${shortSha(e.base)}`),
+  resumed: kind("▸", "working", (e) => `resumed by ${spaced(e.by)}${Number.isSafeInteger(e.pr) && e.pr > 0 ? ` #${e.pr}` : ""}`),
+  reverted: kind("↺", "warn", (e) => `reverted ${prText(e.prs)}`),
+  submitted: kind("+", "waiting", (e) => `submitted #${e.pr}`),
+  needs_human: kind("?", "human", withPr("needs human")),
+  removed: kind("–", "waiting", withPr("removed")),
+  dropped: kind("–", "waiting", withPr("dropped")),
+  gave_up: kind("–", "waiting", withPr("gave up")),
+  closed: kind("–", "waiting", withPr("closed")),
+  reused: kind("·", "dim", withPr("reused")),
+  flaky_probe: kind("·", "dim", withPr("flaky probe")),
+  notified: kind("·", "dim", withPr("notified")),
 };
 
 export function eventRows(events) {
@@ -260,7 +258,7 @@ export function eventRows(events) {
     .sort((a, b) => b.e.at_ms - a.e.at_ms || b.i - a.i)
     .map(({ e, i }) => {
       const known = Object.hasOwn(EVENT, e.event) ? EVENT[e.event] : null;
-      const [glyph, tone, text] = known ?? ["·", "dim", () => e.event];
+      const { glyph, tone, text } = known ?? kind("·", "dim", () => e.event);
       return { key: `${i}`, time: clockText(e.at_ms), glyph, text: text(e), tone };
     });
 }
