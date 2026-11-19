@@ -3,6 +3,10 @@ import { causeText, clockText, failureText, formatAgo, formatDuration } from "./
 export const DETAIL_BATCHES = 120;
 export const DETAIL_EVENTS = 2000;
 export const FLAKY_SHOWN = 20;
+export const DETAIL_WIDTH = 760;
+export const DETAIL_HEIGHT = 520;
+export const DETAIL_MIN_WIDTH = 480;
+const DETAIL_GAP = 8;
 export const TABS = ["overview", "flaky", "events", "batches"];
 
 const BAR_FLOOR = 0.15;
@@ -157,7 +161,7 @@ export function bounceReasons(events) {
   }
   return [...counts]
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
-    .map(([reason, n]) => `${n} ${reason}`)
+    .map(([reason, n]) => `${n} ${spaced(reason)}`)
     .join(", ");
 }
 
@@ -286,4 +290,21 @@ export function batchRows(batches) {
       steps: parts.length > 0 ? parts.join(" · ") : null,
     };
   });
+}
+
+// Where the detail window first opens so it does not cover the panel: beside it, on the side with more room.
+// `viewport` is the app window's size, `panel` is `{ x, width }` of the panel in window coordinates.
+// The window narrows to fit; when even the minimum width does not fit beside the panel, `at` is null (centered).
+export function detailSpot(viewport, panel) {
+  const centered = { width: DETAIL_WIDTH, at: null };
+  const ok = (n) => Number.isFinite(n);
+  if (!isObject(viewport) || !isObject(panel) || !ok(viewport.width) || !ok(viewport.height) || !ok(panel.x) || !ok(panel.width)) return centered;
+  const before = panel.x - DETAIL_GAP;
+  const after = viewport.width - (panel.x + panel.width) - DETAIL_GAP;
+  const room = Math.max(before, after);
+  const width = Math.min(DETAIL_WIDTH, room - DETAIL_GAP);
+  if (width < DETAIL_MIN_WIDTH) return centered;
+  const x = before >= after ? panel.x - DETAIL_GAP - width : panel.x + panel.width + DETAIL_GAP;
+  const y = Math.max(0, Math.floor((viewport.height - DETAIL_HEIGHT) / 2));
+  return { width, at: { x: Math.round(x), y } };
 }

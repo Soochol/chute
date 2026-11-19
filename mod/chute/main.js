@@ -43,10 +43,12 @@ import {
 } from "./board.js";
 import {
   DETAIL_EVENTS,
+  DETAIL_HEIGHT,
   FLAKY_SHOWN,
   TABS,
   batchRows,
   detailArgs,
+  detailSpot,
   eventRows,
   flakyRows,
   overviewOf,
@@ -130,6 +132,8 @@ export default class Chute extends View {
     this.overlay = typeof given.overlay === "string" ? given.overlay : null;
     this.narrow = false;
     this.wide = false;
+    this.origin = null;
+    this.width = 0;
     if (this.file) {
       this.loadFile(cx);
       return;
@@ -419,13 +423,16 @@ export default class Chute extends View {
     });
   }
 
-  openDetail(repo, tab) {
+  openDetail(repo, tab, cx) {
+    const panel = this.origin ? { x: this.origin.x, width: this.width } : null;
+    const spot = detailSpot(cx.viewport_size(), panel);
     openOverlay({
       kind: "window",
       key: "chute-detail",
       mod: MOD,
-      width: 760,
-      height: 520,
+      width: spot.width,
+      height: DETAIL_HEIGHT,
+      ...(spot.at ? { at: spot.at } : {}),
       props: { detail: { repo: repo.id, name: repo.name, tab }, bin: this.bin },
     });
   }
@@ -741,7 +748,11 @@ export default class Chute extends View {
       .border_color(t.border)
       .text_color(t.foreground)
       .text_size(13)
+      .on_mouse_down("left", (e) => {
+        if (e.local_position) this.origin = { x: e.position.x - e.local_position.x };
+      })
       .on_size_change((size, cx) => {
+        this.width = size.width;
         const narrow = isNarrow(size.width);
         const wide = isWide(size.width);
         if (narrow === this.narrow && wide === this.wide) return;
@@ -1027,7 +1038,7 @@ export default class Chute extends View {
           .when(Boolean(flaky.ago), (el) =>
             el.child(mono(div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim)).child(flaky.ago)),
           )
-          .child(textLink(`ledger-${repo.id}`, "Ledger ›", "Open the flaky ledger", t, () => this.openDetail(repo, "flaky"))),
+          .child(textLink(`ledger-${repo.id}`, "Ledger ›", "Open the flaky ledger", t, (cx) => this.openDetail(repo, "flaky", cx))),
       )
       .when(open, (el) =>
         el.child(
@@ -1205,7 +1216,7 @@ export default class Chute extends View {
     return v_flex()
       .gap(4)
       .child(
-        sectionTitle("Last batches", strip.bars.length, t, textLink(`details-${repo.id}`, "Details ›", "Open batch details", t, () => this.openDetail(repo, "overview"))),
+        sectionTitle("Last batches", strip.bars.length, t, textLink(`details-${repo.id}`, "Details ›", "Open batch details", t, (cx) => this.openDetail(repo, "overview", cx))),
       )
       .child(
         h_flex()

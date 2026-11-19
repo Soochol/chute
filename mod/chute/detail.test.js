@@ -7,6 +7,7 @@ import {
   batchRows,
   bounceReasons,
   detailArgs,
+  detailSpot,
   eventRows,
   flakyRows,
   overviewOf,
@@ -250,4 +251,23 @@ test("batch rows show step times only when chute records them", () => {
   assert.equal(rows[3].merged, "");
   const odd = batchesOf([entry("x", 0, 1, { step_times: "bad", skipped: "bad", reruns: 7 })]);
   assert.equal(batchRows(odd)[0].steps, null);
+});
+
+test("the detail window opens beside the panel and narrows when the screen is small", () => {
+  const right = (viewport, width = 360) => detailSpot(viewport, { x: viewport.width - width, width });
+  assert.deepEqual(right({ width: 1920, height: 1100 }), { width: 760, at: { x: 792, y: 290 } });
+  const small = right({ width: 1000, height: 1100 });
+  assert.deepEqual(small, { width: 624, at: { x: 8, y: 290 } });
+  assert.ok(small.at.x + small.width <= 1000 - 360);
+  assert.deepEqual(detailSpot({ width: 1920, height: 1100 }, { x: 0, width: 360 }), { width: 760, at: { x: 368, y: 290 } });
+  assert.deepEqual(detailSpot({ width: 1920, height: 400 }, { x: 1560, width: 360 }).at.y, 0);
+  assert.deepEqual(right({ width: 700, height: 900 }), { width: 760, at: null });
+  assert.deepEqual(detailSpot({ width: 1000, height: 900 }, null), { width: 760, at: null });
+  assert.deepEqual(detailSpot({ width: NaN, height: 900 }, { x: 1, width: 1 }), { width: 760, at: null });
+});
+
+test("a bounce reason reads the same in the overview and in the events", () => {
+  const events = [{ at_ms: 1, event: "bounced", pr: 5, reason: "head_changed", attempts: 1 }];
+  assert.equal(bounceReasons(events), "1 head changed");
+  assert.match(eventRows(events)[0].text, /head changed/);
 });
