@@ -146,7 +146,7 @@ test("events are read one per line, newest first, skipping broken lines", () => 
     eventRows(read.events).map((r) => r.text),
     ["merged #2", "closed #3", "submitted #1"],
   );
-  assert.equal(parseEvents(ok(stdout, "limit warning\n")).cut, true);
+  assert.equal(parseEvents(ok(stdout, "limit warning\n")).cut, false);
   assert.equal(parseEvents(ok("[]\n{}\n")).skipped, 2);
 });
 
@@ -188,6 +188,35 @@ test("each event kind has an english line and an unknown kind shows its name", (
   }
   assert.equal(eventRows([{ at_ms: T0, event: "constructor" }])[0].text, "constructor");
   assert.equal(eventRows([{ at_ms: T0, event: "merged", pr: 1, detail: "한글" }])[0].text, "merged #1");
+});
+
+test("a history warning alone does not say the events were cut", () => {
+  const read = parseEvents(ok(line({ at_ms: 1, event: "merged", pr: 1 }), "skipped a broken history line\n"));
+  assert.equal(read.cut, false);
+});
+
+test("events are cut only when chute gave the limit and warned", () => {
+  const rows = (n) => Array.from({ length: n }, (_, i) => line({ at_ms: i + 1, event: "merged", pr: i + 1 }));
+  const full = rows(DETAIL_EVENTS - 1).concat("{broken").join("\n");
+  assert.equal(parseEvents(ok(full, "warn\n")).cut, true);
+  assert.equal(parseEvents(ok(full, "")).cut, false);
+  assert.equal(parseEvents(ok(rows(DETAIL_EVENTS - 1).join("\n"), "warn\n")).cut, false);
+});
+
+test("an event without a pr number has no #undefined", () => {
+  for (const pr of [undefined, 0, "7"]) {
+    const base = pr === undefined ? {} : { pr };
+    const cases = [
+      [{ event: "merged", ...base }, "merged"],
+      [{ event: "bounced", reason: "head_changed", attempts: 1, ...base }, "bounced \u00b7 head changed \u00b7 attempt 1"],
+      [{ event: "submitted", ...base }, "submitted"],
+    ];
+    for (const [event, text] of cases) {
+      const [row] = eventRows([{ at_ms: T0, ...event }]);
+      assert.equal(row.text, text);
+      assert.doesNotMatch(row.text, /undefined|#/);
+    }
+  }
 });
 
 test("the flaky ledger lists chronic tests first, then by count and last time", () => {

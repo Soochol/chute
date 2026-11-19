@@ -126,7 +126,7 @@ export function parseEvents(result) {
       skipped++;
     }
   }
-  return { kind: "ok", events, skipped, cut: out.stderr.trim() !== "" };
+  return { kind: "ok", events, skipped, cut: out.stderr.trim() !== "" && events.length + skipped >= DETAIL_EVENTS };
 }
 
 const median = (values) => {
@@ -205,12 +205,12 @@ const withPr = (name) => (e) => `${name}${Number.isSafeInteger(e.pr) && e.pr > 0
 const kind = (glyph, tone, text) => ({ glyph, tone, text });
 
 const EVENT = {
-  merged: kind("✓", "ok", (e) => `merged #${e.pr}`),
+  merged: kind("✓", "ok", withPr("merged")),
   bounced: kind(
     "✕",
     "error",
     (e) =>
-      [`bounced #${e.pr}`, spaced(e.reason), Number.isSafeInteger(e.attempts) ? `attempt ${e.attempts}` : ""]
+      [withPr("bounced")(e), spaced(e.reason), Number.isSafeInteger(e.attempts) ? `attempt ${e.attempts}` : ""]
         .filter(Boolean)
         .join(" · "),
   ),
@@ -245,7 +245,7 @@ const EVENT = {
   blocked: kind("✕", "error", (e) => `queue stopped · ${spaced(e.reason)} ${shortSha(e.base)}`),
   resumed: kind("▸", "working", (e) => `resumed by ${spaced(e.by)}${Number.isSafeInteger(e.pr) && e.pr > 0 ? ` #${e.pr}` : ""}`),
   reverted: kind("↺", "warn", (e) => `reverted ${prText(e.prs)}`),
-  submitted: kind("+", "waiting", (e) => `submitted #${e.pr}`),
+  submitted: kind("+", "waiting", withPr("submitted")),
   needs_human: kind("?", "human", withPr("needs human")),
   removed: kind("–", "waiting", withPr("removed")),
   dropped: kind("–", "waiting", withPr("dropped")),
