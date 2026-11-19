@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -173,7 +173,7 @@ pub fn ledger_tests(
     except: Option<&BatchId>,
 ) -> Vec<String> {
     let since = window_start(now, days);
-    let recorded: Vec<&[String]> = events
+    let recorded: HashSet<&str> = events
         .iter()
         .filter(|e| e.at_ms.0 >= since)
         .filter_map(|e| match &e.kind {
@@ -182,13 +182,15 @@ pub fn ledger_tests(
                 step: recorded,
                 tests,
                 ..
-            } if Some(batch) != except && recorded == step => Some(tests.as_slice()),
+            } if Some(batch) != except && recorded == step => Some(tests),
             _ => None,
         })
+        .flatten()
+        .map(String::as_str)
         .collect();
     tests
         .iter()
-        .filter(|test| recorded.iter().any(|named| named.contains(test)))
+        .filter(|test| recorded.contains(test.as_str()))
         .cloned()
         .collect()
 }
@@ -208,15 +210,23 @@ pub fn rerun_signal(
 ) -> Option<(RerunSignal, Vec<String>)> {
     let last = failed.tests();
     let first = failed.first_attempt_tests.as_deref().unwrap_or_default();
+    let in_first: HashSet<&str> = first.iter().map(String::as_str).collect();
     let mut named = first.to_vec();
-    named.extend(last.iter().filter(|t| !first.contains(t)).cloned());
-    if !first.is_empty() && !last.is_empty() && !last.iter().any(|t| first.contains(t)) {
+    named.extend(
+        last.iter()
+            .filter(|t| !in_first.contains(t.as_str()))
+            .cloned(),
+    );
+    if !first.is_empty() && !last.is_empty() && !last.iter().any(|t| in_first.contains(t.as_str()))
+    {
         return Some((RerunSignal::DifferentTests, named));
     }
     let twice: Vec<String> = if first.is_empty() {
         last
     } else {
-        last.into_iter().filter(|t| first.contains(t)).collect()
+        last.into_iter()
+            .filter(|t| in_first.contains(t.as_str()))
+            .collect()
     };
     known_flaky(events, now, days, &failed.step, &twice, batch)
         .then_some((RerunSignal::KnownFlaky, named))
@@ -500,6 +510,59 @@ mod tests {
 
     fn signal(failed: &verify::Failed, events: &[Event]) -> Option<(RerunSignal, Vec<String>)> {
         rerun_signal(failed, events, NOW, 30, &BatchId("now".into()))
+    }
+
+    const MANY: usize = 100_000;
+
+    fn names(prefix: &str) -> Vec<String> {
+        (0..MANY).map(|n| format!("{prefix}::case_{n}")).collect()
+    }
+
+    fn failed_with(first: Vec<String>, last: Vec<String>) -> verify::Failed {
+        let mut failure = failed(None, &["x"]);
+        failure.first_attempt_tests = Some(first);
+        failure.detail = verify::Detail::Tests(crate::model::NonEmpty::new(last).unwrap());
+        failure
+    }
+
+    fn ledgered(batch: &str, tests: Vec<String>) -> Event {
+        Event {
+            at_ms: EpochMs(NOW.0 - 3 * DAY_MS),
+            kind: EventKind::Flaky {
+                batch: BatchId(batch.into()),
+                step: "test".into(),
+                tests,
+                tree: Sha::try_from("a".repeat(40)).unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn rerun_signal_reads_a_hundred_thousand_names_per_attempt() {
+        let (first, last) = (names("first"), names("last"));
+        let failure = failed_with(first.clone(), last.clone());
+        let (kind, named) = signal(&failure, &[]).unwrap();
+        assert_eq!(kind, RerunSignal::DifferentTests);
+        assert_eq!(named, [first.clone(), last].concat());
+
+        let twice = failed_with(first.clone(), first.clone());
+        let known = [ledgered("b1", first.clone())];
+        let (kind, named) = signal(&twice, &known).unwrap();
+        assert_eq!(kind, RerunSignal::KnownFlaky);
+        assert_eq!(named, first);
+        let missing_one = [ledgered("b1", first[1..].to_vec())];
+        assert_eq!(signal(&twice, &missing_one), None);
+    }
+
+    #[test]
+    fn ledger_tests_keeps_the_order_of_a_hundred_thousand_names() {
+        let mut asked = names("case");
+        asked.reverse();
+        let events = [ledgered("b1", names("case"))];
+
+        let found = ledger_tests(&events, NOW, 30, "test", &asked, None);
+
+        assert_eq!(found, asked);
     }
 
     #[test]

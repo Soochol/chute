@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -701,6 +701,7 @@ impl Engine {
             repairing,
             reran: BTreeSet::new(),
             rerunning: None,
+            reran_pushed: BTreeMap::new(),
             earlier_attempts: BTreeMap::new(),
             bases_ran: BTreeSet::new(),
         };
@@ -889,12 +890,16 @@ struct Build {
 
 enum Verdict {
     Pass,
-    Fail(Failed),
+    Fail { failed: Failed, round: u32 },
 }
 
 enum Alone {
     Pass,
-    Fail { failed: Failed, tip: Sha },
+    Fail {
+        failed: Failed,
+        round: u32,
+        tip: Sha,
+    },
     Conflict,
 }
 
@@ -932,6 +937,7 @@ struct Run<'e> {
     repairing: bool,
     reran: BTreeSet<PrNumber>,
     rerunning: Option<Rerunning>,
+    reran_pushed: BTreeMap<Sha, Sha>,
     earlier_attempts: BTreeMap<PrNumber, EarlierRun>,
     bases_ran: BTreeSet<Sha>,
 }
@@ -1451,6 +1457,7 @@ impl Run<'_> {
 
     fn solve(&mut self, mut group: Vec<PrNumber>) -> Result<()> {
         let mut rounds = 0;
+        let mut flaked_tree = None;
         while rounds < PUSH_ROUNDS && !group.is_empty() {
             let b = self.build(&group)?;
             if b.landing.is_empty() {
@@ -1461,6 +1468,7 @@ impl Run<'_> {
                 Verdict::Pass => {
                     if let Some(rerun) = self.rerunning.take() {
                         self.record_flaky(vec![rerun.step], &rerun.failed_tree)?;
+                        flaked_tree = Some(rerun.failed_tree);
                     }
                     if !self.all_still_fit(&b, &mut group)? {
                         continue;
@@ -1473,11 +1481,18 @@ impl Run<'_> {
                         );
                     }
                     match self.slot.push(&b.tip)? {
-                        PushOutcome::Pushed => return self.land(&b),
+                        PushOutcome::Pushed => {
+                            if let Some(flaked) = flaked_tree {
+                                self.reran_pushed.insert(flaked, b.tip.clone());
+                            }
+                            return self.land(&b);
+                        }
                         PushOutcome::MainMoved => rounds += 1,
                     }
                 }
-                Verdict::Fail(failed) => return self.split_or_convict(&b, failed),
+                Verdict::Fail { failed, round } => {
+                    return self.split_or_convict(&b, failed, round);
+                }
             }
         }
         if group.is_empty() {
@@ -1488,10 +1503,10 @@ impl Run<'_> {
         )
     }
 
-    fn split_or_convict(&mut self, b: &Build, failed: Failed) -> Result<()> {
+    fn split_or_convict(&mut self, b: &Build, failed: Failed, round: u32) -> Result<()> {
         match b.members.as_slice() {
             [] => Ok(()),
-            [only] => self.convict(*only, b, failed),
+            [only] => self.convict(*only, b, failed, round),
             members => {
                 self.bisecting = true;
                 let (front, back) = members.split_at(members.len() / 2);
@@ -1582,7 +1597,7 @@ impl Run<'_> {
                 }
                 Ok(Verdict::Pass)
             }
-            Outcome::Failed(failed) => Ok(Verdict::Fail(failed)),
+            Outcome::Failed(failed) => Ok(Verdict::Fail { failed, round }),
             Outcome::Cancelled => Err(Halt::Cancelled.into()),
         }
     }
@@ -1744,11 +1759,12 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn convict(&mut self, pr: PrNumber, b: &Build, failed: Failed) -> Result<()> {
-        let together = (failed.clone(), b.tip.clone());
-        let (failed, tip, blame) = if b.base == self.start_base || self.landed.is_empty() {
+    fn convict(&mut self, pr: PrNumber, b: &Build, failed: Failed, round: u32) -> Result<()> {
+        let together = (failed.clone(), round, b.tip.clone());
+        let (failed, round, tip, blame) = if b.base == self.start_base || self.landed.is_empty() {
             (
                 failed,
+                round,
                 b.tip.clone(),
                 Blame::Solo {
                     base: b.base.clone(),
@@ -1757,24 +1773,32 @@ impl Run<'_> {
         } else {
             let start = self.start_base.clone();
             match self.check_alone(pr, &start)? {
-                Alone::Pass => (together.0, together.1, Blame::Combo(self.landed.clone())),
+                Alone::Pass => (
+                    together.0,
+                    together.1,
+                    together.2,
+                    Blame::Combo(self.landed.clone()),
+                ),
                 Alone::Conflict => (
                     together.0,
                     together.1,
+                    together.2,
                     Blame::Solo {
                         base: b.base.clone(),
                     },
                 ),
                 Alone::Fail {
                     failed: alone,
+                    round: alone_round,
                     tip: alone_tip,
                 } => {
                     if self.base_sound(&start)? {
-                        (alone, alone_tip, Blame::Solo { base: start })
+                        (alone, alone_round, alone_tip, Blame::Solo { base: start })
                     } else {
                         (
                             together.0,
                             together.1,
+                            together.2,
                             Blame::Solo {
                                 base: b.base.clone(),
                             },
@@ -1787,7 +1811,7 @@ impl Run<'_> {
             && let Some((signal, tests)) = self.rerun_signal(pr, &failed)?
         {
             let base = base.clone();
-            return self.rerun(pr, &failed, signal, tests, &tip, base);
+            return self.rerun(pr, &failed, round, (signal, tests), &tip, base);
         }
         let mut base_check = None;
         if !self.repairing {
@@ -1839,12 +1863,13 @@ impl Run<'_> {
             .filter(|e| e.step == failed.step && e.base == *base_of_failure);
         let mut attempts = earlier.map(|e| e.attempts.clone()).unwrap_or_default();
         attempts.extend(attempts_of(failed));
-        let mut named: Vec<String> = Vec::new();
-        for test in attempts.iter().flatten() {
-            if !named.contains(test) {
-                named.push(test.clone());
-            }
-        }
+        let mut seen: HashSet<&String> = HashSet::new();
+        let named: Vec<String> = attempts
+            .iter()
+            .flatten()
+            .filter(|test| seen.insert(*test))
+            .cloned()
+            .collect();
         let ledger_days = self.config.flaky.chronic_days;
         let ledger_tests = flaky::ledger_tests(
             &self.engine.store.history()?.events,
@@ -1884,8 +1909,8 @@ impl Run<'_> {
         &mut self,
         pr: PrNumber,
         failed: &Failed,
-        signal: RerunSignal,
-        tests: Vec<String>,
+        failed_round: u32,
+        (signal, tests): (RerunSignal, Vec<String>),
         failed_tree: &Sha,
         base: Sha,
     ) -> Result<()> {
@@ -1901,7 +1926,7 @@ impl Run<'_> {
         self.record.reruns.push(Rerun {
             pr,
             step: failed.step.clone(),
-            failed_round: self.record.verifications,
+            failed_round,
             signal,
             tests: tests.clone(),
         });
@@ -1925,8 +1950,9 @@ impl Run<'_> {
             Some(ItemResult::Merged { .. }) => {
                 match self.verify(&result.tip, Scope::Changed, false)? {
                     Verdict::Pass => Ok(Alone::Pass),
-                    Verdict::Fail(failed) => Ok(Alone::Fail {
+                    Verdict::Fail { failed, round } => Ok(Alone::Fail {
                         failed,
+                        round,
                         tip: result.tip,
                     }),
                 }
@@ -1958,7 +1984,7 @@ impl Run<'_> {
                 self.bases_ran.insert(base.clone());
                 Ok(BaseVerdict::Sound(BaseCheck::RanInThisBatch))
             }
-            Verdict::Fail(failed) => Ok(BaseVerdict::Broken(failed)),
+            Verdict::Fail { failed, .. } => Ok(BaseVerdict::Broken(failed)),
         }
     }
 
@@ -2118,8 +2144,13 @@ impl Run<'_> {
                 .iter()
                 .find(|s| s.name == entry.step)
                 .and_then(|s| s.probe.as_deref());
-            let landed = self.record.pushed.contains(&entry.tree);
-            let Some(command) = command.filter(|_| landed && !entry.tests.is_empty()) else {
+            let pushed = if self.record.pushed.contains(&entry.tree) {
+                Some(&entry.tree)
+            } else {
+                self.reran_pushed.get(&entry.tree)
+            };
+            let Some((command, pushed)) = command.zip(pushed).filter(|_| !entry.tests.is_empty())
+            else {
                 continue;
             };
             let found = match flaky::probe(&flaky::ProbeJob {
@@ -2131,7 +2162,7 @@ impl Run<'_> {
                 step: &entry.step,
                 tests: &entry.tests,
                 base: &self.start_base,
-                flaked: &entry.tree,
+                flaked: pushed,
                 cancel: &engine.cancel,
                 cache_dir: engine.gitops.cache_dir(),
             }) {

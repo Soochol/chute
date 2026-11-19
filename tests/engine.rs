@@ -2617,6 +2617,35 @@ fn a_flake_on_a_tip_that_was_never_pushed_is_not_probed() {
 }
 
 #[test]
+fn a_flake_found_by_verifying_again_is_probed_on_the_pushed_commit() {
+    let verify = format!(
+        "m='@ROOT@/moved'\nif [ ! -e \"$m\" ]; then touch \"$m\"; (git clone -q '@ORIGIN@' '@ROOT@/mover' && cd '@ROOT@/mover' && echo x > moved.txt && git add moved.txt && git commit -qm 'chore: other push' && git push -q origin HEAD:main) || fail 'mover failed'; fi\n{}",
+        scripted_failures(&[&["test_a"], &["test_b"]])
+    );
+    let lab = Lab::build_with_step(
+        &verify,
+        "",
+        60,
+        &probe_step("git rev-parse HEAD >> '@ROOT@/probed-at'; : {tests}"),
+    );
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.reruns.len(), 1);
+    assert_eq!(probes(&lab).len(), 1, "{:?}", probes(&lab));
+    assert_eq!(record.pushed.len(), 1);
+    assert_eq!(record.flaky.len(), 1);
+    let failed_tree = record.flaky[0].tree.clone();
+    assert_ne!(failed_tree, record.pushed[0]);
+    let probed_at = fs::read_to_string(lab.sb.root().join("probed-at")).unwrap();
+    assert!(probed_at.contains(record.pushed[0].as_str()), "{probed_at}");
+    assert!(!probed_at.contains(failed_tree.as_str()), "{probed_at}");
+}
+
+#[test]
 fn thousands_of_flaked_tests_are_still_probed() {
     let body = "m='@ROOT@/flake-now'\nif [ -e \"$m\" ]; then rm \"$m\"; i=0; while [ $i -lt 5000 ]; do echo \"FAILED some_long_test_name_$i\"; i=$((i+1)); done; fail \"FAILED last\"; fi";
     let lab = Lab::build_with_step(body, "", 60, &probe_step(": {tests}"));
@@ -3139,10 +3168,19 @@ fn checking_a_base_runs_every_step_even_when_paths_would_skip_it() {
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 fn scripted_failures(runs: &[&[&str]]) -> String {
+    let runs: Vec<Option<&[&str]>> = runs.iter().map(|tests| Some(*tests)).collect();
+    scripted_outcomes(&runs)
+}
+
+fn scripted_outcomes(runs: &[Option<&[&str]>]) -> String {
     let mut script = String::from(
         "c='@ROOT@/runs'; n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\ncase $n in\n",
     );
-    for (n, tests) in runs.iter().enumerate() {
+    for (n, outcome) in runs.iter().enumerate() {
+        let Some(tests) = outcome else {
+            script.push_str(&format!("{}) :;;\n", n + 1));
+            continue;
+        };
         let lines: Vec<String> = tests.iter().map(|t| format!("FAILED {t}")).collect();
         let text = if lines.is_empty() {
             "boom".to_owned()
@@ -3241,6 +3279,49 @@ fn a_solo_failure_whose_attempts_name_different_tests_again_is_bounced_after_one
         panic!("검증 실패여야 한다");
     };
     assert_eq!(step.failed_tests, ["test_d"]);
+}
+
+#[test]
+fn a_rerun_found_while_splitting_a_batch_records_the_round_that_failed() {
+    let lab = Lab::new(&scripted_outcomes(&[
+        Some(&["boom_1"]),
+        Some(&["boom_1"]),
+        None,
+        Some(&["boom_2"]),
+        Some(&["boom_2"]),
+        Some(&["boom_3"]),
+        Some(&["boom_3"]),
+        Some(&["test_a"]),
+        Some(&["test_b"]),
+    ]));
+    for n in 1..=3 {
+        open_pr_by_orchestrator(&lab, n, &[(&format!("f{n}.txt"), "x\n")]);
+    }
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1, 2, 3]));
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert_eq!(record.reruns.len(), 1);
+    assert_eq!(record.reruns[0].pr, PrNumber(2));
+    let batch_dir = lab.store.batch_dir(&summary.batch);
+    let rounds_naming = |test: &str| -> Vec<u32> {
+        (1..=record.verifications)
+            .filter(|round| {
+                fs::read_dir(batch_dir.join(format!("verify-{round}")))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|file| fs::read_to_string(file.unwrap().path()).ok())
+                    .any(|log| log.contains(test))
+            })
+            .collect()
+    };
+    assert_eq!(
+        rounds_naming("test_b"),
+        [record.reruns[0].failed_round],
+        "the round of the failure that showed the sign, not the base check after it"
+    );
+    assert!(record.reruns[0].failed_round < record.verifications);
 }
 
 fn bounce_report(lab: &Lab, pr: u64) -> (String, serde_json::Value) {
