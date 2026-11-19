@@ -26,8 +26,8 @@ use crate::model::{
     Agent, BaseCheck, BaseDoubt, Batch, BatchId, BatchRecord, BlockReason, Blocked, BounceReason,
     EpochMs, Event, EventKind, Failure, Flaky, ItemState, MergeRef, NonEmpty, Phase, PrNumber,
     ProbeEvidence, QueueItem, QueuedReason, RemovedReason, RepoInfo, Rerun, RerunSignal, ResumedBy,
-    Reused, Sha, SkippedStep, SoloEvidence, State, StepFailure, TreeKey, VerifiedBy, VerifiedTree,
-    VerifyMode, Warning, WarningKind,
+    Reused, RunOutcome, Sha, SkippedStep, SoloEvidence, State, StepFailure, TreeKey, VerifiedBy,
+    VerifiedTree, VerifyMode, Warning, WarningKind,
 };
 use crate::notify::{BounceDelivery, Line, Notifier, Removal, WaitingWhy, mode_of};
 use crate::pc_limit::Wait;
@@ -704,6 +704,8 @@ impl Engine {
             reran_pushed: BTreeMap::new(),
             earlier_attempts: BTreeMap::new(),
             bases_ran: BTreeSet::new(),
+            last_pass: PassedBy::Reuse,
+            pushed_by_pass: BTreeMap::new(),
         };
         let result = run.execute(&taken);
         let only_deferred = run.only_deferred();
@@ -940,10 +942,20 @@ struct Run<'e> {
     reran_pushed: BTreeMap<Sha, Sha>,
     earlier_attempts: BTreeMap<PrNumber, EarlierRun>,
     bases_ran: BTreeSet<Sha>,
+    last_pass: PassedBy,
+    pushed_by_pass: BTreeMap<Sha, PassedBy>,
+}
+
+/// How the last passing verification passed: a run in this batch, or a reuse of an earlier pass.
+#[derive(Clone, Copy)]
+enum PassedBy {
+    Round(u32),
+    Reuse,
 }
 
 struct EarlierRun {
     step: String,
+    timed_out: bool,
     base: Sha,
     attempts: Vec<Vec<String>>,
 }
@@ -1466,6 +1478,7 @@ impl Run<'_> {
             let reusable = !self.bisecting && self.rerunning.is_none();
             match self.verify(&b.tip, Scope::Changed, reusable)? {
                 Verdict::Pass => {
+                    let passed_by = self.last_pass;
                     if let Some(rerun) = self.rerunning.take() {
                         self.record_flaky(vec![rerun.step], &rerun.failed_tree)?;
                         flaked_tree = Some(rerun.failed_tree);
@@ -1485,6 +1498,7 @@ impl Run<'_> {
                             if let Some(flaked) = flaked_tree {
                                 self.reran_pushed.insert(flaked, b.tip.clone());
                             }
+                            self.pushed_by_pass.insert(b.tip.clone(), passed_by);
                             return self.land(&b);
                         }
                         PushOutcome::MainMoved => rounds += 1,
@@ -1525,6 +1539,7 @@ impl Run<'_> {
         if let (true, Some(key)) = (reusable, &key)
             && self.reuse_pass(key)?
         {
+            self.last_pass = PassedBy::Reuse;
             return Ok(Verdict::Pass);
         }
         self.record.verifications += 1;
@@ -1589,6 +1604,7 @@ impl Run<'_> {
         );
         match outcome {
             Outcome::Passed { flaky } => {
+                self.last_pass = PassedBy::Round(round);
                 self.clear_base_doubt()?;
                 let steady = flaky.is_empty();
                 self.record_flaky(flaky, tree)?;
@@ -1696,7 +1712,6 @@ impl Run<'_> {
         let commits: BTreeMap<PrNumber, Sha> = b.landing.iter().cloned().collect();
         if pushed {
             self.record.pushed.push(b.tip.clone());
-            self.bases_ran.insert(b.tip.clone());
         }
         for (pr, commit) in &b.landing {
             let item = &self.items[pr];
@@ -1816,7 +1831,10 @@ impl Run<'_> {
         let mut base_check = None;
         if !self.repairing {
             match &blame {
-                Blame::Solo { base } => base_check = Some(self.confirm_solo_base(pr, base)?),
+                Blame::Solo { base } => {
+                    let check = self.confirm_solo_base(pr, base)?;
+                    base_check = Some(self.name_pushed_base(base, &failed.step, check));
+                }
                 Blame::Combo(_) => {
                     self.require_sound_base(&b.base)?;
                 }
@@ -1850,6 +1868,30 @@ impl Run<'_> {
         self.bounce(pr, failure, Some(&name))
     }
 
+    /// A base this batch pushed is in `verified_bases` but was not run as a base here. Say how the
+    /// verification that passed it treated the step that failed.
+    fn name_pushed_base(&self, base: &Sha, step: &str, check: BaseCheck) -> BaseCheck {
+        if check != BaseCheck::VerifiedEarlier || self.bases_ran.contains(base) {
+            return check;
+        }
+        match self.pushed_by_pass.get(base) {
+            None => check,
+            Some(PassedBy::Reuse) => BaseCheck::PushedReused,
+            Some(PassedBy::Round(round)) => {
+                let skipped = self
+                    .record
+                    .skipped
+                    .iter()
+                    .any(|s| s.round == *round && s.step == step);
+                if skipped {
+                    BaseCheck::PushedSkippedByPaths
+                } else {
+                    BaseCheck::RanInThisBatch
+                }
+            }
+        }
+    }
+
     fn solo_evidence(
         &self,
         pr: PrNumber,
@@ -1860,8 +1902,9 @@ impl Run<'_> {
         let earlier = self
             .earlier_attempts
             .get(&pr)
-            .filter(|e| e.step == failed.step && e.base == *base_of_failure);
-        let mut attempts = earlier.map(|e| e.attempts.clone()).unwrap_or_default();
+            .filter(|e| e.base == *base_of_failure);
+        let same_step = earlier.filter(|e| e.step == failed.step);
+        let mut attempts = same_step.map(|e| e.attempts.clone()).unwrap_or_default();
         attempts.extend(attempts_of(failed));
         let mut seen: HashSet<&String> = HashSet::new();
         let named: Vec<String> = attempts
@@ -1879,13 +1922,40 @@ impl Run<'_> {
             &named,
             None,
         );
+        let mut run_outcomes: Vec<RunOutcome> = earlier
+            .map(|e| self.earlier_outcome(e, &failed.step))
+            .into_iter()
+            .collect();
+        run_outcomes.push(if matches!(failed.cause, Cause::TimedOut) {
+            RunOutcome::TimedOut
+        } else {
+            RunOutcome::Failed
+        });
         Ok(SoloEvidence {
             base,
-            runs: if earlier.is_some() { 2 } else { 1 },
+            runs: run_outcomes.len() as u32,
             attempts,
             ledger_days,
             ledger_tests,
+            run_outcomes,
         })
+    }
+
+    /// What `step` did in an earlier verification that stopped at the step `earlier` names.
+    /// A verification runs the steps in order and stops at the first one that fails.
+    fn earlier_outcome(&self, earlier: &EarlierRun, step: &str) -> RunOutcome {
+        if earlier.step == step {
+            return if earlier.timed_out {
+                RunOutcome::TimedOut
+            } else {
+                RunOutcome::Failed
+            };
+        }
+        let position = |name: &str| self.config.verify.iter().position(|s| s.name == name);
+        match (position(step), position(&earlier.step)) {
+            (Some(mine), Some(theirs)) if mine < theirs => RunOutcome::Passed,
+            _ => RunOutcome::NotRun,
+        }
     }
 
     fn rerun_signal(
@@ -1919,6 +1989,7 @@ impl Run<'_> {
             pr,
             EarlierRun {
                 step: failed.step.clone(),
+                timed_out: matches!(failed.cause, Cause::TimedOut),
                 base,
                 attempts: attempts_of(failed),
             },

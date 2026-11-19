@@ -569,6 +569,20 @@ pub struct SoloEvidence {
     pub ledger_days: u32,
     #[serde(default)]
     pub ledger_tests: Vec<String>,
+    /// What the reported step did in each verification of this PR on this base, oldest first.
+    /// Empty in a report written before this field existed.
+    #[serde(default)]
+    pub run_outcomes: Vec<RunOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    Failed,
+    TimedOut,
+    Passed,
+    /// An earlier step failed first, so the verification stopped before this step.
+    NotRun,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +590,10 @@ pub struct SoloEvidence {
 pub enum BaseCheck {
     RanInThisBatch,
     VerifiedEarlier,
+    /// This batch pushed the base and its verification skipped the step by `paths`.
+    PushedSkippedByPaths,
+    /// This batch pushed the base and its verification was a reuse of an earlier pass.
+    PushedReused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -884,7 +902,8 @@ pub enum RerunSignal {
 pub struct Rerun {
     pub pr: PrNumber,
     pub step: String,
-    /// The verification round whose failure caused the rerun. The rerun is the next round.
+    /// The verification round whose failure caused the rerun. When the failure was found while
+    /// splitting a group, a base check can run between that round and the rerun.
     pub failed_round: u32,
     pub signal: RerunSignal,
     pub tests: Vec<String>,
