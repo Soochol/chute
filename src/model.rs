@@ -971,17 +971,11 @@ pub struct BatchRecord {
     pub reruns: Vec<Rerun>,
     #[serde(default)]
     pub step_times: Vec<StepRun>,
+    #[serde(default)]
+    pub ran: Vec<String>,
 }
 
 impl BatchRecord {
-    pub fn ran(&self) -> Vec<String> {
-        self.step_times
-            .iter()
-            .filter(|run| run.round == 1)
-            .map(|run| run.step.clone())
-            .collect()
-    }
-
     pub fn passed_times(&self) -> Vec<StepTime> {
         self.step_times
             .iter()
@@ -1451,7 +1445,7 @@ mod tests {
         let record = r#"{"id":"b1","base":"abc1234","prs":[1],"started_ms":1,"finished_ms":2,"merges":[],"bounced":[],"flaky":[],"verify_s":3}"#;
         let record: BatchRecord = serde_json::from_str(record).unwrap();
         assert!(record.step_times.is_empty());
-        assert!(record.ran().is_empty() && record.passed_times().is_empty());
+        assert!(record.ran.is_empty() && record.passed_times().is_empty());
 
         let line = r#"{"at_ms":5,"event":"batch_finished","batch":"b1","merged":[1],"bounced":[],"seconds":9,"verify_s":4}"#;
         let event: Event = serde_json::from_str(line).unwrap();

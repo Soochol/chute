@@ -451,7 +451,7 @@ impl Engine {
                         bounced: bounced_prs,
                         seconds: now.0.saturating_sub(record.started_ms.0) / 1000,
                         verify_s: record.verify_s,
-                        ran: record.ran(),
+                        ran: record.ran.clone(),
                         verifications: record.verifications,
                         step_times: record.passed_times(),
                     })?;
@@ -691,6 +691,7 @@ impl Engine {
                 reused: Vec::new(),
                 reruns: Vec::new(),
                 step_times: Vec::new(),
+                ran: Vec::new(),
             },
             start_base: base,
             items: taken.iter().map(|i| (i.pr, i.clone())).collect(),
@@ -1554,6 +1555,9 @@ impl Run<'_> {
         let round = self.record.verifications;
         let steps = self.config.steps_for(changed.as_deref());
         let left_out = self.config.skipped_steps(changed.as_deref());
+        if round == 1 {
+            self.record.ran = steps.clone();
+        }
         self.update_batch(|b| {
             b.round = round;
             b.step = None;
@@ -2366,7 +2370,7 @@ impl Run<'_> {
                 bounced: self.bounced.clone(),
                 seconds: now.0.saturating_sub(self.record.started_ms.0) / 1000,
                 verify_s: self.record.verify_s,
-                ran: self.record.ran(),
+                ran: self.record.ran.clone(),
                 verifications: self.record.verifications,
                 step_times: self.record.passed_times(),
             })?;

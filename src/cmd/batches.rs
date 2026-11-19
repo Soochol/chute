@@ -257,6 +257,7 @@ mod tests {
                 seconds: 7,
                 result: StepResult::Failed,
             }],
+            ran: Vec::new(),
         };
         let all = [Loaded {
             record: record.clone(),

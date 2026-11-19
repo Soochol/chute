@@ -899,6 +899,7 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
             reused: Vec::new(),
             reruns: Vec::new(),
             step_times: Vec::new(),
+            ran: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1206,6 +1207,7 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
             reused: Vec::new(),
             reruns: Vec::new(),
             step_times: Vec::new(),
+            ran: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1271,6 +1273,7 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
             reused: Vec::new(),
             reruns: Vec::new(),
             step_times: Vec::new(),
+            ran: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1315,6 +1318,7 @@ fn batch_record(
         reused: Vec::new(),
         reruns: Vec::new(),
         step_times: Vec::new(),
+        ran: Vec::new(),
         env: None,
     }
 }
@@ -3819,7 +3823,8 @@ fn a_batch_records_how_long_each_step_took_in_each_round() {
         "a step that sleeps a real second took 0 on the engine's frozen clock; e2e was left out by paths"
     );
 
-    let lab = Lab::new(BAD);
+    let lab = Lab::build_with_step(BAD, "", 60, LINT_AND_E2E);
+    fs::write(lab.sb.root().join("lint.sh"), "exit 0\n").unwrap();
     lab.open_pr(1, &[("a.txt", "a\n")]);
     lab.open_pr(2, &[("BAD", "")]);
 
@@ -3827,6 +3832,11 @@ fn a_batch_records_how_long_each_step_took_in_each_round() {
 
     let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
     assert!(record.verifications > 1, "the batch was split");
+    assert_eq!(
+        record.ran,
+        ["check", "lint"],
+        "ran is the first round's step list even though that round stopped at check"
+    );
     let first_round: Vec<_> = record.step_times.iter().filter(|r| r.round == 1).collect();
     assert_eq!(first_round.len(), 1);
     assert_eq!(first_round[0].step, "check");

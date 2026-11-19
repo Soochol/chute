@@ -286,7 +286,7 @@ fn status_shows_the_daemon_that_holds_the_lock() {
     let dir = sb.chute_home().join("repos/acme__widget");
     fs::write(
         dir.join("daemon.json"),
-        r#"{"pid": 4242, "terminal": "t1zz", "doing": null, "started_ms": 0}"#,
+        r#"{"pid": 4242, "terminal": "t1zz", "doing": "큐를 보는 중", "started_ms": 0}"#,
     )
     .unwrap();
     let lock = fs::File::create(dir.join("daemon.lock")).unwrap();
@@ -294,14 +294,14 @@ fn status_shows_the_daemon_that_holds_the_lock() {
     let idle = status_json(&sb, &repo);
     assert_eq!(
         idle["daemon"],
-        serde_json::json!({"running": false, "terminal": null, "pid": null})
+        serde_json::json!({"running": false, "terminal": null, "pid": null, "doing": null})
     );
 
     lock.lock().unwrap();
     let running = status_json(&sb, &repo);
     assert_eq!(
         running["daemon"],
-        serde_json::json!({"running": true, "terminal": "t1zz", "pid": 4242})
+        serde_json::json!({"running": true, "terminal": "t1zz", "pid": 4242, "doing": "큐를 보는 중"})
     );
 }
 
