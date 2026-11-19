@@ -516,7 +516,7 @@ export function usualSeconds(recent) {
 const RECENT_MERGED_SHOWN = 5;
 
 function recentMergedOf(view, slug, now) {
-  const row = (pr, title, bounces, at, submitted) => {
+  const row = (pr, title, bounces, at, submitted, batch) => {
     const ago = Number.isFinite(at) ? formatAgo(now - at) : "";
     const took = Number.isFinite(at) && Number.isFinite(submitted) && submitted <= at ? formatDuration((at - submitted) / 1000) : "";
     return {
@@ -527,18 +527,83 @@ function recentMergedOf(view, slug, now) {
       took,
       tip: ago ? `Merged ${ago}${clockText(at) ? ` · ${clockText(at)}` : ""}` : "",
       url: pullUrl(slug, pr),
+      batch: typeof batch === "string" && batch !== "" ? batch : null,
+      at: Number.isFinite(at) ? at : null,
     };
   };
   if (Array.isArray(view.recent_merged)) {
     return view.recent_merged
       .filter(isObject)
       .slice(0, RECENT_MERGED_SHOWN)
-      .map((m) => row(m.pr, m.title, m.bounces, m.merged_ms, m.submitted_ms));
+      .map((m) => row(m.pr, m.title, m.bounces, m.merged_ms, m.submitted_ms, m.batch));
   }
   return list(view.recent)
     .filter(isObject)
-    .flatMap((r) => list(r.merged).map((pr) => row(pr, "", 0, r.finished_ms)))
+    .flatMap((r) => list(r.merged).map((pr) => row(pr, "", 0, r.finished_ms, null, r.batch)))
     .slice(0, RECENT_MERGED_SHOWN);
+}
+
+const STRIP_FLOOR = 0.15;
+
+// The recent batches that can be drawn, oldest first: `seconds` and `finished_ms` must be numbers.
+function recentBatchesOf(recent) {
+  return list(recent)
+    .filter((r) => isObject(r) && Number.isFinite(r.seconds) && Number.isFinite(r.finished_ms))
+    .map((r) => ({
+      batch: typeof r.batch === "string" && r.batch !== "" ? r.batch : null,
+      merged: list(r.merged).map(prOf),
+      bounced: list(r.bounced).map(prOf),
+      seconds: Math.max(0, r.seconds),
+      finished_ms: r.finished_ms,
+    }))
+    .reverse();
+}
+
+function stripOf(batches) {
+  if (batches.length === 0) return null;
+  const max = Math.max(...batches.map((b) => b.seconds));
+  const bars = batches.map((b, i) => {
+    const raw = max > 0 ? Math.log(1 + b.seconds) / Math.log(1 + max) : 0;
+    return {
+      key: b.batch ?? String(i),
+      height: Math.max(STRIP_FLOOR, raw),
+      tone: b.bounced.length > 0 ? "bounced" : "merged",
+      tip: [
+        clockText(b.finished_ms),
+        formatDuration(b.seconds),
+        b.merged.length > 0 ? `merged ${b.merged.map((pr) => `#${pr}`).join(" ")}` : "",
+        b.bounced.length > 0 ? `bounced ${b.bounced.map((pr) => `#${pr}`).join(" ")}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    };
+  });
+  return { bars, from: clockText(batches[0].finished_ms), to: clockText(batches[batches.length - 1].finished_ms) };
+}
+
+// Consecutive recent merges of one batch become one group. `recent` is the cleaned batch list from the repo.
+export function recentGroups(rows, recent) {
+  const byId = new Map(list(recent).filter((b) => b.batch).map((b) => [b.batch, b]));
+  const groups = [];
+  for (const row of rows) {
+    const last = groups[groups.length - 1];
+    if (row.batch != null && last && last.batch === row.batch) last.rows.push(row);
+    else groups.push({ key: row.batch != null ? `${row.batch}:${groups.length}` : `row:${groups.length}`, batch: row.batch, rows: [row] });
+  }
+  return groups.map(({ key, batch, rows: members }) => {
+    if (batch == null) return { key, head: null, rows: members };
+    const known = byId.get(batch);
+    const at = known ? known.finished_ms : members[0].at;
+    const count = known ? known.merged.length : members.length;
+    const head = [
+      clockText(at),
+      count > 1 ? `batch of ${count}` : "",
+      known ? formatDuration(known.seconds) : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return { key, head: head || null, rows: members };
+  });
 }
 
 const fileOf = (label, path) => (str(path) ? { label, path: str(path) } : null);
@@ -768,6 +833,11 @@ export const NARROW_WIDTH = 340;
 
 export const isNarrow = (width) => Number.isFinite(width) && width < NARROW_WIDTH;
 
+// From this width (logical px) an open repo is drawn in two columns.
+export const WIDE_WIDTH = 520;
+
+export const isWide = (width) => Number.isFinite(width) && width >= WIDE_WIDTH;
+
 export const RECENT_DEFAULT = 3;
 
 // The recent merges to draw: the first few, or all of them when `open`. `hidden` is how many `+ N more` stands for.
@@ -799,7 +869,7 @@ export const toggleFold = ({ saved, auto }) => ({ saved: !(saved && !auto), auto
 
 const TIME = (ms) => new Date(ms);
 const two = (n) => String(n).padStart(2, "0");
-export const clockText = (ms) => (Number.isFinite(ms) ? `${two(TIME(ms).getHours())}:${two(TIME(ms).getMinutes())}` : "");
+export const clockText = (ms) => (Number.isFinite(ms) && Number.isFinite(TIME(ms).getTime()) ? `${two(TIME(ms).getHours())}:${two(TIME(ms).getMinutes())}` : "");
 export const clockExact = (ms) => {
   if (!Number.isFinite(ms)) return "";
   const d = TIME(ms);
@@ -846,6 +916,8 @@ function repoBoard(view, now) {
     active: false,
     postVerify: null,
     recent: [],
+    recentBatches: [],
+    strip: null,
     today: null,
   };
   if (!hub.reachable) {
@@ -887,6 +959,7 @@ function repoBoard(view, now) {
   const overlaps = overlapNotes(queue);
   for (const card of placed.human) card.overlap = overlaps.get(card.pr) ?? null;
   const recent = recentMergedOf(view, slug, now);
+  const recentBatches = recentBatchesOf(view.recent);
   placed.alerts = alertsOf(view, queue, now, recent);
   placed.batch = batchOf(view.batch, inBatch, now, usualSeconds(view.recent), slug);
 
@@ -907,6 +980,8 @@ function repoBoard(view, now) {
     active: placed.batch.length > 0 || postVerify?.run != null,
     postVerify,
     recent,
+    recentBatches,
+    strip: stripOf(recentBatches),
     today: todayOf(view.today, chronicFlaky(view)),
     sections: SECTION_ORDER.filter((id) => ALWAYS_SHOWN.has(id) || placed[id].length > 0).map((id) => ({
       id,
