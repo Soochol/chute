@@ -22,9 +22,10 @@ pub struct Args {
 
 const SKILL_MD: &str = include_str!("../../skills/chute/SKILL.md");
 
-const MOD_FILES: [(&str, &str); 3] = [
+const MOD_FILES: [(&str, &str); 4] = [
     ("main.js", include_str!("../../mod/chute/main.js")),
     ("board.js", include_str!("../../mod/chute/board.js")),
+    ("detail.js", include_str!("../../mod/chute/detail.js")),
     ("mod.json", include_str!("../../mod/chute/mod.json")),
 ];
 
@@ -581,6 +582,7 @@ mod tests {
             ".codex/skills/chute/SKILL.md",
             ".config/herdr-app/mods/chute/main.js",
             ".config/herdr-app/mods/chute/board.js",
+            ".config/herdr-app/mods/chute/detail.js",
             ".config/herdr-app/mods/chute/mod.json",
         ]
         .map(str::to_owned)

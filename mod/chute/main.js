@@ -1,5 +1,5 @@
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, Tabs, Tab } from "gpui-base";
 import {
   checking,
   closeOverlay,
@@ -41,6 +41,19 @@ import {
   toggleFold,
   toneToken,
 } from "./board.js";
+import {
+  DETAIL_EVENTS,
+  FLAKY_SHOWN,
+  TABS,
+  batchRows,
+  detailArgs,
+  eventRows,
+  flakyRows,
+  overviewOf,
+  parseBatches,
+  parseEvents,
+  parseFlaky,
+} from "./detail.js";
 
 const TICK_MS = 1000;
 const MIN_READ_GAP_MS = 1000;
@@ -123,6 +136,12 @@ export default class Chute extends View {
     }
     const bin = given.bin;
     this.bin = typeof bin === "string" && bin ? bin : "chute";
+    const detail = given.detail;
+    this.detail = detail !== null && typeof detail === "object" && typeof detail.repo === "string" ? detail : null;
+    if (this.detail) {
+      this.initDetail(cx);
+      return;
+    }
     this.result = null;
     this.board = null;
     this.reading = false;
@@ -400,6 +419,316 @@ export default class Chute extends View {
     });
   }
 
+  openDetail(repo, tab) {
+    openOverlay({
+      kind: "window",
+      key: "chute-detail",
+      mod: MOD,
+      width: 760,
+      height: 520,
+      props: { detail: { repo: repo.id, name: repo.name, tab }, bin: this.bin },
+    });
+  }
+
+  initDetail(cx) {
+    this.tab = TABS.includes(this.detail.tab) ? this.detail.tab : "overview";
+    this.flakyMore = false;
+    this.generation = 0;
+    this.data = { batches: null, flaky: null, events: null };
+    this.loadDetail(cx);
+  }
+
+  // Each command fills its own tab, so a slow hub delays only that tab. A newer read drops the answers of an older one.
+  loadDetail(cx) {
+    const generation = ++this.generation;
+    const args = detailArgs(this.detail.repo);
+    const read = {
+      batches: (result) => {
+        const parsed = parseBatches(result);
+        return parsed.kind === "ok" ? { ...parsed, rows: batchRows(parsed.batches) } : parsed;
+      },
+      flaky: (result) => {
+        const parsed = parseFlaky(result);
+        return parsed.kind === "ok" ? { ...parsed, rows: flakyRows(parsed.entries) } : parsed;
+      },
+      events: (result) => {
+        const parsed = parseEvents(result);
+        return parsed.kind === "ok" ? { ...parsed, rows: eventRows(parsed.events) } : parsed;
+      },
+    };
+    this.data = { batches: null, flaky: null, events: null };
+    this.flakyMore = false;
+    cx.notify();
+    for (const name of Object.keys(args)) {
+      cx.spawn(async (cx) => {
+        let result;
+        try {
+          const r = (await exec(this.bin, args[name])) ?? {};
+          result = { code: r.code, stdout: r.stdout, stderr: r.stderr };
+        } catch (e) {
+          result = { spawnError: e };
+        }
+        if (generation !== this.generation) return;
+        this.data[name] = read[name](result);
+        cx.notify();
+      });
+    }
+  }
+
+  detailView(frame, t) {
+    const batches = this.data.batches;
+    const count = batches?.kind === "ok" ? batches.batches.length : null;
+    const flaky = this.data.flaky;
+    const labels = {
+      overview: "Overview",
+      flaky: flaky?.kind === "ok" ? `Flaky ${flaky.chronicCount}` : "Flaky",
+      events: "Events",
+      batches: "Batches",
+    };
+    return frame
+      .child(
+        h_flex()
+          .h(42)
+          .flex_none()
+          .px(14)
+          .gap(8)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .child(div().flex_none().max_w(260).truncate().font_semibold().child(this.detail.name || "chute"))
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(11)
+              .text_color(t.dim)
+              .child(count === null ? "" : `· last ${count} ${count === 1 ? "batch" : "batches"}`),
+          )
+          .child(iconButton("chute-detail-refresh", "Refresh", t, (cx) => this.loadDetail(cx)))
+          .child(iconButton("chute-detail-close", "Close", t, () => this.overlay && closeOverlay(this.overlay))),
+      )
+      .child(
+        Tabs.new("chute-detail-tabs")
+          .h_flex()
+          .flex_none()
+          .px(10)
+          .gap(2)
+          .border_b(1)
+          .border_color(t.border)
+          .children(
+            TABS.map((name) =>
+              Tab.new(`chute-detail-tab-${name}`)
+                .selected(this.tab === name)
+                .px(10)
+                .py(7)
+                .text_size(12)
+                .font_medium()
+                .cursor_pointer()
+                .text_color(this.tab === name ? t.foreground : t.dim)
+                .border_b(2)
+                .border_color(this.tab === name ? t.foreground : t.background)
+                .on_click((_e, cx) => {
+                  this.tab = name;
+                  cx.notify();
+                })
+                .child(labels[name]),
+            ),
+          ),
+      )
+      .child(
+        v_flex()
+          .id("chute-detail-body")
+          .flex_1()
+          .min_h(0)
+          .overflow_y_scrollbar()
+          .p(14)
+          .gap(12)
+          .children(this.tabBody(t)),
+      );
+  }
+
+  tabBody(t) {
+    const empty = { overview: "No batches", flaky: "No flaky tests", events: "No events", batches: "No batches" }[this.tab];
+    const data = this.tab === "overview" ? this.data.batches : this.data[this.tab];
+    const state = (text, color) => [div().text_size(12).text_color(color).whitespace_normal().child(text)];
+    if (data === null) return [h_flex().gap(8).text_color(t.dim).child(div().frames(SPINNER, 90)).child("Loading")];
+    if (data.kind !== "ok") return state(data.detail, t.ansi1);
+    const rows = this.tab === "overview" ? data.batches : this.tab === "flaky" ? data.entries : data.rows;
+    if (rows.length === 0) return state(empty, t.dim);
+    if (this.tab === "overview") return this.overviewTab(data, t);
+    if (this.tab === "flaky") return this.flakyTab(data, t);
+    if (this.tab === "events") return this.eventsTab(data, t);
+    return this.batchesTab(data, t);
+  }
+
+  overviewTab(data, t) {
+    const view = overviewOf(data.batches, this.data.events);
+    const cut = this.data.events?.kind === "ok" && this.data.events.cut;
+    return [
+      h_flex()
+        .flex_wrap()
+        .gap(12)
+        .children(
+          view.counts.map((c) =>
+            v_flex()
+              .flex_1()
+              .min_w(120)
+              .gap(2)
+              .child(mono(div().text_size(24).font_semibold().whitespace_nowrap()).child(c.value))
+              .child(div().text_size(11).text_color(t.dim).child(c.label)),
+          ),
+        ),
+      v_flex()
+        .gap(4)
+        .when(view.bars.length > 0, (el) =>
+          el
+            .child(
+              h_flex()
+                .h(80)
+                .gap(2)
+                .items_end()
+                .children(
+                  view.bars.map((bar, i) =>
+                    div()
+                      .id(`detail-bar-${i}`)
+                      .flex_1()
+                      .min_w(1)
+                      .max_w(28)
+                      .h(4 + 76 * bar.height)
+                      .rounded(2)
+                      .bg(bar.tone === "bounced" ? t.ansi1 : t.ansi2)
+                      .when(bar.faded, (b) => b.opacity(0.4))
+                      .tooltip(bar.tip),
+                  ),
+                ),
+            )
+            .child(
+              h_flex()
+                .text_size(11)
+                .text_color(t.dim)
+                .child(div().flex_1().child(view.axis[0]))
+                .child(div().flex_none().child(view.axis[1]))
+                .child(div().flex_1().text_right().child(view.axis[2])),
+            )
+            .child(
+              div()
+                .text_size(11)
+                .text_color(t.dim)
+                .whitespace_normal()
+                .child("Bar = one batch · height = duration (log scale) · red = bounced a PR"),
+            ),
+        ),
+      ...(view.reasons
+        ? [
+            div()
+              .text_size(12)
+              .text_color(t.muted)
+              .whitespace_normal()
+              .child(`Bounce reasons in 24h: ${view.reasons}${cut ? ` (latest ${DETAIL_EVENTS} events)` : ""}`),
+          ]
+        : []),
+    ];
+  }
+
+  flakyTab(data, t) {
+    const shown = this.flakyMore ? data.rows : data.rows.slice(0, FLAKY_SHOWN);
+    const hidden = data.rows.length - shown.length;
+    return [
+      h_flex()
+        .gap(8)
+        .items_center()
+        .child(
+          div()
+            .flex_1()
+            .min_w(0)
+            .text_size(11)
+            .font_semibold()
+            .text_color(t.muted)
+            .child(data.days === null ? "FLAKY LEDGER" : `FLAKY LEDGER · ${data.days} DAYS`),
+        )
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(`${data.chronicCount} chronic`)),
+      v_flex()
+        .gap(2)
+        .children(
+          shown.map((row) =>
+            h_flex()
+              .id(`detail-flaky-${row.key}`)
+              .gap(10)
+              .px(6)
+              .py(3)
+              .rounded(6)
+              .items_baseline()
+              .hover((s) => s.bg(t.hover))
+              .child(mono(div().flex_1().min_w(0).truncate().text_size(12)).tooltip(row.test).child(row.test))
+              .child(div().flex_none().w(90).truncate().text_size(11).text_color(t.dim).child(row.step))
+              .child(mono(div().flex_none().w(36).text_right().text_size(12)).child(String(row.count)))
+              .child(mono(div().flex_none().w(72).text_right().whitespace_nowrap().text_size(11).text_color(t.dim)).child(row.ago))
+              .child(div().flex_none().w(60).child(row.chronic ? chip("chronic", t.ansi3, t) : div())),
+          ),
+        ),
+      ...(hidden > 0 || this.flakyMore
+        ? [
+            linkRow("detail-flaky-more", t, (cx) => {
+              this.flakyMore = !this.flakyMore;
+              cx.notify();
+            }).child(div().text_size(12).text_color(t.dim).child(hidden > 0 ? `+ ${hidden} more` : "Show less")),
+          ]
+        : []),
+    ];
+  }
+
+  eventsTab(data, t) {
+    return [
+      ...(data.cut ? [div().text_size(11).text_color(t.ansi3).child(`Showing the latest ${DETAIL_EVENTS} events`)] : []),
+      v_flex()
+        .gap(1)
+        .children(
+          data.rows.map((row) =>
+            h_flex()
+              .gap(8)
+              .px(6)
+              .py(2)
+              .items_baseline()
+              .child(timeCell(row.time, t))
+              .child(div().flex_none().w(12).text_color(toneColor(row.tone, t)).child(row.glyph))
+              .child(div().flex_1().min_w(0).text_size(12).whitespace_normal().child(row.text)),
+          ),
+        ),
+    ];
+  }
+
+  batchesTab(data, t) {
+    return [
+      v_flex()
+        .gap(2)
+        .children(
+          data.rows.map((row) =>
+            v_flex()
+              .id(`detail-batch-${row.key}`)
+              .px(6)
+              .py(3)
+              .rounded(6)
+              .hover((s) => s.bg(t.hover))
+              .child(
+                h_flex()
+                  .gap(10)
+                  .items_baseline()
+                  .child(mono(div().flex_none().w(96).truncate().text_size(12)).tooltip(row.key).child(row.id))
+                  .child(timeCell(row.started, t))
+                  .child(mono(div().flex_none().w(64).text_right().whitespace_nowrap().text_size(12)).child(row.took))
+                  .child(mono(div().flex_1().min_w(0).truncate().text_size(12)).child(row.merged))
+                  .when(Boolean(row.bounced), (el) =>
+                    el.child(mono(div().flex_none().whitespace_nowrap().text_size(12).text_color(t.ansi1)).child(row.bounced)),
+                  )
+                  .when(row.reverted, (el) => el.child(chip("reverted", t.ansi3, t))),
+              )
+              .when(row.steps !== null, (el) => el.child(div().text_size(11).text_color(t.dim).whitespace_normal().child(row.steps))),
+          ),
+        ),
+    ];
+  }
+
   render() {
     const t = theme();
     const frame = v_flex()
@@ -422,6 +751,7 @@ export default class Chute extends View {
         cx.notify();
       });
     if (this.file) return this.fileView(frame, t);
+    if (this.detail) return this.detailView(frame, t);
     const body = this.result ? interpret(this.result) : { kind: "loading" };
     return frame.child(this.headerView(t)).child(
       v_flex()
@@ -697,7 +1027,8 @@ export default class Chute extends View {
           )
           .when(Boolean(flaky.ago), (el) =>
             el.child(mono(div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim)).child(flaky.ago)),
-          ),
+          )
+          .child(textLink(`ledger-${repo.id}`, "Ledger ›", "Open the flaky ledger", t, () => this.openDetail(repo, "flaky"))),
       )
       .when(open, (el) =>
         el.child(
@@ -874,7 +1205,9 @@ export default class Chute extends View {
     const strip = repo.strip;
     return v_flex()
       .gap(4)
-      .child(sectionTitle("Last batches", strip.bars.length, t))
+      .child(
+        sectionTitle("Last batches", strip.bars.length, t, textLink(`details-${repo.id}`, "Details ›", "Open batch details", t, () => this.openDetail(repo, "overview"))),
+      )
       .child(
         h_flex()
           .h(28)
@@ -1093,13 +1426,14 @@ const underNeedsYou = (card, t) =>
 const timeCell = (text, t) =>
   mono(div().flex_none().whitespace_nowrap().min_w(44).text_right().text_size(11).text_color(t.dim)).child(text);
 
-function sectionTitle(title, count, t) {
+function sectionTitle(title, count, t, aside) {
   return h_flex()
     .gap(6)
     .items_center()
     .px(6)
     .child(div().flex_1().min_w(0).text_size(11).font_semibold().text_color(t.muted).child(title.toUpperCase()))
-    .when(count != null, (el) => el.child(div().flex_none().min_w(24).text_right().text_size(11).text_color(t.dim).child(String(count))));
+    .when(count != null, (el) => el.child(div().flex_none().min_w(24).text_right().text_size(11).text_color(t.dim).child(String(count))))
+    .when(aside != null, (el) => el.child(aside));
 }
 
 // A square icon button at the end of a row. Its click must not reach the row's own handler.
