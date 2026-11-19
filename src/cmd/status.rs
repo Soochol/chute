@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -10,9 +10,10 @@ use crate::config::{self, Config};
 use crate::hub::{self, Route};
 use crate::machine::Machines;
 use crate::model::{
-    Agent, AgentView, Approval, DaemonView, EpochMs, Event, EventKind, HubView, ItemState,
-    ItemView, MachineId, MergedView, PostPhase, PostState, PrNumber, QueueItem, RecentBatch,
-    RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, VerifiedBy, Warning, WarningKind,
+    Agent, AgentView, Approval, Batch, DaemonInfo, DaemonView, EpochMs, Event, EventKind, HubView,
+    ItemState, ItemView, MachineId, MergedView, PostPhase, PostState, PrNumber, QueueItem,
+    RecentBatch, RepoInfo, RepoView, SchemaV1, StatusView, TerminalId, Today, Usual, VerifiedBy,
+    Warning, WarningKind,
 };
 use crate::queue;
 
@@ -277,6 +278,7 @@ fn hub_down(
             running: false,
             terminal: None,
             pid: None,
+            doing: None,
         },
         blocked: None,
         batch: None,
@@ -286,6 +288,7 @@ fn hub_down(
         recent_merged: Vec::new(),
         warnings: vec![hub_warning(message, now)],
         post_verify: PostState::default(),
+        usual: Usual::default(),
     }
 }
 
@@ -364,11 +367,7 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
         },
         hub: seen.view.clone(),
         approval,
-        daemon: DaemonView {
-            running,
-            terminal: daemon.as_ref().and_then(|d| d.terminal.clone()),
-            pid: daemon.as_ref().map(|d| d.pid),
-        },
+        daemon: daemon_view(running, daemon),
         blocked: state.blocked.clone(),
         batch: state.batch.clone(),
         queue: state
@@ -390,7 +389,82 @@ pub fn view(ctx: &Ctx, info: &RepoInfo, now: &DateTime<Local>) -> Result<StatusV
         recent_merged,
         warnings,
         post_verify: state.post.clone(),
+        usual: usual(&history.events, state.batch.as_ref()),
     })
+}
+
+fn daemon_view(running: bool, info: Option<DaemonInfo>) -> DaemonView {
+    let info = info.filter(|_| running);
+    DaemonView {
+        running,
+        terminal: info.as_ref().and_then(|d| d.terminal.clone()),
+        pid: info.as_ref().map(|d| d.pid),
+        doing: info.and_then(|d| d.doing),
+    }
+}
+
+const USUAL_RUNS: usize = 20;
+const USUAL_MIN_SAMPLES: usize = 3;
+
+fn median(mut values: Vec<u64>) -> Option<u64> {
+    values.sort_unstable();
+    match values.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(values[n / 2]),
+        n => Some((values[n / 2 - 1] + values[n / 2]) / 2),
+    }
+}
+
+fn usual_median(recent_first: impl Iterator<Item = u64>) -> Option<u64> {
+    let last: Vec<u64> = recent_first.take(USUAL_RUNS).collect();
+    if last.len() < USUAL_MIN_SAMPLES {
+        return None;
+    }
+    median(last)
+}
+
+pub fn usual(events: &[Event], batch: Option<&Batch>) -> Usual {
+    let finished = || {
+        events.iter().rev().filter_map(|e| match &e.kind {
+            EventKind::BatchFinished {
+                seconds,
+                ran,
+                verifications,
+                step_times,
+                ..
+            } => Some((*seconds, ran, *verifications, step_times)),
+            _ => None,
+        })
+    };
+    let mut by_step: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for (_, _, _, times) in finished() {
+        for time in times.iter().rev() {
+            let runs = by_step.entry(time.step.as_str()).or_default();
+            if runs.len() < USUAL_RUNS {
+                runs.push(time.seconds);
+            }
+        }
+    }
+    let steps = by_step
+        .into_iter()
+        .filter_map(|(step, runs)| usual_median(runs.into_iter()).map(|s| (step.to_owned(), s)))
+        .collect();
+    let batch_s = batch.filter(|b| !b.steps.is_empty()).and_then(|b| {
+        usual_median(
+            finished()
+                .filter(|(_, ran, verifications, _)| *verifications == 1 && **ran == b.steps)
+                .map(|(seconds, ..)| seconds),
+        )
+    });
+    let post_verify_s = usual_median(events.iter().rev().filter_map(|e| match &e.kind {
+        EventKind::PostGreen { seconds, .. } => Some(*seconds),
+        _ => None,
+    }));
+    Usual {
+        batch_s,
+        steps,
+        post_verify_s,
+    }
 }
 
 /// When a bounced item last bounced; other states have no such time.
@@ -653,7 +727,7 @@ fn human(v: &StatusView) -> String {
 mod tests {
     use super::*;
     use crate::machine::{Core, Machine};
-    use crate::model::{BatchId, BounceReason, PrNumber, Sha};
+    use crate::model::{BatchId, BounceReason, PrNumber, Sha, StepTime};
     use chrono::Utc;
 
     fn id(s: &str) -> MachineId {
@@ -745,6 +819,128 @@ mod tests {
         EpochMs((now.timestamp_millis() - minutes_ago * 60_000) as u64)
     }
 
+    fn finished_with(
+        seconds: u64,
+        ran: &[&str],
+        verifications: u32,
+        steps: &[(&str, u64)],
+    ) -> Event {
+        Event {
+            at_ms: EpochMs(1),
+            kind: EventKind::BatchFinished {
+                batch: BatchId("b".into()),
+                merged: vec![PrNumber(1)],
+                bounced: vec![],
+                seconds,
+                verify_s: seconds,
+                ran: ran.iter().map(|s| (*s).to_owned()).collect(),
+                verifications,
+                step_times: steps
+                    .iter()
+                    .map(|(step, seconds)| StepTime {
+                        step: (*step).to_owned(),
+                        seconds: *seconds,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn running_batch(steps: &[&str]) -> Batch {
+        Batch {
+            id: BatchId("now".into()),
+            base: Sha::try_from("abc1234".to_owned()).unwrap(),
+            prs: vec![PrNumber(1)],
+            phase: crate::model::Phase::Verifying,
+            step: None,
+            steps: steps.iter().map(|s| (*s).to_owned()).collect(),
+            round: 1,
+            started_ms: EpochMs(1),
+            waiting_machine: false,
+            reused: None,
+            step_started_ms: None,
+            done: Vec::new(),
+            skipped: Vec::new(),
+            reruns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_usual_step_time_is_the_median_of_the_last_runs_of_that_step() {
+        let mut events: Vec<Event> = (1..=25)
+            .map(|n| finished_with(n, &["test"], 1, &[("test", n)]))
+            .collect();
+        events.push(finished_with(5, &["lint"], 1, &[("lint", 5)]));
+        events.push(finished_with(7, &["lint"], 1, &[("lint", 7)]));
+
+        let usual = usual(&events, None);
+
+        assert_eq!(
+            usual.steps.get("test"),
+            Some(&15),
+            "runs 6 to 25, the middle two are 15 and 16"
+        );
+        assert!(!usual.steps.contains_key("lint"), "two runs are too few");
+    }
+
+    #[test]
+    fn the_usual_batch_time_counts_only_single_round_batches_that_ran_the_same_steps() {
+        let now = running_batch(&["fmt", "test"]);
+        let same = |seconds| finished_with(seconds, &["fmt", "test"], 1, &[]);
+        let events = vec![
+            same(100),
+            finished_with(900, &["fmt"], 1, &[]),
+            same(300),
+            finished_with(900, &["fmt", "test"], 2, &[]),
+            finished_with(900, &["test", "fmt"], 1, &[]),
+            same(200),
+        ];
+
+        assert_eq!(usual(&events, Some(&now)).batch_s, Some(200));
+        assert_eq!(usual(&events[..3], Some(&now)).batch_s, None, "two samples");
+        assert_eq!(usual(&events, None).batch_s, None, "no batch now");
+        assert_eq!(
+            usual(&events, Some(&running_batch(&[]))).batch_s,
+            None,
+            "a batch with no steps has nothing to compare"
+        );
+    }
+
+    #[test]
+    fn the_usual_post_merge_time_is_the_median_of_recent_green_runs() {
+        let green = |seconds| Event {
+            at_ms: EpochMs(1),
+            kind: EventKind::PostGreen {
+                commit: Sha::try_from("abc1234".to_owned()).unwrap(),
+                previous: None,
+                seconds,
+            },
+        };
+        let five: Vec<Event> = [400, 100, 300, 500, 200].map(green).into();
+
+        assert_eq!(usual(&five, None).post_verify_s, Some(300));
+        assert_eq!(usual(&five[..2], None).post_verify_s, None);
+    }
+
+    #[test]
+    fn the_daemon_says_what_it_is_doing_only_while_it_runs() {
+        let info = || DaemonInfo {
+            pid: 7,
+            terminal: None,
+            doing: Some("큐를 보는 중".to_owned()),
+            started_ms: EpochMs(1),
+        };
+
+        let alive = daemon_view(true, Some(info()));
+        assert_eq!(alive.doing.as_deref(), Some("큐를 보는 중"));
+        assert_eq!(alive.pid, Some(7));
+
+        let stale = daemon_view(false, Some(info()));
+        assert_eq!(stale.doing, None);
+        assert_eq!(stale.pid, None);
+        assert_eq!(daemon_view(true, None).doing, None);
+    }
+
     #[test]
     fn summarize_counts_today_and_lists_recent_newest_first() {
         let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
@@ -767,6 +963,9 @@ mod tests {
                 bounced: vec![],
                 seconds: 60,
                 verify_s: 50,
+                ran: Vec::new(),
+                verifications: 0,
+                step_times: Vec::new(),
             },
         };
         let events = vec![

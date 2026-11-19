@@ -898,6 +898,8 @@ fn a_daemon_that_died_right_after_the_push_finds_the_pr_merged() {
             skipped: Vec::new(),
             reused: Vec::new(),
             reruns: Vec::new(),
+            step_times: Vec::new(),
+            ran: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1204,6 +1206,8 @@ fn recovery_keeps_the_bounces_of_a_batch_and_reports_what_it_had_already_merged(
             skipped: Vec::new(),
             reused: Vec::new(),
             reruns: Vec::new(),
+            step_times: Vec::new(),
+            ran: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1268,6 +1272,8 @@ fn a_recovery_cut_short_finishes_the_record_and_the_events_when_it_runs_again() 
             skipped: Vec::new(),
             reused: Vec::new(),
             reruns: Vec::new(),
+            step_times: Vec::new(),
+            ran: Vec::new(),
             env: None,
         })
         .unwrap();
@@ -1311,6 +1317,8 @@ fn batch_record(
         skipped: Vec::new(),
         reused: Vec::new(),
         reruns: Vec::new(),
+        step_times: Vec::new(),
+        ran: Vec::new(),
         env: None,
     }
 }
@@ -1409,6 +1417,10 @@ fn a_finished_event_already_written_is_not_written_again() {
                 started_ms: chute::model::EpochMs::now(),
                 waiting_machine: false,
                 reused: None,
+                step_started_ms: None,
+                done: Vec::new(),
+                skipped: Vec::new(),
+                reruns: Vec::new(),
             });
             Ok(())
         })
@@ -3768,4 +3780,160 @@ fn a_repair_pr_whose_attempts_name_different_tests_is_verified_again_and_lifts_t
     assert_eq!(record.verifications, 2);
     assert!(lab.state().blocked.is_none());
     assert_eq!(lab.merged_prs(), [3]);
+}
+
+const LINT_AND_E2E: &str = "\n[[verify]]\nname = \"lint\"\nrun = \"sh @ROOT@/lint.sh\"\ntimeout = 60\nfailed = 'FAILED (\\S+)'\n\n[[verify]]\nname = \"e2e\"\nrun = \"true\"\ntimeout = 60\npaths = [\"web/\"]\n";
+
+fn status_into(lab: &Lab, file: &str) -> String {
+    format!(
+        "env CHUTE_HOME='{}' HOME='{}' CHUTE_GIT='{}' '{}' status --json --repo '{}' > '{}'",
+        lab.sb.chute_home().display(),
+        lab.sb.home().display(),
+        lab.sb.root().join("bin/git").display(),
+        env!("CARGO_BIN_EXE_chute"),
+        lab.repo.path().display(),
+        lab.sb.root().join(file).display(),
+    )
+}
+
+#[test]
+fn a_batch_records_how_long_each_step_took_in_each_round() {
+    let lab = Lab::build_with_step("sleep 1", "", 60, LINT_AND_E2E);
+    fs::write(lab.sb.root().join("lint.sh"), "exit 0\n").unwrap();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    let summary = lab
+        .engine_with_clock(Duration::ZERO, chute::clock::Clock::frozen())
+        .run_once()
+        .unwrap();
+
+    let record = lab.store.read_batch(&done(summary).batch).unwrap().unwrap();
+    let step_run = |round, step: &str, seconds, result| chute::model::StepRun {
+        round,
+        step: step.to_owned(),
+        seconds,
+        result,
+    };
+    assert_eq!(
+        record.step_times,
+        [
+            step_run(1, "check", 0, chute::model::StepResult::Passed),
+            step_run(1, "lint", 0, chute::model::StepResult::Passed),
+        ],
+        "a step that sleeps a real second took 0 on the engine's frozen clock; e2e was left out by paths"
+    );
+
+    let lab = Lab::build_with_step(BAD, "", 60, LINT_AND_E2E);
+    fs::write(lab.sb.root().join("lint.sh"), "exit 0\n").unwrap();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("BAD", "")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    let record = lab.store.read_batch(&summary.batch).unwrap().unwrap();
+    assert!(record.verifications > 1, "the batch was split");
+    assert_eq!(
+        record.ran,
+        ["check", "lint"],
+        "ran is the first round's step list even though that round stopped at check"
+    );
+    let first_round: Vec<_> = record.step_times.iter().filter(|r| r.round == 1).collect();
+    assert_eq!(first_round.len(), 1);
+    assert_eq!(first_round[0].step, "check");
+    assert_eq!(first_round[0].result, chute::model::StepResult::Failed);
+    assert!(
+        record
+            .step_times
+            .iter()
+            .any(|r| r.result == chute::model::StepResult::Passed),
+        "a later round passed"
+    );
+}
+
+#[test]
+fn the_status_during_verification_shows_the_steps_done_and_skipped_this_round() {
+    let lab = Lab::build_with_step("exit 0", "", 60, LINT_AND_E2E);
+    let status = status_into(&lab, "status-during.json");
+    fs::write(lab.sb.root().join("lint.sh"), format!("{status}\nexit 0\n")).unwrap();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let during = fs::read_to_string(lab.sb.root().join("status-during.json")).unwrap();
+    let view: StatusView = serde_json::from_str(&during).unwrap();
+    let batch = view.batch.expect("there is a batch while lint runs");
+    assert_eq!(batch.step.as_deref(), Some("lint"));
+    assert_eq!(batch.steps, ["check", "lint"]);
+    assert_eq!(
+        batch
+            .done
+            .iter()
+            .map(|d| d.step.as_str())
+            .collect::<Vec<_>>(),
+        ["check"]
+    );
+    assert!(batch.step_started_ms.is_some());
+    assert_eq!(batch.skipped, ["e2e"]);
+    assert!(batch.reruns.is_empty());
+}
+
+#[test]
+fn a_finished_batch_tells_history_which_steps_it_ran_and_how_long_they_took() {
+    let lab = Lab::build_with_step("exit 0", "", 60, LINT_AND_E2E);
+    fs::write(lab.sb.root().join("lint.sh"), "exit 0\n").unwrap();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+
+    done(lab.engine().run_once().unwrap());
+
+    let finished: Vec<_> = lab
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::BatchFinished {
+                ran,
+                verifications,
+                step_times,
+                ..
+            } => Some((ran, verifications, step_times)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished.len(), 1);
+    let (ran, verifications, step_times) = &finished[0];
+    assert_eq!(ran, &["check", "lint"]);
+    assert_eq!(*verifications, 1);
+    assert_eq!(
+        step_times
+            .iter()
+            .map(|t| t.step.as_str())
+            .collect::<Vec<_>>(),
+        ["check", "lint"]
+    );
+}
+
+#[test]
+fn a_rerun_shows_in_the_status_batch_while_the_rerun_round_runs() {
+    let body = "c='@ROOT@/runs'; n=$(cat \"$c\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$c\"\ncase $n in\n1) fail \"$(printf 'FAILED test_a')\";;\n2) fail \"$(printf 'FAILED test_b')\";;\n3) @STATUS@;;\nesac";
+    let lab = Lab::new(body);
+    open_pr_by_orchestrator(&lab, 1, &[("a.txt", "a\n")]);
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let during = fs::read_to_string(lab.sb.root().join("status-during.json")).unwrap();
+    let view: StatusView = serde_json::from_str(&during).unwrap();
+    let batch = view
+        .batch
+        .expect("there is a batch while the rerun round runs");
+    assert_eq!(batch.round, 2);
+    assert_eq!(
+        batch.reruns,
+        [Rerun {
+            pr: PrNumber(1),
+            step: "check".into(),
+            failed_round: 1,
+            signal: RerunSignal::DifferentTests,
+            tests: strings(&["test_a", "test_b"]),
+        }]
+    );
 }

@@ -21,6 +21,8 @@ fn record(id: &str, finished: u64) -> BatchRecord {
         skipped: Vec::new(),
         reused: Vec::new(),
         reruns: Vec::new(),
+        step_times: Vec::new(),
+        ran: Vec::new(),
         env: None,
     }
 }

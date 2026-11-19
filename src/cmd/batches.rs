@@ -6,7 +6,10 @@ use chrono::{DateTime, Local, TimeZone};
 use serde::Serialize;
 
 use super::{Ctx, run_on_hub};
-use crate::model::{BatchId, BatchRecord, EpochMs, EventKind, PrNumber, RevertRecord, Sha};
+use crate::model::{
+    BatchId, BatchRecord, EpochMs, EventKind, PrNumber, Rerun, Reused, RevertRecord, Sha,
+    SkippedStep, StepRun,
+};
 use crate::store::RepoStore;
 
 const DEFAULT_LIMIT: usize = 20;
@@ -94,6 +97,12 @@ struct Entry {
     bounced: Vec<PrNumber>,
     reverted: bool,
     revert_commit: Option<Sha>,
+    verify_s: u64,
+    verifications: u32,
+    skipped: Vec<SkippedStep>,
+    reused: Vec<Reused>,
+    reruns: Vec<Rerun>,
+    step_times: Vec<StepRun>,
 }
 
 fn entries(all: &[Loaded], limit: usize) -> Vec<Entry> {
@@ -108,6 +117,12 @@ fn entries(all: &[Loaded], limit: usize) -> Vec<Entry> {
             bounced: b.bounced(),
             reverted: b.is_reverted(),
             revert_commit: b.revert.as_ref().map(|r| r.tip.clone()),
+            verify_s: b.record.verify_s,
+            verifications: b.record.verifications,
+            skipped: b.record.skipped.clone(),
+            reused: b.record.reused.clone(),
+            reruns: b.record.reruns.clone(),
+            step_times: b.record.step_times.clone(),
         })
         .collect()
 }
@@ -194,7 +209,84 @@ mod tests {
             bounced: vec![PrNumber(9)],
             reverted,
             revert_commit: None,
+            verify_s: 0,
+            verifications: 0,
+            skipped: Vec::new(),
+            reused: Vec::new(),
+            reruns: Vec::new(),
+            step_times: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_json_entries_carry_the_step_times_skips_reuses_and_reruns_of_the_record() {
+        use crate::model::{RerunSignal, StepResult, VerifiedBy};
+
+        let record = BatchRecord {
+            id: BatchId("b1".into()),
+            base: Sha::try_from("abc1234".to_owned()).unwrap(),
+            prs: vec![PrNumber(1)],
+            started_ms: EpochMs(1),
+            finished_ms: Some(EpochMs(2)),
+            merges: Vec::new(),
+            bounced: vec![PrNumber(1)],
+            flaky: Vec::new(),
+            verify_s: 12,
+            pushed: Vec::new(),
+            verifications: 2,
+            skipped: vec![SkippedStep {
+                round: 1,
+                step: "e2e".into(),
+            }],
+            env: None,
+            reused: vec![Reused {
+                tree: Sha::try_from("def5678".to_owned()).unwrap(),
+                by: VerifiedBy::Preflight,
+                verified_ms: EpochMs(1),
+            }],
+            reruns: vec![Rerun {
+                pr: PrNumber(1),
+                step: "test".into(),
+                failed_round: 1,
+                signal: RerunSignal::KnownFlaky,
+                tests: vec!["t".into()],
+            }],
+            step_times: vec![StepRun {
+                round: 1,
+                step: "test".into(),
+                seconds: 7,
+                result: StepResult::Failed,
+            }],
+            ran: Vec::new(),
+        };
+        let all = [Loaded {
+            record: record.clone(),
+            finished: None,
+            revert: None,
+            reverted_event: false,
+        }];
+
+        let json = serde_json::to_value(entries(&all, 10)).unwrap();
+
+        let entry = &json[0];
+        assert_eq!(entry["verify_s"], 12);
+        assert_eq!(entry["verifications"], 2);
+        assert_eq!(
+            entry["skipped"],
+            serde_json::to_value(&record.skipped).unwrap()
+        );
+        assert_eq!(
+            entry["reused"],
+            serde_json::to_value(&record.reused).unwrap()
+        );
+        assert_eq!(
+            entry["reruns"],
+            serde_json::to_value(&record.reruns).unwrap()
+        );
+        assert_eq!(
+            entry["step_times"],
+            serde_json::json!([{"round": 1, "step": "test", "seconds": 7, "result": "failed"}])
+        );
     }
 
     #[test]

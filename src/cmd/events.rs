@@ -213,6 +213,7 @@ fn describe(kind: &EventKind) -> String {
             bounced,
             seconds,
             verify_s,
+            ..
         } => format!(
             "batch {} 끝 · 머지 {} · 반송 {} · {seconds}초(검증 {verify_s}초)",
             batch.0,
@@ -624,6 +625,9 @@ mod tests {
                     bounced: vec![PrNumber(9)],
                     seconds: 1,
                     verify_s: 1,
+                    ran: Vec::new(),
+                    verifications: 0,
+                    step_times: Vec::new(),
                 },
             },
             Event {
@@ -730,6 +734,9 @@ mod tests {
                 bounced: vec![],
                 seconds: 9,
                 verify_s: 4,
+                ran: Vec::new(),
+                verifications: 0,
+                step_times: Vec::new(),
             },
             EventKind::Reverted {
                 batch: batch.clone(),
