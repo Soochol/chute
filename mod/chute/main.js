@@ -423,9 +423,13 @@ export default class Chute extends View {
     });
   }
 
-  openDetail(repo, tab, cx) {
+  openDetail(repo, tab) {
     const panel = this.origin ? { x: this.origin.x, width: this.width } : null;
-    const spot = detailSpot(cx.viewport_size(), panel);
+    let viewport = null;
+    try {
+      viewport = window.viewport_size();
+    } catch {}
+    const spot = detailSpot(viewport, panel);
     openOverlay({
       kind: "window",
       key: "chute-detail",
@@ -1038,7 +1042,7 @@ export default class Chute extends View {
           .when(Boolean(flaky.ago), (el) =>
             el.child(mono(div().flex_none().whitespace_nowrap().text_size(11).text_color(t.dim)).child(flaky.ago)),
           )
-          .child(textLink(`ledger-${repo.id}`, "Ledger ›", "Open the flaky ledger", t, (cx) => this.openDetail(repo, "flaky", cx))),
+          .child(textLink(`ledger-${repo.id}`, "Ledger ›", "Open the flaky ledger", t, () => this.openDetail(repo, "flaky"))),
       )
       .when(open, (el) =>
         el.child(
@@ -1216,7 +1220,7 @@ export default class Chute extends View {
     return v_flex()
       .gap(4)
       .child(
-        sectionTitle("Last batches", strip.bars.length, t, textLink(`details-${repo.id}`, "Details ›", "Open batch details", t, (cx) => this.openDetail(repo, "overview", cx))),
+        sectionTitle("Last batches", strip.bars.length, t, textLink(`details-${repo.id}`, "Details ›", "Open batch details", t, () => this.openDetail(repo, "overview"))),
       )
       .child(
         h_flex()
