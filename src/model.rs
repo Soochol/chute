@@ -658,7 +658,7 @@ pub struct Batch {
     pub waiting_machine: bool,
     #[serde(default)]
     pub reused: Option<VerifiedBy>,
-    /// When the step in `step` started. Cleared when a round starts.
+    /// When the step in `step` started. `None` whenever `step` is `None`.
     #[serde(default)]
     pub step_started_ms: Option<EpochMs>,
     #[serde(default)]

@@ -3850,6 +3850,61 @@ fn a_batch_records_how_long_each_step_took_in_each_round() {
     );
 }
 
+fn on_push_status_into(lab: &Lab, file: &str) {
+    let hook = lab.repo.origin().join("hooks/pre-receive");
+    let status = status_into(lab, file);
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nunset GIT_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH\n{status}\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn status_batch_while_it_pushes(lab: &Lab, file: &str) -> chute::model::Batch {
+    let during = fs::read_to_string(lab.sb.root().join(file)).unwrap();
+    let view: StatusView = serde_json::from_str(&during).unwrap();
+    view.batch.expect("there is a batch while it pushes")
+}
+
+#[test]
+fn the_status_batch_has_no_step_start_while_it_pushes() {
+    let lab = Lab::build_with_step("exit 0", "", 60, LINT_AND_E2E);
+    fs::write(lab.sb.root().join("lint.sh"), "exit 0\n").unwrap();
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    on_push_status_into(&lab, "status-push.json");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    let batch = status_batch_while_it_pushes(&lab, "status-push.json");
+    assert_eq!(batch.done.len(), 2, "check and lint both passed");
+    assert_eq!(batch.step, None);
+    assert_eq!(batch.step_started_ms, None);
+}
+
+#[test]
+fn the_status_batch_has_no_step_start_while_it_pushes_after_a_failed_round() {
+    let lab = Lab::build(BAD, "", 60);
+    lab.open_pr(1, &[("a.txt", "a\n")]);
+    lab.open_pr(2, &[("BAD", "")]);
+    on_push_status_into(&lab, "status-push.json");
+
+    let summary = done(lab.engine().run_once().unwrap());
+
+    assert_eq!(summary.merged, prs(&[1]));
+    assert_eq!(summary.bounced, prs(&[2]));
+    let batch = status_batch_while_it_pushes(&lab, "status-push.json");
+    assert!(batch.round > 1, "the batch was split before it pushed");
+    assert_eq!(batch.step, None);
+    assert_eq!(batch.step_started_ms, None);
+}
+
 #[test]
 fn the_status_during_verification_shows_the_steps_done_and_skipped_this_round() {
     let lab = Lab::build_with_step("exit 0", "", 60, LINT_AND_E2E);
