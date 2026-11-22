@@ -16,14 +16,15 @@ import {
   RECENT_DEFAULT,
   clockExact,
   clockText,
+  focusOf,
   gradeOf,
+  idleText,
+  listOrder,
   needsClock,
-  nextFold,
   overview,
   overviewText,
   pollInterval,
   recentWindow,
-  toggleFold,
   pullUrl,
   tint,
   toneToken,
@@ -1025,7 +1026,7 @@ test("random malformed status never breaks the board", () => {
     const ctx = `input ${text.slice(0, 500)}`;
     const result = interpret({ code: 0, stdout: text, stderr: "" }, NOW);
 
-    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "problems", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary", "todo", "item", "needs", "flaky", "messages", "stepBar", "retryDots", "strip", "bars", "recentBatches", "merged", "bounced"]);
+    const CONTAINERS = new Set(["repos", "sections", "items", "actions", "args", "prs", "agent", "failure", "preflight", "hub", "marks", "submitter", "facts", "notices", "status", "today", "parts", "details", "postVerify", "green", "run", "recent", "files", "file", "report", "summary", "todo", "item", "needs", "flaky", "messages", "stepBar", "retryDots", "strip", "bars", "recentBatches", "merged", "bounced"]);
     CONTAINERS.add("daemon");
     const leaves = [];
     const walk = (value, path, key) => {
@@ -1920,67 +1921,49 @@ test("queue rows carry the PR URL, and none without a slug", () => {
   for (const entry of section(bare, "batch").items[0].prs) assert.equal(entry.url, null);
 });
 
-const folds = (...steps) => {
-  let state;
-  const out = [];
-  for (const [keys, saved] of steps) {
-    state = nextFold(state, keys, saved);
-    out.push(state);
-  }
-  return out;
+const listed = (repos, pins = []) => {
+  const { shown, idle } = listOrder(repos, new Set(pins.map((slug) => `/r/${slug}`)));
+  return { shown: shown.map((r) => r.slug), idle: idle.map((r) => r.slug) };
 };
 
-test("fold: a folded repo opens for a new problem key, stays open while the same key lasts, folds when all are gone", () => {
-  const [calm, trouble, same, other, cleared] = folds([[], true], [["a"], true], [["a"], true], [["a", "b"], true], [[], true]);
-  assert.equal(calm.folded, true);
-  assert.equal(trouble.folded, false);
-  assert.equal(same.folded, false);
-  assert.equal(other.folded, false);
-  assert.equal(cleared.folded, true);
-  assert.equal(cleared.auto, false);
+test("repo list: busy repos by name, quiet ones apart, whatever their grade", () => {
+  const repos = board([verifying("o/web"), stopped("o/api"), idle("o/docs"), humanTurn("o/chute"), idle("o/bench")]).repos;
+  assert.deepEqual(listed(repos), { shown: ["o/api", "o/chute", "o/web"], idle: ["o/bench", "o/docs"] });
 });
 
-test("fold: a repo with a problem on the first read opens", () => {
-  assert.equal(nextFold(undefined, ["a"], true).folded, false);
-  assert.equal(nextFold({ keys: null, auto: false }, ["a"], true).folded, false);
+test("repo list: a repo keeps its place when its status changes", () => {
+  const before = listed(board([idle("o/a"), verifying("o/b"), queuedOnly("o/c")]).repos);
+  const after = listed(board([stopped("o/a"), verifying("o/b"), queuedOnly("o/c")]).repos);
+  assert.deepEqual(before, { shown: ["o/b", "o/c"], idle: ["o/a"] });
+  assert.deepEqual(after.shown, ["o/a", "o/b", "o/c"]);
 });
 
-test("fold: pressing the head line while it is auto-opened makes the user's choice", () => {
-  const [, trouble] = folds([[], true], [["a"], true]);
-  assert.equal(trouble.auto, true);
-  const chosen = toggleFold({ saved: true, auto: trouble.auto });
-  assert.deepEqual(chosen, { saved: true, auto: false });
-  const after = nextFold({ keys: trouble.keys, auto: chosen.auto }, ["a"], chosen.saved);
-  assert.equal(after.folded, true);
-  const again = nextFold(after, ["a", "b"], true);
-  assert.equal(again.folded, false);
+test("repo list: pinned repos come first by name, and a pinned quiet repo stays in the list", () => {
+  const repos = board([verifying("o/a"), queuedOnly("o/z"), idle("o/m"), idle("o/q")]).repos;
+  assert.deepEqual(listed(repos, ["o/z", "o/m"]), { shown: ["o/m", "o/z", "o/a"], idle: ["o/q"] });
+  assert.deepEqual(listed(repos, ["o/gone"]), listed(repos));
+  assert.deepEqual(listOrder(repos, undefined).shown.map((r) => r.slug), ["o/a", "o/z"]);
 });
 
-test("fold: toggling flips what the user sees", () => {
-  assert.deepEqual(toggleFold({ saved: true, auto: false }), { saved: false, auto: false });
-  assert.deepEqual(toggleFold({ saved: false, auto: false }), { saved: true, auto: false });
+test("repo list: repos with the same name are told apart by slug", () => {
+  const repos = board([idle("b/app"), idle("a/app")]).repos;
+  assert.deepEqual(listed(repos).idle, ["a/app", "b/app"]);
 });
 
-test("fold: a repo the user left open is never folded", () => {
-  const [a, b, c] = folds([[], false], [["a"], false], [[], false]);
-  assert.deepEqual([a.folded, b.folded, c.folded], [false, false, false]);
+test("idle line names the quiet repos", () => {
+  const { idle: quiet } = listOrder(board([idle("o/docs"), idle("o/bench")]).repos, new Set());
+  assert.equal(idleText(quiet), "2 idle · bench, docs");
 });
 
-test("fold: an unreachable hub alone does not open a folded repo, and its problem keys are empty", () => {
-  const hubRepo = interpret(ok(unreachable), NOW).repos[0];
-  assert.equal(hubRepo.hub.reachable, false);
-  assert.deepEqual(hubRepo.problems, []);
-  assert.equal(nextFold({ keys: new Set(), auto: false }, hubRepo.problems, true).folded, true);
-});
-
-test("problem keys are the notice keys plus the stopped daemon", () => {
-  const repo = only([fixture]);
-  for (const notice of repo.notices) assert.ok(repo.problems.includes(notice.key));
-  const off = only(tonedRepo("o/d", (d) => { d.daemon = { running: false }; d.queue = [itemOf(fixture.queue.find((i) => i.state === "queued").pr)]; }));
-  assert.deepEqual(off.problems, ["daemon:off"]);
-  assert.deepEqual(only(tonedRepo("o/i", (d) => { d.daemon = { running: false }; })).problems, []);
-  const warned = only(tonedRepo("o/w", (d) => { d.warnings = [{ kind: "config", message: "x" }]; }));
-  assert.deepEqual(warned.problems, []);
+test("focus: the only repo is always shown alone, a chosen repo only while it is on the board", () => {
+  const one = board([idle("o/a")]);
+  assert.equal(focusOf(one, null).slug, "o/a");
+  const two = board([idle("o/a"), verifying("o/b")]);
+  assert.equal(focusOf(two, null), null);
+  assert.equal(focusOf(two, "/r/o/b").slug, "o/b");
+  assert.equal(focusOf(two, "/r/o/gone"), null);
+  assert.equal(focusOf(interpret({ code: 1, stdout: "", stderr: "boom" }, NOW), "/r/o/a"), null);
+  assert.equal(focusOf(null, "/r/o/a"), null);
 });
 
 test("clock texts are local hh:mm and a full local time", () => {
@@ -2271,7 +2254,6 @@ test("a stopped daemon is an alert, a red status line and an issue only while th
   assert.equal(section(idleRepo, "alerts"), undefined);
   assert.deepEqual(idleRepo.status, { tone: "ok", text: "All clear" });
   assert.equal(overview(board([resting])).issues, 0);
-  assert.deepEqual(idleRepo.problems, []);
   assert.equal(idleRepo.daemon.state, "idle");
 
   const waiting = stoppedDaemon("o/w", queuedItem());
@@ -2279,7 +2261,6 @@ test("a stopped daemon is an alert, a red status line and an issue only while th
   assert.deepEqual(section(off, "alerts").items.map((a) => a.kind), ["daemon"]);
   assert.deepEqual(off.status, { tone: "error", text: "Daemon is off" });
   assert.equal(overview(board([waiting])).issues, 1);
-  assert.deepEqual(off.problems, ["daemon:off"]);
   assert.equal(off.daemon.state, "off");
 
   const bounced = only(stoppedDaemon("o/b", bouncedItem()));

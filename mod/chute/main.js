@@ -30,16 +30,17 @@ import {
   formatDuration,
   interpret,
   isNarrow,
+  focusOf,
+  idleText,
   isWide,
+  listOrder,
   needsClock,
-  nextFold,
   overview,
   overviewText,
   pollInterval,
   recentGroups,
   recentWindow,
   tint,
-  toggleFold,
   toneToken,
 } from "./board.js";
 import {
@@ -62,7 +63,8 @@ const TICK_MS = 1000;
 const MIN_READ_GAP_MS = 1000;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_VIEW_CHARS = 200_000;
-const OLD_FOLD_KEY = "chute.folded";
+const FOCUS_KEY = "chute.focus";
+const PINS_KEY = "chute.pins";
 const SHARED_KEY = "chute.status";
 const SURFACE_ALPHA = 0.06;
 const CARD_ALPHA = 0.12;
@@ -71,7 +73,6 @@ const SKIPPED_ALPHA = 0.03;
 const ICON_SIZE = 20;
 const CARD_SYMBOL = { error: "✕", warn: "△" };
 const NEED_TONE = { worker_gone: "error", last_retry: "warn" };
-const foldKey = (repoId) => `chute.fold.${repoId}`;
 const todayKey = (repoId) => `chute.today.${repoId}`;
 
 // The folder name this copy was installed under; commands to this mod are addressed `<name>.<command>`.
@@ -94,6 +95,27 @@ const recall = (key) => {
     return localStorage.getItem(key) === "1";
   } catch {
     return false;
+  }
+};
+const rememberText = (key, value) => {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {}
+};
+const recallText = (key) => {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+};
+const recallPins = () => {
+  try {
+    const value = JSON.parse(recallText(PINS_KEY) ?? "[]");
+    return new Set(Array.isArray(value) ? value.filter((id) => typeof id === "string") : []);
+  } catch {
+    return new Set();
   }
 };
 
@@ -157,10 +179,10 @@ export default class Chute extends View {
     this.errors = new Map();
     this.sinceRead = 0;
     this.pollMs = LOCAL_POLL_MS;
-    remember(OLD_FOLD_KEY, false);
-    this.folds = new Map();
+    this.focus = recallText(FOCUS_KEY);
+    this.pins = recallPins();
+    this.idleOpen = false;
     this.moreOpen = new Set();
-    this.quietOpen = new Set();
     this.flakyOpen = new Set();
     this.readAt = null;
     this.shared = null;
@@ -178,7 +200,7 @@ export default class Chute extends View {
       for (;;) {
         const command = await nextCommand();
         if (command === "open-file" && this.pendingFile) this.openFile(this.pendingFile.file, this.pendingFile.on);
-        else if (command === "fold") this.foldAll(cx);
+        else if (command === "fold") this.showList(cx);
       }
     });
   }
@@ -232,12 +254,6 @@ export default class Chute extends View {
     }
     for (const repo of board.repos) {
       this.watch(repo.stateDir, cx);
-      if (repo.hub.reachable) {
-        const fold = this.foldOf(repo.id);
-        const next = nextFold(fold, repo.problems, fold.saved);
-        fold.keys = next.keys;
-        fold.auto = next.auto;
-      }
       if (!this.opened.has(`seen:${repo.id}`)) {
         this.opened.add(`seen:${repo.id}`);
         if (recall(todayKey(repo.id))) this.opened.add(repo.id);
@@ -315,51 +331,26 @@ export default class Chute extends View {
     });
   }
 
-  foldOf(id) {
-    let fold = this.folds.get(id);
-    if (!fold) {
-      fold = { saved: recall(foldKey(id)), keys: null, auto: false };
-      this.folds.set(id, fold);
-    }
-    return fold;
-  }
-
-  isFolded(id) {
-    const fold = this.foldOf(id);
-    return fold.saved && !fold.auto;
-  }
-
-  isShut(repo) {
-    return repo.quiet ? !this.quietOpen.has(repo.id) : this.isFolded(repo.id);
-  }
-
-  toggleRepo(repo, cx) {
-    if (repo.quiet) {
-      if (!this.quietOpen.delete(repo.id)) this.quietOpen.add(repo.id);
-      cx.notify();
-      return;
-    }
-    const fold = this.foldOf(repo.id);
-    Object.assign(fold, toggleFold(fold));
-    remember(foldKey(repo.id), fold.saved);
+  showRepo(repo, cx) {
+    this.focus = repo.id;
+    rememberText(FOCUS_KEY, repo.id);
     cx.notify();
   }
 
-  // Folds every repo, or opens every repo when none is open.
-  foldAll(cx) {
-    if (this.board?.kind !== "board") return;
-    const fold = this.board.repos.some((repo) => !this.isShut(repo));
-    for (const repo of this.board.repos) {
-      if (repo.quiet) {
-        if (fold) this.quietOpen.delete(repo.id);
-        else this.quietOpen.add(repo.id);
-        continue;
-      }
-      const state = this.foldOf(repo.id);
-      state.saved = fold;
-      state.auto = false;
-      remember(foldKey(repo.id), fold);
-    }
+  showList(cx) {
+    this.focus = null;
+    rememberText(FOCUS_KEY, null);
+    cx.notify();
+  }
+
+  togglePin(repo, cx) {
+    if (!this.pins.delete(repo.id)) this.pins.add(repo.id);
+    rememberText(PINS_KEY, this.pins.size > 0 ? JSON.stringify([...this.pins]) : null);
+    cx.notify();
+  }
+
+  toggleIdle(cx) {
+    this.idleOpen = !this.idleOpen;
     cx.notify();
   }
 
@@ -834,9 +825,13 @@ export default class Chute extends View {
             )
           : el;
       })
-      .when(this.overlay === null && this.board?.kind === "board", (el) => {
-        const open = this.board.repos.some((repo) => !this.isShut(repo));
-        return el.child(iconButton("chute-fold", open ? "▾" : "▸", t, (cx) => this.foldAll(cx), open ? "Collapse all" : "Expand all"));
+      .when(this.board?.kind === "board" && this.board.repos.length > 1, (el) => {
+        const repo = focusOf(this.board, this.focus);
+        if (!repo) return el;
+        const pinned = this.pins.has(repo.id);
+        return el
+          .child(iconButton("chute-pin", pinned ? "★" : "☆", t, (cx) => this.togglePin(repo, cx), pinned ? "Unpin" : "Pin to top"))
+          .child(iconButton("chute-all", "‹ All", t, (cx) => this.showList(cx), "All repos"));
       })
       .when(node !== null, (el) =>
         el.child(iconButton("chute-close", "✕", t, () => run("layout.hide", { id: node }), "Close")),
@@ -873,7 +868,33 @@ export default class Chute extends View {
     if (body.kind !== "board") return [notice(body, t)];
     const lifted = new Set(body.todo.map((entry) => entry.item));
     const todo = body.todo.length > 0 ? [this.todoView(body, t)] : [];
-    return [...todo, ...body.repos.map((repo) => this.repoView(repo, t, lifted))];
+    const focused = focusOf(body, this.focus);
+    if (focused) return [...todo, this.repoView(focused, body.repos.length > 1, t, lifted)];
+    return [...todo, this.listView(body.repos, t)];
+  }
+
+  listView(repos, t) {
+    const { shown, idle } = listOrder(repos, this.pins);
+    const rows = shown.map((repo) => this.repoHead(repo, "list", t));
+    const idleRows =
+      idle.length === 1
+        ? [this.repoHead(idle[0], "list", t)]
+        : idle.length > 1
+          ? [this.idleLine(idle, t), ...(this.idleOpen ? idle.map((repo) => this.repoHead(repo, "list", t)) : [])]
+          : [];
+    return v_flex()
+      .gap(4)
+      .child(sectionTitle("Repos", repos.length, t))
+      .child(v_flex().gap(2).children([...rows, ...idleRows]));
+  }
+
+  idleLine(idle, t) {
+    const text = idleText(idle);
+    return linkRow("idle-repos", t, (cx) => this.toggleIdle(cx))
+      .items_center()
+      .child(chevron(t, this.idleOpen ? "▾" : "▸"))
+      .child(div().flex_none().w(10).h(16).flex().items_center().justify_center().child(dot(t.muted, false)))
+      .child(div().id("idle-names").flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).tooltip(text).child(text));
   }
 
   todoView(body, t) {
@@ -901,10 +922,8 @@ export default class Chute extends View {
       );
   }
 
-  repoView(repo, t, lifted) {
-    const folded = this.isShut(repo);
-    const view = v_flex().gap(6).child(this.repoHead(repo, folded, t));
-    if (folded) return view;
+  repoView(repo, many, t, lifted) {
+    const view = v_flex().gap(6).child(this.repoHead(repo, many ? "focus" : "only", t));
     const drawn = (section) =>
       section.id === "human"
         ? false
@@ -945,15 +964,18 @@ export default class Chute extends View {
     return v_flex().gap(12).child(retry).children([...live, ...past, ...emptyRow]);
   }
 
-  repoHead(repo, folded, t) {
+  // `mode` is "list" for a row of the repo list, "focus" for the head of the one repo shown, "only" when it is the only repo.
+  repoHead(repo, mode, t) {
     const approval = repo.approval ? ` · ${repo.approval}` : "";
     const color = toneColor(repo.status.tone, t);
-    const status = folded || repo.quiet ? repo.summary : repo.status.text;
+    const status = mode === "list" || repo.quiet ? repo.summary : repo.status.text;
     const statusColor = repo.status.tone === "waiting" ? t.muted : repo.status.tone === "ok" ? t.foreground : color;
+    const onClick = mode === "list" ? (cx) => this.showRepo(repo, cx) : mode === "focus" ? (cx) => this.showList(cx) : null;
+    const row = () => (onClick ? linkRow(`head-${repo.id}`, t, onClick) : h_flex().id(`head-${repo.id}`).px(6).py(4).gap(8));
     const first = h_flex()
       .items_center()
       .gap(8)
-      .child(chevron(t, folded ? "▸" : "▾"))
+      .child(chevron(t, mode === "list" ? "›" : mode === "focus" ? "‹" : ""))
       .child(
         div()
           .id(`daemon-${repo.id}`)
@@ -967,10 +989,11 @@ export default class Chute extends View {
           .child(dot(toneColor(repo.daemon.tone, t), repo.active)),
       )
       .child(div().id(`name-${repo.id}`).flex_shrink(0).max_w(140).truncate().font_semibold().tooltip(`${repo.slug}${approval}`).child(repo.name))
+      .when(mode === "list" && this.pins.has(repo.id), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("★")))
       .when(!repo.hub.local, (el) => el.child(chip(`hub ${repo.hub.label}`, repo.hub.reachable ? t.muted : t.ansi1, t)))
       .child(div().flex_1());
     if (this.narrow) {
-      return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx)).child(
+      return row().child(
         v_flex()
           .flex_1()
           .min_w(0)
@@ -987,7 +1010,7 @@ export default class Chute extends View {
           ),
       );
     }
-    return linkRow(`head-${repo.id}`, t, (cx) => this.toggleRepo(repo, cx))
+    return row()
       .items_center()
       .child(first.flex_1().min_w(0))
       .child(
