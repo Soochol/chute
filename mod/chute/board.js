@@ -890,18 +890,23 @@ export const gradeOf = (tone) => GRADE[tone] ?? 3;
 const byName = (a, b) => a.name.localeCompare(b.name) || a.slug.localeCompare(b.slug) || a.id.localeCompare(b.id);
 
 // How the repo list is laid out. Pinned repos come first, then the rest by name, so a repo keeps its place when its
-// status changes; what needs the user is already lifted into Needs you. Quiet repos that are not pinned go to `idle`,
-// which the panel draws as one line.
-export function listOrder(repos, pinned) {
+// status changes; what needs the user is already lifted into Needs you. Hidden repos go to `hidden` and quiet repos
+// to `idle`, which the panel draws as one line each. Pinning wins over hiding.
+export function listOrder(repos, pinned, hidden) {
   const pin = pinned instanceof Set ? pinned : new Set();
+  const hide = hidden instanceof Set ? hidden : new Set();
   const sorted = [...repos].sort((a, b) => Number(pin.has(b.id)) - Number(pin.has(a.id)) || byName(a, b));
+  const away = (repo) => !pin.has(repo.id) && hide.has(repo.id);
   return {
-    shown: sorted.filter((repo) => pin.has(repo.id) || !repo.quiet),
-    idle: sorted.filter((repo) => !pin.has(repo.id) && repo.quiet),
+    shown: sorted.filter((repo) => !away(repo) && (pin.has(repo.id) || !repo.quiet)),
+    idle: sorted.filter((repo) => !away(repo) && !pin.has(repo.id) && repo.quiet),
+    hidden: sorted.filter(away),
   };
 }
 
-export const idleText = (repos) => `${repos.length} idle · ${repos.map((repo) => repo.name).join(", ")}`;
+const namesText = (word) => (repos) => `${repos.length} ${word} · ${repos.map((repo) => repo.name).join(", ")}`;
+export const idleText = namesText("idle");
+export const hiddenText = namesText("hidden");
 
 // The repo the panel shows alone: the only repo there is, or the chosen one while it is still on the board.
 export function focusOf(board, id) {

@@ -18,6 +18,7 @@ import {
   clockText,
   focusOf,
   gradeOf,
+  hiddenText,
   idleText,
   listOrder,
   needsClock,
@@ -1921,9 +1922,13 @@ test("queue rows carry the PR URL, and none without a slug", () => {
   for (const entry of section(bare, "batch").items[0].prs) assert.equal(entry.url, null);
 });
 
-const listed = (repos, pins = []) => {
-  const { shown, idle } = listOrder(repos, new Set(pins.map((slug) => `/r/${slug}`)));
-  return { shown: shown.map((r) => r.slug), idle: idle.map((r) => r.slug) };
+const ids = (slugs) => new Set(slugs.map((slug) => `/r/${slug}`));
+const listed = (repos, pins = [], hidden = []) => {
+  const order = listOrder(repos, ids(pins), ids(hidden));
+  const slugs = (list) => list.map((r) => r.slug);
+  return hidden.length > 0
+    ? { shown: slugs(order.shown), idle: slugs(order.idle), hidden: slugs(order.hidden) }
+    : { shown: slugs(order.shown), idle: slugs(order.idle) };
 };
 
 test("repo list: busy repos by name, quiet ones apart, whatever their grade", () => {
@@ -1950,9 +1955,27 @@ test("repo list: repos with the same name are told apart by slug", () => {
   assert.deepEqual(listed(repos).idle, ["a/app", "b/app"]);
 });
 
-test("idle line names the quiet repos", () => {
+test("repo list: hidden repos leave the list and the idle line, busy or quiet, and keep name order", () => {
+  const repos = board([verifying("o/web"), stopped("o/api"), idle("o/docs"), idle("o/bench"), idle("o/zz")]).repos;
+  assert.deepEqual(listed(repos, [], ["o/web", "o/docs", "o/bench"]), { shown: ["o/api"], idle: ["o/zz"], hidden: ["o/bench", "o/docs", "o/web"] });
+  assert.deepEqual(listed(repos, [], ["o/gone"]), { shown: ["o/api", "o/web"], idle: ["o/bench", "o/docs", "o/zz"], hidden: [] });
+});
+
+test("repo list: a pinned repo is never hidden", () => {
+  const repos = board([idle("o/a"), verifying("o/b")]).repos;
+  assert.deepEqual(listed(repos, ["o/a"], ["o/a"]), { shown: ["o/a", "o/b"], idle: [], hidden: [] });
+});
+
+test("a hidden repo still puts its work under Needs you", () => {
+  const result = board([humanTurn("o/a"), idle("o/b")]);
+  assert.deepEqual(listOrder(result.repos, new Set(), ids(["o/a"])).hidden.map((r) => r.slug), ["o/a"]);
+  assert.deepEqual(result.todo.map((entry) => entry.repoName), ["a"]);
+});
+
+test("idle and hidden lines name their repos", () => {
   const { idle: quiet } = listOrder(board([idle("o/docs"), idle("o/bench")]).repos, new Set());
   assert.equal(idleText(quiet), "2 idle · bench, docs");
+  assert.equal(hiddenText(quiet.slice(0, 1)), "1 hidden · bench");
 });
 
 test("focus: the only repo is always shown alone, a chosen repo only while it is on the board", () => {
