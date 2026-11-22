@@ -887,22 +887,28 @@ export function recentWindow(recent, open) {
 const GRADE = table({ error: 0, human: 0, working: 1, waiting: 2, ok: 3 });
 export const gradeOf = (tone) => GRADE[tone] ?? 3;
 
-const DAEMON_OFF_KEY = "daemon:off";
+const byName = (a, b) => a.name.localeCompare(b.name) || a.slug.localeCompare(b.slug) || a.id.localeCompare(b.id);
 
-// What the next fold state is for one repo.
-// `prev` is `{ keys, auto }` from the last read (`keys` null before the first read), `keys` the problem keys now,
-// `saved` whether the user left the repo folded. A folded repo opens by itself while a key it did not have before
-// is on it, and folds again once every key is gone.
-export function nextFold(prev, keys, saved) {
-  const had = prev?.keys instanceof Set ? prev.keys : new Set();
-  const now = new Set(keys);
-  const fresh = keys.some((key) => !had.has(key));
-  const auto = !saved ? false : fresh ? true : now.size === 0 ? false : prev?.auto === true;
-  return { folded: saved && !auto, auto, keys: now };
+// How the repo list is laid out. Pinned repos come first, then the rest by name, so a repo keeps its place when its
+// status changes; what needs the user is already lifted into Needs you. Quiet repos that are not pinned go to `idle`,
+// which the panel draws as one line.
+export function listOrder(repos, pinned) {
+  const pin = pinned instanceof Set ? pinned : new Set();
+  const sorted = [...repos].sort((a, b) => Number(pin.has(b.id)) - Number(pin.has(a.id)) || byName(a, b));
+  return {
+    shown: sorted.filter((repo) => pin.has(repo.id) || !repo.quiet),
+    idle: sorted.filter((repo) => !pin.has(repo.id) && repo.quiet),
+  };
 }
 
-// The user pressed the head line: what they see flips and becomes their choice.
-export const toggleFold = ({ saved, auto }) => ({ saved: !(saved && !auto), auto: false });
+export const idleText = (repos) => `${repos.length} idle · ${repos.map((repo) => repo.name).join(", ")}`;
+
+// The repo the panel shows alone: the only repo there is, or the chosen one while it is still on the board.
+export function focusOf(board, id) {
+  if (board?.kind !== "board") return null;
+  if (board.repos.length === 1) return board.repos[0];
+  return board.repos.find((repo) => repo.id === id) ?? null;
+}
 
 const TIME = (ms) => new Date(ms);
 const two = (n) => String(n).padStart(2, "0");
@@ -945,7 +951,6 @@ function repoBoard(view, now) {
     stateDir: str(repo.state_dir),
     hub,
     notices: [],
-    problems: [],
     daemon: DAEMON_UNKNOWN,
     flaky: null,
     quiet: false,
@@ -1015,7 +1020,6 @@ function repoBoard(view, now) {
     quiet,
     daemon: daemonOf(view, queue),
     notices,
-    problems: [...notices.map((n) => n.key), ...(placed.alerts.some((a) => a.kind === "daemon") ? [DAEMON_OFF_KEY] : [])],
     active: placed.batch.length > 0 || postVerify?.run != null,
     postVerify,
     recent,
