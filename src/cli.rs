@@ -67,6 +67,8 @@ pub enum Command {
     Uninstall(cmd::uninstall::Args),
     /// 이 저장소의 허브(대기열을 가진 머신)를 보거나 정한다
     Hub(cmd::hub::Args),
+    /// 이 PC에서 저장소의 chute 등록을 푼다. 기록은 남기고 `chute init`으로 다시 등록한다
+    Forget(cmd::forget::Args),
     /// 다른 머신의 허브가 보고서 묶음을 넘길 때 쓴다. 사람이 쓰지 않는다
     #[command(hide = true)]
     Deliver(cmd::deliver::Args),
@@ -141,6 +143,7 @@ pub fn dispatch(cli: Cli, ctx: &Ctx) -> Result<ExitCode> {
         Command::Events(args) => cmd::events::run(args, ctx),
         Command::Flaky(args) => cmd::flaky::run(args, ctx),
         Command::Gc(args) => cmd::gc::run(args, ctx),
+        Command::Forget(args) => cmd::forget::run(args, ctx),
         Command::Revert(args) => cmd::revert::run(args, ctx),
         Command::Hub(args) => cmd::hub::run(args, ctx),
         Command::Install(args) => cmd::install::run(args, ctx),

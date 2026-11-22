@@ -299,7 +299,7 @@ herdr의 머신 연결은 ssh다. 허브에 명령을 넘기는 PC는 허브에 
 - `chute revert`는 허브에서 실행한다. 다른 PC에서 실행하면 종료 코드 2로 "revert는 허브에서만 실행한다"를 내고, 허브에서 실행할 `hc run --on <허브> --cwd <경로> chute revert <batch>` 명령을 보인다. 되돌린 트리의 검증이 `hc exec`의 제한 시간을 넘을 수 있어 넘기지 않는다.
 - `chute daemon`도 허브에서만 돈다. 다른 PC에서는 `chute up`이 허브에 데몬을 띄운다.
 - `chute approve`, `chute drop`, `chute batches`, `chute giveup`, `chute up`, `chute down`, `chute status`, `chute events`, `chute flaky`는 어느 PC에서 실행해도 허브로 넘어간다.
-- `chute init`, `chute install`, `chute hub`, `chute gc`, `chute --skill`은 그 PC의 일이다. 허브로 넘기지 않는다. 다른 PC에 남은 로그와 보고서는 그 PC에서 `chute gc`로 지운다.
+- `chute init`, `chute install`, `chute hub`, `chute gc`, `chute forget`, `chute --skill`은 그 PC의 일이다. 허브로 넘기지 않는다. 다른 PC에 남은 로그와 보고서는 그 PC에서 `chute gc`로 지운다.
 
 ### 첫 실제 가동에서 확인할 것
 
@@ -485,6 +485,13 @@ batch, preflight, 기준 검증, revert, flaky 확인이 모두 검증 명령을
 - 다시 시작하려면 `chute up`.
 
 `chute daemon`은 `chute up`이 데몬 터미널에서 실행하는 명령이다. 직접 쓸 일은 거의 없다.
+
+### 저장소 등록 풀기
+
+- `chute forget`: 이 PC에서 저장소의 chute 등록을 푼다. 저장소 안에서 실행하거나, 다른 곳에서 `--slug <owner/name>`으로 고른다. `chute status --all`과 현황판에서 사라지고, 훅은 이 저장소의 기본 브랜치 push를 더는 막지 않는다.
+- 기록(`history.jsonl`, batch, 보고서)은 상태 폴더에 남는다. 등록 파일 `repo.json`만 지운다. 저장소에서 `chute init`을 다시 실행하면 기록과 함께 돌아온다.
+- 큐에 PR이 남아 있거나 batch가 남아 있거나 데몬이 돌고 있으면 종료 코드 1로 거절한다. `chute drop`으로 빼거나 `chute down`으로 멈춘 뒤 다시 실행한다.
+- 이 PC의 등록만 푼다. 허브로 넘기지 않으니 다른 PC는 그 PC에서 실행한다. 현황판에서만 안 보이게 하려면 등록을 풀지 말고 현황판의 `Hide`를 쓴다.
 
 ## 동작 규칙
 

@@ -155,6 +155,16 @@ impl RepoStore {
         read_json(&self.dir.join(REPO_FILE))
     }
 
+    /// Removes only `repo.json`. The rest of the folder stays, so `chute init` brings the history back.
+    pub fn unregister(&self) -> Result<()> {
+        let path = self.dir.join(REPO_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("지우지 못했다: {}", path.display())),
+        }
+    }
+
     pub fn setup_record(&self) -> Result<Option<SetupRecord>> {
         read_json(&self.dir.join(SETUP_FILE))
     }

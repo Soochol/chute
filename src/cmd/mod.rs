@@ -7,6 +7,7 @@ pub mod down;
 pub mod drop;
 pub mod events;
 pub mod flaky;
+pub mod forget;
 pub mod gc;
 pub mod giveup;
 pub mod guard;
