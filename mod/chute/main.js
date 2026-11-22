@@ -31,6 +31,7 @@ import {
   interpret,
   isNarrow,
   focusOf,
+  hiddenText,
   idleText,
   isWide,
   listOrder,
@@ -65,6 +66,7 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const MAX_VIEW_CHARS = 200_000;
 const FOCUS_KEY = "chute.focus";
 const PINS_KEY = "chute.pins";
+const HIDDEN_KEY = "chute.hidden";
 const SHARED_KEY = "chute.status";
 const SURFACE_ALPHA = 0.06;
 const CARD_ALPHA = 0.12;
@@ -110,9 +112,9 @@ const recallText = (key) => {
     return null;
   }
 };
-const recallPins = () => {
+const recallIds = (key) => {
   try {
-    const value = JSON.parse(recallText(PINS_KEY) ?? "[]");
+    const value = JSON.parse(recallText(key) ?? "[]");
     return new Set(Array.isArray(value) ? value.filter((id) => typeof id === "string") : []);
   } catch {
     return new Set();
@@ -180,8 +182,10 @@ export default class Chute extends View {
     this.sinceRead = 0;
     this.pollMs = LOCAL_POLL_MS;
     this.focus = recallText(FOCUS_KEY);
-    this.pins = recallPins();
+    this.pins = recallIds(PINS_KEY);
+    this.hidden = recallIds(HIDDEN_KEY);
     this.idleOpen = false;
+    this.hiddenOpen = false;
     this.moreOpen = new Set();
     this.flakyOpen = new Set();
     this.readAt = null;
@@ -343,14 +347,40 @@ export default class Chute extends View {
     cx.notify();
   }
 
-  togglePin(repo, cx) {
-    if (!this.pins.delete(repo.id)) this.pins.add(repo.id);
+  saveIds() {
     rememberText(PINS_KEY, this.pins.size > 0 ? JSON.stringify([...this.pins]) : null);
+    rememberText(HIDDEN_KEY, this.hidden.size > 0 ? JSON.stringify([...this.hidden]) : null);
+  }
+
+  togglePin(repo, cx) {
+    if (!this.pins.delete(repo.id)) {
+      this.pins.add(repo.id);
+      this.hidden.delete(repo.id);
+    }
+    this.saveIds();
     cx.notify();
+  }
+
+  // Hiding takes the repo back to the list, where it has moved to the hidden line.
+  toggleHidden(repo, cx) {
+    if (this.hidden.delete(repo.id)) {
+      this.saveIds();
+      cx.notify();
+      return;
+    }
+    this.hidden.add(repo.id);
+    this.pins.delete(repo.id);
+    this.saveIds();
+    this.showList(cx);
   }
 
   toggleIdle(cx) {
     this.idleOpen = !this.idleOpen;
+    cx.notify();
+  }
+
+  toggleHiddenLine(cx) {
+    this.hiddenOpen = !this.hiddenOpen;
     cx.notify();
   }
 
@@ -829,7 +859,9 @@ export default class Chute extends View {
         const repo = focusOf(this.board, this.focus);
         if (!repo) return el;
         const pinned = this.pins.has(repo.id);
+        const hidden = this.hidden.has(repo.id);
         return el
+          .child(iconButton("chute-hide", hidden ? "Show" : "Hide", t, (cx) => this.toggleHidden(repo, cx), hidden ? "Show in the list again" : "Hide from the list. What needs you still shows"))
           .child(iconButton("chute-pin", pinned ? "★" : "☆", t, (cx) => this.togglePin(repo, cx), pinned ? "Unpin" : "Pin to top"))
           .child(iconButton("chute-all", "‹ All", t, (cx) => this.showList(cx), "All repos"));
       })
@@ -874,27 +906,37 @@ export default class Chute extends View {
   }
 
   listView(repos, t) {
-    const { shown, idle } = listOrder(repos, this.pins);
+    const { shown, idle, hidden } = listOrder(repos, this.pins, this.hidden);
     const rows = shown.map((repo) => this.repoHead(repo, "list", t));
     const idleRows =
       idle.length === 1
         ? [this.repoHead(idle[0], "list", t)]
         : idle.length > 1
-          ? [this.idleLine(idle, t), ...(this.idleOpen ? idle.map((repo) => this.repoHead(repo, "list", t)) : [])]
+          ? [
+              this.foldLine("idle", idleText(idle), this.idleOpen, (cx) => this.toggleIdle(cx), t),
+              ...(this.idleOpen ? idle.map((repo) => this.repoHead(repo, "list", t)) : []),
+            ]
           : [];
+    const hiddenRows =
+      hidden.length > 0
+        ? [
+            this.foldLine("hidden", hiddenText(hidden), this.hiddenOpen, (cx) => this.toggleHiddenLine(cx), t),
+            ...(this.hiddenOpen ? hidden.map((repo) => this.repoHead(repo, "list", t)) : []),
+          ]
+        : [];
     return v_flex()
       .gap(4)
       .child(sectionTitle("Repos", repos.length, t))
-      .child(v_flex().gap(2).children([...rows, ...idleRows]));
+      .child(v_flex().gap(2).children([...rows, ...idleRows, ...hiddenRows]));
   }
 
-  idleLine(idle, t) {
-    const text = idleText(idle);
-    return linkRow("idle-repos", t, (cx) => this.toggleIdle(cx))
+  // One line that stands for several repos and opens to list them.
+  foldLine(id, text, open, onClick, t) {
+    return linkRow(`${id}-repos`, t, onClick)
       .items_center()
-      .child(chevron(t, this.idleOpen ? "▾" : "▸"))
+      .child(chevron(t, open ? "▾" : "▸"))
       .child(div().flex_none().w(10).h(16).flex().items_center().justify_center().child(dot(t.muted, false)))
-      .child(div().id("idle-names").flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).tooltip(text).child(text));
+      .child(div().id(`${id}-names`).flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).tooltip(text).child(text));
   }
 
   todoView(body, t) {
