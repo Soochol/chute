@@ -236,9 +236,11 @@ PR마다 연속 반송 횟수를 센다. 기본 3번 반송한 뒤에 또 실패
 - `--since`는 epoch 밀리초, RFC 3339 시각, 상대 시간(`30m`, `2h`, `1d`) 가운데 하나다. 그 시각 이후(같은 시각 포함)의 사건을 낸다. 같은 시각의 사건이 여럿일 수 있으니 이미 처리한 사건은 `(at_ms, event, pr)`로 거른다.
 - 알림 줄의 `at=`는 그 사건의 `at_ms`와 같거나 몇 밀리초 어긋난다(`flaky` 알림은 어긋날 수 있다). `chute events --since <at - 1000>`처럼 조금 앞선 값으로 같은 사건을 찾는다.
 - `--limit`의 기본값은 500이고 가장 최근 것만 남긴다. 잘리면 stderr에 알린다.
-- `--json`은 history 한 줄과 같은 JSON을 한 줄에 하나씩 낸다. 사건 종류에 `submitted`, `dropped`, `removed`, `notified`, `resumed`, `flaky_probe`가 있다. `removed`는 `pr`, `reason`(`budget`, `gave_up`, `upgrade`), `detail`, `report`를 담는다. `bounced`에는 작업자에게 닿지 않은 이유를 적는 `unreachable`이 있다(없으면 `null`). 옛 기록의 `needs_human`, `gave_up`, `notified kind=human`은 더 쓰지 않지만 그대로 읽고 보인다. `notified`의 `delivered`가 `sent`와 `same_as_agent`가 아니면 사람용 출력의 그 줄 끝에 `(놓친 알림)`이 붙는다. 값 가운데 `no_terminal`, `gone`, `blocked`, `unknown_machine`, `failed`는 알림이 가지 못한 것이다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄 하나만 보낸 것이니 갔다고 보고 표시를 붙이지 않는다.
+- `--json`은 history 한 줄과 같은 JSON을 한 줄에 하나씩 낸다. 사건 종류에 `submitted`, `dropped`, `removed`, `notified`, `resumed`, `flaky_probe`, `flaky_resolved`가 있다. `removed`는 `pr`, `reason`(`budget`, `gave_up`, `upgrade`), `detail`, `report`를 담는다. `bounced`에는 작업자에게 닿지 않은 이유를 적는 `unreachable`이 있다(없으면 `null`). 옛 기록의 `needs_human`, `gave_up`, `notified kind=human`은 더 쓰지 않지만 그대로 읽고 보인다. `notified`의 `delivered`가 `sent`와 `same_as_agent`가 아니면 사람용 출력의 그 줄 끝에 `(놓친 알림)`이 붙는다. 값 가운데 `no_terminal`, `gone`, `blocked`, `unknown_machine`, `failed`는 알림이 가지 못한 것이다. `same_as_agent`는 작업자와 같은 터미널이라 반송 줄 하나만 보낸 것이니 갔다고 보고 표시를 붙이지 않는다.
 
 **`chute flaky [--days <n>] [--json]`.** 흔들린 시험의 장부다. (단계, 시험)마다 흔들린 횟수, 마지막 시각, 근거(`base`, `made`, `unresolved`), 만성 여부를 보인다. `made`는 그 batch가 흔들림을 만들었을 수 있다는 뜻이다. chute는 흔들린 batch를 그대로 머지하고 기록만 한다. 허브가 다른 PC여도 허브의 것을 낸다.
+
+**`chute flaky --resolve <단계> [<시험>] --note <근거>`.** 원인을 고친 시험을 표시한다. 그 시각까지의 흔들림은 만성 판정과 반송 판단(장부에 있는 시험이라 다시 돌려 보는 것)에서 빠지고, 만성 경고도 바로 사라진다. 흔들림 기록은 지우지 않아 장부의 횟수는 그대로이고 줄 끝에 `풀림 <시각> (<근거>)`이 붙는다. JSON 항목에는 `resolved`(`at_ms`, `note`)가 있다(풀림이 없으면 `null`). 그 시험이 다시 흔들리면 풀림이 무효가 되어 30일 기록을 모두 다시 센다. 최근 `flaky.chronic_days`일 장부에 없는 단계·시험은 받지 않는다. 시험 이름 없이 단계만 주면 시험 이름 없이 기록된 그 단계의 흔들림을 푼다. 근거에는 고친 PR이나 커밋, 반복 실행 결과를 적는다. 오케스트레이터나 사람이 쓴다.
 
 **`chute gc [--dry-run] [--json]`.** 오래된 검증 로그, preflight 로그, 반송 보고서, 실패 트리 참조, 남는 preflight 슬롯을 지운다. `--dry-run`은 지울 것과 크기만 보인다. 이 PC의 상태 폴더만 다루고 허브로 넘기지 않는다. 기록(`history.jsonl`, `state.json`, `batch.json`, `revert.json`)과 큐가 멈춘 이유의 로그는 지우지 않는다. 데몬이 시작할 때와 한 시간마다 같은 정리를 하니 직접 쓸 일은 드물다.
 

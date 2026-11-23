@@ -1112,6 +1112,13 @@ pub enum EventKind {
         runs: u32,
         failures: u32,
     },
+    /// A person marked a flaky key as fixed. Its earlier flakes stop counting toward chronic and
+    /// the known-flaky judgment until it flakes again.
+    FlakyResolved {
+        step: String,
+        test: Option<String>,
+        note: String,
+    },
     PostGreen {
         commit: Sha,
         previous: Option<Sha>,

@@ -153,3 +153,47 @@ fn flaky_asked_of_a_pc_that_is_not_the_hub_answers_not_hub_and_an_unreachable_hu
 
     assert_eq!(output.status.code(), Some(2), "{}", err(&output));
 }
+
+#[test]
+fn resolving_on_another_pc_marks_the_hubs_ledger_and_lifts_chronic() {
+    let net = forward_kit::net();
+    let (a, b) = (net.node("a"), net.node("b"));
+    seed(b, &ledger());
+
+    let output = a.chute(
+        BIN,
+        &["flaky", "--resolve", "test", "a", "--note", "PR #9 고침"],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", err(&output));
+    assert!(
+        out(&output).contains("단계 test의 시험 a: 고친 것으로 표시했다"),
+        "{}",
+        out(&output)
+    );
+    assert!(out(&output).contains("흔들림 3번"), "{}", out(&output));
+    let report = json(&b.chute(BIN, &["flaky", "--json"]));
+    let a_entry = &report["entries"][0];
+    assert_eq!(a_entry["test"], "a");
+    assert_eq!(a_entry["count"], 3);
+    assert_eq!(a_entry["chronic"], false);
+    assert_eq!(a_entry["resolved"]["note"], "PR #9 고침");
+    assert_eq!(report["entries"][1]["resolved"], Value::Null);
+    let plain = out(&b.chute(BIN, &["flaky"]));
+    assert!(plain.contains("· 풀림 "), "{plain}");
+    assert!(plain.contains("(PR #9 고침)"), "{plain}");
+    assert!(store(a).history().unwrap().events.is_empty());
+}
+
+#[test]
+fn resolving_a_test_the_ledger_does_not_have_fails_and_records_nothing() {
+    let net = forward_kit::net();
+    let hub = net.node("b");
+    seed(hub, &ledger());
+
+    let output = hub.chute(BIN, &["flaky", "--resolve", "test", "zzz", "--note", "x"]);
+
+    assert_eq!(output.status.code(), Some(2), "{}", err(&output));
+    assert!(err(&output).contains("장부에 없다"), "{}", err(&output));
+    assert_eq!(store(hub).history().unwrap().events.len(), ledger().len());
+}

@@ -7,7 +7,7 @@ use serde::Serialize;
 use super::events::probe_evidence;
 use super::{Ctx, run_on_hub};
 use crate::config::{Config, FlakyPolicy};
-use crate::flaky::{Entry, ledger};
+use crate::flaky::{Entry, Key, ledger, resolve as resolve_key};
 use crate::model::EpochMs;
 
 #[derive(clap::Args, Debug)]
@@ -18,6 +18,18 @@ pub struct Args {
     /// 장부를 JSON 하나로 낸다
     #[arg(long)]
     pub json: bool,
+    /// 이 단계(와 시험)를 고친 것으로 표시한다. 지금까지의 흔들림은 만성 판정과 반송 판단에서 빠지고, 다시 흔들리면 풀림이 무효가 된다
+    #[arg(
+        long,
+        num_args = 1..=2,
+        value_names = ["단계", "시험"],
+        requires = "note",
+        conflicts_with_all = ["days", "json"]
+    )]
+    pub resolve: Option<Vec<String>>,
+    /// --resolve의 근거(고친 PR이나 커밋, 반복 실행 결과)
+    #[arg(long, value_name = "근거", requires = "resolve")]
+    pub note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -35,6 +47,13 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
     }
     if args.json {
         forwarded.push("--json".into());
+    }
+    if let Some(resolve) = &args.resolve {
+        forwarded.push("--resolve".into());
+        forwarded.extend(resolve.iter().cloned());
+    }
+    if let Some(note) = &args.note {
+        forwarded.extend(["--note".into(), note.clone()]);
     }
     let forwarded: Vec<&str> = forwarded.iter().map(String::as_str).collect();
     if let Some(code) = run_on_hub(ctx, &forwarded)? {
@@ -57,6 +76,19 @@ pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
             FlakyPolicy::default()
         }
     };
+    if let Some(resolve) = &args.resolve {
+        let key = Key {
+            step: resolve[0].clone(),
+            test: resolve.get(1).cloned(),
+        };
+        let note = args.note.as_deref().unwrap_or_default();
+        let set_aside = resolve_key(&store, EpochMs::now(), &policy, &key, note)?;
+        println!(
+            "{}: 고친 것으로 표시했다. 지금까지의 흔들림 {set_aside}번은 만성 판정과 반송 판단에서 빠진다. 다시 흔들리면 풀림이 무효가 된다",
+            key.label()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     let history = store.history()?;
     if !history.broken_lines.is_empty() {
         eprintln!(
@@ -92,13 +124,7 @@ where
         policy.chronic_days, policy.chronic
     );
     for entry in entries {
-        let at = i64::try_from(entry.last_ms.0)
-            .ok()
-            .and_then(|ms| tz.timestamp_millis_opt(ms).single())
-            .map_or_else(
-                || format!("at={}", entry.last_ms.0),
-                |t| t.format("%Y-%m-%d %H:%M").to_string(),
-            );
+        let at = when(entry.last_ms, tz);
         text.push_str(&format!(
             "{} · {}번 · 마지막 {at} · batch {}",
             entry.key.label(),
@@ -111,9 +137,29 @@ where
         if entry.chronic {
             text.push_str(" · 만성");
         }
+        if let Some(resolved) = &entry.resolved {
+            text.push_str(&format!(
+                " · 풀림 {} ({})",
+                when(resolved.at_ms, tz),
+                resolved.note
+            ));
+        }
         text.push('\n');
     }
     text
+}
+
+fn when<Tz: TimeZone>(at: EpochMs, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    i64::try_from(at.0)
+        .ok()
+        .and_then(|ms| tz.timestamp_millis_opt(ms).single())
+        .map_or_else(
+            || format!("at={}", at.0),
+            |t| t.format("%Y-%m-%d %H:%M").to_string(),
+        )
 }
 
 #[cfg(test)]
@@ -135,6 +181,7 @@ mod tests {
             last_batch: BatchId("b1".into()),
             evidence: Some(ProbeEvidence::Made),
             chronic,
+            resolved: None,
         }
     }
 
@@ -152,6 +199,48 @@ mod tests {
             "최근 30일에 흔들린 시험 (만성: 30일에 3번)\n\
              단계 test의 시험 a::b · 3번 · 마지막 2023-11-14 22:13 · batch b1 · 흔들림을 재현함 · 만성\n\
              단계 test · 1번 · 마지막 2023-11-14 22:13 · batch b1 · 흔들림을 재현함\n"
+        );
+    }
+
+    #[test]
+    fn a_resolved_line_shows_when_and_why_instead_of_chronic() {
+        let mut fixed = entry(Some("a::b"), 5, false);
+        fixed.resolved = Some(crate::flaky::Resolution {
+            at_ms: EpochMs(1_700_100_000_000),
+            note: "PR #648".into(),
+        });
+
+        let text = render(&[fixed], 30, &FlakyPolicy::default(), &Utc);
+
+        assert!(
+            text.ends_with(
+                "단계 test의 시험 a::b · 5번 · 마지막 2023-11-14 22:13 · batch b1 · 흔들림을 재현함 · 풀림 2023-11-16 02:00 (PR #648)\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn resolve_needs_a_note_and_takes_a_step_with_an_optional_test() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: Args,
+        }
+        let parse = |argv: &[&str]| Cli::try_parse_from([&["chute"], argv].concat());
+
+        assert!(parse(&["--resolve", "e2e"]).is_err());
+        assert!(parse(&["--note", "x"]).is_err());
+        assert!(parse(&["--resolve", "e2e", "--note", "x", "--json"]).is_err());
+        let step = parse(&["--resolve", "e2e", "--note", "x"]).unwrap().args;
+        assert_eq!(step.resolve, Some(vec!["e2e".to_owned()]));
+        let test = parse(&["--resolve", "e2e", "a.spec.ts:1", "--note", "x"])
+            .unwrap()
+            .args;
+        assert_eq!(
+            test.resolve,
+            Some(vec!["e2e".to_owned(), "a.spec.ts:1".to_owned()])
         );
     }
 

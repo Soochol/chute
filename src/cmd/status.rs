@@ -590,6 +590,7 @@ pub fn summarize<Tz: TimeZone>(
             | EventKind::Notified { .. }
             | EventKind::Resumed { .. }
             | EventKind::FlakyProbe { .. }
+            | EventKind::FlakyResolved { .. }
             | EventKind::Reused { .. }
             | EventKind::PostGreen { .. }
             | EventKind::PostFailed { .. }

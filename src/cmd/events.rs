@@ -122,6 +122,7 @@ fn involves(kind: &EventKind, target: PrNumber) -> bool {
         EventKind::Flaky { .. }
         | EventKind::Blocked { .. }
         | EventKind::FlakyProbe { .. }
+        | EventKind::FlakyResolved { .. }
         | EventKind::Reused { .. }
         | EventKind::PostGreen { .. } => false,
         EventKind::PostFailed { culprit, .. } => {
@@ -334,6 +335,13 @@ fn describe(kind: &EventKind) -> String {
             names(tests),
             probe_evidence(*evidence)
         ),
+        EventKind::FlakyResolved { step, test, note } => {
+            let key = crate::flaky::Key {
+                step: step.clone(),
+                test: test.clone(),
+            };
+            format!("흔들림 풀림 · {} · 근거 {note}", key.label())
+        }
         EventKind::PostGreen {
             commit,
             previous,
@@ -784,6 +792,11 @@ mod tests {
                 evidence: ProbeEvidence::Made,
                 runs: 5,
                 failures: 2,
+            },
+            EventKind::FlakyResolved {
+                step: "e2e".into(),
+                test: Some("login".into()),
+                note: "PR #9".into(),
             },
             EventKind::PostGreen {
                 commit: sha("9f8e7d6a5b4c"),
