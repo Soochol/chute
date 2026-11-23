@@ -176,6 +176,8 @@ test("each event kind has an english line and an unknown kind shows its name", (
     [{ event: "needs_human", pr: 9, reason: "budget" }, "needs human #9"],
     [{ event: "reused", batch: "b" }, "reused"],
     [{ event: "flaky_probe", batch: "b", step: "e2e", tests: [] }, "flaky probe"],
+    [{ event: "flaky_resolved", step: "e2e", test: "e2e/a.spec.ts:1", note: "PR #9 고침" }, "flaky resolved e2e/a.spec.ts:1 · e2e"],
+    [{ event: "flaky_resolved", step: "lint", test: null, note: "x" }, "flaky resolved lint"],
     [{ event: "notified", kind: "merged", pr: 4 }, "notified #4"],
     [{ event: "new_thing", pr: 4, detail: "extra" }, "new_thing"],
   ];
@@ -241,7 +243,10 @@ test("the flaky ledger lists chronic tests first, then by count and last time", 
     rows.map((r) => r.test),
     ["top", "new", "old", "quiet", "tie-new", "tie-old"],
   );
-  assert.deepEqual(rows[1], { key: rows[1].key, test: "new", step: "e2e", count: 4, ago: "2h ago", chronic: true });
+  assert.deepEqual(rows[1], { key: rows[1].key, test: "new", step: "e2e", count: 4, ago: "2h ago", chronic: true, resolved: false });
+  const fixed = flakyRows([{ ...e("fixed", 5, 1, false), resolved: { at_ms: now, note: "PR #9" } }], now)[0];
+  assert.equal(fixed.resolved, true);
+  assert.equal(fixed.chronic, false);
   assert.equal(flakyRows([{ step: "check", count: 1, last_ms: now, chronic: false }], now)[0].test, "(whole step)");
   assert.deepEqual(flakyRows([], now), []);
 });

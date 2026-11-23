@@ -697,7 +697,7 @@ export default class Chute extends View {
               .child(div().flex_none().w(90).truncate().text_size(11).text_color(t.dim).child(row.step))
               .child(mono(div().flex_none().w(36).text_right().text_size(12)).child(String(row.count)))
               .child(mono(div().flex_none().w(72).text_right().whitespace_nowrap().text_size(11).text_color(t.dim)).child(row.ago))
-              .child(div().flex_none().w(60).child(row.chronic ? chip("chronic", t.ansi3, t) : div())),
+              .child(div().flex_none().w(60).child(row.chronic ? chip("chronic", t.ansi3, t) : row.resolved ? chip("resolved", t.ansi2, t) : div())),
           ),
         ),
       ...(hidden > 0 || this.flakyMore

@@ -197,6 +197,7 @@ export function flakyRows(entries, now = Date.now()) {
       count: count(e),
       ago: Number.isFinite(e.last_ms) ? formatAgo(now - e.last_ms) : "",
       chronic: e.chronic === true,
+      resolved: isObject(e.resolved),
     }));
 }
 
@@ -253,6 +254,7 @@ const EVENT = {
   closed: kind("–", "waiting", withPr("closed")),
   reused: kind("·", "dim", withPr("reused")),
   flaky_probe: kind("·", "dim", withPr("flaky probe")),
+  flaky_resolved: kind("✓", "ok", (e) => `flaky resolved ${typeof e.test === "string" ? `${e.test} · ` : ""}${str(e.step)}`),
   notified: kind("·", "dim", withPr("notified")),
 };
 

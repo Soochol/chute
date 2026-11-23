@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::config::{Config, FlakyPolicy, PROBE_PLACEHOLDER};
@@ -65,6 +65,56 @@ pub struct Entry {
     pub last_batch: BatchId,
     pub evidence: Option<ProbeEvidence>,
     pub chronic: bool,
+    /// The resolution in force, if any. Its flakes still show in `count`.
+    pub resolved: Option<Resolution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Resolution {
+    pub at_ms: EpochMs,
+    pub note: String,
+}
+
+type Resolved = BTreeMap<Key, Resolution>;
+
+/// The latest resolution of each key, unless the key flaked after it.
+fn resolutions(events: &[Event]) -> Resolved {
+    let mut held = Resolved::new();
+    for event in events {
+        if let EventKind::FlakyResolved { step, test, note } = &event.kind {
+            let key = Key {
+                step: step.clone(),
+                test: test.clone(),
+            };
+            if held.get(&key).is_none_or(|r| r.at_ms <= event.at_ms) {
+                held.insert(
+                    key,
+                    Resolution {
+                        at_ms: event.at_ms,
+                        note: note.clone(),
+                    },
+                );
+            }
+        }
+    }
+    if held.is_empty() {
+        return held;
+    }
+    for event in events {
+        if let EventKind::Flaky { step, tests, .. } = &event.kind {
+            for key in keys_of(step, tests) {
+                if held.get(&key).is_some_and(|r| event.at_ms > r.at_ms) {
+                    held.remove(&key);
+                }
+            }
+        }
+    }
+    held
+}
+
+/// Whether a flake of `key` at `at` still counts: it came after the key's resolution, if any.
+fn still_counts(resolved: &Resolved, key: &Key, at: EpochMs) -> bool {
+    resolved.get(key).is_none_or(|r| at > r.at_ms)
 }
 
 struct Tally {
@@ -77,7 +127,7 @@ fn window_start(now: EpochMs, days: u32) -> u64 {
     now.0.saturating_sub(u64::from(days) * DAY_MS)
 }
 
-fn tally(events: &[Event], since: u64) -> BTreeMap<Key, Tally> {
+fn tally(events: &[Event], since: u64, resolved: &Resolved) -> BTreeMap<Key, Tally> {
     let mut flakes: Vec<(&Event, &BatchId, &str, &[String])> = events
         .iter()
         .filter(|e| e.at_ms.0 >= since)
@@ -92,6 +142,9 @@ fn tally(events: &[Event], since: u64) -> BTreeMap<Key, Tally> {
     let mut counts: BTreeMap<Key, Tally> = BTreeMap::new();
     for (event, batch, step, tests) in flakes {
         for key in keys_of(step, tests) {
+            if !still_counts(resolved, &key, event.at_ms) {
+                continue;
+            }
             let tally = counts.entry(key).or_insert_with(|| Tally {
                 count: 0,
                 last_ms: event.at_ms,
@@ -126,14 +179,16 @@ fn evidence_for(events: &[Event], batch: &BatchId, key: &Key) -> Option<ProbeEvi
 }
 
 /// Flakes of the last `days` days, most frequent first. `chronic` is judged over the policy's
-/// own window, whatever `days` is.
+/// own window, whatever `days` is, and leaves out the flakes a resolution set aside.
 pub fn ledger(events: &[Event], now: EpochMs, policy: &FlakyPolicy, days: u32) -> Vec<Entry> {
-    let chronic = chronic_keys(events, now, policy);
-    let mut entries: Vec<Entry> = tally(events, window_start(now, days))
+    let resolved = resolutions(events);
+    let chronic = chronic_keys(events, now, policy, &resolved);
+    let mut entries: Vec<Entry> = tally(events, window_start(now, days), &Resolved::new())
         .into_iter()
         .map(|(key, t)| Entry {
             evidence: evidence_for(events, &t.last_batch, &key),
             chronic: chronic.contains_key(&key),
+            resolved: resolved.get(&key).cloned(),
             key,
             count: t.count,
             last_ms: t.last_ms,
@@ -151,7 +206,7 @@ pub fn ledger(events: &[Event], now: EpochMs, policy: &FlakyPolicy, days: u32) -
 
 /// Whether each of `tests` was recorded as flaky in `step` within the last `days` days by a batch
 /// other than `except`. An empty `tests` is never known, and neither is a step-level record that
-/// names no test.
+/// names no test. A flake that a resolution set aside does not count.
 pub fn known_flaky(
     events: &[Event],
     now: EpochMs,
@@ -173,6 +228,7 @@ pub fn ledger_tests(
     except: Option<&BatchId>,
 ) -> Vec<String> {
     let since = window_start(now, days);
+    let resolved = &resolutions(events);
     let recorded: HashSet<&str> = events
         .iter()
         .filter(|e| e.at_ms.0 >= since)
@@ -182,10 +238,22 @@ pub fn ledger_tests(
                 step: recorded,
                 tests,
                 ..
-            } if Some(batch) != except && recorded == step => Some(tests),
+            } if Some(batch) != except && recorded == step => Some((e.at_ms, tests)),
             _ => None,
         })
-        .flatten()
+        .flat_map(|(at, tests)| {
+            tests.iter().filter(move |test| {
+                resolved.is_empty()
+                    || still_counts(
+                        resolved,
+                        &Key {
+                            step: step.to_owned(),
+                            test: Some((*test).clone()),
+                        },
+                        at,
+                    )
+            })
+        })
         .map(String::as_str)
         .collect();
     tests
@@ -232,8 +300,13 @@ pub fn rerun_signal(
         .then_some((RerunSignal::KnownFlaky, named))
 }
 
-fn chronic_keys(events: &[Event], now: EpochMs, policy: &FlakyPolicy) -> BTreeMap<Key, u32> {
-    tally(events, window_start(now, policy.chronic_days))
+fn chronic_keys(
+    events: &[Event],
+    now: EpochMs,
+    policy: &FlakyPolicy,
+    resolved: &Resolved,
+) -> BTreeMap<Key, u32> {
+    tally(events, window_start(now, policy.chronic_days), resolved)
         .into_iter()
         .filter(|(_, t)| t.count >= policy.chronic)
         .map(|(key, t)| (key, t.count))
@@ -259,7 +332,7 @@ pub fn refresh_chronic(
     policy: &FlakyPolicy,
     touched: &[Key],
 ) -> Result<Vec<Key>> {
-    let chronic = chronic_keys(events, now, policy);
+    let chronic = chronic_keys(events, now, policy, &resolutions(events));
     store.update(|state| {
         state
             .warnings
@@ -300,6 +373,43 @@ pub fn refresh_chronic(
         }
         Ok(due)
     })
+}
+
+/// Records that `key` was fixed, with the reason, and brings the chronic warnings in line. The
+/// key must have flaked within the policy's window. Returns how many of those flakes it sets
+/// aside.
+pub fn resolve(
+    store: &RepoStore,
+    now: EpochMs,
+    policy: &FlakyPolicy,
+    key: &Key,
+    note: &str,
+) -> Result<u32> {
+    let note = note.trim();
+    if note.is_empty() {
+        bail!("--note에 고쳤다고 보는 근거를 적는다(PR 번호, 커밋, 반복 실행 결과 등)");
+    }
+    let mut events = store.history()?.events;
+    let since = window_start(now, policy.chronic_days);
+    let Some(found) = tally(&events, since, &Resolved::new()).remove(key) else {
+        bail!(
+            "{}: 최근 {}일 장부에 없다. `chute flaky`로 단계와 시험 이름을 확인한다",
+            key.label(),
+            policy.chronic_days
+        );
+    };
+    let event = Event {
+        at_ms: now,
+        kind: EventKind::FlakyResolved {
+            step: key.step.clone(),
+            test: key.test.clone(),
+            note: note.to_owned(),
+        },
+    };
+    store.append_history(&event)?;
+    events.push(event);
+    refresh_chronic(store, &events, now, policy, &[])?;
+    Ok(found.count)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -756,6 +866,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = crate::store::Home::at(dir.path());
         let store = home.repo(&crate::model::Slug::new("acme", "widget").unwrap());
+        std::fs::create_dir_all(store.dir()).unwrap();
         (dir, store)
     }
 
@@ -833,6 +944,138 @@ mod tests {
         assert!(warned(&store, &three("a"), &[]).is_empty());
         assert_eq!(messages(&store).len(), 1);
         assert_eq!(warned(&store, &three("a"), std::slice::from_ref(&a)), [a]);
+    }
+
+    fn resolved(days_ago: u64, step: &str, test: Option<&str>) -> Event {
+        Event {
+            at_ms: EpochMs(NOW.0 - days_ago * DAY_MS),
+            kind: EventKind::FlakyResolved {
+                step: step.into(),
+                test: test.map(str::to_owned),
+                note: "PR #9".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_resolution_sets_earlier_flakes_aside_from_chronic_but_keeps_their_count() {
+        let mut events = three("a");
+        events.push(resolved(0, "test", Some("a")));
+
+        let entries = ledger(&events, NOW, &policy(), 30);
+
+        assert_eq!(entries[0].count, 3);
+        assert!(!entries[0].chronic);
+        assert_eq!(
+            entries[0].resolved,
+            Some(Resolution {
+                at_ms: NOW,
+                note: "PR #9".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_flake_after_the_resolution_voids_it_and_every_flake_counts_again() {
+        let mut events = three("a");
+        events.push(resolved(1, "test", Some("a")));
+        events.push(flaky(0, "b9", "test", &["a"]));
+
+        let entries = ledger(&events, NOW, &policy(), 30);
+
+        assert_eq!(entries[0].count, 4);
+        assert!(entries[0].chronic);
+        assert_eq!(entries[0].resolved, None);
+    }
+
+    #[test]
+    fn a_later_resolution_after_a_new_flake_holds_again() {
+        let mut events = three("a");
+        events.push(resolved(2, "test", Some("a")));
+        events.push(flaky(1, "b9", "test", &["a"]));
+        events.push(resolved(0, "test", Some("a")));
+
+        assert!(!ledger(&events, NOW, &policy(), 30)[0].chronic);
+    }
+
+    #[test]
+    fn a_resolution_names_one_key_only() {
+        let mut events: Vec<Event> = three("a").into_iter().chain(three("b")).collect();
+        events.push(resolved(0, "test", Some("a")));
+        events.push(resolved(0, "lint", Some("b")));
+        events.push(resolved(0, "test", None));
+
+        let chronic: Vec<String> = ledger(&events, NOW, &policy(), 30)
+            .into_iter()
+            .filter(|e| e.chronic)
+            .map(|e| e.key.test.unwrap())
+            .collect();
+
+        assert_eq!(chronic, ["b"]);
+    }
+
+    #[test]
+    fn the_known_flaky_judgment_leaves_out_resolved_flakes_until_the_test_flakes_again() {
+        let failure = failed(Some(&["a"]), &["a"]);
+        let mut events = vec![
+            flaky(3, "b1", "test", &["a"]),
+            resolved(2, "test", Some("a")),
+        ];
+
+        assert_eq!(signal(&failure, &events), None);
+        assert!(ledger_tests(&events, NOW, 30, "test", &["a".into()], None).is_empty());
+        events.push(flaky(1, "b2", "test", &["a"]));
+        assert!(signal(&failure, &events).is_some());
+    }
+
+    #[test]
+    fn resolving_drops_the_chronic_warning_and_keeps_the_flakes() {
+        let (_dir, store) = store();
+        let a = key("test", Some("a"));
+        for event in three("a") {
+            store.append_history(&event).unwrap();
+        }
+        warned(&store, &three("a"), &[]);
+        assert_eq!(messages(&store).len(), 1);
+
+        let set_aside = resolve(&store, NOW, &policy(), &a, "  PR #9  ").unwrap();
+
+        assert_eq!(set_aside, 3);
+        assert!(messages(&store).is_empty());
+        let events = store.history().unwrap().events;
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events[3].kind,
+            EventKind::FlakyResolved {
+                step: "test".into(),
+                test: Some("a".into()),
+                note: "PR #9".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolving_needs_a_reason_and_a_key_in_the_ledger() {
+        let (_dir, store) = store();
+        store
+            .append_history(&flaky(1, "b1", "test", &["a"]))
+            .unwrap();
+        store
+            .append_history(&flaky(40, "b0", "test", &["old"]))
+            .unwrap();
+
+        let empty = resolve(&store, NOW, &policy(), &key("test", Some("a")), " ").unwrap_err();
+        assert!(empty.to_string().contains("--note"), "{empty:#}");
+        for missing in [
+            key("test", Some("x")),
+            key("lint", Some("a")),
+            key("test", None),
+            key("test", Some("old")),
+        ] {
+            let err = resolve(&store, NOW, &policy(), &missing, "PR #9").unwrap_err();
+            assert!(err.to_string().contains("장부에 없다"), "{err:#}");
+        }
+        assert_eq!(store.history().unwrap().events.len(), 2);
     }
 
     #[test]
