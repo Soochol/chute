@@ -1673,12 +1673,12 @@ test("a batch without started_ms shows no usual time, elapsed time or progress e
   assert.equal(batch().usual, "usually 6m 40s");
 });
 
-test("recent merges: five from recent_merged, with titles, bounce counts and a GitHub address", () => {
+test("recent merges: up to 100 from recent_merged, with titles, bounce counts and a GitHub address", () => {
   const data = clone(fixture);
-  data.recent_merged = Array.from({ length: 7 }, (_, i) => ({ pr: 20 - i, title: `제목 ${i}`, batch: "b", merged_ms: NOW - 60_000 * (i + 1), bounces: i === 1 ? 2 : 0 }));
+  data.recent_merged = Array.from({ length: 105 }, (_, i) => ({ pr: 200 - i, title: `제목 ${i}`, batch: "b", merged_ms: NOW - 60_000 * (i + 1), bounces: i === 1 ? 2 : 0 }));
   const recent = only(data).recent;
-  assert.equal(recent.length, 5);
-  assert.deepEqual({ ...recent[1], tip: undefined }, { pr: 19, title: "제목 1", bounces: 2, ago: "2m ago", took: "", tip: undefined, url: "https://github.com/Soochol/chute/pull/19", batch: "b", at: NOW - 120_000 });
+  assert.equal(recent.length, 100);
+  assert.deepEqual({ ...recent[1], tip: undefined }, { pr: 199, title: "제목 1", bounces: 2, ago: "2m ago", took: "", tip: undefined, url: "https://github.com/Soochol/chute/pull/199", batch: "b", at: NOW - 120_000 });
   assert.deepEqual(only([fixture]).recent.map((m) => [m.pr, m.title, m.bounces]), [
     [8, "feat: 큐 상태 전이 추가", 1],
     [7, "fix: 잠금 해제 순서를 고친다", 0],
