@@ -1327,29 +1327,35 @@ export default class Chute extends View {
     return v_flex()
       .gap(4)
       .child(sectionTitle("Recent", null, t))
-      .children(
-        groups.map((group) =>
-          v_flex()
-            .gap(2)
-            .when(group.head != null, (el) =>
-              el.child(div().px(6).min_w(0).truncate().text_size(11).text_color(t.dim).child(group.head)),
-            )
-            .children(
-              group.rows.map((m) => {
-                const i = at++;
-                const id = `merged-${repo.id}-${i}`;
-                const row = m.url ? linkRow(id, t, (cx) => cx.open_url(m.url)) : hoverRow(h_flex().id(id).px(6).py(4), t);
-                return gridRow(row, t, {
-                  narrow: this.narrow || this.wide,
-                  pr: m.pr,
-                  title: m.title,
-                  time: timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
-                  icons: rowIcons(id, m, t),
-                  chips: m.bounces > 0 ? [chip(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`, t.dim, t)] : [],
-                });
-              }),
+      .child(
+        v_flex()
+          .id(`recent-list-${repo.id}`)
+          .gap(4)
+          .when(open, (el) => el.max_h(320).overflow_y_scrollbar())
+          .children(
+            groups.map((group) =>
+              v_flex()
+                .gap(2)
+                .when(group.head != null, (el) =>
+                  el.child(div().px(6).min_w(0).truncate().text_size(11).text_color(t.dim).child(group.head)),
+                )
+                .children(
+                  group.rows.map((m) => {
+                    const i = at++;
+                    const id = `merged-${repo.id}-${i}`;
+                    const row = m.url ? linkRow(id, t, (cx) => cx.open_url(m.url)) : hoverRow(h_flex().id(id).px(6).py(4), t);
+                    return gridRow(row, t, {
+                      narrow: this.narrow || this.wide,
+                      pr: m.pr,
+                      title: m.title,
+                      time: timeCell(m.took, t).id(`took-${repo.id}-${i}`).when(Boolean(m.tip), (el) => el.tooltip(m.tip)),
+                      icons: rowIcons(id, m, t),
+                      chips: m.bounces > 0 ? [chip(`${m.bounces} ${m.bounces === 1 ? "bounce" : "bounces"}`, t.dim, t)] : [],
+                    });
+                  }),
+                ),
             ),
-        ),
+          ),
       )
       .when(hidden > 0, (el) =>
         el.child(

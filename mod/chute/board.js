@@ -516,7 +516,7 @@ export function usualSeconds(recent) {
   return samples.length % 2 ? samples[mid] : (samples[mid - 1] + samples[mid]) / 2;
 }
 
-const RECENT_MERGED_SHOWN = 5;
+export const RECENT_MERGED_SHOWN = 100;
 
 function recentMergedOf(view, slug, now) {
   const row = (pr, title, bounces, at, submitted, batch) => {

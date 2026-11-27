@@ -28,7 +28,7 @@ pub struct Args {
 }
 
 const RECENT_BATCHES: usize = 10;
-const RECENT_MERGED: usize = 5;
+const RECENT_MERGED: usize = 100;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn run(args: Args, ctx: &Ctx) -> Result<ExitCode> {
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_merged_lists_five_newest_first_with_bounces_counted_before_the_merge() {
+    fn recent_merged_lists_up_to_limit_newest_first_with_bounces_counted_before_the_merge() {
         let now = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
         let sha = Sha::try_from("abc1234".to_owned()).unwrap();
         let bounced = |pr, minutes_ago| Event {
@@ -1086,29 +1086,50 @@ mod tests {
                 title: title.map(str::to_owned),
             },
         };
-        let events = vec![
-            merged(1, 100, None),
-            bounced(2, 90),
-            bounced(2, 80),
-            merged(2, 70, Some("fix: two")),
-            bounced(3, 65),
-            merged(3, 60, Some("feat: three")),
-            merged(4, 50, Some("feat: four")),
-            merged(5, 40, Some("feat: five")),
-            merged(6, 30, Some("feat: six")),
-            bounced(7, 20),
+        let mut events = vec![
+            merged(1, 200, None),
+            bounced(2, 190),
+            bounced(2, 180),
+            merged(2, 170, Some("fix: two")),
+            bounced(3, 165),
+            merged(3, 160, Some("feat: three")),
         ];
+        for pr in 4..=(RECENT_MERGED as u64 + 1) {
+            events.push(merged(pr, 160 - pr as i64, Some(&format!("feat: {pr}"))));
+        }
+        events.push(bounced(999, 1));
         let (_, _, recent) = summarize(&events, &now);
-        let prs: Vec<u64> = recent.iter().map(|m| m.pr.0).collect();
-        assert_eq!(prs, [6, 5, 4, 3, 2], "the oldest merge falls off");
-        assert_eq!(recent[0].title.as_deref(), Some("feat: six"));
-        assert_eq!(recent[0].batch, BatchId("b6".into()));
-        assert_eq!(recent[0].merged_ms, at(&now, 30));
-        let bounces: Vec<u32> = recent.iter().map(|m| m.bounces).collect();
+        assert_eq!(recent.len(), RECENT_MERGED);
+        assert_eq!(recent[0].pr, PrNumber(RECENT_MERGED as u64 + 1));
         assert_eq!(
-            bounces,
-            [0, 0, 0, 1, 2],
-            "bounces of #7 (not merged) count for no one"
+            recent.last().unwrap().pr,
+            PrNumber(2),
+            "the oldest merge falls off"
+        );
+        assert_eq!(
+            recent[0].title.as_deref(),
+            Some(format!("feat: {}", RECENT_MERGED + 1).as_str())
+        );
+        assert_eq!(recent[0].batch, BatchId(format!("b{}", RECENT_MERGED + 1)));
+        assert_eq!(
+            recent[0].merged_ms,
+            at(&now, 160 - (RECENT_MERGED as i64 + 1))
+        );
+        let bounces_of = |pr: u64| {
+            recent
+                .iter()
+                .find(|m| m.pr == PrNumber(pr))
+                .unwrap()
+                .bounces
+        };
+        assert_eq!(
+            [
+                bounces_of(RECENT_MERGED as u64 + 1),
+                bounces_of(3),
+                bounces_of(2)
+            ],
+            [0, 1, 2],
+            "bounces of #999 (not merged) count for no one"
         );
 
         let (_, _, all) = summarize(&events[..2], &now);
